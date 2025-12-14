@@ -131,7 +131,3 @@ docker run --rm -p 53:53/udp -v $(pwd)/config/pipeline_local.json:/etc/kixdns/pi
 ## 许可证
 
 本项目采用 GNU 通用公共许可证 v3.0（GPL-3.0）发布，详见 `LICENSE` 文件。
-
----
-
-说明：此 README 为发布版说明文档，适合与源代码一同分发。如需我帮助将 `kixdns_release` 打包为 zip 或生成发布清单，请告诉我是否继续。 
