@@ -26,16 +26,16 @@ use crate::matcher::RuntimePipelineConfig;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "KixDNS async DNS with hot-reload pipelines", long_about = None)]
 struct Args {
-    /// 配置文件路径（JSON）
+    /// 配置文件路径（JSON） / Config file path (JSON)
     #[arg(short = 'c', long = "config", default_value = "config/pipeline.json")]
     config: PathBuf,
-    /// 监听实例标签，用于 pipeline 选择（可选）。
+    /// 监听实例标签，用于 pipeline 选择（可选）。 / Listener instance label for pipeline selection (optional)
     #[arg(long = "listener-label", default_value = "default")]
     listener_label: String,
-    /// 启用调试日志
+    /// 启用调试日志 / Enable debug logging
     #[arg(long = "debug", default_value_t = false)]
     debug: bool,
-    /// UDP worker 数量（默认 CPU 核心数）
+    /// UDP worker 数量（默认 CPU 核心数） / Number of UDP workers (defaults to CPU core count)
     #[arg(long = "udp-workers", default_value_t = 0)]
     udp_workers: usize,
 }
@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
 
     watcher::spawn(args.config.clone(), pipeline.clone());
 
-    // UDP worker 数量：默认为 CPU 核心数，最少 1 个
+    // UDP worker 数量：默认为 CPU 核心数，最少 1 个 / UDP worker count: defaults to CPU core count, minimum 1
     let udp_workers = if args.udp_workers > 0 {
         args.udp_workers
     } else {
@@ -72,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
 
     #[cfg(unix)]
     {
-        // On Unix create individual sockets with SO_REUSEPORT so kernel distributes packets
+        // On Unix create individual sockets with SO_REUSEPORT so kernel distributes packets / 在 Unix 上创建带有 SO_REUSEPORT 的独立套接字，以便内核分发数据包
         for worker_id in 0..udp_workers {
             let engine = engine.clone();
             let std_socket = create_reuseport_udp_socket(bind_addr)
@@ -89,8 +89,8 @@ async fn main() -> anyhow::Result<()> {
 
     #[cfg(not(unix))]
     {
-        // Non-Unix: create a single shared socket and spawn workers that share it
-        // Use socket2 to set buffer sizes
+        // Non-Unix: create a single shared socket and spawn workers that share it / 非 Unix：创建单个共享套接字并生成共享它的工作线程
+        // Use socket2 to set buffer sizes / 使用 socket2 设置缓冲区大小
         use socket2::{Domain, Protocol, Socket, Type};
         let domain = if bind_addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
         let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create socket")?;
@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // TCP listener
+    // TCP listener / TCP 监听器
     let tcp_listener = TcpListener::bind(bind_tcp)
         .await
         .context("bind tcp listener")?;
@@ -123,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 等待所有任务
+    // 等待所有任务 / Wait for all tasks
     let _ = tcp_handle.await;
     for h in udp_handles {
         let _ = h.await;
@@ -133,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init_tracing(debug: bool) {
-    // 为压测降低日志开销：默认禁用 JSON，非 debug 仅 warn
+    // 为压测降低日志开销：默认禁用 JSON，非 debug 仅 warn / Reduce logging overhead for benchmarking: disable JSON by default, warn-only in non-debug mode
     let fmt_layer = fmt::layer()
         .with_target(false)
         .with_ansi(false)
@@ -147,7 +147,7 @@ fn init_tracing(debug: bool) {
         .init();
 }
 
-// 在 Unix 上创建带 SO_REUSEPORT 的 UDP socket；非 Unix 使用标准绑定
+// 在 Unix 上创建带 SO_REUSEPORT 的 UDP socket；非 Unix 使用标准绑定 / Create UDP socket with SO_REUSEPORT on Unix; use standard binding on non-Unix
 #[cfg(unix)]
 fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
@@ -159,7 +159,7 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
     };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
-    // Try to set SO_REUSEPORT via libc to avoid depending on socket2 method availability
+    // Try to set SO_REUSEPORT via libc to avoid depending on socket2 method availability / 尝试通过 libc 设置 SO_REUSEPORT，避免依赖 socket2 方法的可用性
     #[allow(unused_imports)]
     use libc::{SO_REUSEPORT, SOL_SOCKET, c_int, c_void, setsockopt, socklen_t};
     let val: c_int = 1;
@@ -174,7 +174,7 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
         )
     };
     if ret != 0 {
-        // non-fatal: continue without reuseport
+        // non-fatal: continue without reuseport / 非致命错误：不使用 reuseport 继续
     }
     let _ = socket.set_recv_buffer_size(4 * 1024 * 1024);
     let _ = socket.set_send_buffer_size(4 * 1024 * 1024);
@@ -183,43 +183,43 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
     Ok(socket.into())
 }
 
-/// 高性能 UDP worker：直接在接收循环中处理请求，避免 spawn 开销
+/// 高性能 UDP worker：直接在接收循环中处理请求，避免 spawn 开销 / High-performance UDP worker: process requests directly in receive loop, avoiding spawn overhead
 async fn run_udp_worker(
     _worker_id: usize,
     socket: Arc<UdpSocket>,
     engine: Engine,
 ) -> anyhow::Result<()> {
-    // 预分配缓冲区
-    // 使用 BytesMut 避免 Bytes::copy_from_slice 的内存分配
+    // 预分配缓冲区 / Pre-allocate buffer
+    // 使用 BytesMut 避免 Bytes::copy_from_slice 的内存分配 / Use BytesMut to avoid memory allocation in Bytes::copy_from_slice
     use bytes::BytesMut;
     let mut buf = BytesMut::with_capacity(4096);
 
     loop {
-        // 确保有足够的空间
+        // 确保有足够的空间 / Ensure sufficient space
         if buf.capacity() < 4096 {
             buf.reserve(4096 - buf.len());
         }
-        // 这是一个 unsafe 操作，因为 recv_from 需要 &mut [u8]，但 BytesMut 未初始化的部分不能直接给 safe Rust
-        // 但是 tokio 的 UdpSocket::recv_buf 支持 BytesMut，不过这里我们用标准 recv_from
-        // 简单起见，我们先 resize，然后 truncate
-        // 性能损耗极小，因为 resize 0u8 也是 memset
+        // 这是一个 unsafe 操作，因为 recv_from 需要 &mut [u8]，但 BytesMut 未初始化的部分不能直接给 safe Rust / This is an unsafe operation because recv_from requires &mut [u8], but uninitialized parts of BytesMut cannot be directly given to safe Rust
+        // 但是 tokio 的 UdpSocket::recv_buf 支持 BytesMut，不过这里我们用标准 recv_from / However, tokio's UdpSocket::recv_buf supports BytesMut, but we use standard recv_from here
+        // 简单起见，我们先 resize，然后 truncate / For simplicity, we resize first, then truncate
+        // 性能损耗极小，因为 resize 0u8 也是 memset / Performance loss is minimal because resize 0u8 is also memset
         unsafe { buf.set_len(buf.capacity()); }
         
         match socket.recv_from(&mut buf).await {
             Ok((len, peer)) => {
                 unsafe { buf.set_len(len); }
-                // 零拷贝获取 Bytes
+                // 零拷贝获取 Bytes / Zero-copy obtain Bytes
                 let packet_bytes = buf.split().freeze();
                 
-                // 快速路径：尝试同步处理（缓存命中等场景）
+                // 快速路径：尝试同步处理（缓存命中等场景） / Fast path: try synchronous handling (cache hit scenarios, etc.)
                 match engine.handle_packet_fast(&packet_bytes, peer) {
                     Ok(Some(resp)) => {
-                        // 缓存命中，直接发送
+                        // 缓存命中，直接发送 / Cache hit, send directly
                         let _ = socket.send_to(&resp, peer).await;
                     }
                     Ok(None) => {
-                        // 需要异步处理（上游转发），spawn 处理
-                        // packet_bytes 已经是 Bytes，无需再次 copy
+                        // 需要异步处理（上游转发），spawn 处理 / Need async processing (upstream forwarding), spawn for handling
+                        // packet_bytes 已经是 Bytes，无需再次 copy / packet_bytes is already Bytes, no need to copy again
                         let engine = engine.clone();
                         let socket = Arc::clone(&socket);
                         tokio::spawn(async move {
@@ -229,17 +229,17 @@ async fn run_udp_worker(
                         });
                     }
                     Err(_) => {
-                        // 解析错误，忽略
+                        // 解析错误，忽略 / Parse error, ignore
                     }
                 }
                 
-                // 重置 buffer 供下次使用 (split 后 buf 为空，需要 reserve)
-                // 实际上 split() 拿走了所有权，buf 变为空。
-                // 下次循环开头会 reserve。
+                // 重置 buffer 供下次使用 (split 后 buf 为空，需要 reserve) / Reset buffer for next use (buf is empty after split, need reserve)
+                // 实际上 split() 拿走了所有权，buf 变为空。 / Actually split() takes ownership, buf becomes empty
+                // 下次循环开头会 reserve。 / Will reserve at the beginning of next loop
             }
             Err(_) => {
-                // 继续接收，不退出
-                // 如果出错，buf 长度可能不对，重置
+                // 继续接收，不退出 / Continue receiving, don't exit
+                // 如果出错，buf 长度可能不对，重置 / If error occurs, buf length might be wrong, reset
                 buf.clear();
             }
         }

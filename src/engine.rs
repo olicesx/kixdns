@@ -42,32 +42,32 @@ pub struct Engine {
     udp_client: Arc<UdpClient>,
     tcp_mux: Arc<TcpMultiplexer>,
     listener_label: Arc<str>,
-    // Rule execution result cache: Hash -> (Key, Decision)
-    // Key is stored to verify collisions
+    // Rule execution result cache: Hash -> (Key, Decision) / 规则执行结果缓存：哈希 -> (键, 决策)
+    // Key is stored to verify collisions / 存储键以验证冲突
     rule_cache: Cache<u64, RuleCacheEntry>,
-    // Runtime metrics for diagnosing concurrency and upstream latency
+    // Runtime metrics for diagnosing concurrency and upstream latency / 运行时指标，用于诊断并发和上游延迟
     pub metrics_inflight: Arc<AtomicUsize>,
     pub metrics_total_requests: Arc<AtomicU64>,
     pub metrics_fastpath_hits: Arc<AtomicU64>,
     pub metrics_upstream_ns_total: Arc<AtomicU64>,
     pub metrics_upstream_calls: Arc<AtomicU64>,
-    // Per-request id generator for tracing
+    // Per-request id generator for tracing / 每个请求的 ID 生成器用于追踪
     pub request_id_counter: Arc<AtomicU64>,
-    // In-flight dedupe map: cache_hash -> waiters
+    // In-flight dedupe map: cache_hash -> waiters / 进行中的去重映射：缓存哈希 -> 等待者
     pub inflight: Arc<DashMap<u64, Vec<oneshot::Sender<anyhow::Result<Bytes>>>, FxBuildHasher>>,
 }
 
 impl Engine {
     pub fn new(pipeline: Arc<ArcSwap<RuntimePipelineConfig>>, listener_label: String) -> Self {
-        // moka 缓存：最大 10000 条，默认 TTL 300 秒（会被实际 TTL 覆盖）
+        // moka 缓存：最大 10000 条，默认 TTL 300 秒（会被实际 TTL 覆盖） / moka cache: max 10000 entries, default TTL 300 seconds (will be overridden by actual TTL)
         let cache = new_cache(10_000, 300);
-        // Rule cache: 100k entries, 60s TTL
+        // Rule cache: 100k entries, 60s TTL / 规则缓存：10万条，60秒 TTL
         let rule_cache = Cache::builder()
             .max_capacity(100_000)
             .time_to_live(Duration::from_secs(60))
             .build();
 
-        // UDP socket pool size from config
+        // UDP socket pool size from config / 从配置获取 UDP 套接字池大小
         let udp_pool_size = pipeline.load().settings.udp_pool_size;
         let tcp_pool_size = pipeline.load().settings.tcp_pool_size;
         let compiled = compile_pipelines(&pipeline.load());
@@ -94,7 +94,7 @@ impl Engine {
         let mut h = FxHasher::default();
         pipeline_id.hash(&mut h);
         qname.to_ascii_lowercase().hash(&mut h);
-        // RecordType implements Copy+Debug, hash by its u16 representation
+        // RecordType implements Copy+Debug, hash by its u16 representation / RecordType 实现了 Copy+Debug，使用其 u16 表示进行哈希
         u16::from(qtype).hash(&mut h);
         h.finish()
     }
@@ -116,31 +116,31 @@ impl Engine {
         )
     }
 
-    /// 快速路径：同步尝试缓存命中
-    /// 返回 Ok(Some(bytes)) 表示缓存命中，可直接返回
-    /// 返回 Ok(None) 表示需要异步处理（上游转发）
-    /// 返回 Err 表示解析错误
+    /// 快速路径：同步尝试缓存命中 / Fast path: synchronous cache hit attempt
+    /// 返回 Ok(Some(bytes)) 表示缓存命中，可直接返回 / Return Ok(Some(bytes)) means cache hit, can return directly
+    /// 返回 Ok(None) 表示需要异步处理（上游转发） / Return Ok(None) means async processing needed (upstream forwarding)
+    /// 返回 Err 表示解析错误 / Return Err means parsing error
     #[inline]
     pub fn handle_packet_fast(&self, packet: &[u8], peer: SocketAddr) -> anyhow::Result<Option<Bytes>> {
-        // 快速解析，避免完整 Message 解析和大量分配
-        // 使用栈上缓冲区避免 String 分配
+        // 快速解析，避免完整 Message 解析和大量分配 / Quick parsing, avoiding full Message parsing and massive allocations
+        // 使用栈上缓冲区避免 String 分配 / Use stack buffer to avoid String allocation
         let mut qname_buf = [0u8; 256];
         let req_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
         let t_start = std::time::Instant::now();
         let q = match parse_quick(packet, &mut qname_buf) {
             Some(q) => q,
             None => {
-                // quick parse failed
+                // quick parse failed / 快速解析失败
                 let elapsed = t_start.elapsed().as_nanos();
                 tracing::info!(request_id = req_id, phase = "parse_quick_fail", elapsed_ns = elapsed, "fastpath parse failed");
                 return Ok(None);
             }
         };
-        // Count incoming quick-parsed requests
+        // Count incoming quick-parsed requests / 计数进入的快速解析请求
         self.metrics_total_requests.fetch_add(1, Ordering::Relaxed);
         let t_after_parse = t_start.elapsed();
         
-        // 获取 pipeline ID
+        // 获取 pipeline ID / Get pipeline ID
         let cfg = self.pipeline.load();
         let qclass = DNSClass::from(q.qclass);
         let edns_present = false;
@@ -153,17 +153,17 @@ impl Engine {
             &self.listener_label,
         );
         
-        // 1. Check Response Cache (L2)
-        // TODO: Optimize CacheKey to avoid Arc allocation on lookup?
-        // Currently we still allocate Arc<str> in CacheKey::new.
-        // But we saved the String allocation in parse_quick.
+        // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
+        // TODO: Optimize CacheKey to avoid Arc allocation on lookup? / TODO：优化 CacheKey 以避免查找时的 Arc 分配？
+        // Currently we still allocate Arc<str> in CacheKey::new. / 目前我们仍然在 CacheKey::new 中分配 Arc<str>
+        // But we saved the String allocation in parse_quick. / 但我们在 parse_quick 中节省了 String 分配
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
         let cache_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, q.qname, qtype);
         
         if let Some(hit) = self.cache.get(&cache_hash) {
-            // Verify collision
+            // Verify collision / 验证冲突
             if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == q.qname && hit.pipeline_id.as_ref() == pipeline_id {
-                // 复制 ID 到缓存响应中
+                // 复制 ID 到缓存响应中 / Copy ID into cached response
                 let mut resp = hit.bytes.to_vec();
                 if resp.len() >= 2 {
                     let id_bytes = q.tx_id.to_be_bytes();
@@ -177,7 +177,7 @@ impl Engine {
             }
         }
 
-        // 2. Compiled rule fast-path for static decisions
+        // 2. Compiled rule fast-path for static decisions / 2. 编译规则的静态决策快速路径
         if let Some(compiled) = self.compiled_for(&pipeline_id) {
             let qclass = DNSClass::from(q.qclass);
             if let Some(decision) = fast_static_match(
@@ -205,8 +205,8 @@ impl Engine {
             }
         }
 
-        // 3. Check Rule Cache (L1) for Static Responses
-        // Zero-allocation lookup using hash
+        // 3. Check Rule Cache (L1) for Static Responses / 3. 检查规则缓存（L1）的静态响应
+        // Zero-allocation lookup using hash / 使用哈希的零分配查找
         let rule_hash = calculate_rule_hash(&pipeline_id, q.qname, peer.ip());
         if let Some(entry) = self.rule_cache.get(&rule_hash) {
             if entry.matches(&pipeline_id, q.qname, peer.ip()) {
@@ -226,17 +226,17 @@ impl Engine {
                 }
             }
         }
-        // Log timing up to fastpath checks
+        // Log timing up to fastpath checks / 记录到快速路径检查的时间
         let elapsed_ns = t_start.elapsed().as_nanos();
         tracing::debug!(request_id = req_id, phase = "fastpath_checks_done", elapsed_ns = elapsed_ns, "fastpath checks done, falling back to async path");
         
-        // 缓存未命中，需要异步处理
+        // 缓存未命中，需要异步处理 / Cache miss, need async processing
         Ok(None)
     }
 
     #[inline]
     pub async fn handle_packet(&self, packet: &[u8], peer: SocketAddr) -> anyhow::Result<Bytes> {
-        // Track requests and inflight concurrency for diagnostics.
+        // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
         let _req_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
         self.metrics_total_requests.fetch_add(1, Ordering::Relaxed);
         struct InflightGuard(Arc<AtomicUsize>);
@@ -252,12 +252,12 @@ impl Engine {
         let upstream_timeout = cfg.upstream_timeout();
         let response_jump_limit = cfg.settings.response_jump_limit as usize;
 
-        // Lazy Parse: Use quick parse first
+        // Lazy Parse: Use quick parse first / 延迟解析：首先使用快速解析
         let mut qname_buf = [0u8; 256];
         let (qname, qtype, qclass, tx_id, edns_present) = if let Some(q) = parse_quick(packet, &mut qname_buf) {
-            (q.qname.to_string(), hickory_proto::rr::RecordType::from(q.qtype), DNSClass::from(q.qclass), q.tx_id, false) // TODO: check EDNS in quick parse
+            (q.qname.to_string(), hickory_proto::rr::RecordType::from(q.qtype), DNSClass::from(q.qclass), q.tx_id, false) // TODO: check EDNS in quick parse / TODO：在快速解析中检查 EDNS
         } else {
-            // Fallback to full parse if quick parse fails (unlikely for standard queries)
+            // Fallback to full parse if quick parse fails (unlikely for standard queries) / 如果快速解析失败则回退到完整解析（对于标准查询不太可能）
             let req = Message::from_bytes(packet).context("parse request")?;
             let question = req.queries().first().context("empty question")?;
             (
@@ -281,11 +281,11 @@ impl Engine {
         );
 
         let dedupe_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, &qname, qtype);
-        // moka 同步缓存自动处理过期，无需检查 expires_at
+        // moka 同步缓存自动处理过期，无需检查 expires_at / moka sync cache automatically handles expiration, no need to check expires_at
         if let Some(hit) = self.cache.get(&dedupe_hash) {
             if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == qname && hit.pipeline_id.as_ref() == pipeline_id {
                 let latency = start.elapsed();
-                // clone bytes and rewrite transaction ID to match requester
+                // clone bytes and rewrite transaction ID to match requester / 克隆字节并重写事务 ID 以匹配请求者
                 let mut resp_vec = hit.bytes.to_vec();
                 if resp_vec.len() >= 2 {
                     let id_bytes = tx_id.to_be_bytes();
@@ -402,7 +402,7 @@ impl Engine {
                 anyhow::bail!("unresolved pipeline jump");
             }
             Decision::Static { rcode, answers } => {
-                // Need full request for building response
+                // Need full request for building response / 需要完整请求来构建响应
                 let req = Message::from_bytes(packet).context("parse request for static")?;
                 let resp_bytes = build_response(&req, rcode, answers)?;
                 if min_ttl > Duration::from_secs(0) {
@@ -1772,7 +1772,7 @@ struct UdpSocketState {
     next_id: AtomicU16,
 }
 
-/// 高性能 UDP 客户端池，使用 channel 分发 socket
+/// 高性能 UDP 客户端池，使用 channel 分发 socket / High-performance UDP client pool using channel for socket distribution
 struct UdpClient {
     pool: Vec<UdpSocketState>,
     next_idx: AtomicUsize,
@@ -1943,7 +1943,7 @@ impl UdpClient {
     }
 }
 
-/// TCP 连接复用器，使用 DashMap 管理连接池
+/// TCP 连接复用器，使用 DashMap 管理连接池 / TCP connection multiplexer, managing connection pool with DashMap
 struct TcpMultiplexer {
     pools: dashmap::DashMap<String, Arc<TcpConnectionPool>>,
     pool_size: usize,

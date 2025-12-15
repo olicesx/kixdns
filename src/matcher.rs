@@ -94,7 +94,7 @@ pub enum RuntimeResponseMatcher {
     ResponseUpstreamIp {
         nets: Vec<IpNet>,
     },
-    /// 匹配 Answer 中任意 A/AAAA 记录的 IP
+    /// 匹配 Answer 中任意 A/AAAA 记录的 IP / Match IPs of any A/AAAA records in the Answer
     ResponseAnswerIp {
         nets: Vec<IpNet>,
     },
@@ -359,8 +359,8 @@ pub fn apply_match_operator(op: &MatchOperator, mut results: impl Iterator<Item 
     }
 }
 
-/// Evaluate a left-to-right chain where each item carries its own operator.
-/// The first item's result seeds the accumulator; empty chains default to true.
+/// Evaluate a left-to-right chain where each item carries its own operator. / 评估从左到右的链，其中每个项目都带有自己的运算符
+/// The first item's result seeds the accumulator; empty chains default to true. / 第一个项目的结果作为累加器的种子；空链默认为 true
 #[inline]
 pub fn eval_match_chain<T>(
     entries: &[T],

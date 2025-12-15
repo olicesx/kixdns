@@ -10,7 +10,7 @@ use crate::config;
 use crate::matcher::RuntimePipelineConfig;
 
 pub fn spawn(path: PathBuf, pipeline: Arc<ArcSwap<RuntimePipelineConfig>>) {
-    // 使用阻塞线程持有watcher，避免异步生命周期问题。
+    // 使用阻塞线程持有watcher，避免异步生命周期问题。 / Use blocking thread to hold watcher, avoiding async lifetime issues.
     thread::spawn(move || {
         if let Err(err) = run_watcher(path, pipeline) {
             error!(target = "watcher", error = %err, "config watcher exited with error");
@@ -28,7 +28,7 @@ fn run_watcher(path: PathBuf, pipeline: Arc<ArcSwap<RuntimePipelineConfig>>) -> 
     for res in rx {
         match res {
             Ok(_event) => {
-                // Simple retry mechanism to handle file write races (e.g. truncate+write)
+                // Simple retry mechanism to handle file write races (e.g. truncate+write) / 简单的重试机制来处理文件写入竞争（如截断+写入）
                 let mut retries = 3;
                 while retries > 0 {
                     match config::load_config(&path)
@@ -44,7 +44,7 @@ fn run_watcher(path: PathBuf, pipeline: Arc<ArcSwap<RuntimePipelineConfig>>) -> 
                             if retries == 0 {
                                 warn!(target = "watcher", path = %path.display(), error = %err, "config reload failed, keeping old config");
                             } else {
-                                // Wait a bit and retry
+                                // Wait a bit and retry / 稍等后重试
                                 std::thread::sleep(std::time::Duration::from_millis(50));
                             }
                         }
