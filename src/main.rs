@@ -29,6 +29,17 @@ enum RecvResult {
 }
 
 /// Set transaction ID in the first two bytes of a DNS packet
+///
+/// This function modifies the DNS message header by replacing the transaction ID
+/// (the first two bytes) with the provided `tx_id` value in big-endian format.
+///
+/// # Parameters
+/// * `packet` - A mutable slice representing the DNS packet. Must be at least 2 bytes.
+/// * `tx_id` - The new transaction ID to set in the packet header.
+///
+/// # Behavior
+/// If the packet is smaller than 2 bytes, the function does nothing silently.
+/// This is safe because DNS packets must be at least 12 bytes to be valid.
 #[inline]
 fn set_transaction_id(packet: &mut [u8], tx_id: u16) {
     if packet.len() >= 2 {
