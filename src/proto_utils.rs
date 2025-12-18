@@ -137,8 +137,9 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
             let rd_len = u16::from_be_bytes([packet[next_pos + 8], packet[next_pos + 9]]);
             
             // Validate arithmetic to prevent overflow and ensure entire record fits in packet
-            if next_pos > packet.len() - 10 - (rd_len as usize) { break; }
-            ar_pos = next_pos + 10 + rd_len as usize;
+            let rd_len_usize = rd_len as usize;
+            if packet.len() < 10 + rd_len_usize || next_pos > packet.len() - 10 - rd_len_usize { break; }
+            ar_pos = next_pos + 10 + rd_len_usize;
         }
     }
 
@@ -173,7 +174,12 @@ fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
             if max_jumps == 0 { return None; }
             
             let offset = (((len as u16) & 0x3F) << 8) | (packet[pos + 1] as u16);
-            pos = offset as usize;
+            let offset_usize = offset as usize;
+            
+            // Validate that compression pointer offset is within packet bounds
+            if offset_usize >= packet_len { return None; }
+            
+            pos = offset_usize;
             continue;
         }
         
