@@ -113,8 +113,11 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     // 5. Check for EDNS in Additional section / 在附加部分检查 EDNS
     let mut edns_present = false;
     if ar_count > 0 && an_count == 0 && ns_count == 0 {
-        // For standard queries, AN and NS are 0. We only check Additional if they are 0 to keep it fast.
-        // 对于标准查询，AN 和 NS 为 0。我们仅在它们为 0 时检查 Additional 以保持速度。
+        // Fast-path optimization: for standard query messages, AN and NS are expected to be 0.
+        // We only scan the Additional section in this common case to keep parsing fast, which may miss EDNS
+        // in non-standard messages (e.g., UPDATE, or responses mistakenly treated as queries).
+        // 快速路径优化：对于标准查询消息，AN 和 NS 通常为 0。仅在这种常见情况下扫描 Additional 以提升性能，
+        // 这在非标准消息（例如 UPDATE，或被误当作查询处理的响应）中可能漏检 EDNS。
         let mut ar_pos = pos;
         for _ in 0..ar_count {
             if ar_pos >= packet.len() { break; }
@@ -132,7 +135,13 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
                 break;
             }
             let rd_len = u16::from_be_bytes([packet[next_pos + 8], packet[next_pos + 9]]);
-            ar_pos = next_pos + 10 + rd_len as usize;
+            
+            // Validate arithmetic to prevent overflow and ensure entire record fits in packet
+            let rd_len_usize = rd_len as usize;
+            // Check packet length first to avoid underflow in subsequent arithmetic
+            if packet.len() < 10 + rd_len_usize { break; }
+            if next_pos > packet.len() - 10 - rd_len_usize { break; }
+            ar_pos = next_pos + 10 + rd_len_usize;
         }
     }
 
@@ -148,15 +157,41 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     })
 }
 
+/// Maximum number of compression pointer jumps allowed to prevent infinite loops
+const MAX_COMPRESSION_JUMPS: u32 = 5;
+
 /// 跳过 DNS 名称并返回下一个位置 / Skip DNS name and return next position
 fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
     let packet_len = packet.len();
+    let mut max_jumps = MAX_COMPRESSION_JUMPS;
+    
     loop {
         if pos >= packet_len { return None; }
         let len = packet[pos];
         if len == 0 { return Some(pos + 1); }
-        if (len & 0xC0) == 0xC0 { return Some(pos + 2); }
-        pos += 1 + len as usize;
+        
+        if (len & 0xC0) == 0xC0 {
+            // Compression pointer - check bounds before returning
+            if pos + 2 > packet_len { return None; }
+            
+            // Follow compression pointer to prevent infinite loops
+            max_jumps -= 1;
+            if max_jumps == 0 { return None; }
+            
+            let offset = (((len as u16) & 0x3F) << 8) | (packet[pos + 1] as u16);
+            let offset_usize = offset as usize;
+            
+            // Validate that compression pointer offset is within packet bounds
+            if offset_usize >= packet_len { return None; }
+            
+            pos = offset_usize;
+            continue;
+        }
+        
+        // Regular label - check bounds before advancing
+        let new_pos = pos + 1 + len as usize;
+        if new_pos > packet_len { return None; }
+        pos = new_pos;
     }
 }
 
