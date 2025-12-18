@@ -24,14 +24,24 @@ KixDNS 是用 Rust 开发的高性能、可扩展 DNS 服务器，面向低延�
 - 智能 TTL：遵循上游 TTL，同步支持可配置的最小 TTL。
 - 去重（Singleflight）：合并相同请求的并发上游调用以防止缓存击穿。
 
-## 附带工具
+## 安装
 
-项目包含一个基于浏览器的配置编辑器，用于生成和管理 `pipeline` 的 JSON 配置文件：
+### 预编译二进制文件
 
-- 位置：`tools/config_editor.html`
-- 使用方法：在现代浏览器中打开该 HTML 文件并按页面说明导出配置。
+从 [Releases 页面](https://github.com/olicesx/kixdns/releases) 下载适合你平台的预编译二进制文件：
 
-## 构建
+- Linux (x86_64, ARM64)
+- FreeBSD (x86_64, ARM64)
+
+```bash
+# 下载并解压
+tar xzf kixdns-linux-x86_64.tar.gz
+
+# 验证 SHA256 校验和
+sha256sum -c kixdns-linux-x86_64.tar.gz.sha256
+```
+
+### 从源码构建
 
 确保已安装 Rust（stable 通道），然后在项目根目录运行：
 
@@ -40,6 +50,13 @@ cargo build --release
 ```
 
 构建产物位于：`target/release/kixdns`。
+
+## 附带工具
+
+项目包含一个基于浏览器的配置编辑器，用于生成和管理 `pipeline` 的 JSON 配置文件：
+
+- 位置：`tools/config_editor.html`
+- 使用方法：在现代浏览器中打开该 HTML 文件并按页面说明导出配置。
 
 ## 配置示例
 

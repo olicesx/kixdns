@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: KixDNS ${{ github.ref_name }}
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: false
+
+  build-and-upload:
+    name: Build and Upload ${{ matrix.platform }}-${{ matrix.arch }}
+    needs: create-release
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            platform: linux
+            arch: x86_64
+            toolchain: stable
+          - target: aarch64-unknown-linux-gnu
+            platform: linux
+            arch: arm64
+            toolchain: stable
+          - target: x86_64-unknown-freebsd
+            platform: freebsd
+            arch: x86_64
+            toolchain: stable
+            use_cross: true
+          - target: aarch64-unknown-freebsd
+            platform: freebsd
+            arch: arm64
+            toolchain: nightly
+            use_cross: true
+            build_std: "-Z build-std=std,panic_abort"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation dependencies (Linux ARM64)
+        if: matrix.platform == 'linux' && matrix.arch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install cross (FreeBSD)
+        if: matrix.use_cross
+        run: |
+          cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Add rust-src component (FreeBSD ARM64)
+        if: matrix.toolchain == 'nightly'
+        run: |
+          rustup component add rust-src --toolchain ${{ matrix.toolchain }}
+
+      - name: Set up cross-compilation environment (Linux ARM64)
+        if: matrix.platform == 'linux' && matrix.arch == 'arm64'
+        run: |
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Build (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          strip target/${{ matrix.target }}/release/kixdns || true
+
+      - name: Build (FreeBSD)
+        if: matrix.use_cross
+        run: |
+          if [ -n "${{ matrix.build_std }}" ]; then
+            cross +${{ matrix.toolchain }} build --target ${{ matrix.target }} ${{ matrix.build_std }} --release
+          else
+            cross +${{ matrix.toolchain }} build --target ${{ matrix.target }} --release
+          fi
+          strip target/${{ matrix.target }}/release/kixdns || true
+
+      - name: Package binary
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf kixdns-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz kixdns
+          sha256sum kixdns-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz > kixdns-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz.sha256
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: target/${{ matrix.target }}/release/kixdns-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz
+          asset_name: kixdns-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz
+          asset_content_type: application/gzip
+
+      - name: Upload Checksum
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: target/${{ matrix.target }}/release/kixdns-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz.sha256
+          asset_name: kixdns-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz.sha256
+          asset_content_type: text/plain
