@@ -10,34 +10,8 @@ permissions:
   contents: write
 
 jobs:
-  create-release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Extract version from tag
-        id: get_version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref_name }}
-          release_name: KixDNS ${{ github.ref_name }}
-          body_path: CHANGELOG.md
-          draft: false
-          prerelease: false
-
-  build-and-upload:
-    name: Build and Upload ${{ matrix.platform }}-${{ matrix.arch }}
-    needs: create-release
+  build:
+    name: Build ${{ matrix.platform }}-${{ matrix.arch }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -117,23 +91,43 @@ jobs:
           cd target/${{ matrix.target }}/release
           tar czf kixdns-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz kixdns
           sha256sum kixdns-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz > kixdns-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz.sha256
+          mv kixdns-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz* ../../../
 
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kixdns-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            kixdns-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz
+            kixdns-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz.sha256
+          retention-days: 7
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) -exec mv {} release-assets/ \;
+          ls -lh release-assets/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: KixDNS ${{ github.ref_name }}
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: false
+          files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: target/${{ matrix.target }}/release/kixdns-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz
-          asset_name: kixdns-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz
-          asset_content_type: application/gzip
-
-      - name: Upload Checksum
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: target/${{ matrix.target }}/release/kixdns-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz.sha256
-          asset_name: kixdns-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz.sha256
-          asset_content_type: text/plain

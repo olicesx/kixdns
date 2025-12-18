@@ -1,7 +1,7 @@
 #!/bin/bash
 # Script to create a new release tag for KixDNS
 
-set -e
+set -eu
 
 # Check if version argument is provided
 if [ $# -eq 0 ]; then
