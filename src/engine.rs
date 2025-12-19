@@ -1328,7 +1328,7 @@ impl Engine {
             let dur = start.elapsed();
             let dur_ns = dur.as_nanos() as u64;
             self.metrics_last_upstream_latency_ns.store(dur_ns, Ordering::Relaxed);
-            tracing::info!(upstream=%upstream, error=%e, elapsed_ns = dur_ns, "upstream call failed");
+            tracing::warn!(upstream=%upstream, error=%e, elapsed_ns = dur_ns, "upstream call failed");
         }
         res
     }
