@@ -130,14 +130,14 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init_tracing(debug: bool) {
-    // 默认关闭所有日志输出以最大化性能，除非显式指定
-    // Disable all logging by default for maximum performance unless explicitly enabled
+    // 默认仅保留错误日志以平衡性能与可观测性，除非显式指定
+    // Default to error-level logging to balance performance with observability unless explicitly enabled
     let fmt_layer = fmt::layer()
         .with_target(false)
         .with_ansi(false)
         .with_level(debug);
 
-    let level = if debug { "debug" } else { "off" };
+    let level = if debug { "debug" } else { "error" };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
     tracing_subscriber::registry()
         .with(filter)
