@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
@@ -32,7 +32,7 @@ use crate::config::{Action, Transport};
 use crate::matcher::{
     RuntimePipeline, RuntimePipelineConfig, RuntimeResponseMatcherWithOp, eval_match_chain,
 };
-use crate::proto_utils::{parse_quick, build_static_response_fast};
+use crate::proto_utils::parse_quick;
 
 /// Fast-path response for UDP workers.
 ///
@@ -49,10 +49,6 @@ pub struct EngineInner {
     pub compiled_pipelines: Vec<CompiledPipeline>,
 }
 
-thread_local! {
-    static ENGINE_CANDIDATE_CACHE: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(Vec::with_capacity(128));
-}
-
 #[derive(Clone)]
 pub struct Engine {
     state: Arc<ArcSwap<EngineInner>>,
@@ -62,7 +58,7 @@ pub struct Engine {
     listener_label: Arc<str>,
     // Rule execution result cache: Hash -> (Key, Decision) / 规则执行结果缓存：哈希 -> (键, 决策)
     // Key is stored to verify collisions / 存储键以验证冲突
-    rule_cache: Cache<u64, RuleCacheEntry, FxBuildHasher>,
+    rule_cache: Cache<u64, RuleCacheEntry>,
     // Runtime metrics for diagnosing concurrency and upstream latency / 运行时指标，用于诊断并发和上游延迟
     pub metrics_inflight: Arc<AtomicUsize>,
     pub metrics_total_requests: Arc<AtomicU64>,
@@ -83,7 +79,7 @@ impl Engine {
         let rule_cache = Cache::builder()
             .max_capacity(100_000)
             .time_to_live(Duration::from_secs(60))
-            .build_with_hasher(FxBuildHasher::default());
+            .build();
 
         // UDP socket pool size from config / 从配置获取 UDP 套接字池大小
         let udp_pool_size = cfg.settings.udp_pool_size;
@@ -223,16 +219,6 @@ impl Engine {
                 q.edns_present,
             ) {
                 if let Decision::Static { rcode, answers } = decision {
-                    if answers.is_empty() {
-                        // 优化：使用预编码模板快速生成响应 / Optimization: use pre-encoded template for fast response generation
-                        if let Some(bytes) = build_static_response_fast(packet, rcode) {
-                            self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
-                            let elapsed_ns = t_start.elapsed().as_nanos();
-                            tracing::debug!(request_id = req_id, phase = "fast_static_preencoded", elapsed_ns = elapsed_ns, "fast static match preencoded");
-                            return Ok(Some(FastPathResponse::Direct(Bytes::from(bytes))));
-                        }
-                    }
-
                     let resp = build_fast_static_response(
                         q.tx_id,
                         q.qname,
@@ -416,7 +402,7 @@ impl Engine {
                         };
                         break;
                     }
-                    if let Some(p) = cfg.pipelines.iter().find(|p| p.id.as_ref() == *pipeline) {
+                    if let Some(p) = cfg.pipelines.iter().find(|p| p.id == *pipeline) {
                         current_pipeline_id = pipeline.clone();
                         dedupe_hash = Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, &qname, qtype);
                         dedupe_registered = false;
@@ -492,10 +478,50 @@ impl Engine {
                 allow_reuse,
             } => {
                 let mut cleanup_guard = None;
-                let resp = if allow_reuse && reused_response.is_some() {
-                    Ok(reused_response.take().unwrap().raw)
+                let resp = if allow_reuse {
+                    if let Some(ctx) = reused_response.take() {
+                        Ok(ctx.raw)
+                    } else {
+                        if !dedupe_registered {
+                            use dashmap::mapref::entry::Entry;
+                            let rx = match self.inflight.entry(dedupe_hash) {
+                                Entry::Occupied(mut entry) => {
+                                    let (tx, rx) = oneshot::channel();
+                                    entry.get_mut().push(tx);
+                                    Some(rx)
+                                }
+                                Entry::Vacant(entry) => {
+                                    entry.insert(Vec::new());
+                                    dedupe_registered = true;
+                                    cleanup_guard = Some(InflightCleanupGuard::new(self.inflight.clone(), dedupe_hash));
+                                    None
+                                }
+                            };
+
+                            if let Some(rx) = rx {
+                                match rx.await {
+                                    Ok(Ok(bytes)) => {
+                                        let mut resp_vec = bytes.to_vec();
+                                        if resp_vec.len() >= 2 {
+                                            let id_bytes = tx_id.to_be_bytes();
+                                            resp_vec[0] = id_bytes[0];
+                                            resp_vec[1] = id_bytes[1];
+                                        }
+                                        return Ok(Bytes::from(resp_vec));
+                                    }
+                                    Ok(Err(e)) => return Err(e),
+                                    Err(_) => {
+                                        // sender dropped, fallthrough to attempt upstream
+                                    }
+                                }
+                            }
+                        }
+                        self.forward_upstream(packet, &upstream, upstream_timeout, transport).await
+                    }
                 } else {
-                    // In-flight merging logic / 合并进行中的重复请求逻辑
+                    // If reuse is not allowed (e.g. explicit Forward action), we must clear any reused response
+                    // and force a new request.
+                    
                     if !dedupe_registered {
                         use dashmap::mapref::entry::Entry;
                         let rx = match self.inflight.entry(dedupe_hash) {
@@ -748,7 +774,7 @@ impl Engine {
                                     let pipeline = cfg
                                         .pipelines
                                         .iter()
-                                        .find(|p| p.id.as_ref() == current_pipeline_id)
+                                        .find(|p| p.id == current_pipeline_id)
                                         .expect("pipeline missing while continuing");
                                     decision = self.apply_rules(
                                         &state,
@@ -860,7 +886,7 @@ impl Engine {
                                         let pipeline = cfg
                                             .pipelines
                                             .iter()
-                                            .find(|p| p.id.as_ref() == current_pipeline_id)
+                                            .find(|p| p.id == current_pipeline_id)
                                             .expect("pipeline missing while continuing");
                                         decision = self.apply_rules(
                                             &state,
@@ -896,6 +922,7 @@ impl Engine {
         skip_rules: Option<&HashSet<String>>,
     ) -> Decision {
         // 1. Check Rule Cache
+        // Use hash for lookup to avoid cloning String for key on every lookup
         let rule_hash = calculate_rule_hash(&pipeline.id, qname, client_ip);
         let allow_rule_cache_lookup = skip_rules.map_or(true, |set| set.is_empty());
         
@@ -907,216 +934,218 @@ impl Engine {
             }
         }
 
+        let upstream_default = state.pipeline.settings.default_upstream.clone();
+
         // 2. Candidate Selection (compiled index if available)
-        let decision = ENGINE_CANDIDATE_CACHE.with(|cache| {
-            let mut candidates = cache.borrow_mut();
-            if let Some(compiled) = self.compiled_for(state, &pipeline.id) {
-                compiled.index.fill_candidates(qname, qtype, &mut candidates);
-            } else {
-                // Fallback to runtime indices
-                candidates.clear();
-                candidates.extend_from_slice(&pipeline.always_check_rules);
+        let mut candidate_indices = if let Some(compiled) = self.compiled_for(state, &pipeline.id) {
+            compiled.index.get_candidates(qname, qtype)
+        } else {
+            Vec::new()
+        };
 
-                let mut search_name = qname;
-                loop {
-                    if let Some(indices) = pipeline.domain_suffix_index.get(search_name) {
-                        candidates.extend_from_slice(indices);
-                    }
+        if candidate_indices.is_empty() {
+            // Fallback to runtime indices
+            candidate_indices.extend_from_slice(&pipeline.always_check_rules);
 
-                    if let Some(idx) = search_name.find('.') {
-                        search_name = &search_name[idx + 1..];
-                    } else {
-                        break;
-                    }
+            let mut search_name = qname;
+            loop {
+                if let Some(indices) = pipeline.domain_suffix_index.get(search_name) {
+                    candidate_indices.extend_from_slice(indices);
                 }
 
-                candidates.sort_unstable();
-                candidates.dedup();
+                if let Some(idx) = search_name.find('.') {
+                    search_name = &search_name[idx + 1..];
+                } else {
+                    break;
+                }
             }
 
-            // 3. Execute Rules
-            'rules: for &idx in candidates.iter() {
-                let rule = match pipeline.rules.get(idx) {
-                    Some(r) => r,
-                    None => continue,
-                };
-                if skip_rules.map_or(false, |set| set.contains(&rule.name)) {
-                    continue;
-                }
-                let req_match = eval_match_chain(
-                    &rule.matchers,
-                    |m| m.operator,
-                    |m| matcher_matches(&m.matcher, qname, qclass, client_ip, edns_present),
-                );
+            candidate_indices.sort_unstable();
+            candidate_indices.dedup();
+        }
 
-                if req_match {
-                    for action in &rule.actions {
-                        match action {
-                            Action::StaticResponse { rcode } => {
-                                let code = parse_rcode(&rcode).unwrap_or(ResponseCode::NXDomain);
-                                let d = Decision::Static {
-                                    rcode: code,
-                                    answers: Vec::new(),
-                                };
-                                self.rule_cache.insert(
-                                    rule_hash,
-                                    RuleCacheEntry {
-                                        pipeline_id: pipeline.id.clone(),
-                                        qname_hash: fast_hash_str(qname),
-                                        client_ip,
-                                        decision: d.clone(),
-                                    },
-                                );
-                                return Some(d);
-                            }
-                            Action::StaticIpResponse { ip } => {
-                                if let Ok(ip_addr) = ip.parse::<IpAddr>() {
-                                    if let Ok(name) = std::str::FromStr::from_str(qname) {
-                                        let rdata = match ip_addr {
-                                            IpAddr::V4(v4) => RData::A(A(v4)),
-                                            IpAddr::V6(v6) => RData::AAAA(AAAA(v6)),
-                                        };
-                                        let record = Record::from_rdata(name, 300, rdata);
-                                        let d = Decision::Static {
-                                            rcode: ResponseCode::NoError,
-                                            answers: vec![record],
-                                        };
-                                        self.rule_cache.insert(
-                                            rule_hash,
-                                            RuleCacheEntry {
-                                                pipeline_id: pipeline.id.clone(),
-                                                qname_hash: fast_hash_str(qname),
-                                                client_ip,
-                                                decision: d.clone(),
-                                            },
-                                        );
-                                        return Some(d);
-                                    }
-                                }
-                                let d = Decision::Static {
-                                    rcode: ResponseCode::ServFail,
-                                    answers: Vec::new(),
-                                };
-                                self.rule_cache.insert(
-                                    rule_hash,
-                                    RuleCacheEntry {
-                                        pipeline_id: pipeline.id.clone(),
-                                        qname_hash: fast_hash_str(qname),
-                                        client_ip,
-                                        decision: d.clone(),
-                                    },
-                                );
-                                return Some(d);
-                            }
-                            Action::JumpToPipeline { pipeline: target } => {
-                                let d = Decision::Jump {
-                                    pipeline: target.clone(),
-                                };
-                                self.rule_cache.insert(
-                                    rule_hash,
-                                    RuleCacheEntry {
-                                        pipeline_id: pipeline.id.clone(),
-                                        qname_hash: fast_hash_str(qname),
-                                        client_ip,
-                                        decision: d.clone(),
-                                    },
-                                );
-                                return Some(d);
-                            }
-                            Action::Allow => {
-                                let d = Decision::Forward {
-                                    upstream: state.pipeline.settings.default_upstream.clone(),
-                                    response_matchers: Vec::new(),
-                                    response_matcher_operator: crate::config::MatchOperator::And,
-                                    response_actions_on_match: Vec::new(),
-                                    response_actions_on_miss: Vec::new(),
-                                    rule_name: rule.name.clone(),
-                                    transport: Transport::Udp,
-                                    continue_on_match: false,
-                                    continue_on_miss: false,
-                                    allow_reuse: true,
-                                };
-                                self.rule_cache.insert(
-                                    rule_hash,
-                                    RuleCacheEntry {
-                                        pipeline_id: pipeline.id.clone(),
-                                        qname_hash: fast_hash_str(qname),
-                                        client_ip,
-                                        decision: d.clone(),
-                                    },
-                                );
-                                return Some(d);
-                            }
-                            Action::Deny => {
-                                let d = Decision::Static {
-                                    rcode: ResponseCode::Refused,
-                                    answers: Vec::new(),
-                                };
-                                self.rule_cache.insert(
-                                    rule_hash,
-                                    RuleCacheEntry {
-                                        pipeline_id: pipeline.id.clone(),
-                                        qname_hash: fast_hash_str(qname),
-                                        client_ip,
-                                        decision: d.clone(),
-                                    },
-                                );
-                                return Some(d);
-                            }
-                            Action::Forward {
-                                upstream,
-                                transport,
-                            } => {
-                                let upstream_addr = upstream
-                                    .as_ref()
-                                    .cloned()
-                                    .unwrap_or_else(|| state.pipeline.settings.default_upstream.clone());
-                                let continue_on_match = contains_continue(&rule.response_actions_on_match);
-                                let continue_on_miss = contains_continue(&rule.response_actions_on_miss);
-                                let d = Decision::Forward {
-                                    upstream: upstream_addr,
-                                    response_matchers: rule.response_matchers.clone(),
-                                    response_matcher_operator: rule.response_matcher_operator,
-                                    response_actions_on_match: rule.response_actions_on_match.clone(),
-                                    response_actions_on_miss: rule.response_actions_on_miss.clone(),
-                                    rule_name: rule.name.clone(),
-                                    transport: transport.unwrap_or(Transport::Udp),
-                                    continue_on_match,
-                                    continue_on_miss,
-                                    allow_reuse: false,
-                                };
-                                if !continue_on_match && !continue_on_miss {
+        // 3. Execute Rules
+        'rules: for idx in candidate_indices {
+            let rule = match pipeline.rules.get(idx) {
+                Some(r) => r,
+                None => continue, // Skip if index is out of bounds due to reload race / 如果由于重载竞争导致索引越界，则跳过
+            };
+            if skip_rules.map_or(false, |set| set.contains(&rule.name)) {
+                continue;
+            }
+            let req_match = eval_match_chain(
+                &rule.matchers,
+                |m| m.operator,
+                |m| matcher_matches(&m.matcher, qname, qclass, client_ip, edns_present),
+            );
+
+            if req_match {
+                for action in &rule.actions {
+                    match action {
+                        Action::StaticResponse { rcode } => {
+                            let code = parse_rcode(&rcode).unwrap_or(ResponseCode::NXDomain);
+                            let d = Decision::Static {
+                                rcode: code,
+                                answers: Vec::new(),
+                            };
+                            self.rule_cache.insert(
+                                rule_hash,
+                                RuleCacheEntry {
+                                    pipeline_id: Arc::from(pipeline.id.as_str()),
+                                    qname_hash: fast_hash_str(qname),
+                                    client_ip,
+                                    decision: d.clone(),
+                                },
+                            );
+                            return d;
+                        }
+                        Action::StaticIpResponse { ip } => {
+                            if let Ok(ip_addr) = ip.parse::<IpAddr>() {
+                                if let Ok(name) = std::str::FromStr::from_str(qname) {
+                                    let rdata = match ip_addr {
+                                        IpAddr::V4(v4) => RData::A(A(v4)),
+                                        IpAddr::V6(v6) => RData::AAAA(AAAA(v6)),
+                                    };
+                                    let record = Record::from_rdata(name, 300, rdata);
+                                    let d = Decision::Static {
+                                        rcode: ResponseCode::NoError,
+                                        answers: vec![record],
+                                    };
                                     self.rule_cache.insert(
                                         rule_hash,
                                         RuleCacheEntry {
-                                            pipeline_id: pipeline.id.clone(),
+                                            pipeline_id: Arc::from(pipeline.id.as_str()),
                                             qname_hash: fast_hash_str(qname),
                                             client_ip,
                                             decision: d.clone(),
                                         },
                                     );
+                                    return d;
                                 }
-                                return Some(d);
                             }
-                            Action::Log { level } => {
-                                log_match(level.as_deref(), rule.name.as_str(), qname, client_ip);
+                            let d = Decision::Static {
+                                rcode: ResponseCode::ServFail,
+                                answers: Vec::new(),
+                            };
+                            self.rule_cache.insert(
+                                rule_hash,
+                                RuleCacheEntry {
+                                    pipeline_id: Arc::from(pipeline.id.as_str()),
+                                    qname_hash: fast_hash_str(qname),
+                                    client_ip,
+                                    decision: d.clone(),
+                                },
+                            );
+                            return d;
+                        }
+                        Action::JumpToPipeline { pipeline: target } => {
+                            let d = Decision::Jump {
+                                pipeline: target.clone(),
+                            };
+                            self.rule_cache.insert(
+                                rule_hash,
+                                RuleCacheEntry {
+                                    pipeline_id: Arc::from(pipeline.id.as_str()),
+                                    qname_hash: fast_hash_str(qname),
+                                    client_ip,
+                                    decision: d.clone(),
+                                },
+                            );
+                            return d;
+                        }
+                        Action::Allow => {
+                            let d = Decision::Forward {
+                                upstream: upstream_default.clone(),
+                                response_matchers: Vec::new(),
+                                response_matcher_operator: crate::config::MatchOperator::And,
+                                response_actions_on_match: Vec::new(),
+                                response_actions_on_miss: Vec::new(),
+                                rule_name: rule.name.clone(),
+                                transport: Transport::Udp,
+                                continue_on_match: false,
+                                continue_on_miss: false,
+                                allow_reuse: true,
+                            };
+                            self.rule_cache.insert(
+                                rule_hash,
+                                RuleCacheEntry {
+                                    pipeline_id: Arc::from(pipeline.id.as_str()),
+                                    qname_hash: fast_hash_str(qname),
+                                    client_ip,
+                                    decision: d.clone(),
+                                },
+                            );
+                            return d;
+                        }
+                        Action::Deny => {
+                            let d = Decision::Static {
+                                rcode: ResponseCode::Refused,
+                                answers: Vec::new(),
+                            };
+                            self.rule_cache.insert(
+                                rule_hash,
+                                RuleCacheEntry {
+                                    pipeline_id: Arc::from(pipeline.id.as_str()),
+                                    qname_hash: fast_hash_str(qname),
+                                    client_ip,
+                                    decision: d.clone(),
+                                },
+                            );
+                            return d;
+                        }
+                        Action::Forward {
+                            upstream,
+                            transport,
+                        } => {
+                            let upstream_addr = upstream
+                                .as_ref()
+                                .cloned()
+                                .unwrap_or_else(|| upstream_default.clone());
+                            let continue_on_match = contains_continue(&rule.response_actions_on_match);
+                            let continue_on_miss = contains_continue(&rule.response_actions_on_miss);
+                            let d = Decision::Forward {
+                                upstream: upstream_addr,
+                                response_matchers: rule.response_matchers.clone(),
+                                response_matcher_operator: rule.response_matcher_operator,
+                                response_actions_on_match: rule.response_actions_on_match.clone(),
+                                response_actions_on_miss: rule.response_actions_on_miss.clone(),
+                                rule_name: rule.name.clone(),
+                                transport: transport.unwrap_or(Transport::Udp),
+                                continue_on_match,
+                                continue_on_miss,
+                                allow_reuse: false,
+                            };
+                            if !continue_on_match && !continue_on_miss {
+                                self.rule_cache.insert(
+                                    rule_hash,
+                                    RuleCacheEntry {
+                                        pipeline_id: Arc::from(pipeline.id.as_str()),
+                                        qname_hash: fast_hash_str(qname),
+                                        client_ip,
+                                        decision: d.clone(),
+                                    },
+                                );
                             }
-                            Action::Continue => {
-                                continue 'rules;
-                            }
+                            return d;
+                        }
+                        Action::Log { level } => {
+                            log_match(level.as_deref(), rule.name.as_str(), qname, client_ip);
+                            // Log action doesn't terminate rule processing, so we continue.
+                            // But we can't cache side effects (logging).
+                            // If we cache the result, we skip logging on subsequent hits!
+                            // This is a trade-off. Layer 3 usually implies sampling logs or skipping them for cached hot paths.
+                            // We will accept that cached hits won't log again.
+                        }
+                        Action::Continue => {
+                            continue 'rules;
                         }
                     }
                 }
             }
-            None
-        });
-
-        if let Some(d) = decision {
-            return d;
         }
 
         let d = Decision::Forward {
-            upstream: state.pipeline.settings.default_upstream.clone(),
+            upstream: upstream_default,
             response_matchers: Vec::new(),
             response_matcher_operator: crate::config::MatchOperator::And,
             response_actions_on_match: Vec::new(),
@@ -1130,7 +1159,7 @@ impl Engine {
         self.rule_cache.insert(
             rule_hash,
             RuleCacheEntry {
-                pipeline_id: pipeline.id.clone(),
+                pipeline_id: Arc::from(pipeline.id.as_str()),
                 qname_hash: fast_hash_str(qname),
                 client_ip,
                 decision: d.clone(),
@@ -1429,7 +1458,7 @@ impl Engine {
                 return Ok(resp_bytes);
             }
 
-            let Some(pipeline) = state.pipeline.pipelines.iter().find(|p| p.id.as_ref() == pipeline_id) else {
+            let Some(pipeline) = state.pipeline.pipelines.iter().find(|p| p.id == pipeline_id) else {
                 let resp_bytes = build_response(req, ResponseCode::ServFail, Vec::new())?;
                 for g in &mut cleanup_guards { g.defuse(); }
                 for h in &inflight_hashes { self.notify_inflight_waiters(*h, &resp_bytes).await; }
@@ -1465,7 +1494,7 @@ impl Engine {
                     }
                     pipeline_id = pipeline;
                     local_jumps -= 1;
-                    if let Some(next_pipeline) = state.pipeline.pipelines.iter().find(|p| p.id.as_ref() == pipeline_id) {
+                    if let Some(next_pipeline) = state.pipeline.pipelines.iter().find(|p| p.id == pipeline_id) {
                         skip_rules.clear();
                         decision = self.apply_rules(
                             state,
@@ -1750,14 +1779,14 @@ fn select_pipeline<'a>(
             |m| m.matcher.matches(listener_label, client_ip, qname, qclass, edns_present),
         );
         if matched {
-            if let Some(p) = cfg.pipelines.iter().find(|p| p.id.as_ref() == rule.pipeline) {
-                return (Some(p), p.id.to_string());
+            if let Some(p) = cfg.pipelines.iter().find(|p| p.id == rule.pipeline) {
+                return (Some(p), p.id.clone());
             }
         }
     }
 
     match cfg.pipelines.first() {
-        Some(p) => (Some(p), p.id.to_string()),
+        Some(p) => (Some(p), p.id.clone()),
         None => (None, "default".to_string()),
     }
 }
@@ -1915,7 +1944,7 @@ impl UdpClient {
         let mut attempts = 0;
         let mut new_id;
         loop {
-            new_id = state.next_id.fetch_add(1, Ordering::AcqRel);
+            new_id = state.next_id.fetch_add(1, Ordering::Relaxed);
             if !state.inflight.contains_key(&new_id) {
                 break;
             }
@@ -2801,7 +2830,7 @@ enum ResponseActionResult {
 
 #[inline]
 fn calculate_rule_hash(pipeline_id: &str, qname: &str, client_ip: IpAddr) -> u64 {
-    let mut hasher = FxHasher::default();
+    let mut hasher = DefaultHasher::new();
     pipeline_id.hash(&mut hasher);
     qname.hash(&mut hasher);
     client_ip.hash(&mut hasher);
@@ -2827,7 +2856,7 @@ impl RuleCacheEntry {
 
 #[inline]
 fn fast_hash_str(s: &str) -> u64 {
-    let mut h = FxHasher::default();
+    let mut h = DefaultHasher::new();
     s.hash(&mut h);
     h.finish()
 }

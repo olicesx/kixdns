@@ -1,4 +1,3 @@
-use hickory_proto::op::ResponseCode;
 use std::str::from_utf8;
 
 /// 快速解析结果，尽可能零拷贝 / Quick parse result with zero-copy where possible
@@ -199,52 +198,8 @@ fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
 /// 快速解析响应包，仅提取 RCODE 和最小 TTL / Quick parse response packet, extracting only RCODE and minimum TTL
 /// 避免全量解析 Message / Avoid full Message parsing
 pub struct QuickResponse {
-    pub rcode: ResponseCode,
+    pub rcode: hickory_proto::op::ResponseCode,
     pub min_ttl: u32,
-}
-
-/// 预编码的静态响应模板，用于极速返回错误码 / Pre-encoded static response templates for ultra-fast error returns
-pub fn build_static_response_fast(
-    packet: &[u8],
-    rcode: ResponseCode,
-) -> Option<Vec<u8>> {
-    if packet.len() < 12 {
-        return None;
-    }
-
-    // 1. 提取请求中的关键信息 / Extract key info from request
-    let tx_id = &packet[0..2];
-    let flags = u16::from_be_bytes([packet[2], packet[3]]);
-    let rd = flags & 0x0100; // Recursion Desired bit
-
-    // 2. 构造响应头部 / Construct response header
-    // QR=1, OpCode=Query, AA=0, TC=0, RD=req.RD, RA=1, Z=0, RCODE=rcode
-    let mut resp_flags = 0x8000 | 0x0080 | rd; // QR | RA | RD
-    resp_flags |= u16::from(rcode) & 0x000F;
-
-    let mut resp = Vec::with_capacity(packet.len() + 12);
-    resp.extend_from_slice(tx_id);
-    resp.extend_from_slice(&resp_flags.to_be_bytes());
-    
-    // QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
-    resp.extend_from_slice(&1u16.to_be_bytes());
-    resp.extend_from_slice(&0u16.to_be_bytes());
-    resp.extend_from_slice(&0u16.to_be_bytes());
-    resp.extend_from_slice(&0u16.to_be_bytes());
-
-    // 3. 拷贝 Question 部分 / Copy Question section
-    let mut pos = 12;
-    let packet_len = packet.len();
-    
-    // Skip Name using the validated skip_name function
-    pos = skip_name(packet, pos)?;
-    
-    if pos + 4 > packet_len { return None; }
-    pos += 4; // Type + Class
-
-    resp.extend_from_slice(&packet[12..pos]);
-
-    Some(resp)
 }
 
 pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {

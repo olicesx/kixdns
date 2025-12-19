@@ -21,44 +21,6 @@ use crate::config::load_config;
 use crate::engine::{Engine, FastPathResponse};
 use crate::matcher::RuntimePipelineConfig;
 
-/// Result type for batch UDP receive operations
-enum RecvResult {
-    Packet(bytes::Bytes, std::net::SocketAddr),
-    NoData,
-    Error,
-}
-
-/// Set transaction ID in the first two bytes of a DNS packet
-///
-/// This function modifies the DNS message header by replacing the transaction ID
-/// (the first two bytes) with the provided `tx_id` value in big-endian format.
-///
-/// # Parameters
-/// * `packet` - A mutable slice representing the DNS packet. Must be at least 2 bytes.
-/// * `tx_id` - The new transaction ID to set in the packet header.
-///
-/// # Behavior
-/// If the packet is smaller than 2 bytes, the function does nothing silently.
-/// This is safe because DNS packets must be at least 12 bytes to be valid.
-#[inline]
-fn set_transaction_id(packet: &mut [u8], tx_id: u16) {
-    if packet.len() >= 2 {
-        packet[..2].copy_from_slice(&tx_id.to_be_bytes());
-    }
-}
-
-/// Spawn an async task to send data to peer when socket buffer is full
-///
-/// This is used as a fallback when `try_send_to` returns WouldBlock to ensure
-/// responses are not silently dropped under backpressure.
-fn spawn_async_send(socket: Arc<UdpSocket>, data: bytes::Bytes, peer: SocketAddr) {
-    tokio::spawn(async move {
-        if let Err(e) = socket.send_to(&data, peer).await {
-            tracing::warn!("async send fallback failed to {}: {}", peer, e);
-        }
-    });
-}
-
 #[derive(Parser, Debug)]
 #[command(author, version, about = "KixDNS async DNS with hot-reload pipelines", long_about = None)]
 struct Args {
@@ -218,94 +180,56 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
     Ok(socket.into())
 }
 
-/// 高性能 UDP worker：批量接收并处理请求 / High-performance UDP worker: batch receive and process requests
+/// 高性能 UDP worker：直接在接收循环中处理请求，避免 spawn 开销 / High-performance UDP worker: process requests directly in receive loop, avoiding spawn overhead
 async fn run_udp_worker(
     _worker_id: usize,
     socket: Arc<UdpSocket>,
     engine: Engine,
 ) -> anyhow::Result<()> {
+    // 预分配缓冲区 / Pre-allocate buffer
+    // 使用 BytesMut 避免 Bytes::copy_from_slice 的内存分配 / Use BytesMut to avoid memory allocation in Bytes::copy_from_slice
     use bytes::BytesMut;
-    
-    // 线程局部缓冲区，减少分配 / Thread-local buffers to reduce allocations
-    thread_local! {
-        static RECV_BUF: std::cell::RefCell<BytesMut> = std::cell::RefCell::new(BytesMut::with_capacity(4096));
-        static SEND_BUF: std::cell::RefCell<BytesMut> = std::cell::RefCell::new(BytesMut::with_capacity(512));
-    }
+    let mut buf = BytesMut::with_capacity(4096);
+    // 复用发送缓冲区：用于缓存命中时 patch TXID，避免每包堆分配 / Reuse send buffer to patch TXID on cache hits, avoiding per-packet heap allocation
+    let mut send_buf = BytesMut::with_capacity(512);
 
     loop {
-        // 等待第一个包到达 / Wait for the first packet to arrive
-        socket.readable().await?;
-
-        // 批量处理循环 / Batch processing loop
-        let mut batch_count = 0;
-        const MAX_BATCH: usize = 32;
-
-        while batch_count < MAX_BATCH {
-            let recv_result = RECV_BUF.with(|rb| {
-                let mut buf = rb.borrow_mut();
-                let current_len = buf.len();
-                if buf.capacity() < 4096 {
-                    buf.reserve(4096 - current_len);
-                }
+        // 确保有足够的空间 / Ensure sufficient space
+        if buf.capacity() < 4096 {
+            buf.reserve(4096 - buf.len());
+        }
+        
+        // 使用 tokio 的 recv_buf_from 配合 BytesMut，实现安全且零拷贝的接收 / Use tokio's recv_buf_from with BytesMut for safe and zero-copy reception
+        match socket.recv_buf_from(&mut buf).await {
+            Ok((_len, peer)) => {
+                // 零拷贝获取 Bytes / Zero-copy obtain Bytes
+                let packet_bytes = buf.split().freeze();
                 
-                match socket.try_recv_buf_from(&mut *buf) {
-                    Ok((_len, peer)) => {
-                        let packet = buf.split().freeze();
-                        RecvResult::Packet(packet, peer)
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => RecvResult::NoData,
-                    Err(_e) => {
-                        // 严重错误则退出 / Exit on severe error
-                        RecvResult::Error
-                    }
-                }
-            });
-
-            let (packet_bytes, peer) = match recv_result {
-                RecvResult::Packet(packet, peer) => (packet, peer),
-                RecvResult::NoData => break,
-                RecvResult::Error => break,
-            };
-                
-                batch_count += 1;
-
-                // 快速路径处理 / Fast path processing
+                // 快速路径：尝试同步处理（缓存命中等场景） / Fast path: try synchronous handling (cache hit scenarios, etc.)
                 match engine.handle_packet_fast(&packet_bytes, peer) {
                     Ok(Some(resp)) => match resp {
                         FastPathResponse::Direct(bytes) => {
-                            match socket.try_send_to(&bytes, peer) {
-                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                    // Fallback to async send on backpressure
-                                    spawn_async_send(Arc::clone(&socket), bytes, peer);
-                                }
-                                _ => {}
-                            }
+                            // 已包含正确 TXID，可直接发送 / Already contains correct TXID
+                            let _ = socket.send_to(&bytes, peer).await;
                         }
                         FastPathResponse::CacheHit { cached, tx_id } => {
-                            let send_result = SEND_BUF.with(|sb| {
-                                let mut send_buf = sb.borrow_mut();
-                                send_buf.clear();
-                                let cap = send_buf.capacity();
-                                if cap < cached.len() {
-                                    send_buf.reserve(cached.len() - cap);
-                                }
-                                send_buf.extend_from_slice(&cached);
-                                set_transaction_id(&mut send_buf, tx_id);
-                                socket.try_send_to(&send_buf, peer)
-                            });
-                            
-                            if let Err(ref e) = send_result {
-                                if e.kind() == std::io::ErrorKind::WouldBlock {
-                                    // Fallback to async send on backpressure
-                                    let mut response = bytes::BytesMut::with_capacity(cached.len());
-                                    response.extend_from_slice(&cached);
-                                    set_transaction_id(&mut response, tx_id);
-                                    spawn_async_send(Arc::clone(&socket), response.freeze(), peer);
-                                }
+                            // 复用 send_buf：copy + patch TXID / Reuse send_buf: copy + patch TXID
+                            send_buf.clear();
+                            if send_buf.capacity() < cached.len() {
+                                send_buf.reserve(cached.len() - send_buf.capacity());
                             }
+                            send_buf.extend_from_slice(&cached);
+                            if send_buf.len() >= 2 {
+                                let id_bytes = tx_id.to_be_bytes();
+                                send_buf[0] = id_bytes[0];
+                                send_buf[1] = id_bytes[1];
+                            }
+                            let _ = socket.send_to(&send_buf, peer).await;
                         }
                     },
                     Ok(None) => {
+                        // 需要异步处理（上游转发），spawn 处理 / Need async processing (upstream forwarding), spawn for handling
+                        // packet_bytes 已经是 Bytes，无需再次 copy / packet_bytes is already Bytes, no need to copy again
                         let engine = engine.clone();
                         let socket = Arc::clone(&socket);
                         tokio::spawn(async move {
@@ -314,8 +238,20 @@ async fn run_udp_worker(
                             }
                         });
                     }
-                    Err(_) => {}
+                    Err(_) => {
+                        // 解析错误，忽略 / Parse error, ignore
+                    }
                 }
+                
+                // 重置 buffer 供下次使用 (split 后 buf 为空，需要 reserve) / Reset buffer for next use (buf is empty after split, need reserve)
+                // 实际上 split() 拿走了所有权，buf 变为空。 / Actually split() takes ownership, buf becomes empty
+                // 下次循环开头会 reserve。 / Will reserve at the beginning of next loop
+            }
+            Err(_) => {
+                // 继续接收，不退出 / Continue receiving, don't exit
+                // 如果出错，buf 长度可能不对，重置 / If error occurs, buf length might be wrong, reset
+                buf.clear();
+            }
         }
     }
 }

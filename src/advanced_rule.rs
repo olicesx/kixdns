@@ -12,10 +12,6 @@ use crate::engine::{Decision, make_static_ip_answer};
 use crate::matcher::eval_match_chain;
 use crate::matcher::{RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig, RuntimeRule};
 
-thread_local! {
-    static CANDIDATE_CACHE: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(Vec::with_capacity(128));
-}
-
 #[derive(Debug, Clone)]
 pub struct CompiledPipeline {
     pub id: Arc<str>,
@@ -116,9 +112,8 @@ impl RuleIndex {
         }
     }
 
-    pub fn fill_candidates(&self, qname: &str, qtype: RecordType, candidates: &mut Vec<usize>) {
-        candidates.clear();
-        candidates.extend_from_slice(&self.always_check);
+    pub fn get_candidates(&self, qname: &str, qtype: RecordType) -> Vec<usize> {
+        let mut candidates = self.always_check.clone();
 
         if let Some(indices) = self.domain_exact.get(qname) {
             candidates.extend_from_slice(indices);
@@ -142,6 +137,7 @@ impl RuleIndex {
 
         candidates.sort_unstable();
         candidates.dedup();
+        candidates
     }
 }
 
@@ -160,7 +156,7 @@ fn compile_pipeline(p: &RuntimePipeline) -> CompiledPipeline {
     }
 
     CompiledPipeline {
-        id: p.id.clone(),
+        id: Arc::from(p.id.as_str()),
         rules,
         index,
     }
@@ -227,36 +223,33 @@ pub(crate) fn fast_static_match(
     client_ip: IpAddr,
     edns_present: bool,
 ) -> Option<Decision> {
-    CANDIDATE_CACHE.with(|cache| {
-        let mut candidates = cache.borrow_mut();
-        pipeline.index.fill_candidates(qname, qtype, &mut candidates);
-        for &idx in candidates.iter() {
-            let rule = pipeline.rules.get(idx)?;
-            let matched = eval_match_chain(
-                &rule.matchers,
-                |m| m.operator,
-                |m| compiled_matcher_matches(&m.matcher, qname, qtype, qclass, client_ip, edns_present),
-            );
-            if !matched {
-                continue;
-            }
-            if let Some(pre) = &rule.precomputed {
-                match pre {
-                    PrecomputedAction::Static { rcode } => {
-                        return Some(Decision::Static {
-                            rcode: *rcode,
-                            answers: Vec::new(),
-                        });
-                    }
-                    PrecomputedAction::StaticIp { ip } => {
-                        let (rcode, answers) = make_static_ip_answer(qname, ip);
-                        return Some(Decision::Static { rcode, answers });
-                    }
+    let candidates = pipeline.index.get_candidates(qname, qtype);
+    for idx in candidates {
+        let rule = pipeline.rules.get(idx)?;
+        let matched = eval_match_chain(
+            &rule.matchers,
+            |m| m.operator,
+            |m| compiled_matcher_matches(&m.matcher, qname, qtype, qclass, client_ip, edns_present),
+        );
+        if !matched {
+            continue;
+        }
+        if let Some(pre) = &rule.precomputed {
+            match pre {
+                PrecomputedAction::Static { rcode } => {
+                    return Some(Decision::Static {
+                        rcode: *rcode,
+                        answers: Vec::new(),
+                    });
+                }
+                PrecomputedAction::StaticIp { ip } => {
+                    let (rcode, answers) = make_static_ip_answer(qname, ip);
+                    return Some(Decision::Static { rcode, answers });
                 }
             }
         }
-        None
-    })
+    }
+    None
 }
 
 fn compiled_matcher_matches(
