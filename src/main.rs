@@ -130,13 +130,14 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init_tracing(debug: bool) {
-    // 为压测降低日志开销：默认禁用 JSON，非 debug 仅 warn / Reduce logging overhead for benchmarking: disable JSON by default, warn-only in non-debug mode
+    // 默认关闭所有日志输出以最大化性能，除非显式指定
+    // Disable all logging by default for maximum performance unless explicitly enabled
     let fmt_layer = fmt::layer()
         .with_target(false)
         .with_ansi(false)
         .with_level(debug);
 
-    let level = if debug { "debug" } else { "warn" };
+    let level = if debug { "debug" } else { "off" };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
     tracing_subscriber::registry()
         .with(filter)
@@ -192,6 +193,10 @@ async fn run_udp_worker(
     let mut buf = BytesMut::with_capacity(4096);
     // 复用发送缓冲区：用于缓存命中时 patch TXID，避免每包堆分配 / Reuse send buffer to patch TXID on cache hits, avoiding per-packet heap allocation
     let mut send_buf = BytesMut::with_capacity(512);
+    
+    // 自适应流控：每 100 个请求检查一次是否需要调整 permits
+    // Adaptive flow control: check if adjustment needed every 100 requests
+    let mut request_count = 0u32;
 
     loop {
         // 确保有足够的空间 / Ensure sufficient space
@@ -204,6 +209,13 @@ async fn run_udp_worker(
             Ok((_len, peer)) => {
                 // 零拷贝获取 Bytes / Zero-copy obtain Bytes
                 let packet_bytes = buf.split().freeze();
+                
+                // 每 100 个请求检查一次流控调整 / Check flow control adjustment every 100 requests
+                request_count += 1;
+                if request_count >= 100 {
+                    request_count = 0;
+                    engine.adjust_flow_control().await;
+                }
                 
                 // 快速路径：尝试同步处理（缓存命中等场景） / Fast path: try synchronous handling (cache hit scenarios, etc.)
                 match engine.handle_packet_fast(&packet_bytes, peer) {
@@ -228,15 +240,24 @@ async fn run_udp_worker(
                         }
                     },
                     Ok(None) => {
-                        // 需要异步处理（上游转发），spawn 处理 / Need async processing (upstream forwarding), spawn for handling
-                        // packet_bytes 已经是 Bytes，无需再次 copy / packet_bytes is already Bytes, no need to copy again
-                        let engine = engine.clone();
-                        let socket = Arc::clone(&socket);
-                        tokio::spawn(async move {
-                            if let Ok(resp) = engine.handle_packet(&packet_bytes, peer).await {
-                                let _ = socket.send_to(&resp, peer).await;
-                            }
-                        });
+                        // 需要异步处理（上游转发），尝试获取 permit 以限制并发任务数
+                        // Need async processing, try to acquire permit for backpressure
+                        let permit_mgr = Arc::clone(&engine.permit_manager);
+                        
+                        // 非阻塞式尝试获取 permit，避免 async 等待导致的延迟
+                        // Non-blocking try_acquire to avoid async waiting in the hot path
+                        if let Some(permit) = permit_mgr.try_acquire() {
+                            let engine = engine.clone();
+                            let socket = Arc::clone(&socket);
+                            tokio::spawn(async move {
+                                let _permit = permit; // 任务完成时自动释放
+                                if let Ok(resp) = engine.handle_packet(&packet_bytes, peer).await {
+                                    let _ = socket.send_to(&resp, peer).await;
+                                }
+                            });
+                        }
+                        // 如果 PermitManager 已满，直接丢弃请求（客户端将等待超时）
+                        // If permit manager is full, drop the request (client will timeout)
                     }
                     Err(_) => {
                         // 解析错误，忽略 / Parse error, ignore

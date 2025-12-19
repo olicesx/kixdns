@@ -4,7 +4,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicUsize, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
@@ -33,6 +33,41 @@ use crate::matcher::{
     RuntimePipeline, RuntimePipelineConfig, RuntimeResponseMatcherWithOp, eval_match_chain,
 };
 use crate::proto_utils::parse_quick;
+
+// Thread-local object pool for reusing BytesMut buffers to reduce heap allocations
+thread_local! {
+    static BUFFER_POOL: std::cell::RefCell<Vec<bytes::BytesMut>> = std::cell::RefCell::new(Vec::with_capacity(8));
+}
+
+/// Get or create a BytesMut buffer from thread-local pool
+#[inline]
+fn pool_acquire_buffer(capacity: usize) -> bytes::BytesMut {
+    BUFFER_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if let Some(mut buf) = pool.pop() {
+            if buf.capacity() < capacity {
+                buf.reserve(capacity - buf.capacity());
+            } else {
+                buf.clear();
+            }
+            buf
+        } else {
+            bytes::BytesMut::with_capacity(capacity)
+        }
+    })
+}
+
+/// Return a BytesMut buffer to the thread-local pool
+#[inline]
+#[allow(dead_code)]
+fn pool_release_buffer(buf: bytes::BytesMut) {
+    BUFFER_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < 8 {
+            pool.push(buf);
+        }
+    })
+}
 
 /// Fast-path response for UDP workers.
 ///
@@ -69,27 +104,125 @@ pub struct Engine {
     pub request_id_counter: Arc<AtomicU64>,
     // In-flight dedupe map: cache_hash -> waiters / 进行中的去重映射：缓存哈希 -> 等待者
     pub inflight: Arc<DashMap<u64, Vec<oneshot::Sender<anyhow::Result<Bytes>>>, FxBuildHasher>>,
+    // Semaphore to limit concurrent handle_packet async tasks / 用于限制并发 handle_packet 异步任务数量
+    pub permit_manager: Arc<PermitManager>,
+    // Latest upstream latency for adaptive flow control / 用于自适应流控的最新上游延迟
+    pub metrics_last_upstream_latency_ns: Arc<AtomicU64>,
+    // Adaptive flow control state / 自适应流控状态
+    pub flow_control_state: Arc<FlowControlState>,
+}
+
+/// Adaptive flow control state for dynamic semaphore adjustment
+pub struct FlowControlState {
+    pub max_permits: AtomicUsize,
+    pub min_permits: usize,
+    pub last_adjustment: Mutex<Instant>,
+    pub critical_latency_threshold_ns: u64,
+    pub adjustment_interval: Duration,
+}
+
+/// Permit manager for dynamic flow control feedback
+/// 动态流控的 Permit 管理器
+pub struct PermitManager {
+    // Current active permits (acquired) / 当前活跃 permits（已获得）
+    active_permits: Arc<AtomicUsize>,
+    // Maximum permits that can be granted / 可授予的最大 permits
+    max_permits: Arc<AtomicUsize>,
+}
+
+impl PermitManager {
+    pub fn new(initial_permits: usize) -> Self {
+        Self {
+            active_permits: Arc::new(AtomicUsize::new(0)),
+            max_permits: Arc::new(AtomicUsize::new(initial_permits)),
+        }
+    }
+    
+    /// Try to acquire a permit without blocking / 非阻塞地尝试获取 permit
+    pub fn try_acquire(&self) -> Option<PermitGuard> {
+        loop {
+            let active = self.active_permits.load(Ordering::Acquire);
+            let max = self.max_permits.load(Ordering::Acquire);
+            
+            if active >= max {
+                return None;
+            }
+            
+            match self.active_permits.compare_exchange(
+                active,
+                active + 1,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(PermitGuard {
+                    active_permits: Arc::clone(&self.active_permits),
+                }),
+                Err(_) => continue, // Retry on CAS failure / CAS 失败时重试
+            }
+        }
+    }
+    
+    /// Get current inflight permits count / 获取当前进行中的 permits 数
+    pub fn inflight(&self) -> usize {
+        self.active_permits.load(Ordering::Acquire)
+    }
+    
+    /// Update max permits for dynamic adjustment / 更新最大 permits 用于动态调整
+    pub fn set_max_permits(&self, new_max: usize) {
+        self.max_permits.store(new_max, Ordering::Release);
+    }
+    
+    /// Get current max permits / 获取当前最大 permits
+    pub fn max_permits(&self) -> usize {
+        self.max_permits.load(Ordering::Acquire)
+    }
+}
+
+/// RAII guard for automatic permit release / RAII 守卫用于自动 permit 释放
+pub struct PermitGuard {
+    active_permits: Arc<AtomicUsize>,
+}
+
+impl Drop for PermitGuard {
+    fn drop(&mut self) {
+        self.active_permits.fetch_sub(1, Ordering::Release);
+    }
 }
 
 impl Engine {
     pub fn new(cfg: RuntimePipelineConfig, listener_label: String) -> Self {
         // moka 缓存：最大 10000 条，默认 TTL 300 秒（会被实际 TTL 覆盖） / moka cache: max 10000 entries, default TTL 300 seconds (will be overridden by actual TTL)
         let cache = new_cache(10_000, 300);
-        // Rule cache: 100k entries, 60s TTL / 规则缓存：10万条，60秒 TTL
+        // Rule cache: 10k entries, 60s TTL / 规则缓存：1万条，60秒 TTL
         let rule_cache = Cache::builder()
-            .max_capacity(100_000)
+            .max_capacity(10_000)
             .time_to_live(Duration::from_secs(60))
             .build();
 
-        // UDP socket pool size from config / 从配置获取 UDP 套接字池大小
+        // Extract flow control settings before moving cfg / 在 move cfg 之前提取流控设置
         let udp_pool_size = cfg.settings.udp_pool_size;
         let tcp_pool_size = cfg.settings.tcp_pool_size;
+        let flow_control_initial_permits = cfg.settings.flow_control_initial_permits;
+        let flow_control_min_permits = cfg.settings.flow_control_min_permits;
+        let flow_control_max_permits = cfg.settings.flow_control_max_permits;
+        let flow_control_latency_threshold_ms = cfg.settings.flow_control_latency_threshold_ms;
+        let flow_control_adjustment_interval_secs = cfg.settings.flow_control_adjustment_interval_secs;
+        
         let compiled = compile_pipelines(&cfg);
         
         let state = Arc::new(ArcSwap::from_pointee(EngineInner {
             pipeline: cfg,
             compiled_pipelines: compiled,
         }));
+
+        let flow_control_state = Arc::new(FlowControlState {
+            max_permits: AtomicUsize::new(flow_control_max_permits),
+            min_permits: flow_control_min_permits,
+            last_adjustment: Mutex::new(Instant::now()),
+            critical_latency_threshold_ns: flow_control_latency_threshold_ms * 1_000_000,
+            adjustment_interval: Duration::from_secs(flow_control_adjustment_interval_secs),
+        });
+        let permit_manager = Arc::new(PermitManager::new(flow_control_initial_permits));
 
         Self {
             state,
@@ -103,8 +236,11 @@ impl Engine {
             metrics_fastpath_hits: Arc::new(AtomicU64::new(0)),
             metrics_upstream_ns_total: Arc::new(AtomicU64::new(0)),
             metrics_upstream_calls: Arc::new(AtomicU64::new(0)),
+            metrics_last_upstream_latency_ns: Arc::new(AtomicU64::new(0)),
             request_id_counter: Arc::new(AtomicU64::new(1)),
             inflight: Arc::new(DashMap::with_hasher(FxBuildHasher::default())),
+            permit_manager,
+            flow_control_state,
         }
     }
 
@@ -119,11 +255,63 @@ impl Engine {
         self.rule_cache.invalidate_all();
     }
 
+    /// 动态调整 flow control permits 基于系统负载和延迟 / Adaptively adjust flow control permits based on system load and latency
+    pub async fn adjust_flow_control(&self) {
+        let state = &self.flow_control_state;
+        let mut last_adj = state.last_adjustment.lock().await;
+        let now = Instant::now();
+        
+        // 检查调整间隔是否已过期 / Check if adjustment interval has passed
+        if now.duration_since(*last_adj) < state.adjustment_interval {
+            return;
+        }
+        *last_adj = now;
+
+        let inflight = self.permit_manager.inflight();
+        let latest_latency = self.metrics_last_upstream_latency_ns.load(Ordering::Relaxed);
+        let current_permits = self.permit_manager.max_permits();
+
+        // 决策逻辑：如果延迟高或进行中请求多，减少 permits
+        // Decision logic: reduce permits if latency is high or inflight requests are many
+        let should_reduce = latest_latency > state.critical_latency_threshold_ns 
+            || inflight > current_permits * 2 / 3;
+        
+        let should_increase = latest_latency < state.critical_latency_threshold_ns / 2
+            && inflight < current_permits / 3;
+
+        if should_reduce && current_permits > state.min_permits {
+            let new_permits = (current_permits * 9 / 10).max(state.min_permits);
+            self.permit_manager.set_max_permits(new_permits);
+            tracing::info!(
+                event = "flow_control_reduce",
+                current_permits = current_permits,
+                new_permits = new_permits,
+                latest_latency_ms = latest_latency / 1_000_000,
+                inflight = inflight,
+                "reducing permits due to high latency or load"
+            );
+        } else if should_increase && current_permits < state.max_permits.load(Ordering::Relaxed) {
+            let new_permits = (current_permits * 11 / 10).min(state.max_permits.load(Ordering::Relaxed));
+            self.permit_manager.set_max_permits(new_permits);
+            tracing::info!(
+                event = "flow_control_increase",
+                current_permits = current_permits,
+                new_permits = new_permits,
+                latest_latency_ms = latest_latency / 1_000_000,
+                inflight = inflight,
+                "increasing permits - system performing well"
+            );
+        }
+    }
+
     #[inline]
     fn calculate_cache_hash_for_dedupe(pipeline_id: &str, qname: &str, qtype: hickory_proto::rr::RecordType) -> u64 {
         let mut h = FxHasher::default();
         pipeline_id.hash(&mut h);
-        qname.to_ascii_lowercase().hash(&mut h);
+        // Hash qname case-insensitively without allocation / 不分配内存地进行不区分大小写的 qname 哈希
+        for b in qname.as_bytes() {
+            h.write_u8(b.to_ascii_lowercase());
+        }
         // RecordType implements Copy+Debug, hash by its u16 representation / RecordType 实现了 Copy+Debug，使用其 u16 表示进行哈希
         u16::from(qtype).hash(&mut h);
         h.finish()
@@ -196,7 +384,7 @@ impl Engine {
         
         if let Some(hit) = self.cache.get(&cache_hash) {
             // Verify collision / 验证冲突
-            if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == q.qname && hit.pipeline_id.as_ref() == pipeline_id {
+            if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == q.qname && hit.pipeline_id == pipeline_id {
                 self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
                 let elapsed = t_after_parse.as_nanos();
                 tracing::debug!(request_id = req_id, phase = "cache_hit", elapsed_ns = elapsed, "fastpath cache hit");
@@ -240,7 +428,7 @@ impl Engine {
         let rule_hash = calculate_rule_hash(&pipeline_id, q.qname, peer.ip());
         if let Some(entry) = self.rule_cache.get(&rule_hash) {
             if entry.matches(&pipeline_id, q.qname, peer.ip()) {
-                if let Decision::Static { rcode, answers } = &entry.decision {
+                if let Decision::Static { rcode, answers } = entry.decision.as_ref() {
                     let resp = build_fast_static_response(
                         q.tx_id,
                         q.qname,
@@ -265,6 +453,18 @@ impl Engine {
     }
 
     #[inline]
+    fn insert_rule_cache(&self, hash: u64, pipeline_id: Arc<str>, qname: &str, client_ip: IpAddr, decision: Decision) {
+        self.rule_cache.insert(
+            hash,
+            RuleCacheEntry {
+                pipeline_id,
+                qname_hash: fast_hash_str(qname),
+                client_ip,
+                decision: Arc::new(decision),
+            },
+        );
+    }
+
     pub async fn handle_packet(&self, packet: &[u8], peer: SocketAddr) -> anyhow::Result<Bytes> {
         // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
         let _req_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
@@ -315,10 +515,10 @@ impl Engine {
         let dedupe_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, qname_ref, qtype);
         // moka 同步缓存自动处理过期，无需检查 expires_at / moka sync cache automatically handles expiration, no need to check expires_at
         if let Some(hit) = self.cache.get(&dedupe_hash) {
-            if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == *qname_ref && hit.pipeline_id.as_ref() == pipeline_id {
+            if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == *qname_ref && hit.pipeline_id == pipeline_id {
                 let latency = start.elapsed();
                 // clone bytes and rewrite transaction ID to match requester / 克隆字节并重写事务 ID 以匹配请求者
-                let mut resp_bytes = bytes::BytesMut::with_capacity(hit.bytes.len());
+                let mut resp_bytes = pool_acquire_buffer(hit.bytes.len());
                 resp_bytes.extend_from_slice(&hit.bytes);
                 if resp_bytes.len() >= 2 {
                     let id_bytes = tx_id.to_be_bytes();
@@ -403,7 +603,7 @@ impl Engine {
                         break;
                     }
                     if let Some(p) = cfg.pipelines.iter().find(|p| p.id == *pipeline) {
-                        current_pipeline_id = pipeline.clone();
+                        current_pipeline_id = p.id.clone();
                         dedupe_hash = Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, &qname, qtype);
                         dedupe_registered = false;
                         skip_rules.clear();
@@ -445,7 +645,7 @@ impl Engine {
                         rcode,
                         source: Arc::from("static"),
                         qname: Arc::from(qname.as_str()),
-                        pipeline_id: Arc::from(current_pipeline_id.as_str()),
+                        pipeline_id: current_pipeline_id.clone(),
                         qtype: u16::from(qtype),
                     };
                     self.cache.insert(dedupe_hash, entry);
@@ -610,7 +810,7 @@ impl Engine {
                                     rcode,
                                     source: Arc::from(upstream.as_str()),
                                     qname: Arc::from(qname.as_str()),
-                                    pipeline_id: Arc::from(pipeline_id.as_str()),
+                                    pipeline_id: pipeline_id.clone(),
                                     qtype: u16::from(qtype),
                                 };
                                 self.cache.insert(dedupe_hash, entry);
@@ -678,7 +878,7 @@ impl Engine {
                                         rcode: ctx.msg.response_code(),
                                         source: Arc::from(ctx.upstream.as_str()),
                                         qname: Arc::from(qname.as_str()),
-                                        pipeline_id: Arc::from(pipeline_id.as_str()),
+                                        pipeline_id: pipeline_id.clone(),
                                         qtype: u16::from(qtype),
                                     };
                                     self.cache.insert(dedupe_hash, entry);
@@ -713,7 +913,7 @@ impl Engine {
                                         rcode,
                                         source: Arc::from(source),
                                         qname: Arc::from(qname.as_str()),
-                                        pipeline_id: Arc::from(current_pipeline_id.as_str()),
+                                        pipeline_id: current_pipeline_id.clone(),
                                         qtype: u16::from(qtype),
                                     };
                                     self.cache.insert(dedupe_hash, entry);
@@ -841,7 +1041,7 @@ impl Engine {
                                                 rcode: ctx.msg.response_code(),
                                                 source: Arc::from(ctx.upstream.as_str()),
                                                 qname: Arc::from(qname.as_str()),
-                                                pipeline_id: Arc::from(pipeline_id.as_str()),
+                                                pipeline_id: pipeline_id.clone(),
                                                 qtype: u16::from(qtype),
                                             };
                                             self.cache.insert(dedupe_hash, entry);
@@ -929,7 +1129,7 @@ impl Engine {
         if allow_rule_cache_lookup {
             if let Some(entry) = self.rule_cache.get(&rule_hash) {
                 if entry.matches(&pipeline.id, qname, client_ip) {
-                    return entry.decision.clone();
+                    return (*entry.decision).clone();
                 }
             }
         }
@@ -988,15 +1188,7 @@ impl Engine {
                                 rcode: code,
                                 answers: Vec::new(),
                             };
-                            self.rule_cache.insert(
-                                rule_hash,
-                                RuleCacheEntry {
-                                    pipeline_id: Arc::from(pipeline.id.as_str()),
-                                    qname_hash: fast_hash_str(qname),
-                                    client_ip,
-                                    decision: d.clone(),
-                                },
-                            );
+                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
                             return d;
                         }
                         Action::StaticIpResponse { ip } => {
@@ -1011,15 +1203,7 @@ impl Engine {
                                         rcode: ResponseCode::NoError,
                                         answers: vec![record],
                                     };
-                                    self.rule_cache.insert(
-                                        rule_hash,
-                                        RuleCacheEntry {
-                                            pipeline_id: Arc::from(pipeline.id.as_str()),
-                                            qname_hash: fast_hash_str(qname),
-                                            client_ip,
-                                            decision: d.clone(),
-                                        },
-                                    );
+                                    self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
                                     return d;
                                 }
                             }
@@ -1027,30 +1211,14 @@ impl Engine {
                                 rcode: ResponseCode::ServFail,
                                 answers: Vec::new(),
                             };
-                            self.rule_cache.insert(
-                                rule_hash,
-                                RuleCacheEntry {
-                                    pipeline_id: Arc::from(pipeline.id.as_str()),
-                                    qname_hash: fast_hash_str(qname),
-                                    client_ip,
-                                    decision: d.clone(),
-                                },
-                            );
+                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
                             return d;
                         }
                         Action::JumpToPipeline { pipeline: target } => {
                             let d = Decision::Jump {
-                                pipeline: target.clone(),
+                                pipeline: Arc::from(target.as_str()),
                             };
-                            self.rule_cache.insert(
-                                rule_hash,
-                                RuleCacheEntry {
-                                    pipeline_id: Arc::from(pipeline.id.as_str()),
-                                    qname_hash: fast_hash_str(qname),
-                                    client_ip,
-                                    decision: d.clone(),
-                                },
-                            );
+                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
                             return d;
                         }
                         Action::Allow => {
@@ -1066,15 +1234,7 @@ impl Engine {
                                 continue_on_miss: false,
                                 allow_reuse: true,
                             };
-                            self.rule_cache.insert(
-                                rule_hash,
-                                RuleCacheEntry {
-                                    pipeline_id: Arc::from(pipeline.id.as_str()),
-                                    qname_hash: fast_hash_str(qname),
-                                    client_ip,
-                                    decision: d.clone(),
-                                },
-                            );
+                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
                             return d;
                         }
                         Action::Deny => {
@@ -1082,15 +1242,7 @@ impl Engine {
                                 rcode: ResponseCode::Refused,
                                 answers: Vec::new(),
                             };
-                            self.rule_cache.insert(
-                                rule_hash,
-                                RuleCacheEntry {
-                                    pipeline_id: Arc::from(pipeline.id.as_str()),
-                                    qname_hash: fast_hash_str(qname),
-                                    client_ip,
-                                    decision: d.clone(),
-                                },
-                            );
+                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
                             return d;
                         }
                         Action::Forward {
@@ -1116,15 +1268,7 @@ impl Engine {
                                 allow_reuse: false,
                             };
                             if !continue_on_match && !continue_on_miss {
-                                self.rule_cache.insert(
-                                    rule_hash,
-                                    RuleCacheEntry {
-                                        pipeline_id: Arc::from(pipeline.id.as_str()),
-                                        qname_hash: fast_hash_str(qname),
-                                        client_ip,
-                                        decision: d.clone(),
-                                    },
-                                );
+                                self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
                             }
                             return d;
                         }
@@ -1156,15 +1300,7 @@ impl Engine {
             continue_on_miss: false,
             allow_reuse: false,
         };
-        self.rule_cache.insert(
-            rule_hash,
-            RuleCacheEntry {
-                pipeline_id: Arc::from(pipeline.id.as_str()),
-                qname_hash: fast_hash_str(qname),
-                client_ip,
-                decision: d.clone(),
-            },
-        );
+        self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
         d
     }
 
@@ -1182,12 +1318,17 @@ impl Engine {
         };
         if let Ok(_) = &res {
             let dur = start.elapsed();
+            let dur_ns = dur.as_nanos() as u64;
             self.metrics_upstream_calls.fetch_add(1, Ordering::Relaxed);
-            self.metrics_upstream_ns_total.fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
-            tracing::debug!(upstream=%upstream, upstream_ns = dur.as_nanos() as u64, "upstream call latency");
+            self.metrics_upstream_ns_total.fetch_add(dur_ns, Ordering::Relaxed);
+            // 记录最新的延迟供自适应流控使用 / Record latest latency for adaptive flow control
+            self.metrics_last_upstream_latency_ns.store(dur_ns, Ordering::Relaxed);
+            tracing::debug!(upstream=%upstream, upstream_ns = dur_ns, "upstream call latency");
         } else if let Err(e) = &res {
             let dur = start.elapsed();
-            tracing::warn!(upstream=%upstream, error=%e, elapsed_ns = dur.as_nanos() as u64, "upstream call failed");
+            let dur_ns = dur.as_nanos() as u64;
+            self.metrics_last_upstream_latency_ns.store(dur_ns, Ordering::Relaxed);
+            tracing::info!(upstream=%upstream, error=%e, elapsed_ns = dur_ns, "upstream call failed");
         }
         res
     }
@@ -1290,7 +1431,7 @@ impl Engine {
                         });
                     }
                     return Ok(ResponseActionResult::Jump {
-                        pipeline: pipeline.clone(),
+                        pipeline: Arc::from(pipeline.as_str()),
                         remaining_jumps: remaining_jumps - 1,
                     });
                 }
@@ -1408,7 +1549,7 @@ impl Engine {
     async fn process_response_jump(
         &self,
         state: &EngineInner,
-        mut pipeline_id: String,
+        mut pipeline_id: Arc<str>,
         mut remaining_jumps: usize,
         req: &Message,
         packet: &[u8],
@@ -1527,7 +1668,7 @@ impl Engine {
                         rcode,
                         source: Arc::from("static"),
                         qname: Arc::from(qname),
-                        pipeline_id: Arc::from(pipeline_id.as_str()),
+                        pipeline_id: pipeline_id.clone(),
                         qtype: u16::from(qtype),
                     };
                     self.cache.insert(dedupe_hash, entry);
@@ -1669,7 +1810,7 @@ impl Engine {
                                         rcode: msg.response_code(),
                                         source: Arc::from(upstream.as_str()),
                                         qname: Arc::from(qname),
-                                        pipeline_id: Arc::from(pipeline_id.as_str()),
+                                        pipeline_id: pipeline_id.clone(),
                                         qtype: u16::from(qtype),
                                     };
                                     self.cache.insert(dedupe_hash, entry);
@@ -1715,7 +1856,7 @@ impl Engine {
                                             rcode: ctx.msg.response_code(),
                                             source: Arc::from(ctx.upstream.as_str()),
                                             qname: Arc::from(qname),
-                                            pipeline_id: Arc::from(pipeline_id.as_str()),
+                                            pipeline_id: pipeline_id.clone(),
                                             qtype: u16::from(qtype),
                                         };
                                         self.cache.insert(dedupe_hash, entry);
@@ -1771,7 +1912,7 @@ fn select_pipeline<'a>(
     qclass: DNSClass,
     edns_present: bool,
     listener_label: &str,
-) -> (Option<&'a RuntimePipeline>, String) {
+) -> (Option<&'a RuntimePipeline>, Arc<str>) {
     for rule in &cfg.pipeline_select {
         let matched = eval_match_chain(
             &rule.matchers,
@@ -1779,7 +1920,7 @@ fn select_pipeline<'a>(
             |m| m.matcher.matches(listener_label, client_ip, qname, qclass, edns_present),
         );
         if matched {
-            if let Some(p) = cfg.pipelines.iter().find(|p| p.id == rule.pipeline) {
+            if let Some(p) = cfg.pipelines.iter().find(|p| p.id.as_ref() == rule.pipeline) {
                 return (Some(p), p.id.clone());
             }
         }
@@ -1787,7 +1928,7 @@ fn select_pipeline<'a>(
 
     match cfg.pipelines.first() {
         Some(p) => (Some(p), p.id.clone()),
-        None => (None, "default".to_string()),
+        None => (None, Arc::from("default")),
     }
 }
 
@@ -2796,7 +2937,7 @@ pub(crate) enum Decision {
         allow_reuse: bool,
     },
     Jump {
-        pipeline: String,
+        pipeline: Arc<str>,
     },
 }
 
@@ -2820,7 +2961,7 @@ enum ResponseActionResult {
         source: &'static str,
     },
     Jump {
-        pipeline: String,
+        pipeline: Arc<str>,
         remaining_jumps: usize,
     },
     Continue {
@@ -2842,7 +2983,7 @@ struct RuleCacheEntry {
     pipeline_id: Arc<str>,
     qname_hash: u64,
     client_ip: IpAddr,
-    decision: Decision,
+    decision: Arc<Decision>,
 }
 
 impl RuleCacheEntry {
