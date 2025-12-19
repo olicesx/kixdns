@@ -156,7 +156,7 @@ fn compile_pipeline(p: &RuntimePipeline) -> CompiledPipeline {
     }
 
     CompiledPipeline {
-        id: Arc::from(p.id.as_str()),
+        id: p.id.clone(),
         rules,
         index,
     }
