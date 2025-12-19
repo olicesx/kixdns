@@ -187,9 +187,15 @@ impl Engine {
             .time_to_live(Duration::from_secs(60))
             .build();
 
-        // UDP socket pool size from config / 从配置获取 UDP 套接字池大小
+        // Extract flow control settings before moving cfg / 在 move cfg 之前提取流控设置
         let udp_pool_size = cfg.settings.udp_pool_size;
         let tcp_pool_size = cfg.settings.tcp_pool_size;
+        let flow_control_initial_permits = cfg.settings.flow_control_initial_permits;
+        let flow_control_min_permits = cfg.settings.flow_control_min_permits;
+        let flow_control_max_permits = cfg.settings.flow_control_max_permits;
+        let flow_control_latency_threshold_ms = cfg.settings.flow_control_latency_threshold_ms;
+        let flow_control_adjustment_interval_secs = cfg.settings.flow_control_adjustment_interval_secs;
+        
         let compiled = compile_pipelines(&cfg);
         
         let state = Arc::new(ArcSwap::from_pointee(EngineInner {
@@ -198,13 +204,13 @@ impl Engine {
         }));
 
         let flow_control_state = Arc::new(FlowControlState {
-            max_permits: AtomicUsize::new(800),
-            min_permits: 100,
+            max_permits: AtomicUsize::new(flow_control_max_permits),
+            min_permits: flow_control_min_permits,
             last_adjustment: Mutex::new(Instant::now()),
-            critical_latency_threshold_ns: 100_000_000, // 100ms
-            adjustment_interval: Duration::from_secs(5),
+            critical_latency_threshold_ns: flow_control_latency_threshold_ms * 1_000_000,
+            adjustment_interval: Duration::from_secs(flow_control_adjustment_interval_secs),
         });
-        let permit_manager = Arc::new(PermitManager::new(500));
+        let permit_manager = Arc::new(PermitManager::new(flow_control_initial_permits));
 
         Self {
             state,

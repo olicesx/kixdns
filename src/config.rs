@@ -46,6 +46,21 @@ pub struct GlobalSettings {
     /// TCP 上游连接池大小。 / TCP upstream connection pool size
     #[serde(default = "default_tcp_pool_size")]
     pub tcp_pool_size: usize,
+    /// 自适应流控初始 permits 数量。 / Initial permits for adaptive flow control
+    #[serde(default = "default_flow_control_initial_permits")]
+    pub flow_control_initial_permits: usize,
+    /// 自适应流控最小 permits 数量。 / Minimum permits for adaptive flow control
+    #[serde(default = "default_flow_control_min_permits")]
+    pub flow_control_min_permits: usize,
+    /// 自适应流控最大 permits 数量。 / Maximum permits for adaptive flow control
+    #[serde(default = "default_flow_control_max_permits")]
+    pub flow_control_max_permits: usize,
+    /// 上游延迟告急阈值（毫秒）。 / Critical latency threshold (milliseconds)
+    #[serde(default = "default_flow_control_latency_threshold_ms")]
+    pub flow_control_latency_threshold_ms: u64,
+    /// 流控调整间隔（秒）。 / Flow control adjustment interval (seconds)
+    #[serde(default = "default_flow_control_adjustment_interval_secs")]
+    pub flow_control_adjustment_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -333,6 +348,53 @@ mod tests {
         assert_eq!(rule.matcher_operator, MatchOperator::And);
         assert_eq!(rule.response_matcher_operator, MatchOperator::And);
     }
+
+    #[test]
+    fn flow_control_settings_default_when_omitted() {
+        let raw = serde_json::json!({
+            "pipelines": [
+                {
+                    "id": "p1",
+                    "rules": []
+                }
+            ]
+        });
+
+        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        // Verify flow control settings have correct defaults
+        assert_eq!(cfg.settings.flow_control_initial_permits, 500);
+        assert_eq!(cfg.settings.flow_control_min_permits, 100);
+        assert_eq!(cfg.settings.flow_control_max_permits, 800);
+        assert_eq!(cfg.settings.flow_control_latency_threshold_ms, 100);
+        assert_eq!(cfg.settings.flow_control_adjustment_interval_secs, 5);
+    }
+
+    #[test]
+    fn flow_control_settings_can_be_customized() {
+        let raw = serde_json::json!({
+            "settings": {
+                "flow_control_initial_permits": 200,
+                "flow_control_min_permits": 50,
+                "flow_control_max_permits": 400,
+                "flow_control_latency_threshold_ms": 150,
+                "flow_control_adjustment_interval_secs": 10
+            },
+            "pipelines": [
+                {
+                    "id": "p1",
+                    "rules": []
+                }
+            ]
+        });
+
+        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        // Verify custom flow control settings
+        assert_eq!(cfg.settings.flow_control_initial_permits, 200);
+        assert_eq!(cfg.settings.flow_control_min_permits, 50);
+        assert_eq!(cfg.settings.flow_control_max_permits, 400);
+        assert_eq!(cfg.settings.flow_control_latency_threshold_ms, 150);
+        assert_eq!(cfg.settings.flow_control_adjustment_interval_secs, 10);
+    }
 }
 
 fn default_min_ttl() -> u32 {
@@ -365,4 +427,24 @@ fn default_udp_pool_size() -> usize {
 
 fn default_tcp_pool_size() -> usize {
     64
+}
+
+fn default_flow_control_initial_permits() -> usize {
+    500
+}
+
+fn default_flow_control_min_permits() -> usize {
+    100
+}
+
+fn default_flow_control_max_permits() -> usize {
+    800
+}
+
+fn default_flow_control_latency_threshold_ms() -> u64 {
+    100
+}
+
+fn default_flow_control_adjustment_interval_secs() -> u64 {
+    5
 }

@@ -56,7 +56,8 @@
                 <div class="card">
                     <div class="card-header bg-light fw-bold">全局设置 (Settings)</div>
                     <div class="card-body">
-                        <div class="row g-3">
+                        <h6 class="fw-bold mb-2 text-primary">基础配置</h6>
+                        <div class="row g-3 mb-3">
                             <div class="col-md-6">
                                 <label class="form-label">UDP 监听地址</label>
                                 <input type="text" class="form-control" v-model="config.settings.bind_udp">
@@ -84,6 +85,36 @@
                             <div class="col-md-3">
                                 <label class="form-label">UDP 连接池大小</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.udp_pool_size" placeholder="0=禁用">
+                            </div>
+                        </div>
+
+                        <hr>
+                        <h6 class="fw-bold mb-2 text-success">自适应流量控制配置 (Flow Control)</h6>
+                        <div class="row g-3">
+                            <div class="col-md-6">
+                                <label class="form-label">初始许可数 (Initial Permits)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.flow_control_initial_permits" placeholder="500">
+                                <div class="form-text small">初始并发任务数</div>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label">最小许可数 (Min Permits)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.flow_control_min_permits" placeholder="100">
+                                <div class="form-text small">并发下限</div>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label">最大许可数 (Max Permits)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.flow_control_max_permits" placeholder="800">
+                                <div class="form-text small">并发上限</div>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label">延迟阈值 (ms)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.flow_control_latency_threshold_ms" placeholder="100">
+                                <div class="form-text small">压力判断的延迟阈值</div>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label">调整间隔 (seconds)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.flow_control_adjustment_interval_secs" placeholder="5">
+                                <div class="form-text small">流控参数检查频率</div>
                             </div>
                         </div>
                     </div>
@@ -388,7 +419,12 @@
                         default_upstream: "1.1.1.1:53",
                         upstream_timeout_ms: 2000,
                         response_jump_limit: 10,
-                        udp_pool_size: 0
+                        udp_pool_size: 0,
+                        flow_control_initial_permits: 500,
+                        flow_control_min_permits: 100,
+                        flow_control_max_permits: 800,
+                        flow_control_latency_threshold_ms: 100,
+                        flow_control_adjustment_interval_secs: 5
                     },
                     pipeline_select: [],
                     pipelines: []
