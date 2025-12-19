@@ -239,12 +239,12 @@ impl Engine {
             metrics_upstream_calls: Arc::new(AtomicU64::new(0)),
             metrics_last_upstream_latency_ns: Arc::new(AtomicU64::new(0)),
             request_id_counter: Arc::new(AtomicU64::new(1)),
-            // Use 64 shards for better concurrency under high load (default is num_cpus * 4)
-            // More shards = less lock contention but more memory overhead
-            inflight: Arc::new(DashMap::with_capacity_and_hasher_and_shard_amount(
-                256,
+            // Use default shard count (DashMap default) to reduce fixed memory overhead,
+            // but still set a modest initial capacity to avoid tiny re-allocs.
+            // This keeps memory low while retaining reasonable throughput for typical loads.
+            inflight: Arc::new(DashMap::with_capacity_and_hasher(
+                128,
                 FxBuildHasher::default(),
-                64,
             )),
             permit_manager,
             flow_control_state,
