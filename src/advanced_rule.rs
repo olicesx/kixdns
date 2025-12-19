@@ -112,17 +112,18 @@ impl RuleIndex {
         }
     }
 
-    pub fn get_candidates(&self, qname: &str, qtype: RecordType) -> Vec<usize> {
-        let mut candidates = self.always_check.clone();
+    /// Get candidate rule indices into provided Vec to avoid allocation
+    pub fn get_candidates_into(&self, qname: &str, qtype: RecordType, out: &mut Vec<usize>) {
+        out.extend_from_slice(&self.always_check);
 
         if let Some(indices) = self.domain_exact.get(qname) {
-            candidates.extend_from_slice(indices);
+            out.extend_from_slice(indices);
         }
 
         let mut search_name = qname;
         loop {
             if let Some(indices) = self.domain_suffix.get(search_name) {
-                candidates.extend_from_slice(indices);
+                out.extend_from_slice(indices);
             }
             if let Some(idx) = search_name.find('.') {
                 search_name = &search_name[idx + 1..];
@@ -132,11 +133,16 @@ impl RuleIndex {
         }
 
         if let Some(indices) = self.query_type.get(&qtype) {
-            candidates.extend_from_slice(indices);
+            out.extend_from_slice(indices);
         }
 
-        candidates.sort_unstable();
-        candidates.dedup();
+        out.sort_unstable();
+        out.dedup();
+    }
+
+    pub fn get_candidates(&self, qname: &str, qtype: RecordType) -> Vec<usize> {
+        let mut candidates = Vec::new();
+        self.get_candidates_into(qname, qtype, &mut candidates);
         candidates
     }
 }

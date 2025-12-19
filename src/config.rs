@@ -20,7 +20,7 @@ pub struct PipelineConfig {
     pub pipelines: Vec<Pipeline>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct GlobalSettings {
     /// 最小TTL秒数，缺省0。 / Minimum TTL in seconds, defaults to 0
     #[serde(default = "default_min_ttl")]
@@ -31,6 +31,9 @@ pub struct GlobalSettings {
     /// TCP监听地址，缺省0.0.0.0:5353。 / TCP listen address, defaults to 0.0.0.0:5353
     #[serde(default = "default_bind_tcp")]
     pub bind_tcp: String,
+    /// Moka 缓存最大条目数（默认 10000） / Moka cache max entries (default 10000)
+    #[serde(default = "default_cache_capacity")]
+    pub cache_capacity: u64,
     /// 默认上游DNS。 / Default upstream DNS
     #[serde(default = "default_upstream")]
     pub default_upstream: String,
@@ -61,6 +64,32 @@ pub struct GlobalSettings {
     /// 流控调整间隔（秒）。 / Flow control adjustment interval (seconds)
     #[serde(default = "default_flow_control_adjustment_interval_secs")]
     pub flow_control_adjustment_interval_secs: u64,
+}
+
+impl Default for GlobalSettings {
+    fn default() -> Self {
+        Self {
+            min_ttl: default_min_ttl(),
+            bind_udp: default_bind_udp(),
+            bind_tcp: default_bind_tcp(),
+            default_upstream: default_upstream(),
+            upstream_timeout_ms: default_upstream_timeout_ms(),
+            response_jump_limit: default_response_jump_limit(),
+            udp_pool_size: default_udp_pool_size(),
+            tcp_pool_size: default_tcp_pool_size(),
+            flow_control_initial_permits: default_flow_control_initial_permits(),
+            flow_control_min_permits: default_flow_control_min_permits(),
+            flow_control_max_permits: default_flow_control_max_permits(),
+            flow_control_latency_threshold_ms: default_flow_control_latency_threshold_ms(),
+            flow_control_adjustment_interval_secs: default_flow_control_adjustment_interval_secs(),
+            cache_capacity: default_cache_capacity(),
+        }
+    }
+
+}
+
+fn default_cache_capacity() -> u64 {
+    10_000
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -6,6 +5,7 @@ use hickory_proto::op::Message;
 use hickory_proto::rr::{DNSClass, RecordType};
 use ipnet::IpNet;
 use regex::Regex;
+use rustc_hash::FxHashMap;
 
 use crate::config::{self, Action, MatchOperator, PipelineConfig};
 
@@ -22,14 +22,14 @@ pub struct RuntimePipeline {
     pub rules: Vec<RuntimeRule>,
     // Indices for O(1) lookup
     // Maps domain suffix -> list of rule indices that MUST be checked
-    pub domain_suffix_index: HashMap<String, Vec<usize>>,
+    pub domain_suffix_index: FxHashMap<String, Vec<usize>>,
     // Rules that are NOT indexed by domain (must always be checked)
     pub always_check_rules: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RuntimeRule {
-    pub name: String,
+    pub name: Arc<str>,
     #[allow(dead_code)]
     pub matcher_operator: MatchOperator,
     pub matchers: Vec<RuntimeMatcherWithOp>,
@@ -165,7 +165,7 @@ impl RuntimePipelineConfig {
                     }
                 }
                 rules.push(RuntimeRule {
-                    name: r.name,
+                    name: Arc::from(r.name),
                     matcher_operator: r.matcher_operator,
                     matchers,
                     actions: r.actions,
@@ -177,7 +177,7 @@ impl RuntimePipelineConfig {
             }
 
             // Build Indices
-            let mut domain_suffix_index: HashMap<String, Vec<usize>> = HashMap::new();
+            let mut domain_suffix_index: FxHashMap<String, Vec<usize>> = FxHashMap::default();
             let mut always_check_rules = Vec::new();
 
             for (idx, rule) in rules.iter().enumerate() {

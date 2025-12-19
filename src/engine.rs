@@ -1,14 +1,14 @@
-use std::collections::{hash_map::DefaultHasher, HashSet};
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicUsize, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use rustc_hash::{FxHasher, FxBuildHasher};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -116,9 +116,10 @@ pub struct Engine {
 pub struct FlowControlState {
     pub max_permits: AtomicUsize,
     pub min_permits: usize,
-    pub last_adjustment: Mutex<Instant>,
+    /// Last adjustment timestamp in milliseconds since UNIX_EPOCH
+    pub last_adjustment_ms: AtomicU64,
     pub critical_latency_threshold_ns: u64,
-    pub adjustment_interval: Duration,
+    pub adjustment_interval_ms: u64,
 }
 
 /// Permit manager for dynamic flow control feedback
@@ -191,8 +192,10 @@ impl Drop for PermitGuard {
 
 impl Engine {
     pub fn new(cfg: RuntimePipelineConfig, listener_label: String) -> Self {
-        // moka 缓存：最大 10000 条，默认 TTL 300 秒（会被实际 TTL 覆盖） / moka cache: max 10000 entries, default TTL 300 seconds (will be overridden by actual TTL)
-        let cache = new_cache(10_000, 300);
+        // moka 缓存：容量由配置控制（默认 10000 条），默认 TTL 300 秒（会被实际 TTL 覆盖）
+        // moka cache capacity is configurable via settings.cache_capacity (default 10000)
+        let cache_capacity = cfg.settings.cache_capacity;
+        let cache = new_cache(cache_capacity, 300);
         // Rule cache: 10k entries, 60s TTL / 规则缓存：1万条，60秒 TTL
         let rule_cache = Cache::builder()
             .max_capacity(10_000)
@@ -218,9 +221,9 @@ impl Engine {
         let flow_control_state = Arc::new(FlowControlState {
             max_permits: AtomicUsize::new(flow_control_max_permits),
             min_permits: flow_control_min_permits,
-            last_adjustment: Mutex::new(Instant::now()),
+            last_adjustment_ms: AtomicU64::new(0),
             critical_latency_threshold_ns: flow_control_latency_threshold_ms * 1_000_000,
-            adjustment_interval: Duration::from_secs(flow_control_adjustment_interval_secs),
+            adjustment_interval_ms: flow_control_adjustment_interval_secs * 1000,
         });
         let permit_manager = Arc::new(PermitManager::new(flow_control_initial_permits));
 
@@ -238,7 +241,13 @@ impl Engine {
             metrics_upstream_calls: Arc::new(AtomicU64::new(0)),
             metrics_last_upstream_latency_ns: Arc::new(AtomicU64::new(0)),
             request_id_counter: Arc::new(AtomicU64::new(1)),
-            inflight: Arc::new(DashMap::with_hasher(FxBuildHasher::default())),
+            // Use default shard count (DashMap default) to reduce fixed memory overhead,
+            // but still set a modest initial capacity to avoid tiny re-allocs.
+            // This keeps memory low while retaining reasonable throughput for typical loads.
+            inflight: Arc::new(DashMap::with_capacity_and_hasher(
+                128,
+                FxBuildHasher::default(),
+            )),
             permit_manager,
             flow_control_state,
         }
@@ -256,16 +265,28 @@ impl Engine {
     }
 
     /// 动态调整 flow control permits 基于系统负载和延迟 / Adaptively adjust flow control permits based on system load and latency
-    pub async fn adjust_flow_control(&self) {
+    pub fn adjust_flow_control(&self) {
         let state = &self.flow_control_state;
-        let mut last_adj = state.last_adjustment.lock().await;
-        let now = Instant::now();
+        
+        // Get current time in milliseconds
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        
+        let last_ms = state.last_adjustment_ms.load(Ordering::Relaxed);
         
         // 检查调整间隔是否已过期 / Check if adjustment interval has passed
-        if now.duration_since(*last_adj) < state.adjustment_interval {
+        if now_ms.saturating_sub(last_ms) < state.adjustment_interval_ms {
             return;
         }
-        *last_adj = now;
+        
+        // Try to CAS the timestamp - only one thread will succeed
+        if state.last_adjustment_ms.compare_exchange(
+            last_ms, now_ms, Ordering::AcqRel, Ordering::Relaxed
+        ).is_err() {
+            return;  // Another thread already updated
+        }
 
         let inflight = self.permit_manager.inflight();
         let latest_latency = self.metrics_last_upstream_latency_ns.load(Ordering::Relaxed);
@@ -543,7 +564,7 @@ impl Engine {
         }
 
         let qname = qname_cow.into_owned();
-        let mut skip_rules = HashSet::new();
+        let mut skip_rules: HashSet<Arc<str>> = HashSet::new();
         let mut current_pipeline_id = pipeline_id.clone();
         let mut dedupe_hash = Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, &qname, qtype);
         let mut dedupe_registered = false;
@@ -552,12 +573,12 @@ impl Engine {
         let mut decision = match pipeline_opt {
             Some(p) => self.apply_rules(&state, p, peer.ip(), &qname, qtype, qclass, edns_present, None),
             None => Decision::Forward {
-                upstream: cfg.settings.default_upstream.clone(),
+                upstream: Arc::from(cfg.settings.default_upstream.as_str()),
                 response_matchers: Vec::new(),
                 response_matcher_operator: crate::config::MatchOperator::And,
                 response_actions_on_match: Vec::new(),
                 response_actions_on_miss: Vec::new(),
-                rule_name: "default".to_string(),
+                rule_name: Arc::from("default"),
                 transport: Transport::Udp,
                 continue_on_match: false,
                 continue_on_miss: false,
@@ -701,13 +722,14 @@ impl Engine {
                             if let Some(rx) = rx {
                                 match rx.await {
                                     Ok(Ok(bytes)) => {
-                                        let mut resp_vec = bytes.to_vec();
-                                        if resp_vec.len() >= 2 {
+                                        // Zero-copy TX ID rewrite using BytesMut
+                                        let mut resp_mut = BytesMut::from(bytes.as_ref());
+                                        if resp_mut.len() >= 2 {
                                             let id_bytes = tx_id.to_be_bytes();
-                                            resp_vec[0] = id_bytes[0];
-                                            resp_vec[1] = id_bytes[1];
+                                            resp_mut[0] = id_bytes[0];
+                                            resp_mut[1] = id_bytes[1];
                                         }
-                                        return Ok(Bytes::from(resp_vec));
+                                        return Ok(resp_mut.freeze());
                                     }
                                     Ok(Err(e)) => return Err(e),
                                     Err(_) => {
@@ -741,13 +763,14 @@ impl Engine {
                         if let Some(rx) = rx {
                             match rx.await {
                                 Ok(Ok(bytes)) => {
-                                    let mut resp_vec = bytes.to_vec();
-                                    if resp_vec.len() >= 2 {
+                                    // Zero-copy TX ID rewrite using BytesMut
+                                    let mut resp_mut = BytesMut::from(bytes.as_ref());
+                                    if resp_mut.len() >= 2 {
                                         let id_bytes = tx_id.to_be_bytes();
-                                        resp_vec[0] = id_bytes[0];
-                                        resp_vec[1] = id_bytes[1];
+                                        resp_mut[0] = id_bytes[0];
+                                        resp_mut[1] = id_bytes[1];
                                     }
-                                    return Ok(Bytes::from(resp_vec));
+                                    return Ok(resp_mut.freeze());
                                 }
                                 Ok(Err(e)) => return Err(e),
                                 Err(_) => {
@@ -808,7 +831,7 @@ impl Engine {
                                 let entry = CacheEntry {
                                     bytes: raw.clone(),
                                     rcode,
-                                    source: Arc::from(upstream.as_str()),
+                                    source: upstream.clone(),
                                     qname: Arc::from(qname.as_str()),
                                     pipeline_id: pipeline_id.clone(),
                                     qtype: u16::from(qtype),
@@ -845,7 +868,7 @@ impl Engine {
                         let ctx = ResponseContext {
                             raw: raw.clone(),
                             msg,
-                            upstream: upstream.clone(),
+                            upstream: upstream.clone(),  // upstream is already Arc<str>
                             transport,
                         };
                         let action_result = self
@@ -876,7 +899,7 @@ impl Engine {
                                     let entry = CacheEntry {
                                         bytes: ctx.raw.clone(),
                                         rcode: ctx.msg.response_code(),
-                                        source: Arc::from(ctx.upstream.as_str()),
+                                        source: ctx.upstream.clone(),
                                         qname: Arc::from(qname.as_str()),
                                         pipeline_id: pipeline_id.clone(),
                                         qtype: u16::from(qtype),
@@ -1039,7 +1062,7 @@ impl Engine {
                                             let entry = CacheEntry {
                                                 bytes: ctx.raw.clone(),
                                                 rcode: ctx.msg.response_code(),
-                                                source: Arc::from(ctx.upstream.as_str()),
+                                                source: ctx.upstream.clone(),
                                                 qname: Arc::from(qname.as_str()),
                                                 pipeline_id: pipeline_id.clone(),
                                                 qtype: u16::from(qtype),
@@ -1119,7 +1142,7 @@ impl Engine {
         qtype: hickory_proto::rr::RecordType,
         qclass: DNSClass,
         edns_present: bool,
-        skip_rules: Option<&HashSet<String>>,
+        skip_rules: Option<&HashSet<Arc<str>>>,
     ) -> Decision {
         // 1. Check Rule Cache
         // Use hash for lookup to avoid cloning String for key on every lookup
@@ -1223,7 +1246,7 @@ impl Engine {
                         }
                         Action::Allow => {
                             let d = Decision::Forward {
-                                upstream: upstream_default.clone(),
+                                upstream: Arc::from(upstream_default.as_str()),
                                 response_matchers: Vec::new(),
                                 response_matcher_operator: crate::config::MatchOperator::And,
                                 response_actions_on_match: Vec::new(),
@@ -1249,10 +1272,10 @@ impl Engine {
                             upstream,
                             transport,
                         } => {
-                            let upstream_addr = upstream
+                            let upstream_addr: Arc<str> = upstream
                                 .as_ref()
-                                .cloned()
-                                .unwrap_or_else(|| upstream_default.clone());
+                                .map(|s| Arc::from(s.as_str()))
+                                .unwrap_or_else(|| Arc::from(upstream_default.as_str()));
                             let continue_on_match = contains_continue(&rule.response_actions_on_match);
                             let continue_on_miss = contains_continue(&rule.response_actions_on_miss);
                             let d = Decision::Forward {
@@ -1273,7 +1296,7 @@ impl Engine {
                             return d;
                         }
                         Action::Log { level } => {
-                            log_match(level.as_deref(), rule.name.as_str(), qname, client_ip);
+                            log_match(level.as_deref(), &rule.name, qname, client_ip);
                             // Log action doesn't terminate rule processing, so we continue.
                             // But we can't cache side effects (logging).
                             // If we cache the result, we skip logging on subsequent hits!
@@ -1289,12 +1312,12 @@ impl Engine {
         }
 
         let d = Decision::Forward {
-            upstream: upstream_default,
+            upstream: Arc::from(upstream_default.as_str()),
             response_matchers: Vec::new(),
             response_matcher_operator: crate::config::MatchOperator::And,
             response_actions_on_match: Vec::new(),
             response_actions_on_miss: Vec::new(),
-            rule_name: "default".to_string(),
+            rule_name: Arc::from("default"),
             transport: Transport::Udp,
             continue_on_match: false,
             continue_on_miss: false,
@@ -1328,7 +1351,7 @@ impl Engine {
             let dur = start.elapsed();
             let dur_ns = dur.as_nanos() as u64;
             self.metrics_last_upstream_latency_ns.store(dur_ns, Ordering::Relaxed);
-            tracing::info!(upstream=%upstream, error=%e, elapsed_ns = dur_ns, "upstream call failed");
+            tracing::warn!(upstream=%upstream, error=%e, elapsed_ns = dur_ns, "upstream call failed");
         }
         res
     }
@@ -1485,11 +1508,11 @@ impl Engine {
                         });
                     }
 
-                    let upstream_addr = upstream.as_ref().cloned().unwrap_or_else(|| {
+                    let upstream_addr: Arc<str> = upstream.as_ref().map(|s| Arc::from(s.as_str())).unwrap_or_else(|| {
                         ctx_opt
                             .as_ref()
                             .map(|ctx| ctx.upstream.clone())
-                            .unwrap_or_else(|| upstream_default.to_string())
+                            .unwrap_or_else(|| Arc::from(upstream_default))
                     });
                     let use_transport = transport.unwrap_or(Transport::Udp);
                     let raw = match self
@@ -1521,7 +1544,7 @@ impl Engine {
                     ctx_opt = Some(ResponseContext {
                         raw,
                         msg,
-                        upstream: upstream_addr,
+                        upstream: upstream_addr,  // upstream_addr is already Arc<str>
                         transport: use_transport,
                     });
                 }
@@ -1586,7 +1609,7 @@ impl Engine {
             }
         }
 
-        let mut skip_rules = HashSet::new();
+        let mut skip_rules: HashSet<Arc<str>> = HashSet::new();
         let mut reused_response: Option<ResponseContext> = None;
         let mut inflight_hashes = Vec::new();
         let mut cleanup_guards: Vec<InflightCleanupGuard> = Vec::new();
@@ -1711,14 +1734,14 @@ impl Engine {
                                 if let Some(rx) = rx {
                                     match rx.await {
                                         Ok(Ok(bytes)) => {
-                                            // Rewrite Transaction ID for followers
-                                            let mut resp_vec = bytes.to_vec();
-                                            if resp_vec.len() >= 2 {
+                                            // Rewrite Transaction ID for followers using BytesMut
+                                            let mut resp_mut = BytesMut::from(bytes.as_ref());
+                                            if resp_mut.len() >= 2 {
                                                 let id_bytes = req.id().to_be_bytes();
-                                                resp_vec[0] = id_bytes[0];
-                                                resp_vec[1] = id_bytes[1];
+                                                resp_mut[0] = id_bytes[0];
+                                                resp_mut[1] = id_bytes[1];
                                             }
-                                            let resp_bytes = Bytes::from(resp_vec);
+                                            let resp_bytes = resp_mut.freeze();
 
                                             for g in &mut cleanup_guards { g.defuse(); }
                                             for h in &inflight_hashes { self.notify_inflight_waiters(*h, &bytes).await; }
@@ -1756,14 +1779,14 @@ impl Engine {
                             if let Some(rx) = rx {
                                 match rx.await {
                                     Ok(Ok(bytes)) => {
-                                        // Rewrite Transaction ID for followers
-                                        let mut resp_vec = bytes.to_vec();
-                                        if resp_vec.len() >= 2 {
+                                        // Rewrite Transaction ID for followers using BytesMut
+                                        let mut resp_mut = BytesMut::from(bytes.as_ref());
+                                        if resp_mut.len() >= 2 {
                                             let id_bytes = req.id().to_be_bytes();
-                                            resp_vec[0] = id_bytes[0];
-                                            resp_vec[1] = id_bytes[1];
+                                            resp_mut[0] = id_bytes[0];
+                                            resp_mut[1] = id_bytes[1];
                                         }
-                                        let resp_bytes = Bytes::from(resp_vec);
+                                        let resp_bytes = resp_mut.freeze();
 
                                         for g in &mut cleanup_guards { g.defuse(); }
                                         for h in &inflight_hashes { self.notify_inflight_waiters(*h, &bytes).await; }
@@ -1808,7 +1831,7 @@ impl Engine {
                                     let entry = CacheEntry {
                                         bytes: raw.clone(),
                                         rcode: msg.response_code(),
-                                        source: Arc::from(upstream.as_str()),
+                                        source: upstream.clone(),
                                         qname: Arc::from(qname),
                                         pipeline_id: pipeline_id.clone(),
                                         qtype: u16::from(qtype),
@@ -1823,7 +1846,7 @@ impl Engine {
                             let ctx = ResponseContext {
                                 raw,
                                 msg,
-                                upstream: upstream.clone(),
+                                upstream: upstream.clone(),  // upstream is already Arc<str>
                                 transport,
                             };
                             let action_result = self
@@ -1854,7 +1877,7 @@ impl Engine {
                                         let entry = CacheEntry {
                                             bytes: ctx.raw.clone(),
                                             rcode: ctx.msg.response_code(),
-                                            source: Arc::from(ctx.upstream.as_str()),
+                                            source: ctx.upstream.clone(),
                                             qname: Arc::from(qname),
                                             pipeline_id: pipeline_id.clone(),
                                             qtype: u16::from(qtype),
@@ -1934,11 +1957,10 @@ fn select_pipeline<'a>(
 
 impl Engine {
     #[inline]
-    fn compiled_for(&self, state: &EngineInner, pipeline_id: &str) -> Option<CompiledPipeline> {
+    fn compiled_for<'a>(&self, state: &'a EngineInner, pipeline_id: &str) -> Option<&'a CompiledPipeline> {
         state.compiled_pipelines
             .iter()
             .find(|p| p.id.as_ref() == pipeline_id)
-            .cloned()
     }
 }
 
@@ -1995,12 +2017,11 @@ impl UdpClient {
                                     let id = u16::from_be_bytes([buf[0], buf[1]]);
                                     if let Some((_, (original_id, expected_addr, tx))) = inflight_clone.remove(&id) {
                                         if src == expected_addr {
-                                            // Restore original ID
-                                            let mut resp_data = buf[..len].to_vec();
+                                            // Restore original ID - modify in place then copy
                                             let orig_bytes = original_id.to_be_bytes();
-                                            resp_data[0] = orig_bytes[0];
-                                            resp_data[1] = orig_bytes[1];
-                                            let _ = tx.send(Ok(Bytes::from(resp_data)));
+                                            buf[0] = orig_bytes[0];
+                                            buf[1] = orig_bytes[1];
+                                            let _ = tx.send(Ok(Bytes::copy_from_slice(&buf[..len])));
                                         }
                                     }
                                 }
@@ -2099,8 +2120,9 @@ impl UdpClient {
         let (tx, rx) = oneshot::channel();
         state.inflight.insert(new_id, (original_id, addr, tx));
 
-        // Rewrite packet with new ID
-        let mut new_packet = packet.to_vec();
+        // Rewrite packet with new ID using BytesMut to avoid full copy
+        let mut new_packet = BytesMut::with_capacity(packet.len());
+        new_packet.extend_from_slice(packet);
         let id_bytes = new_id.to_be_bytes();
         new_packet[0] = id_bytes[0];
         new_packet[1] = id_bytes[1];
@@ -2123,7 +2145,7 @@ impl UdpClient {
 
 /// TCP 连接复用器，使用 DashMap 管理连接池 / TCP connection multiplexer, managing connection pool with DashMap
 struct TcpMultiplexer {
-    pools: dashmap::DashMap<String, Arc<TcpConnectionPool>>,
+    pools: dashmap::DashMap<Arc<str>, Arc<TcpConnectionPool>>,
     pool_size: usize,
 }
 
@@ -2147,14 +2169,15 @@ impl TcpMultiplexer {
         upstream: &str,
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
+        let upstream_key: Arc<str> = Arc::from(upstream);
         let pool = self
             .pools
-            .entry(upstream.to_string())
+            .entry(upstream_key.clone())
             .or_insert_with(|| {
                 let mut clients = Vec::with_capacity(self.pool_size);
                 let size = if self.pool_size == 0 { 1 } else { self.pool_size };
                 for _ in 0..size {
-                    clients.push(Arc::new(TcpMuxClient::new(upstream.to_string())));
+                    clients.push(Arc::new(TcpMuxClient::new(upstream_key.clone())));
                 }
                 Arc::new(TcpConnectionPool {
                     clients,
@@ -2169,12 +2192,12 @@ impl TcpMultiplexer {
 }
 
 struct TcpMuxClient {
-    upstream: String,
+    upstream: Arc<str>,
+    /// Write half protected by Mutex - serves as both connection storage and write serialization
     conn: Arc<Mutex<Option<OwnedWriteHalf>>>,
     pending: Arc<dashmap::DashMap<u16, Pending>>,
     next_id: AtomicU16,
     inflight_limit: Arc<Semaphore>,
-    write_lock: Mutex<()>,
 }
 
 struct Pending {
@@ -2183,28 +2206,14 @@ struct Pending {
 }
 
 impl TcpMuxClient {
-    fn new(upstream: String) -> Self {
+    fn new(upstream: Arc<str>) -> Self {
         Self {
             upstream,
             conn: Arc::new(Mutex::new(None)),
             pending: Arc::new(dashmap::DashMap::new()),
             next_id: AtomicU16::new(1),
             inflight_limit: Arc::new(Semaphore::new(128)),
-            write_lock: Mutex::new(()),
         }
-    }
-
-    async fn ensure_conn(&self) -> anyhow::Result<()> {
-        let mut guard = self.conn.lock().await;
-        if guard.is_some() {
-            return Ok(());
-        }
-        let stream = TcpStream::connect(&self.upstream).await?;
-        let (read_half, write_half) = stream.into_split();
-        *guard = Some(write_half);
-        drop(guard);
-        self.spawn_reader(read_half).await;
-        Ok(())
     }
 
     async fn spawn_reader(&self, mut reader: OwnedReadHalf) {
@@ -2212,6 +2221,9 @@ impl TcpMuxClient {
         let upstream = self.upstream.clone();
         let conn = Arc::clone(&self.conn);
         tokio::spawn(async move {
+            // Pre-allocate a reusable buffer for TCP reads
+            // DNS TCP max is 65535 bytes, but typical responses are much smaller
+            let mut reusable_buf = BytesMut::with_capacity(4096);
             loop {
                 let mut len_buf = [0u8; 2];
                 if let Err(err) = reader.read_exact(&mut len_buf).await {
@@ -2221,8 +2233,12 @@ impl TcpMuxClient {
                     break;
                 }
                 let resp_len = u16::from_be_bytes(len_buf) as usize;
-                let mut buf = vec![0u8; resp_len];
-                if let Err(err) = reader.read_exact(&mut buf).await {
+                
+                // Resize buffer if needed, reusing allocation
+                reusable_buf.clear();
+                reusable_buf.resize(resp_len, 0);
+                
+                if let Err(err) = reader.read_exact(&mut reusable_buf[..resp_len]).await {
                     debug!(target = "tcp_mux", upstream = %upstream, error = %err, "tcp read body failed");
                     Self::fail_all_async(&pending, anyhow::anyhow!("tcp read body failed"), &conn)
                         .await;
@@ -2232,10 +2248,12 @@ impl TcpMuxClient {
                 if resp_len < 2 {
                     continue;
                 }
-                let resp_id = u16::from_be_bytes([buf[0], buf[1]]);
+                let resp_id = u16::from_be_bytes([reusable_buf[0], reusable_buf[1]]);
                 if let Some((_, p)) = pending.remove(&resp_id) {
-                    buf[0..2].copy_from_slice(&p.original_id.to_be_bytes());
-                    let _ = p.tx.send(Ok(Bytes::from(buf)));
+                    reusable_buf[0..2].copy_from_slice(&p.original_id.to_be_bytes());
+                    // Split off the used portion to send, keeping capacity for reuse
+                    let response = reusable_buf.split_to(resp_len).freeze();
+                    let _ = p.tx.send(Ok(response));
                 } else {
                     debug!(target = "tcp_mux", upstream = %upstream, resp_id, "response with unknown id");
                 }
@@ -2261,20 +2279,30 @@ impl TcpMuxClient {
         let remaining = timeout_dur - elapsed;
 
         let original_id = u16::from_be_bytes([packet[0], packet[1]]);
-        let (mut new_packet, new_id) = self.rewrite_id(packet).await?;
+        let (new_packet, new_id) = self.rewrite_id(packet).await?;
 
         let (tx, rx) = oneshot::channel();
         self.pending.insert(new_id, Pending { original_id, tx });
 
-        // 2. Ensure connection and write with remaining timeout
+        // 2. Ensure connection and write with remaining timeout (single lock)
         let write_res = timeout(remaining, async {
-            self.ensure_conn().await?;
-            let mut out = Vec::with_capacity(2 + new_packet.len());
+            // Build TCP DNS frame: 2-byte length prefix + payload
+            let mut out = BytesMut::with_capacity(2 + new_packet.len());
             out.extend_from_slice(&(new_packet.len() as u16).to_be_bytes());
-            out.append(&mut new_packet);
+            out.extend_from_slice(&new_packet);
 
-            let _wguard = self.write_lock.lock().await;
+            // Single lock acquisition - conn Mutex provides both connection management and write serialization
             let mut guard = self.conn.lock().await;
+            
+            // Ensure connection exists
+            if guard.is_none() {
+                let stream = TcpStream::connect(&*self.upstream).await?;
+                let (read_half, write_half) = stream.into_split();
+                *guard = Some(write_half);
+                // Spawn reader while holding the lock to prevent races
+                self.spawn_reader(read_half).await;
+            }
+            
             let writer = guard.as_mut().context("tcp write half missing")?;
             writer.write_all(&out).await?;
             Ok::<(), anyhow::Error>(())
@@ -2317,7 +2345,8 @@ impl TcpMuxClient {
         Ok(resp)
     }
 
-    async fn rewrite_id(&self, packet: &[u8]) -> anyhow::Result<(Vec<u8>, u16)> {
+    /// Rewrite DNS transaction ID, returning BytesMut for efficient further operations
+    async fn rewrite_id(&self, packet: &[u8]) -> anyhow::Result<(BytesMut, u16)> {
         let mut tries = 0;
         let new_id = loop {
             let cand = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -2330,7 +2359,8 @@ impl TcpMuxClient {
                 anyhow::bail!("no available dns ids for tcp mux");
             }
         };
-        let mut buf = packet.to_vec();
+        let mut buf = BytesMut::with_capacity(packet.len());
+        buf.extend_from_slice(packet);
         buf[0..2].copy_from_slice(&new_id.to_be_bytes());
         Ok((buf, new_id))
     }
@@ -2473,7 +2503,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_mux_rewrite_id_no_deadlock_under_contention() {
         // Prepare a client with many pending IDs to force contention on the pending lock.
-        let client = Arc::new(TcpMuxClient::new("127.0.0.1:0".to_string()));
+        let client = Arc::new(TcpMuxClient::new(Arc::from("127.0.0.1:0")));
         for id in 1u16..200u16 {
             client.pending.insert(
                 id,
@@ -2537,7 +2567,7 @@ mod tests {
             "edge",
         );
         assert!(opt.is_some());
-        assert_eq!(id, "p2");
+        assert_eq!(id.as_ref(), "p2");
     }
 
     #[test]
@@ -2571,7 +2601,7 @@ mod tests {
             "edge",
         );
         assert!(opt.is_some());
-        assert_eq!(id, "p2");
+        assert_eq!(id.as_ref(), "p2");
     }
 
     #[allow(dead_code)]
@@ -2597,13 +2627,13 @@ mod tests {
         let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse");
         let runtime = RuntimePipelineConfig::from_config(cfg.clone()).expect("runtime");
 
-        let arc = Arc::new(ArcSwap::from_pointee(runtime.clone()));
-        let engine = Engine::new(arc.clone(), "lbl".to_string());
+        let engine = Engine::new(runtime.clone(), "lbl".to_string());
+        let state = engine.state.load();
 
         // StaticResponse should return Static decision
         let decision = engine.apply_rules(
-            &runtime,
-            &runtime.pipelines[0],
+            &state,
+            &state.pipeline.pipelines[0],
             "127.0.0.1".parse().unwrap(),
             "a.example.com",
             hickory_proto::rr::RecordType::A,
@@ -2636,12 +2666,12 @@ mod tests {
         });
         let cfg2: crate::config::PipelineConfig = serde_json::from_value(raw2).expect("parse");
         let runtime2 = RuntimePipelineConfig::from_config(cfg2.clone()).expect("runtime");
-        let arc2 = Arc::new(arc_swap::ArcSwap::from_pointee(runtime2.clone()));
-        let engine2 = Engine::new(arc2.clone(), "lbl".to_string());
+        let engine2 = Engine::new(runtime2.clone(), "lbl".to_string());
+        let state2 = engine2.state.load();
 
         let decision2 = engine2.apply_rules(
-            &runtime2,
-            &runtime2.pipelines[0],
+            &state2,
+            &state2.pipeline.pipelines[0],
             "127.0.0.1".parse().unwrap(),
             "x.example.com",
             hickory_proto::rr::RecordType::A,
@@ -2656,7 +2686,7 @@ mod tests {
                 response_matcher_operator,
                 ..
             } => {
-                assert_eq!(upstream, "8.8.8.8:53");
+                assert_eq!(upstream.as_ref(), "8.8.8.8:53");
                 assert_eq!(response_matchers.len(), 1);
                 assert_eq!(response_matcher_operator, crate::config::MatchOperator::And);
             }
@@ -2670,12 +2700,12 @@ mod tests {
         });
         let cfg3: crate::config::PipelineConfig = serde_json::from_value(raw3).expect("parse");
         let runtime3 = RuntimePipelineConfig::from_config(cfg3.clone()).expect("runtime");
-        let arc3 = Arc::new(arc_swap::ArcSwap::from_pointee(runtime3.clone()));
-        let engine3 = Engine::new(arc3.clone(), "lbl".to_string());
+        let engine3 = Engine::new(runtime3.clone(), "lbl".to_string());
+        let state3 = engine3.state.load();
 
         let decision3 = engine3.apply_rules(
-            &runtime3,
-            &runtime3.pipelines[0],
+            &state3,
+            &state3.pipeline.pipelines[0],
             "127.0.0.1".parse().unwrap(),
             "y.example.com",
             hickory_proto::rr::RecordType::A,
@@ -2684,7 +2714,7 @@ mod tests {
             None,
         );
         match decision3 {
-            Decision::Forward { upstream, .. } => assert_eq!(upstream, "1.2.3.4:53"),
+            Decision::Forward { upstream, .. } => assert_eq!(upstream.as_ref(), "1.2.3.4:53"),
             _ => panic!("expected forward from allow"),
         }
 
@@ -2694,12 +2724,12 @@ mod tests {
         });
         let cfg4: crate::config::PipelineConfig = serde_json::from_value(raw4).expect("parse");
         let runtime4 = RuntimePipelineConfig::from_config(cfg4.clone()).expect("runtime");
-        let arc4 = Arc::new(arc_swap::ArcSwap::from_pointee(runtime4.clone()));
-        let engine4 = Engine::new(arc4.clone(), "lbl".to_string());
+        let engine4 = Engine::new(runtime4.clone(), "lbl".to_string());
+        let state4 = engine4.state.load();
 
         let decision4 = engine4.apply_rules(
-            &runtime4,
-            &runtime4.pipelines[0],
+            &state4,
+            &state4.pipeline.pipelines[0],
             "127.0.0.1".parse().unwrap(),
             "z.example.com",
             hickory_proto::rr::RecordType::A,
@@ -2708,7 +2738,7 @@ mod tests {
             None,
         );
         match decision4 {
-            Decision::Jump { pipeline } => assert_eq!(pipeline, "other"),
+            Decision::Jump { pipeline } => assert_eq!(pipeline.as_ref(), "other"),
             _ => panic!("expected jump"),
         }
     }
@@ -2724,8 +2754,7 @@ mod tests {
             pipeline_select: Vec::new(),
             pipelines: Vec::new(),
         };
-        let arc = Arc::new(arc_swap::ArcSwap::from_pointee(runtime.clone()));
-        Engine::new(arc, "lbl".to_string())
+        Engine::new(runtime, "lbl".to_string())
     }
 
     fn build_response_context() -> ResponseContext {
@@ -2737,7 +2766,7 @@ mod tests {
         ResponseContext {
             raw: Bytes::from_static(b"resp"),
             msg,
-            upstream: TEST_UPSTREAM.to_string(),
+            upstream: Arc::from(TEST_UPSTREAM),
             transport: Transport::Udp,
         }
     }
@@ -2778,7 +2807,7 @@ mod tests {
         match result {
             ResponseActionResult::Upstream { ctx, resp_match } => {
                 assert!(resp_match);
-                assert_eq!(ctx.upstream, TEST_UPSTREAM);
+                assert_eq!(ctx.upstream.as_ref(), TEST_UPSTREAM);
             }
             _ => panic!("expected upstream result"),
         }
@@ -2891,8 +2920,10 @@ fn build_response(
     msg.set_authoritative(false);
     msg.set_response_code(rcode);
 
-    let queries: Vec<Query> = req.queries().iter().cloned().collect();
-    msg.add_queries(queries);
+    // Directly add queries without intermediate Vec allocation
+    for q in req.queries() {
+        msg.add_query(q.clone());
+    }
     for ans in answers {
         msg.add_answer(ans);
     }
@@ -2906,12 +2937,12 @@ fn build_response(
 }
 
 fn extract_ttl(msg: &Message) -> u64 {
-    let ttl_answers = msg
-        .answers()
+    // Directly iterate without collecting to Vec
+    msg.answers()
         .iter()
         .map(|r| r.ttl() as u64)
-        .collect::<Vec<_>>();
-    ttl_answers.into_iter().min().unwrap_or(0)
+        .min()
+        .unwrap_or(0)
 }
 
 // 已使用 moka 自动过期缓存，无需手动 GC
@@ -2923,12 +2954,12 @@ pub(crate) enum Decision {
         answers: Vec<Record>,
     },
     Forward {
-        upstream: String,
+        upstream: Arc<str>,
         response_matchers: Vec<RuntimeResponseMatcherWithOp>,
         response_matcher_operator: crate::config::MatchOperator,
         response_actions_on_match: Vec<Action>,
         response_actions_on_miss: Vec<Action>,
-        rule_name: String,
+        rule_name: Arc<str>,
         transport: Transport,
         #[allow(dead_code)]
         continue_on_match: bool,
@@ -2945,7 +2976,7 @@ pub(crate) enum Decision {
 struct ResponseContext {
     raw: Bytes,
     msg: Message,
-    upstream: String,
+    upstream: Arc<str>,
     transport: Transport,
 }
 
@@ -2971,7 +3002,7 @@ enum ResponseActionResult {
 
 #[inline]
 fn calculate_rule_hash(pipeline_id: &str, qname: &str, client_ip: IpAddr) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FxHasher::default();
     pipeline_id.hash(&mut hasher);
     qname.hash(&mut hasher);
     client_ip.hash(&mut hasher);
@@ -2997,7 +3028,7 @@ impl RuleCacheEntry {
 
 #[inline]
 fn fast_hash_str(s: &str) -> u64 {
-    let mut h = DefaultHasher::new();
+    let mut h = FxHasher::default();
     s.hash(&mut h);
     h.finish()
 }
