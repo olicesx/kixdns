@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use hickory_proto::op::Message;
 use hickory_proto::rr::{DNSClass, RecordType};
@@ -17,7 +18,7 @@ pub struct RuntimePipelineConfig {
 
 #[derive(Debug, Clone)]
 pub struct RuntimePipeline {
-    pub id: String,
+    pub id: Arc<str>,
     pub rules: Vec<RuntimeRule>,
     // Indices for O(1) lookup
     // Maps domain suffix -> list of rule indices that MUST be checked
@@ -209,7 +210,7 @@ impl RuntimePipelineConfig {
             }
 
             pipelines.push(RuntimePipeline {
-                id: p.id,
+                id: Arc::from(p.id.as_str()),
                 rules,
                 domain_suffix_index,
                 always_check_rules,
