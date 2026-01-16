@@ -34,6 +34,78 @@ use crate::matcher::{
 };
 use crate::proto_utils::parse_quick;
 
+// Thread-local metrics counters to reduce CAS contention on hot path
+// These are aggregated periodically to global counters
+thread_local! {
+    static THREAD_METRICS: std::cell::RefCell<ThreadLocalMetrics> = std::cell::RefCell::new(ThreadLocalMetrics::new());
+}
+
+struct ThreadLocalMetrics {
+    total_requests: u64,
+    fastpath_hits: u64,
+    upstream_calls: u64,
+    upstream_ns_total: u64,
+    last_flush: std::time::Instant,
+}
+
+impl ThreadLocalMetrics {
+    fn new() -> Self {
+        Self {
+            total_requests: 0,
+            fastpath_hits: 0,
+            upstream_calls: 0,
+            upstream_ns_total: 0,
+            last_flush: std::time::Instant::now(),
+        }
+    }
+    
+    /// Flush thread-local metrics to global atomics if enough time has passed
+    fn maybe_flush(&mut self, engine: &Engine) {
+        let now = std::time::Instant::now();
+        // Flush every second to reduce contention while still providing reasonable accuracy
+        if now.duration_since(self.last_flush) >= Duration::from_secs(1) {
+            if self.total_requests > 0 {
+                engine.metrics_total_requests.fetch_add(self.total_requests, Ordering::Relaxed);
+                self.total_requests = 0;
+            }
+            if self.fastpath_hits > 0 {
+                engine.metrics_fastpath_hits.fetch_add(self.fastpath_hits, Ordering::Relaxed);
+                self.fastpath_hits = 0;
+            }
+            if self.upstream_calls > 0 {
+                engine.metrics_upstream_calls.fetch_add(self.upstream_calls, Ordering::Relaxed);
+                self.upstream_calls = 0;
+            }
+            if self.upstream_ns_total > 0 {
+                engine.metrics_upstream_ns_total.fetch_add(self.upstream_ns_total, Ordering::Relaxed);
+                self.upstream_ns_total = 0;
+            }
+            self.last_flush = now;
+        }
+    }
+    
+    /// Force flush all pending metrics
+    fn force_flush(&mut self, engine: &Engine) {
+        if self.total_requests > 0 {
+            engine.metrics_total_requests.fetch_add(self.total_requests, Ordering::Relaxed);
+            self.total_requests = 0;
+        }
+        if self.fastpath_hits > 0 {
+            engine.metrics_fastpath_hits.fetch_add(self.fastpath_hits, Ordering::Relaxed);
+            self.fastpath_hits = 0;
+        }
+        if self.upstream_calls > 0 {
+            engine.metrics_upstream_calls.fetch_add(self.upstream_calls, Ordering::Relaxed);
+            self.upstream_calls = 0;
+        }
+        if self.upstream_ns_total > 0 {
+            engine.metrics_upstream_ns_total.fetch_add(self.upstream_ns_total, Ordering::Relaxed);
+            self.upstream_ns_total = 0;
+        }
+        self.last_flush = std::time::Instant::now();
+    }
+}
+
 // Thread-local object pool for reusing BytesMut buffers to reduce heap allocations
 thread_local! {
     static BUFFER_POOL: std::cell::RefCell<Vec<bytes::BytesMut>> = std::cell::RefCell::new(Vec::with_capacity(8));
@@ -333,6 +405,45 @@ impl Engine {
         }
     }
 
+    /// Thread-local increment for total_requests counter (reduces CAS contention)
+    #[inline]
+    fn incr_total_requests(&self) {
+        THREAD_METRICS.with(|m| {
+            let mut metrics = m.borrow_mut();
+            metrics.total_requests += 1;
+            metrics.maybe_flush(self);
+        });
+    }
+
+    /// Thread-local increment for fastpath_hits counter (reduces CAS contention)
+    #[inline]
+    fn incr_fastpath_hits(&self) {
+        THREAD_METRICS.with(|m| {
+            let mut metrics = m.borrow_mut();
+            metrics.fastpath_hits += 1;
+            metrics.maybe_flush(self);
+        });
+    }
+
+    /// Thread-local increment for upstream metrics (reduces CAS contention)
+    #[inline]
+    fn incr_upstream_metrics(&self, duration_ns: u64) {
+        THREAD_METRICS.with(|m| {
+            let mut metrics = m.borrow_mut();
+            metrics.upstream_calls += 1;
+            metrics.upstream_ns_total += duration_ns;
+            metrics.maybe_flush(self);
+        });
+    }
+
+    /// Force flush thread-local metrics (useful for testing or shutdown)
+    #[allow(dead_code)]
+    pub fn flush_thread_metrics(&self) {
+        THREAD_METRICS.with(|m| {
+            m.borrow_mut().force_flush(self);
+        });
+    }
+
     #[inline]
     fn calculate_cache_hash_for_dedupe(pipeline_id: &str, qname: &str, qtype: hickory_proto::rr::RecordType) -> u64 {
         let mut h = FxHasher::default();
@@ -348,6 +459,9 @@ impl Engine {
 
     #[allow(dead_code)]
     pub fn metrics_snapshot(&self) -> String {
+        // Flush thread-local metrics before reading to get accurate snapshot
+        self.flush_thread_metrics();
+        
         let inflight = self.metrics_inflight.load(Ordering::Relaxed);
         let total = self.metrics_total_requests.load(Ordering::Relaxed);
         let fast = self.metrics_fastpath_hits.load(Ordering::Relaxed);
@@ -388,7 +502,7 @@ impl Engine {
             }
         };
         // Count incoming quick-parsed requests / 计数进入的快速解析请求
-        self.metrics_total_requests.fetch_add(1, Ordering::Relaxed);
+        self.incr_total_requests();
         let t_after_parse = t_start.elapsed();
         
         // 获取 pipeline ID / Get pipeline ID
@@ -414,7 +528,7 @@ impl Engine {
         if let Some(hit) = self.cache.get(&cache_hash) {
             // Verify collision / 验证冲突
             if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == q.qname.as_ref() && hit.pipeline_id == pipeline_id {
-                self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
+                self.incr_fastpath_hits();
                 let elapsed = t_after_parse.as_nanos();
                 tracing::debug!(request_id = req_id, phase = "cache_hit", elapsed_ns = elapsed, "fastpath cache hit");
                 return Ok(Some(FastPathResponse::CacheHit {
@@ -444,7 +558,7 @@ impl Engine {
                         rcode,
                         &answers,
                     )?;
-                    self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
+                    self.incr_fastpath_hits();
                     let elapsed_ns = t_start.elapsed().as_nanos();
                     tracing::debug!(request_id = req_id, phase = "fast_static", elapsed_ns = elapsed_ns, "fast static match");
                     return Ok(Some(FastPathResponse::Direct(resp)));
@@ -466,7 +580,7 @@ impl Engine {
                         *rcode,
                         answers,
                     )?;
-                    self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
+                    self.incr_fastpath_hits();
                     let elapsed_ns = t_start.elapsed().as_nanos();
                     tracing::debug!(request_id = req_id, phase = "rule_cache_hit", elapsed_ns = elapsed_ns, "rule cache hit");
                     return Ok(Some(FastPathResponse::Direct(resp)));
@@ -497,7 +611,7 @@ impl Engine {
     pub async fn handle_packet(&self, packet: &[u8], peer: SocketAddr) -> anyhow::Result<Bytes> {
         // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
         let _req_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
-        self.metrics_total_requests.fetch_add(1, Ordering::Relaxed);
+        self.incr_total_requests();
         struct InflightGuard(Arc<AtomicUsize>);
         impl Drop for InflightGuard {
             fn drop(&mut self) {
@@ -1350,8 +1464,7 @@ impl Engine {
         if let Ok(_) = &res {
             let dur = start.elapsed();
             let dur_ns = dur.as_nanos() as u64;
-            self.metrics_upstream_calls.fetch_add(1, Ordering::Relaxed);
-            self.metrics_upstream_ns_total.fetch_add(dur_ns, Ordering::Relaxed);
+            self.incr_upstream_metrics(dur_ns);
             // 记录最新的延迟供自适应流控使用 / Record latest latency for adaptive flow control
             self.metrics_last_upstream_latency_ns.store(dur_ns, Ordering::Relaxed);
             tracing::debug!(upstream=%upstream, upstream_ns = dur_ns, "upstream call latency");
