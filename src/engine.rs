@@ -100,40 +100,8 @@ impl ThreadLocalMetrics {
     }
 }
 
-// Thread-local object pool for reusing BytesMut buffers to reduce heap allocations
-thread_local! {
-    static BUFFER_POOL: std::cell::RefCell<Vec<bytes::BytesMut>> = std::cell::RefCell::new(Vec::with_capacity(8));
-}
-
-/// Get or create a BytesMut buffer from thread-local pool
-#[inline]
-fn pool_acquire_buffer(capacity: usize) -> bytes::BytesMut {
-    BUFFER_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
-        if let Some(mut buf) = pool.pop() {
-            if buf.capacity() < capacity {
-                buf.reserve(capacity - buf.capacity());
-            } else {
-                buf.clear();
-            }
-            buf
-        } else {
-            bytes::BytesMut::with_capacity(capacity)
-        }
-    })
-}
-
-/// Return a BytesMut buffer to the thread-local pool
-#[inline]
-#[allow(dead_code)]
-fn pool_release_buffer(buf: bytes::BytesMut) {
-    BUFFER_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
-        if pool.len() < 8 {
-            pool.push(buf);
-        }
-    })
-}
+// Thread-local object pool removed as it was ineffective (buffers never returned)
+// relying on jemalloc/system allocator is cleaner than a broken custom pool.
 
 /// Fast-path response for UDP workers.
 ///
@@ -615,14 +583,14 @@ impl Engine {
         // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
         let _req_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
         self.incr_total_requests();
-        struct InflightGuard(Arc<AtomicUsize>);
-        impl Drop for InflightGuard {
+        struct InflightGuard<'a>(&'a AtomicUsize);
+        impl<'a> Drop for InflightGuard<'a> {
             fn drop(&mut self) {
                 self.0.fetch_sub(1, Ordering::Relaxed);
             }
         }
         self.metrics_inflight.fetch_add(1, Ordering::Relaxed);
-        let _inflight_guard = InflightGuard(self.metrics_inflight.clone());
+        let _inflight_guard = InflightGuard(&self.metrics_inflight);
         let state = self.state.load();
         let cfg = &state.pipeline;
         let min_ttl = cfg.min_ttl();
@@ -664,7 +632,7 @@ impl Engine {
             if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == *qname_ref && hit.pipeline_id == pipeline_id {
                 let latency = start.elapsed();
                 // clone bytes and rewrite transaction ID to match requester / 克隆字节并重写事务 ID 以匹配请求者
-                let mut resp_bytes = pool_acquire_buffer(hit.bytes.len());
+                let mut resp_bytes = BytesMut::with_capacity(hit.bytes.len());
                 resp_bytes.extend_from_slice(&hit.bytes);
                 if resp_bytes.len() >= 2 {
                     let id_bytes = tx_id.to_be_bytes();
@@ -1119,11 +1087,19 @@ impl Engine {
                                     } else {
                                         Some(&skip_rules)
                                     };
-                                    let pipeline = cfg
-                                        .pipelines
-                                        .iter()
-                                        .find(|p| p.id == current_pipeline_id)
-                                        .expect("pipeline missing while continuing");
+                                    // Safely handle missing pipeline (e.g., config reload race)
+                                    let pipeline = if let Some(p) = cfg.pipelines.iter().find(|p| p.id == current_pipeline_id) {
+                                        p
+                                    } else {
+                                        warn!("pipeline missing while continuing: {}", current_pipeline_id);
+                                        let req = Message::from_bytes(packet).context("parse request")?;
+                                        let resp_bytes = build_response(&req, ResponseCode::ServFail, Vec::new())?;
+                                        if let Some(g) = cleanup_guard.as_mut() {
+                                            g.defuse();
+                                        }
+                                        self.notify_inflight_waiters(dedupe_hash, &resp_bytes).await;
+                                        return Ok(resp_bytes);
+                                    };
                                     decision = self.apply_rules(
                                         &state,
                                         pipeline,
@@ -1231,11 +1207,16 @@ impl Engine {
                                         } else {
                                             Some(&skip_rules)
                                         };
-                                        let pipeline = cfg
-                                            .pipelines
-                                            .iter()
-                                            .find(|p| p.id == current_pipeline_id)
-                                            .expect("pipeline missing while continuing");
+                                        let pipeline = if let Some(p) = cfg.pipelines.iter().find(|p| p.id == current_pipeline_id) {
+                                            p
+                                        } else {
+                                            warn!("pipeline missing while continuing: {}", current_pipeline_id);
+                                            let req = Message::from_bytes(packet).context("parse request")?;
+                                            let resp_bytes = build_response(&req, ResponseCode::ServFail, Vec::new())?;
+                                            if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
+                                            self.notify_inflight_waiters(dedupe_hash, &resp_bytes).await;
+                                            return Ok(resp_bytes);
+                                        };
                                         decision = self.apply_rules(
                                             &state,
                                             pipeline,
@@ -2104,65 +2085,65 @@ struct UdpClient {
 
 impl UdpClient {
     fn new(size: usize) -> Self {
-        let mut pool = Vec::with_capacity(size);
-        if size > 0 {
-            for _ in 0..size {
-                // Use socket2 to set buffer sizes
-                let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("create socket");
-                // Set buffer sizes to 4MB to prevent packet loss under load
-                if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
-                    warn!("failed to set udp recv buffer size: {}", e);
-                }
-                if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
-                    warn!("failed to set udp send buffer size: {}", e);
-                }
-                socket.bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into()).expect("bind");
-                socket.set_nonblocking(true).expect("set nonblocking");
-                
-                let std_sock: std::net::UdpSocket = socket.into();
-                let socket = Arc::new(tokio::net::UdpSocket::from_std(std_sock).expect("from_std"));
-                let inflight = Arc::new(DashMap::with_hasher(FxBuildHasher::default()));
-                
-                let state = UdpSocketState {
-                    socket: socket.clone(),
-                    inflight: inflight.clone(),
-                    next_id: AtomicU16::new(0),
-                };
-                pool.push(state);
+        // Prevent port exhaustion by enforcing minimum pool size
+        let effective_size = if size == 0 { 1 } else { size };
+        let mut pool = Vec::with_capacity(effective_size);
+        for _ in 0..effective_size {
+            // Use socket2 to set buffer sizes
+            let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("create socket");
+            // Set buffer sizes to 4MB to prevent packet loss under load
+            if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
+                warn!("failed to set udp recv buffer size: {}", e);
+            }
+            if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
+                warn!("failed to set udp send buffer size: {}", e);
+            }
+            socket.bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into()).expect("bind");
+            socket.set_nonblocking(true).expect("set nonblocking");
+            
+            let std_sock: std::net::UdpSocket = socket.into();
+            let socket = Arc::new(tokio::net::UdpSocket::from_std(std_sock).expect("from_std"));
+            let inflight = Arc::new(DashMap::with_hasher(FxBuildHasher::default()));
+            
+            let state = UdpSocketState {
+                socket: socket.clone(),
+                inflight: inflight.clone(),
+                next_id: AtomicU16::new(0),
+            };
+            pool.push(state);
 
-                let socket_clone = socket.clone();
-                let inflight_clone = inflight.clone();
-                tokio::spawn(async move {
-                    // Use BytesMut for efficient buffer management and zero-copy ID rewrite
-                    let mut buf = BytesMut::with_capacity(4096);
-                    buf.resize(4096, 0);
-                    loop {
-                        match socket_clone.recv_from(&mut buf).await {
-                            Ok((len, src)) => {
-                                if len >= 2 {
-                                    let id = u16::from_be_bytes([buf[0], buf[1]]);
-                                    if let Some((_, (original_id, expected_addr, tx))) = inflight_clone.remove(&id) {
-                                        if src == expected_addr {
-                                            // Zero-copy: modify in place and freeze
-                                            let orig_bytes = original_id.to_be_bytes();
-                                            buf[0] = orig_bytes[0];
-                                            buf[1] = orig_bytes[1];
-                                            let response = buf.split_to(len).freeze();
-                                            let _ = tx.send(Ok(response));
-                                            // Reset buffer for next iteration
-                                            buf.resize(4096, 0);
-                                        }
+            let socket_clone = socket.clone();
+            let inflight_clone = inflight.clone();
+            tokio::spawn(async move {
+                // Use BytesMut for efficient buffer management and zero-copy ID rewrite
+                let mut buf = BytesMut::with_capacity(4096);
+                buf.resize(4096, 0);
+                loop {
+                    match socket_clone.recv_from(&mut buf).await {
+                        Ok((len, src)) => {
+                            if len >= 2 {
+                                let id = u16::from_be_bytes([buf[0], buf[1]]);
+                                if let Some((_, (original_id, expected_addr, tx))) = inflight_clone.remove(&id) {
+                                    if src == expected_addr {
+                                        // Zero-copy: modify in place and freeze
+                                        let orig_bytes = original_id.to_be_bytes();
+                                        buf[0] = orig_bytes[0];
+                                        buf[1] = orig_bytes[1];
+                                        let response = buf.split_to(len).freeze();
+                                        let _ = tx.send(Ok(response));
+                                        // Reset buffer for next iteration
+                                        buf.resize(4096, 0);
                                     }
                                 }
                             }
-                            Err(e) => {
-                                tracing::error!("UDP pool recv error: {}", e);
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("UDP pool recv error: {}", e);
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                     }
-                });
-            }
+                }
+            });
         }
         Self {
             pool,
@@ -2178,47 +2159,7 @@ impl UdpClient {
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
         if self.pool.is_empty() {
-            // Use a fresh socket for every request to avoid race conditions
-            // caused by sharing sockets in the pool without a dispatcher.
-            // Use socket2 to set buffer sizes
-            let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).context("create socket")?;
-            if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
-                warn!("failed to set udp recv buffer size: {}", e);
-            }
-            if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
-                warn!("failed to set udp send buffer size: {}", e);
-            }
-            socket.bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into()).context("bind")?;
-            socket.set_nonblocking(true).context("set nonblocking")?;
-            let sock = tokio::net::UdpSocket::from_std(socket.into()).context("from_std")?;
-
-            let addr: SocketAddr = upstream.parse().context("invalid upstream address")?;
-            sock.connect(addr).await?;
-            sock.send(packet).await?;
-
-            let mut buf = [0u8; 4096];
-            let recv_res = timeout(timeout_dur, async {
-                loop {
-                    let size = sock.recv(&mut buf).await?;
-                    // Since we connected to the upstream, we only receive packets from it.
-                    // And since it's a fresh socket, any packet is likely our response.
-                    if size >= 2 && packet.len() >= 2 {
-                        if buf[0] == packet[0] && buf[1] == packet[1] {
-                            return Ok::<_, anyhow::Error>(Bytes::copy_from_slice(&buf[..size]));
-                        }
-                    } else {
-                        // Fallback for weird packets, though DNS should have ID.
-                        return Ok::<_, anyhow::Error>(Bytes::copy_from_slice(&buf[..size]));
-                    }
-                }
-            })
-            .await;
-
-            return match recv_res {
-                Ok(Ok(bytes)) => Ok(bytes),
-                Ok(Err(err)) => Err(err),
-                Err(_) => anyhow::bail!("udp timeout"),
-            };
+            return Err(anyhow::anyhow!("UDP pool not initialized"));
         }
 
         // Pool logic
