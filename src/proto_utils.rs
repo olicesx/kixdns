@@ -120,7 +120,9 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
         // 这在非标准消息（例如 UPDATE，或被误当作查询处理的响应）中可能漏检 EDNS。
         let mut ar_pos = pos;
         for _ in 0..ar_count {
-            if ar_pos >= packet.len() { break; }
+            if ar_pos >= packet.len() {
+                break;
+            }
             let name_byte = packet[ar_pos];
             let next_pos = if name_byte == 0 {
                 ar_pos + 1
@@ -128,19 +130,26 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
                 skip_name(packet, ar_pos).unwrap_or(packet.len())
             };
 
-            if next_pos + 10 > packet.len() { break; }
+            if next_pos + 10 > packet.len() {
+                break;
+            }
             let rr_type = u16::from_be_bytes([packet[next_pos], packet[next_pos + 1]]);
-            if rr_type == 41 { // OPT
+            if rr_type == 41 {
+                // OPT
                 edns_present = true;
                 break;
             }
             let rd_len = u16::from_be_bytes([packet[next_pos + 8], packet[next_pos + 9]]);
-            
+
             // Validate arithmetic to prevent overflow and ensure entire record fits in packet
             let rd_len_usize = rd_len as usize;
             // Check packet length first to avoid underflow in subsequent arithmetic
-            if packet.len() < 10 + rd_len_usize { break; }
-            if next_pos > packet.len() - 10 - rd_len_usize { break; }
+            if packet.len() < 10 + rd_len_usize {
+                break;
+            }
+            if next_pos > packet.len() - 10 - rd_len_usize {
+                break;
+            }
             ar_pos = next_pos + 10 + rd_len_usize;
         }
     }
@@ -164,33 +173,45 @@ const MAX_COMPRESSION_JUMPS: u32 = 5;
 fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
     let packet_len = packet.len();
     let mut max_jumps = MAX_COMPRESSION_JUMPS;
-    
+
     loop {
-        if pos >= packet_len { return None; }
+        if pos >= packet_len {
+            return None;
+        }
         let len = packet[pos];
-        if len == 0 { return Some(pos + 1); }
-        
+        if len == 0 {
+            return Some(pos + 1);
+        }
+
         if (len & 0xC0) == 0xC0 {
             // Compression pointer - check bounds before returning
-            if pos + 2 > packet_len { return None; }
-            
+            if pos + 2 > packet_len {
+                return None;
+            }
+
             // Follow compression pointer to prevent infinite loops
             max_jumps -= 1;
-            if max_jumps == 0 { return None; }
-            
+            if max_jumps == 0 {
+                return None;
+            }
+
             let offset = (((len as u16) & 0x3F) << 8) | (packet[pos + 1] as u16);
             let offset_usize = offset as usize;
-            
+
             // Validate that compression pointer offset is within packet bounds
-            if offset_usize >= packet_len { return None; }
-            
+            if offset_usize >= packet_len {
+                return None;
+            }
+
             pos = offset_usize;
             continue;
         }
-        
+
         // Regular label - check bounds before advancing
         let new_pos = pos + 1 + len as usize;
-        if new_pos > packet_len { return None; }
+        if new_pos > packet_len {
+            return None;
+        }
         pos = new_pos;
     }
 }
@@ -218,7 +239,7 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     let an_count = u16::from_be_bytes([packet[6], packet[7]]);
     // We don't strictly need NS and AR counts for TTL, but we iterate through them if we want to be thorough. / 对于 TTL，我们并不严格需要 NS 和 AR 计数，但如果想彻底，可以遍历它们
     // For caching, we usually care about Answer section TTLs. / 对于缓存，我们通常关心 Answer 部分的 TTL
-    
+
     if an_count == 0 {
         return Some(QuickResponse { rcode, min_ttl: 0 });
     }
@@ -230,7 +251,9 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     for _ in 0..qd_count {
         // Skip Name / 跳过名称
         loop {
-            if pos >= packet_len { return None; }
+            if pos >= packet_len {
+                return None;
+            }
             let len = packet[pos];
             if len == 0 {
                 pos += 1;
@@ -252,7 +275,9 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     for _ in 0..an_count {
         // Skip Name / 跳过名称
         loop {
-            if pos >= packet_len { return None; }
+            if pos >= packet_len {
+                return None;
+            }
             let len = packet[pos];
             if len == 0 {
                 pos += 1;
@@ -265,15 +290,22 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
             pos += 1 + (len as usize);
         }
 
-        if pos + 10 > packet_len { return None; }
-        
+        if pos + 10 > packet_len {
+            return None;
+        }
+
         // Type(2) Class(2) TTL(4) RDLen(2) / 类型(2) 类别(2) TTL(4) 数据长度(2)
         // Offset 0: Type / 偏移量 0：类型
         // Offset 2: Class / 偏移量 2：类别
         // Offset 4: TTL / 偏移量 4：TTL
         // Offset 8: RDLen / 偏移量 8：数据长度
-        
-        let ttl = u32::from_be_bytes([packet[pos + 4], packet[pos + 5], packet[pos + 6], packet[pos + 7]]);
+
+        let ttl = u32::from_be_bytes([
+            packet[pos + 4],
+            packet[pos + 5],
+            packet[pos + 6],
+            packet[pos + 7],
+        ]);
         if ttl < min_ttl {
             min_ttl = ttl;
         }

@@ -89,7 +89,6 @@ impl Default for GlobalSettings {
             dashmap_shards: default_dashmap_shards(),
         }
     }
-
 }
 
 fn default_cache_capacity() -> u64 {
