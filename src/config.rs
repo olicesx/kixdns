@@ -20,47 +20,6 @@ pub struct PipelineConfig {
     pub pipelines: Vec<Pipeline>,
 }
 
-/// DNS 预取配置 / DNS prefetch settings
-#[derive(Debug, Clone, Deserialize)]
-pub struct PrefetchSettings {
-    /// 是否启用预取（默认 true） / Enable prefetch (default true)
-    #[serde(default = "default_prefetch_enabled")]
-    pub prefetch_enabled: bool,
-
-    /// 热度阈值（访问次数，默认 10） / Hot threshold (access count, default 10)
-    #[serde(default = "default_prefetch_hot_threshold")]
-    pub prefetch_hot_threshold: u64,
-
-    /// 预取并发数（默认 5） / Prefetch concurrency (default 5)
-    #[serde(default = "default_prefetch_concurrency")]
-    pub prefetch_concurrency: usize,
-
-    /// 预取最小间隔（秒，默认 30） / Min prefetch interval in seconds (default 30)
-    #[serde(default = "default_prefetch_min_interval_secs")]
-    pub prefetch_min_interval_secs: u64,
-
-    /// 查询 A 记录时预取 AAAA 记录（默认 true）/ Prefetch AAAA when querying A (default true)
-    #[serde(default = "default_prefetch_ipv6_on_ipv4")]
-    pub prefetch_ipv6_on_ipv4: bool,
-
-    /// 查询主域名时预取 CDN 域名（默认 true）/ Prefetch CDN domains for primary queries (default true)
-    #[serde(default = "default_prefetch_cdn_on_root")]
-    pub prefetch_cdn_on_root: bool,
-}
-
-impl Default for PrefetchSettings {
-    fn default() -> Self {
-        Self {
-            prefetch_enabled: true,
-            prefetch_hot_threshold: 10,
-            prefetch_concurrency: 5,
-            prefetch_min_interval_secs: 30,
-            prefetch_ipv6_on_ipv4: true,
-            prefetch_cdn_on_root: true,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct GlobalSettings {
     /// 最小TTL秒数，缺省0。 / Minimum TTL in seconds, defaults to 0
@@ -108,9 +67,6 @@ pub struct GlobalSettings {
     /// 流控调整间隔（秒）。 / Flow control adjustment interval (seconds)
     #[serde(default = "default_flow_control_adjustment_interval_secs")]
     pub flow_control_adjustment_interval_secs: u64,
-    /// DNS 预取配置 / DNS prefetch configuration
-    #[serde(default)]
-    pub prefetch: PrefetchSettings,
 }
 
 impl Default for GlobalSettings {
@@ -131,9 +87,9 @@ impl Default for GlobalSettings {
             flow_control_adjustment_interval_secs: default_flow_control_adjustment_interval_secs(),
             cache_capacity: default_cache_capacity(),
             dashmap_shards: default_dashmap_shards(),
-            prefetch: PrefetchSettings::default(),
         }
     }
+
 }
 
 fn default_cache_capacity() -> u64 {
@@ -476,31 +432,6 @@ mod tests {
         assert_eq!(cfg.settings.flow_control_latency_threshold_ms, 150);
         assert_eq!(cfg.settings.flow_control_adjustment_interval_secs, 10);
     }
-
-    #[test]
-    fn prefetch_feature_flags_default_enabled() {
-        let raw = serde_json::json!({
-            "pipelines": []
-        });
-        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        assert!(cfg.settings.prefetch.prefetch_ipv6_on_ipv4);
-        assert!(cfg.settings.prefetch.prefetch_cdn_on_root);
-    }
-
-    #[test]
-    fn prefetch_cdn_flag_can_be_disabled() {
-        let raw = serde_json::json!({
-            "settings": {
-                "prefetch": {
-                    "prefetch_cdn_on_root": false
-                }
-            },
-            "pipelines": []
-        });
-
-        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        assert!(!cfg.settings.prefetch.prefetch_cdn_on_root);
-    }
 }
 
 fn default_min_ttl() -> u32 {
@@ -513,30 +444,6 @@ fn default_bind_udp() -> String {
 
 fn default_bind_tcp() -> String {
     "0.0.0.0:5353".to_string()
-}
-
-fn default_prefetch_enabled() -> bool {
-    true
-}
-
-fn default_prefetch_hot_threshold() -> u64 {
-    10
-}
-
-fn default_prefetch_concurrency() -> usize {
-    5
-}
-
-fn default_prefetch_min_interval_secs() -> u64 {
-    30
-}
-
-fn default_prefetch_ipv6_on_ipv4() -> bool {
-    true
-}
-
-fn default_prefetch_cdn_on_root() -> bool {
-    true
 }
 
 fn default_upstream() -> String {

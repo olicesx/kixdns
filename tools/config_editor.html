@@ -99,56 +99,6 @@
                         </div>
 
                         <hr>
-                        <h6 class="fw-bold mb-2 text-info">DNS 预取配置 (Prefetch)</h6>
-                        <div class="row g-3">
-                            <div class="col-md-2">
-                                <label class="form-label">启用预取</label>
-                                <div class="form-check form-switch mt-2">
-                                    <input class="form-check-input" type="checkbox" v-model="config.settings.prefetch.prefetch_enabled">
-                                    <label class="form-check-label">启用</label>
-                                </div>
-                            </div>
-                            <div class="col-md-2">
-                                <label class="form-label">热度阈值</label>
-                                <input type="number" class="form-control" v-model.number="config.settings.prefetch.prefetch_hot_threshold" placeholder="10">
-                                <div class="form-text small">访问次数</div>
-                            </div>
-                            <div class="col-md-2">
-                                <label class="form-label">并发数</label>
-                                <input type="number" class="form-control" v-model.number="config.settings.prefetch.prefetch_concurrency" min="1" max="20" placeholder="5">
-                            </div>
-                            <div class="col-md-2">
-                                <label class="form-label">最小间隔(秒)</label>
-                                <input type="number" class="form-control" v-model.number="config.settings.prefetch.prefetch_min_interval_secs" min="5" max="300" placeholder="30">
-                            </div>
-                        </div>
-
-                        <div class="row g-3 mt-2">
-                            <div class="col-md-3">
-                                <label class="form-label">A→AAAA 预取</label>
-                                <div class="form-check form-switch mt-2">
-                                    <input class="form-check-input" type="checkbox" v-model="config.settings.prefetch.prefetch_ipv6_on_ipv4">
-                                    <label class="form-check-label">启用</label>
-                                </div>
-                                <div class="form-text small">查询 A 记录时自动预取 AAAA 记录。</div>
-                            </div>
-                            <div class="col-md-3">
-                                <label class="form-label">主域名→CDN 预取</label>
-                                <div class="form-check form-switch mt-2">
-                                    <input class="form-check-input" type="checkbox" v-model="config.settings.prefetch.prefetch_cdn_on_root">
-                                    <label class="form-check-label">启用</label>
-                                </div>
-                                <div class="form-text small">命中主域名后自动预取上游 CNAME 推断的 CDN 域名。</div>
-                            </div>
-                        </div>
-
-                        <div class="mt-3">
-                            <div class="alert alert-secondary small mb-0">
-                                CDN 关联域名会依据上游响应中的 CNAME 自动学习并预取，无需手动维护映射表。
-                            </div>
-                        </div>
-
-                        <hr>
                         <h6 class="fw-bold mb-2 text-success">自适应流量控制配置 (Flow Control)</h6>
                         <div class="row g-3">
                             <div class="col-md-6">
@@ -486,15 +436,7 @@
                         flow_control_latency_threshold_ms: 100,
                         flow_control_adjustment_interval_secs: 5,
                         cache_capacity: 10000,
-                        dashmap_shards: 0,
-                        prefetch: {
-                            prefetch_enabled: true,
-                            prefetch_hot_threshold: 10,
-                            prefetch_concurrency: 5,
-                            prefetch_min_interval_secs: 30,
-                            prefetch_ipv6_on_ipv4: true,
-                            prefetch_cdn_on_root: true
-                        }
+                        dashmap_shards: 0
                     },
                     pipeline_select: [],
                     pipelines: []
