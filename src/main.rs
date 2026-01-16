@@ -299,6 +299,8 @@ async fn handle_tcp_conn(
 ) -> anyhow::Result<()> {
     const MAX_TCP_FRAME: usize = 64 * 1024;
     let mut len_buf = [0u8; 2];
+    // Reuse buffer across requests on the same connection
+    let mut buf = Vec::with_capacity(512);
 
     loop {
         if let Err(err) = stream.read_exact(&mut len_buf).await {
@@ -312,7 +314,9 @@ async fn handle_tcp_conn(
             return Ok(());
         }
 
-        let mut buf = vec![0u8; frame_len];
+        // Resize buffer only if needed, reuse capacity
+        buf.clear();
+        buf.resize(frame_len, 0);
         if stream.read_exact(&mut buf).await.is_err() {
             return Ok(());
         }

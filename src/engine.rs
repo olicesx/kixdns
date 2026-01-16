@@ -11,6 +11,7 @@ use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use rustc_hash::{FxHasher, FxBuildHasher};
+use smallvec::SmallVec;
 use socket2::{Domain, Protocol, Socket, Type};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA};
@@ -75,7 +76,8 @@ pub struct Engine {
     // Per-request id generator for tracing / 每个请求的 ID 生成器用于追踪
     pub request_id_counter: Arc<AtomicU64>,
     // In-flight dedupe map: cache_hash -> waiters / 进行中的去重映射：缓存哈希 -> 等待者
-    pub inflight: Arc<DashMap<u64, Vec<oneshot::Sender<anyhow::Result<Bytes>>>, FxBuildHasher>>,
+    // SmallVec<[_; 8]> avoids heap allocation for typical Singleflight scenarios (<=8 waiters)
+    pub inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>,
     // Semaphore to limit concurrent handle_packet async tasks / 用于限制并发 handle_packet 异步任务数量
     pub permit_manager: Arc<PermitManager>,
     // Latest upstream latency for adaptive flow control / 用于自适应流控的最新上游延迟
@@ -99,21 +101,22 @@ pub struct FlowControlState {
 /// 动态流控的 Permit 管理器
 pub struct PermitManager {
     // Current active permits (acquired) / 当前活跃 permits（已获得）
-    active_permits: Arc<AtomicUsize>,
+    active_permits: AtomicUsize,
     // Maximum permits that can be granted / 可授予的最大 permits
-    max_permits: Arc<AtomicUsize>,
+    max_permits: AtomicUsize,
 }
 
 impl PermitManager {
     pub fn new(initial_permits: usize) -> Self {
         Self {
-            active_permits: Arc::new(AtomicUsize::new(0)),
-            max_permits: Arc::new(AtomicUsize::new(initial_permits)),
+            active_permits: AtomicUsize::new(0),
+            max_permits: AtomicUsize::new(initial_permits),
         }
     }
     
     /// Try to acquire a permit without blocking / 非阻塞地尝试获取 permit
-    pub fn try_acquire(&self) -> Option<PermitGuard> {
+    /// Returns a guard that holds Arc<PermitManager> to ensure permit is released
+    pub fn try_acquire(self: &Arc<Self>) -> Option<PermitGuard> {
         loop {
             let active = self.active_permits.load(Ordering::Acquire);
             let max = self.max_permits.load(Ordering::Acquire);
@@ -129,7 +132,7 @@ impl PermitManager {
                 Ordering::Acquire,
             ) {
                 Ok(_) => return Some(PermitGuard {
-                    active_permits: Arc::clone(&self.active_permits),
+                    manager: Arc::clone(self),
                 }),
                 Err(_) => continue, // Retry on CAS failure / CAS 失败时重试
             }
@@ -154,12 +157,12 @@ impl PermitManager {
 
 /// RAII guard for automatic permit release / RAII 守卫用于自动 permit 释放
 pub struct PermitGuard {
-    active_permits: Arc<AtomicUsize>,
+    manager: Arc<PermitManager>,
 }
 
 impl Drop for PermitGuard {
     fn drop(&mut self) {
-        self.active_permits.fetch_sub(1, Ordering::Release);
+        self.manager.active_permits.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -596,13 +599,13 @@ impl Engine {
         };
 
         struct InflightCleanupGuard {
-            inflight: Arc<DashMap<u64, Vec<oneshot::Sender<anyhow::Result<Bytes>>>, FxBuildHasher>>,
+            inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>,
             hash: u64,
             active: bool,
         }
 
         impl InflightCleanupGuard {
-            fn new(inflight: Arc<DashMap<u64, Vec<oneshot::Sender<anyhow::Result<Bytes>>>, FxBuildHasher>>, hash: u64) -> Self {
+            fn new(inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>, hash: u64) -> Self {
                 Self { inflight, hash, active: true }
             }
             
@@ -721,7 +724,7 @@ impl Engine {
                                     Some(rx)
                                 }
                                 Entry::Vacant(entry) => {
-                                    entry.insert(Vec::new());
+                                    entry.insert(SmallVec::new());
                                     dedupe_registered = true;
                                     cleanup_guard = Some(InflightCleanupGuard::new(self.inflight.clone(), dedupe_hash));
                                     None
@@ -762,7 +765,7 @@ impl Engine {
                                 Some(rx)
                             }
                             Entry::Vacant(entry) => {
-                                entry.insert(Vec::new());
+                                entry.insert(SmallVec::new());
                                 dedupe_registered = true;
                                 cleanup_guard = Some(InflightCleanupGuard::new(self.inflight.clone(), dedupe_hash));
                                 None
@@ -1182,10 +1185,11 @@ impl Engine {
         let upstream_default = state.pipeline.settings.default_upstream.clone();
 
         // 2. Candidate Selection (compiled index if available)
-        let mut candidate_indices = if let Some(compiled) = self.compiled_for(state, &pipeline.id) {
+        // SmallVec<[usize; 32]> avoids heap allocation for typical rule sets (<= 32 candidates)
+        let mut candidate_indices: SmallVec<[usize; 32]> = if let Some(compiled) = self.compiled_for(state, &pipeline.id) {
             compiled.index.get_candidates(qname, qtype)
         } else {
-            Vec::new()
+            SmallVec::new()
         };
 
         if candidate_indices.is_empty() {
@@ -1607,13 +1611,13 @@ impl Engine {
     ) -> anyhow::Result<Bytes> {
         let cfg = &state.pipeline;
         struct InflightCleanupGuard {
-            inflight: Arc<DashMap<u64, Vec<oneshot::Sender<anyhow::Result<Bytes>>>, FxBuildHasher>>,
+            inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>,
             hash: u64,
             active: bool,
         }
 
         impl InflightCleanupGuard {
-            fn new(inflight: Arc<DashMap<u64, Vec<oneshot::Sender<anyhow::Result<Bytes>>>, FxBuildHasher>>, hash: u64) -> Self {
+            fn new(inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>, hash: u64) -> Self {
                 Self { inflight, hash, active: true }
             }
             
@@ -1745,7 +1749,7 @@ impl Engine {
                                         Some(rx)
                                     }
                                     Entry::Vacant(entry) => {
-                                        entry.insert(Vec::new());
+                                        entry.insert(SmallVec::new());
                                         cleanup_guards.push(InflightCleanupGuard::new(self.inflight.clone(), dedupe_hash));
                                         inflight_hashes.push(dedupe_hash);
                                         None
@@ -1790,7 +1794,7 @@ impl Engine {
                                     Some(rx)
                                 }
                                 Entry::Vacant(entry) => {
-                                    entry.insert(Vec::new());
+                                    entry.insert(SmallVec::new());
                                     cleanup_guards.push(InflightCleanupGuard::new(self.inflight.clone(), dedupe_hash));
                                     inflight_hashes.push(dedupe_hash);
                                     None

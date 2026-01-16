@@ -6,6 +6,7 @@ use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{DNSClass, RecordType};
 use ipnet::IpNet;
 use regex::Regex;
+use smallvec::SmallVec;
 
 use crate::config::{Action, MatchOperator};
 use crate::engine::{Decision, make_static_ip_answer};
@@ -126,8 +127,9 @@ impl RuleIndex {
         }
     }
 
-    /// Get candidate rule indices into provided Vec to avoid allocation
-    pub fn get_candidates_into(&self, qname: &str, qtype: RecordType, out: &mut Vec<usize>) {
+    /// Get candidate rule indices into provided SmallVec to avoid allocation
+    /// SmallVec<[usize; 32]> keeps up to 32 candidates on stack (typical case)
+    pub fn get_candidates_into(&self, qname: &str, qtype: RecordType, out: &mut SmallVec<[usize; 32]>) {
         out.extend_from_slice(&self.always_check);
 
         if let Some(indices) = self.domain_exact.get(qname) {
@@ -154,8 +156,8 @@ impl RuleIndex {
         out.dedup();
     }
 
-    pub fn get_candidates(&self, qname: &str, qtype: RecordType) -> Vec<usize> {
-        let mut candidates = Vec::new();
+    pub fn get_candidates(&self, qname: &str, qtype: RecordType) -> SmallVec<[usize; 32]> {
+        let mut candidates = SmallVec::new();
         self.get_candidates_into(qname, qtype, &mut candidates);
         candidates
     }
