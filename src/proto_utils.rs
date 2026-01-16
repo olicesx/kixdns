@@ -88,15 +88,25 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
 
         let label_bytes = &packet[current_pos..current_pos + label_len];
 
-        // Optimize: process bytes directly to avoid UTF-8 validation per label / 优化：直接处理字节以避免每个标签的 UTF-8 验证
-        // DNS labels are typically ASCII (or Punycode). / DNS 标签通常是 ASCII（或 Punycode）
-        // If raw UTF-8 is used, to_ascii_lowercase on bytes is safe (leaves non-ASCII bytes unchanged). / 如果使用原始 UTF-8，字节上的 to_ascii_lowercase 是安全的（保留非 ASCII 字节不变）
-        for &b in label_bytes {
-            if buf_pos >= buf.len() {
-                return None;
+        // Performance optimization: Check if label needs lowercasing
+        // Most DNS labels are already lowercase, so we can avoid the copy in common case
+        let needs_lowercase = label_bytes.iter().any(|&b| b.is_ascii_uppercase());
+        
+        // Copy label bytes to buffer
+        if buf_pos + label_len > buf.len() {
+            return None;
+        }
+        
+        if needs_lowercase {
+            // Only lowercase if necessary
+            for &b in label_bytes {
+                buf[buf_pos] = b.to_ascii_lowercase();
+                buf_pos += 1;
             }
-            buf[buf_pos] = b.to_ascii_lowercase();
-            buf_pos += 1;
+        } else {
+            // Zero-copy: just copy the bytes as-is
+            buf[buf_pos..buf_pos + label_len].copy_from_slice(label_bytes);
+            buf_pos += label_len;
         }
 
         current_pos += label_len;
