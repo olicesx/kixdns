@@ -177,7 +177,9 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
         )
     };
     if ret != 0 {
-        // non-fatal: continue without reuseport / 非致命错误：不使用 reuseport 继续
+        // Log warning if SO_REUSEPORT fails / SO_REUSEPORT 失败时记录警告
+        let err = std::io::Error::last_os_error();
+        tracing::warn!("SO_REUSEPORT failed: {}, falling back to shared socket", err);
     }
     let _ = socket.set_recv_buffer_size(4 * 1024 * 1024);
     let _ = socket.set_send_buffer_size(4 * 1024 * 1024);
@@ -188,7 +190,7 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
 
 /// 高性能 UDP worker：直接在接收循环中处理请求，避免 spawn 开销 / High-performance UDP worker: process requests directly in receive loop, avoiding spawn overhead
 async fn run_udp_worker(
-    _worker_id: usize,
+    worker_id: usize,
     socket: Arc<UdpSocket>,
     engine: Engine,
 ) -> anyhow::Result<()> {
@@ -202,6 +204,8 @@ async fn run_udp_worker(
     // 自适应流控：每 100 个请求检查一次是否需要调整 permits
     // Adaptive flow control: check if adjustment needed every 100 requests
     let mut request_count = 0u32;
+    
+    info!(worker_id, "UDP worker started");
 
     loop {
         // 确保有足够的空间 / Ensure sufficient space
