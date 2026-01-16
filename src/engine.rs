@@ -40,6 +40,10 @@ thread_local! {
     static THREAD_METRICS: std::cell::RefCell<ThreadLocalMetrics> = std::cell::RefCell::new(ThreadLocalMetrics::new());
 }
 
+/// Interval for flushing thread-local metrics to global counters
+/// Configurable for testing and tuning in different environments
+const METRICS_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+
 struct ThreadLocalMetrics {
     total_requests: u64,
     fastpath_hits: u64,
@@ -62,8 +66,8 @@ impl ThreadLocalMetrics {
     /// Flush thread-local metrics to global atomics if enough time has passed
     fn maybe_flush(&mut self, engine: &Engine) {
         let now = std::time::Instant::now();
-        // Flush every second to reduce contention while still providing reasonable accuracy
-        if now.duration_since(self.last_flush) >= Duration::from_secs(1) {
+        // Flush periodically to reduce contention while still providing reasonable accuracy
+        if now.duration_since(self.last_flush) >= METRICS_FLUSH_INTERVAL {
             if self.total_requests > 0 {
                 engine.metrics_total_requests.fetch_add(self.total_requests, Ordering::Relaxed);
                 self.total_requests = 0;
@@ -357,7 +361,11 @@ impl Engine {
         // Using try_lock to avoid blocking - if another thread is adjusting, we skip
         let mut last_adjustment = match state.last_adjustment.try_lock() {
             Ok(guard) => guard,
-            Err(_) => return, // Another thread is adjusting, skip this attempt
+            Err(_) => {
+                // Another thread is adjusting, skip this attempt to avoid contention
+                tracing::debug!("flow control adjustment skipped - another thread adjusting");
+                return;
+            }
         };
 
         // Check if adjustment interval has passed

@@ -90,7 +90,14 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
 
         // Performance optimization: Check if label needs lowercasing
         // Most DNS labels are already lowercase, so we can avoid the copy in common case
-        let needs_lowercase = label_bytes.iter().any(|&b| b.is_ascii_uppercase());
+        // Use simple loop for better cache locality and early break
+        let mut needs_lowercase = false;
+        for &b in label_bytes {
+            if b.is_ascii_uppercase() {
+                needs_lowercase = true;
+                break;
+            }
+        }
         
         // Copy label bytes to buffer
         if buf_pos + label_len > buf.len() {
