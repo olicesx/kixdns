@@ -2115,7 +2115,7 @@ impl UdpClient {
             let socket_clone = socket.clone();
             let inflight_clone = inflight.clone();
             tokio::spawn(async move {
-                // Use BytesMut for efficient buffer management and zero-copy ID rewrite
+                // Use BytesMut for efficient buffer management
                 let mut buf = BytesMut::with_capacity(4096);
                 buf.resize(4096, 0);
                 loop {
@@ -2125,14 +2125,15 @@ impl UdpClient {
                                 let id = u16::from_be_bytes([buf[0], buf[1]]);
                                 if let Some((_, (original_id, expected_addr, tx))) = inflight_clone.remove(&id) {
                                     if src == expected_addr {
-                                        // Zero-copy: modify in place and freeze
+                                        // Restore original ID and copy logic
+                                        // Avoiding split_to/freeze to prevent reallocation of the main buffer
                                         let orig_bytes = original_id.to_be_bytes();
                                         buf[0] = orig_bytes[0];
                                         buf[1] = orig_bytes[1];
-                                        let response = buf.split_to(len).freeze();
+                                        
+                                        // Allocate exactly what we need for the response, separate from the recv buffer
+                                        let response = Bytes::copy_from_slice(&buf[..len]);
                                         let _ = tx.send(Ok(response));
-                                        // Reset buffer for next iteration
-                                        buf.resize(4096, 0);
                                     }
                                 }
                             }
@@ -2172,23 +2173,27 @@ impl UdpClient {
         }
         let original_id = u16::from_be_bytes([packet[0], packet[1]]);
 
-        // Find a free ID
+        // Find a free ID using atomic entry API to avoid race conditions and double locking
         let mut attempts = 0;
         let mut new_id;
+        let (tx, rx) = oneshot::channel();
+        
         loop {
             new_id = state.next_id.fetch_add(1, Ordering::Relaxed);
-            if !state.inflight.contains_key(&new_id) {
-                break;
-            }
-            attempts += 1;
-            if attempts > 100 {
-                warn!("udp pool exhausted: socket_idx={} inflight_count={}", idx, state.inflight.len());
-                return Err(anyhow::anyhow!("udp pool exhausted (too many inflight requests)"));
+            match state.inflight.entry(new_id) {
+                dashmap::mapref::entry::Entry::Vacant(e) => {
+                    e.insert((original_id, addr, tx));
+                    break;
+                }
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    attempts += 1;
+                    if attempts > 100 {
+                        warn!("udp pool exhausted: socket_idx={} inflight_count={}", idx, state.inflight.len());
+                        return Err(anyhow::anyhow!("udp pool exhausted (too many inflight requests)"));
+                    }
+                }
             }
         }
-
-        let (tx, rx) = oneshot::channel();
-        state.inflight.insert(new_id, (original_id, addr, tx));
 
         // Rewrite packet with new ID using BytesMut to avoid full copy
         let mut new_packet = BytesMut::with_capacity(packet.len());
