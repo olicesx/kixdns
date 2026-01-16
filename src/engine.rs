@@ -32,6 +32,7 @@ use crate::config::{Action, Transport};
 use crate::matcher::{
     RuntimePipeline, RuntimePipelineConfig, RuntimeResponseMatcherWithOp, eval_match_chain,
 };
+use crate::prefetch::{PrefetchManager, PrefetchConfig};
 use crate::proto_utils::parse_quick;
 
 // Thread-local object pool for reusing BytesMut buffers to reduce heap allocations
@@ -110,6 +111,8 @@ pub struct Engine {
     pub metrics_last_upstream_latency_ns: Arc<AtomicU64>,
     // Adaptive flow control state / 自适应流控状态
     pub flow_control_state: Arc<FlowControlState>,
+    // Prefetch manager for proactive DNS resolution / DNS 预取管理器
+    prefetch_manager: Arc<crate::prefetch::PrefetchManager>,
 }
 
 /// Adaptive flow control state for dynamic semaphore adjustment
@@ -212,6 +215,13 @@ impl Engine {
         let flow_control_adjustment_interval_secs = cfg.settings.flow_control_adjustment_interval_secs;
         let dashmap_shards = cfg.settings.dashmap_shards;
         
+        // Extract prefetch settings before moving cfg / 在 move cfg 之前提取预取设置
+        let prefetch_enabled = cfg.settings.prefetch.prefetch_enabled;
+        let prefetch_hot_threshold = cfg.settings.prefetch.prefetch_hot_threshold;
+        let prefetch_ttl_ratio = cfg.settings.prefetch.prefetch_ttl_ratio;
+        let prefetch_concurrency = cfg.settings.prefetch.prefetch_concurrency;
+        let prefetch_min_interval_secs = cfg.settings.prefetch.prefetch_min_interval_secs;
+        
         let compiled = compile_pipelines(&cfg);
         
         let state = Arc::new(ArcSwap::from_pointee(EngineInner {
@@ -227,6 +237,18 @@ impl Engine {
             adjustment_interval_ms: flow_control_adjustment_interval_secs * 1000,
         });
         let permit_manager = Arc::new(PermitManager::new(flow_control_initial_permits));
+
+        // Create prefetch manager with configuration
+        let prefetch_config = PrefetchConfig {
+            enabled: prefetch_enabled,
+            hot_threshold: prefetch_hot_threshold,
+            ttl_ratio: prefetch_ttl_ratio,
+            concurrency: prefetch_concurrency,
+            min_interval: std::time::Duration::from_secs(
+                prefetch_min_interval_secs
+            ),
+        };
+        let prefetch_manager = Arc::new(PrefetchManager::new(prefetch_config));
 
         Self {
             state,
@@ -259,6 +281,7 @@ impl Engine {
             },
             permit_manager,
             flow_control_state,
+            prefetch_manager,
         }
     }
 
@@ -425,6 +448,11 @@ impl Engine {
             // Verify collision / 验证冲突
             if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == q.qname && hit.pipeline_id == pipeline_id {
                 self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
+                
+                // Record access for prefetch statistics
+                // Assume 300 seconds TTL for prefetch calculation (will be refined)
+                self.prefetch_manager.record_access(cache_hash, &hit, 300);
+                
                 let elapsed = t_after_parse.as_nanos();
                 tracing::debug!(request_id = req_id, phase = "cache_hit", elapsed_ns = elapsed, "fastpath cache hit");
                 return Ok(Some(FastPathResponse::CacheHit {

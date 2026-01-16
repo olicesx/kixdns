@@ -20,6 +20,42 @@ pub struct PipelineConfig {
     pub pipelines: Vec<Pipeline>,
 }
 
+/// DNS 预取配置 / DNS prefetch settings
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrefetchSettings {
+    /// 是否启用预取（默认 true） / Enable prefetch (default true)
+    #[serde(default = "default_prefetch_enabled")]
+    pub prefetch_enabled: bool,
+
+    /// 热度阈值（访问次数，默认 10） / Hot threshold (access count, default 10)
+    #[serde(default = "default_prefetch_hot_threshold")]
+    pub prefetch_hot_threshold: u64,
+
+    /// TTL 剩余比例阈值（0-1，默认 0.3） / TTL remaining ratio (0-1, default 0.3)
+    #[serde(default = "default_prefetch_ttl_ratio")]
+    pub prefetch_ttl_ratio: f64,
+
+    /// 预取并发数（默认 5） / Prefetch concurrency (default 5)
+    #[serde(default = "default_prefetch_concurrency")]
+    pub prefetch_concurrency: usize,
+
+    /// 预取最小间隔（秒，默认 30） / Min prefetch interval in seconds (default 30)
+    #[serde(default = "default_prefetch_min_interval_secs")]
+    pub prefetch_min_interval_secs: u64,
+}
+
+impl Default for PrefetchSettings {
+    fn default() -> Self {
+        Self {
+            prefetch_enabled: true,
+            prefetch_hot_threshold: 10,
+            prefetch_ttl_ratio: 0.3,
+            prefetch_concurrency: 5,
+            prefetch_min_interval_secs: 30,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GlobalSettings {
     /// 最小TTL秒数，缺省0。 / Minimum TTL in seconds, defaults to 0
@@ -67,6 +103,9 @@ pub struct GlobalSettings {
     /// 流控调整间隔（秒）。 / Flow control adjustment interval (seconds)
     #[serde(default = "default_flow_control_adjustment_interval_secs")]
     pub flow_control_adjustment_interval_secs: u64,
+    /// DNS 预取配置 / DNS prefetch configuration
+    #[serde(default)]
+    pub prefetch: PrefetchSettings,
 }
 
 impl Default for GlobalSettings {
@@ -87,6 +126,7 @@ impl Default for GlobalSettings {
             flow_control_adjustment_interval_secs: default_flow_control_adjustment_interval_secs(),
             cache_capacity: default_cache_capacity(),
             dashmap_shards: default_dashmap_shards(),
+            prefetch: PrefetchSettings::default(),
         }
     }
 
@@ -444,6 +484,26 @@ fn default_bind_udp() -> String {
 
 fn default_bind_tcp() -> String {
     "0.0.0.0:5353".to_string()
+}
+
+fn default_prefetch_enabled() -> bool {
+    true
+}
+
+fn default_prefetch_hot_threshold() -> u64 {
+    10
+}
+
+fn default_prefetch_ttl_ratio() -> f64 {
+    0.3
+}
+
+fn default_prefetch_concurrency() -> usize {
+    5
+}
+
+fn default_prefetch_min_interval_secs() -> u64 {
+    30
 }
 
 fn default_upstream() -> String {

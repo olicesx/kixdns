@@ -99,6 +99,36 @@
                         </div>
 
                         <hr>
+                        <h6 class="fw-bold mb-2 text-info">DNS 预取配置 (Prefetch)</h6>
+                        <div class="row g-3">
+                            <div class="col-md-2">
+                                <label class="form-label">启用预取</label>
+                                <div class="form-check form-switch mt-2">
+                                    <input class="form-check-input" type="checkbox" v-model="config.settings.prefetch.prefetch_enabled">
+                                    <label class="form-check-label">启用</label>
+                                </div>
+                            </div>
+                            <div class="col-md-2">
+                                <label class="form-label">热度阈值</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.prefetch.prefetch_hot_threshold" placeholder="10">
+                                <div class="form-text small">访问次数</div>
+                            </div>
+                            <div class="col-md-2">
+                                <label class="form-label">TTL 比例</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.prefetch.prefetch_ttl_ratio" step="0.1" min="0" max="1" placeholder="0.3">
+                                <div class="form-text small">0-1</div>
+                            </div>
+                            <div class="col-md-2">
+                                <label class="form-label">并发数</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.prefetch.prefetch_concurrency" min="1" max="20" placeholder="5">
+                            </div>
+                            <div class="col-md-2">
+                                <label class="form-label">最小间隔(秒)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.prefetch.prefetch_min_interval_secs" min="5" max="300" placeholder="30">
+                            </div>
+                        </div>
+
+                        <hr>
                         <h6 class="fw-bold mb-2 text-success">自适应流量控制配置 (Flow Control)</h6>
                         <div class="row g-3">
                             <div class="col-md-6">
@@ -436,7 +466,14 @@
                         flow_control_latency_threshold_ms: 100,
                         flow_control_adjustment_interval_secs: 5,
                         cache_capacity: 10000,
-                        dashmap_shards: 0
+                        dashmap_shards: 0,
+                        prefetch: {
+                            prefetch_enabled: true,
+                            prefetch_hot_threshold: 10,
+                            prefetch_ttl_ratio: 0.3,
+                            prefetch_concurrency: 5,
+                            prefetch_min_interval_secs: 30
+                        }
                     },
                     pipeline_select: [],
                     pipelines: []
