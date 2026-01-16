@@ -380,20 +380,15 @@ impl Engine {
         // 快速解析，避免完整 Message 解析和大量分配 / Quick parsing, avoiding full Message parsing and massive allocations
         // 使用栈上缓冲区避免 String 分配 / Use stack buffer to avoid String allocation
         let mut qname_buf = [0u8; 256];
-        let req_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
-        let t_start = std::time::Instant::now();
         let q = match parse_quick(packet, &mut qname_buf) {
             Some(q) => q,
             None => {
-                // quick parse failed / 快速解析失败
-                let elapsed = t_start.elapsed().as_nanos();
-                tracing::debug!(request_id = req_id, phase = "parse_quick_fail", elapsed_ns = elapsed, "fastpath parse failed");
+                // quick parse failed, fallback to async path / 快速解析失败，回退到异步路径
                 return Ok(None);
             }
         };
         // Count incoming quick-parsed requests / 计数进入的快速解析请求
         self.incr_total_requests();
-        let t_after_parse = t_start.elapsed();
         
         // 获取 pipeline ID / Get pipeline ID
         let state = self.state.load();
@@ -409,9 +404,6 @@ impl Engine {
         );
         
         // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
-        // TODO: Optimize CacheKey to avoid Arc allocation on lookup? / TODO：优化 CacheKey 以避免查找时的 Arc 分配？
-        // Currently we still allocate Arc<str> in CacheKey::new. / 目前我们仍然在 CacheKey::new 中分配 Arc<str>
-        // But we saved the String allocation in parse_quick. / 但我们在 parse_quick 中节省了 String 分配
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
         let cache_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, q.qname.as_ref(), qtype);
         
@@ -419,8 +411,6 @@ impl Engine {
             // Verify collision / 验证冲突
             if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == q.qname.as_ref() && hit.pipeline_id == pipeline_id {
                 self.incr_fastpath_hits();
-                let elapsed = t_after_parse.as_nanos();
-                tracing::debug!(request_id = req_id, phase = "cache_hit", elapsed_ns = elapsed, "fastpath cache hit");
                 return Ok(Some(FastPathResponse::CacheHit {
                     cached: hit.bytes.clone(),
                     tx_id: q.tx_id,
@@ -449,8 +439,6 @@ impl Engine {
                         &answers,
                     )?;
                     self.incr_fastpath_hits();
-                    let elapsed_ns = t_start.elapsed().as_nanos();
-                    tracing::debug!(request_id = req_id, phase = "fast_static", elapsed_ns = elapsed_ns, "fast static match");
                     return Ok(Some(FastPathResponse::Direct(resp)));
                 }
             }
@@ -471,15 +459,10 @@ impl Engine {
                         answers,
                     )?;
                     self.incr_fastpath_hits();
-                    let elapsed_ns = t_start.elapsed().as_nanos();
-                    tracing::debug!(request_id = req_id, phase = "rule_cache_hit", elapsed_ns = elapsed_ns, "rule cache hit");
                     return Ok(Some(FastPathResponse::Direct(resp)));
                 }
             }
         }
-        // Log timing up to fastpath checks / 记录到快速路径检查的时间
-        let elapsed_ns = t_start.elapsed().as_nanos();
-        tracing::debug!(request_id = req_id, phase = "fastpath_checks_done", elapsed_ns = elapsed_ns, "fastpath checks done, falling back to async path");
         
         // 缓存未命中，需要异步处理 / Cache miss, need async processing
         Ok(None)
