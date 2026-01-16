@@ -397,7 +397,7 @@ impl Engine {
         let qclass = DNSClass::from(q.qclass);
         let (_pipeline_opt, pipeline_id) = select_pipeline(
             cfg,
-            q.qname,
+            q.qname.as_ref(),
             peer.ip(),
             qclass,
             q.edns_present,
@@ -409,11 +409,11 @@ impl Engine {
         // Currently we still allocate Arc<str> in CacheKey::new. / 目前我们仍然在 CacheKey::new 中分配 Arc<str>
         // But we saved the String allocation in parse_quick. / 但我们在 parse_quick 中节省了 String 分配
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
-        let cache_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, q.qname, qtype);
+        let cache_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, q.qname.as_ref(), qtype);
         
         if let Some(hit) = self.cache.get(&cache_hash) {
             // Verify collision / 验证冲突
-            if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == q.qname && hit.pipeline_id == pipeline_id {
+            if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == q.qname.as_ref() && hit.pipeline_id == pipeline_id {
                 self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
                 let elapsed = t_after_parse.as_nanos();
                 tracing::debug!(request_id = req_id, phase = "cache_hit", elapsed_ns = elapsed, "fastpath cache hit");
@@ -429,7 +429,7 @@ impl Engine {
             let qclass = DNSClass::from(q.qclass);
             if let Some(decision) = fast_static_match(
                 &compiled,
-                q.qname,
+                q.qname.as_ref(),
                 qtype,
                 qclass,
                 peer.ip(),
@@ -438,7 +438,7 @@ impl Engine {
                 if let Decision::Static { rcode, answers } = decision {
                     let resp = build_fast_static_response(
                         q.tx_id,
-                        q.qname,
+                        q.qname.as_ref(),
                         q.qtype,
                         q.qclass,
                         rcode,
@@ -454,13 +454,13 @@ impl Engine {
 
         // 3. Check Rule Cache (L1) for Static Responses / 3. 检查规则缓存（L1）的静态响应
         // Zero-allocation lookup using hash / 使用哈希的零分配查找
-        let rule_hash = calculate_rule_hash(&pipeline_id, q.qname, peer.ip());
+        let rule_hash = calculate_rule_hash(&pipeline_id, q.qname.as_ref(), peer.ip());
         if let Some(entry) = self.rule_cache.get(&rule_hash) {
-            if entry.matches(&pipeline_id, q.qname, peer.ip()) {
+            if entry.matches(&pipeline_id, q.qname.as_ref(), peer.ip()) {
                 if let Decision::Static { rcode, answers } = entry.decision.as_ref() {
                     let resp = build_fast_static_response(
                         q.tx_id,
-                        q.qname,
+                        q.qname.as_ref(),
                         q.qtype,
                         q.qclass,
                         *rcode,
@@ -515,7 +515,7 @@ impl Engine {
         // Lazy Parse: Use quick parse first / 延迟解析：首先使用快速解析
         let mut qname_buf = [0u8; 256];
         let (qname_cow, qtype, qclass, tx_id, edns_present) = if let Some(q) = parse_quick(packet, &mut qname_buf) {
-            (std::borrow::Cow::Borrowed(q.qname), hickory_proto::rr::RecordType::from(q.qtype), DNSClass::from(q.qclass), q.tx_id, q.edns_present)
+            (q.qname, hickory_proto::rr::RecordType::from(q.qtype), DNSClass::from(q.qclass), q.tx_id, q.edns_present)
         } else {
             // Fallback to full parse if quick parse fails (unlikely for standard queries) / 如果快速解析失败则回退到完整解析（对于标准查询不太可能）
             let req = Message::from_bytes(packet).context("parse request")?;

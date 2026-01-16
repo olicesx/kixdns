@@ -1,9 +1,9 @@
-use std::str::from_utf8;
+use std::borrow::Cow;
 
 /// 快速解析结果，尽可能零拷贝 / Quick parse result with zero-copy where possible
 pub struct QuickQuery<'a> {
     pub tx_id: u16,
-    pub qname: &'a str,
+    pub qname: Cow<'a, str>,
     pub qtype: u16,
     pub qclass: u16,
     pub edns_present: bool,
@@ -145,8 +145,12 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
         }
     }
 
-    // Return slice of buf / 返回缓冲区的切片
-    let qname = from_utf8(&buf[..buf_pos]).ok()?;
+    // Return slice of buf as string
+    // RFC 1035-compliant: DNS labels are octet strings, not necessarily valid UTF-8.
+    // We use from_utf8_lossy to avoid rejecting non-UTF-8 labels while maintaining
+    // case-insensitive ASCII comparison behavior. Invalid UTF-8 bytes are replaced
+    // with the Unicode replacement character (U+FFFD).
+    let qname = String::from_utf8_lossy(&buf[..buf_pos]);
 
     Some(QuickQuery {
         tx_id,
