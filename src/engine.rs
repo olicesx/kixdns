@@ -3,20 +3,20 @@ use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicUsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
-use rustc_hash::{FxHasher, FxBuildHasher};
-use socket2::{Domain, Protocol, Socket, Type};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{DNSClass, Name, RData, Record};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable, BinEncoder};
 use moka::sync::Cache;
+use rustc_hash::{FxBuildHasher, FxHasher};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{
     TcpStream, UdpSocket,
@@ -26,13 +26,13 @@ use tokio::sync::{Mutex, Semaphore, oneshot};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use crate::cache::{CacheEntry, DnsCache, new_cache};
 use crate::advanced_rule::{CompiledPipeline, compile_pipelines, fast_static_match};
+use crate::cache::{CacheEntry, DnsCache, new_cache};
 use crate::config::{Action, Transport};
 use crate::matcher::{
     RuntimePipeline, RuntimePipelineConfig, RuntimeResponseMatcherWithOp, eval_match_chain,
 };
-use crate::prefetch::{PrefetchManager, PrefetchConfig};
+use crate::prefetch::{PrefetchConfig, PrefetchJob, PrefetchManager};
 use crate::proto_utils::parse_quick;
 
 // Thread-local object pool for reusing BytesMut buffers to reduce heap allocations
@@ -141,41 +141,43 @@ impl PermitManager {
             max_permits: Arc::new(AtomicUsize::new(initial_permits)),
         }
     }
-    
+
     /// Try to acquire a permit without blocking / 非阻塞地尝试获取 permit
     pub fn try_acquire(&self) -> Option<PermitGuard> {
         loop {
             let active = self.active_permits.load(Ordering::Acquire);
             let max = self.max_permits.load(Ordering::Acquire);
-            
+
             if active >= max {
                 return None;
             }
-            
+
             match self.active_permits.compare_exchange(
                 active,
                 active + 1,
                 Ordering::Release,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(PermitGuard {
-                    active_permits: Arc::clone(&self.active_permits),
-                }),
+                Ok(_) => {
+                    return Some(PermitGuard {
+                        active_permits: Arc::clone(&self.active_permits),
+                    });
+                }
                 Err(_) => continue, // Retry on CAS failure / CAS 失败时重试
             }
         }
     }
-    
+
     /// Get current inflight permits count / 获取当前进行中的 permits 数
     pub fn inflight(&self) -> usize {
         self.active_permits.load(Ordering::Acquire)
     }
-    
+
     /// Update max permits for dynamic adjustment / 更新最大 permits 用于动态调整
     pub fn set_max_permits(&self, new_max: usize) {
         self.max_permits.store(new_max, Ordering::Release);
     }
-    
+
     /// Get current max permits / 获取当前最大 permits
     pub fn max_permits(&self) -> usize {
         self.max_permits.load(Ordering::Acquire)
@@ -212,18 +214,20 @@ impl Engine {
         let flow_control_min_permits = cfg.settings.flow_control_min_permits;
         let flow_control_max_permits = cfg.settings.flow_control_max_permits;
         let flow_control_latency_threshold_ms = cfg.settings.flow_control_latency_threshold_ms;
-        let flow_control_adjustment_interval_secs = cfg.settings.flow_control_adjustment_interval_secs;
+        let flow_control_adjustment_interval_secs =
+            cfg.settings.flow_control_adjustment_interval_secs;
         let dashmap_shards = cfg.settings.dashmap_shards;
-        
+
         // Extract prefetch settings before moving cfg / 在 move cfg 之前提取预取设置
         let prefetch_enabled = cfg.settings.prefetch.prefetch_enabled;
         let prefetch_hot_threshold = cfg.settings.prefetch.prefetch_hot_threshold;
-        let prefetch_ttl_ratio = cfg.settings.prefetch.prefetch_ttl_ratio;
         let prefetch_concurrency = cfg.settings.prefetch.prefetch_concurrency;
         let prefetch_min_interval_secs = cfg.settings.prefetch.prefetch_min_interval_secs;
-        
+        let prefetch_ipv6_on_ipv4 = cfg.settings.prefetch.prefetch_ipv6_on_ipv4;
+        let prefetch_cdn_on_root = cfg.settings.prefetch.prefetch_cdn_on_root;
+
         let compiled = compile_pipelines(&cfg);
-        
+
         let state = Arc::new(ArcSwap::from_pointee(EngineInner {
             pipeline: cfg,
             compiled_pipelines: compiled,
@@ -242,11 +246,10 @@ impl Engine {
         let prefetch_config = PrefetchConfig {
             enabled: prefetch_enabled,
             hot_threshold: prefetch_hot_threshold,
-            ttl_ratio: prefetch_ttl_ratio,
             concurrency: prefetch_concurrency,
-            min_interval: std::time::Duration::from_secs(
-                prefetch_min_interval_secs
-            ),
+            min_interval: Duration::from_secs(prefetch_min_interval_secs),
+            ipv6_on_ipv4_enabled: prefetch_ipv6_on_ipv4,
+            cdn_prefetch_enabled: prefetch_cdn_on_root,
         };
         let prefetch_manager = Arc::new(PrefetchManager::new(prefetch_config));
 
@@ -318,9 +321,12 @@ impl Engine {
             // Try to update timestamp - only one thread will succeed
             // Using weak variant is acceptable in a loop as it can spuriously fail
             match state.last_adjustment_ms.compare_exchange_weak(
-                last_ms, now_ms, Ordering::AcqRel, Ordering::Relaxed
+                last_ms,
+                now_ms,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
             ) {
-                Ok(_) => break,  // Successfully acquired adjustment right
+                Ok(_) => break, // Successfully acquired adjustment right
                 Err(current) => {
                     // Another thread updated timestamp, reload and recheck
                     last_ms = current;
@@ -330,7 +336,9 @@ impl Engine {
         }
 
         let inflight = self.permit_manager.inflight();
-        let latest_latency = self.metrics_last_upstream_latency_ns.load(Ordering::Relaxed);
+        let latest_latency = self
+            .metrics_last_upstream_latency_ns
+            .load(Ordering::Relaxed);
         let current_permits = self.permit_manager.max_permits();
 
         // 决策逻辑：如果延迟高或进行中请求多，减少 permits
@@ -353,7 +361,8 @@ impl Engine {
                 "reducing permits due to high latency or load"
             );
         } else if should_increase && current_permits < state.max_permits.load(Ordering::Relaxed) {
-            let new_permits = (current_permits * 11 / 10).min(state.max_permits.load(Ordering::Relaxed));
+            let new_permits =
+                (current_permits * 11 / 10).min(state.max_permits.load(Ordering::Relaxed));
             self.permit_manager.set_max_permits(new_permits);
             tracing::info!(
                 event = "flow_control_increase",
@@ -367,7 +376,11 @@ impl Engine {
     }
 
     #[inline]
-    fn calculate_cache_hash_for_dedupe(pipeline_id: &str, qname: &str, qtype: hickory_proto::rr::RecordType) -> u64 {
+    fn calculate_cache_hash_for_dedupe(
+        pipeline_id: &str,
+        qname: &str,
+        qtype: hickory_proto::rr::RecordType,
+    ) -> u64 {
         let mut h = FxHasher::default();
         pipeline_id.hash(&mut h);
         // Hash qname case-insensitively without allocation / 不分配内存地进行不区分大小写的 qname 哈希
@@ -416,14 +429,19 @@ impl Engine {
             None => {
                 // quick parse failed / 快速解析失败
                 let elapsed = t_start.elapsed().as_nanos();
-                tracing::debug!(request_id = req_id, phase = "parse_quick_fail", elapsed_ns = elapsed, "fastpath parse failed");
+                tracing::debug!(
+                    request_id = req_id,
+                    phase = "parse_quick_fail",
+                    elapsed_ns = elapsed,
+                    "fastpath parse failed"
+                );
                 return Ok(None);
             }
         };
         // Count incoming quick-parsed requests / 计数进入的快速解析请求
         self.metrics_total_requests.fetch_add(1, Ordering::Relaxed);
         let t_after_parse = t_start.elapsed();
-        
+
         // 获取 pipeline ID / Get pipeline ID
         let state = self.state.load();
         let cfg = &state.pipeline;
@@ -436,25 +454,38 @@ impl Engine {
             q.edns_present,
             &self.listener_label,
         );
-        
+
         // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
         // TODO: Optimize CacheKey to avoid Arc allocation on lookup? / TODO：优化 CacheKey 以避免查找时的 Arc 分配？
         // Currently we still allocate Arc<str> in CacheKey::new. / 目前我们仍然在 CacheKey::new 中分配 Arc<str>
         // But we saved the String allocation in parse_quick. / 但我们在 parse_quick 中节省了 String 分配
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
         let cache_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, q.qname, qtype);
-        
+
         if let Some(hit) = self.cache.get(&cache_hash) {
             // Verify collision / 验证冲突
-            if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == q.qname && hit.pipeline_id == pipeline_id {
+            if hit.qtype == u16::from(qtype)
+                && hit.qname.as_ref() == q.qname
+                && hit.pipeline_id == pipeline_id
+            {
                 self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
-                
+
                 // Record access for prefetch statistics
                 // Assume 300 seconds TTL for prefetch calculation (will be refined)
                 self.prefetch_manager.record_access(cache_hash, &hit, 300);
-                
+
+                let pipeline_id = hit.pipeline_id.clone();
+                let qname_arc = hit.qname.clone();
+                let upstream = hit.source.clone();
+                self.schedule_prefetch_jobs(pipeline_id, qname_arc, qtype, upstream);
+
                 let elapsed = t_after_parse.as_nanos();
-                tracing::debug!(request_id = req_id, phase = "cache_hit", elapsed_ns = elapsed, "fastpath cache hit");
+                tracing::debug!(
+                    request_id = req_id,
+                    phase = "cache_hit",
+                    elapsed_ns = elapsed,
+                    "fastpath cache hit"
+                );
                 return Ok(Some(FastPathResponse::CacheHit {
                     cached: hit.bytes.clone(),
                     tx_id: q.tx_id,
@@ -465,26 +496,21 @@ impl Engine {
         // 2. Compiled rule fast-path for static decisions / 2. 编译规则的静态决策快速路径
         if let Some(compiled) = self.compiled_for(&state, &pipeline_id) {
             let qclass = DNSClass::from(q.qclass);
-            if let Some(decision) = fast_static_match(
-                &compiled,
-                q.qname,
-                qtype,
-                qclass,
-                peer.ip(),
-                q.edns_present,
-            ) {
+            if let Some(decision) =
+                fast_static_match(&compiled, q.qname, qtype, qclass, peer.ip(), q.edns_present)
+            {
                 if let Decision::Static { rcode, answers } = decision {
                     let resp = build_fast_static_response(
-                        q.tx_id,
-                        q.qname,
-                        q.qtype,
-                        q.qclass,
-                        rcode,
-                        &answers,
+                        q.tx_id, q.qname, q.qtype, q.qclass, rcode, &answers,
                     )?;
                     self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
                     let elapsed_ns = t_start.elapsed().as_nanos();
-                    tracing::debug!(request_id = req_id, phase = "fast_static", elapsed_ns = elapsed_ns, "fast static match");
+                    tracing::debug!(
+                        request_id = req_id,
+                        phase = "fast_static",
+                        elapsed_ns = elapsed_ns,
+                        "fast static match"
+                    );
                     return Ok(Some(FastPathResponse::Direct(resp)));
                 }
             }
@@ -497,30 +523,42 @@ impl Engine {
             if entry.matches(&pipeline_id, q.qname, peer.ip()) {
                 if let Decision::Static { rcode, answers } = entry.decision.as_ref() {
                     let resp = build_fast_static_response(
-                        q.tx_id,
-                        q.qname,
-                        q.qtype,
-                        q.qclass,
-                        *rcode,
-                        answers,
+                        q.tx_id, q.qname, q.qtype, q.qclass, *rcode, answers,
                     )?;
                     self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
                     let elapsed_ns = t_start.elapsed().as_nanos();
-                    tracing::debug!(request_id = req_id, phase = "rule_cache_hit", elapsed_ns = elapsed_ns, "rule cache hit");
+                    tracing::debug!(
+                        request_id = req_id,
+                        phase = "rule_cache_hit",
+                        elapsed_ns = elapsed_ns,
+                        "rule cache hit"
+                    );
                     return Ok(Some(FastPathResponse::Direct(resp)));
                 }
             }
         }
         // Log timing up to fastpath checks / 记录到快速路径检查的时间
         let elapsed_ns = t_start.elapsed().as_nanos();
-        tracing::debug!(request_id = req_id, phase = "fastpath_checks_done", elapsed_ns = elapsed_ns, "fastpath checks done, falling back to async path");
-        
+        tracing::debug!(
+            request_id = req_id,
+            phase = "fastpath_checks_done",
+            elapsed_ns = elapsed_ns,
+            "fastpath checks done, falling back to async path"
+        );
+
         // 缓存未命中，需要异步处理 / Cache miss, need async processing
         Ok(None)
     }
 
     #[inline]
-    fn insert_rule_cache(&self, hash: u64, pipeline_id: Arc<str>, qname: &str, client_ip: IpAddr, decision: Decision) {
+    fn insert_rule_cache(
+        &self,
+        hash: u64,
+        pipeline_id: Arc<str>,
+        qname: &str,
+        client_ip: IpAddr,
+        decision: Decision,
+    ) {
         self.rule_cache.insert(
             hash,
             RuleCacheEntry {
@@ -530,6 +568,186 @@ impl Engine {
                 decision: Arc::new(decision),
             },
         );
+    }
+
+    fn insert_cache_with_prefetch(
+        &self,
+        dedupe_hash: u64,
+        entry: CacheEntry,
+        response: Option<&Message>,
+    ) {
+        let pipeline_id = entry.pipeline_id.clone();
+        let qname = entry.qname.clone();
+        let qtype = hickory_proto::rr::RecordType::from(entry.qtype);
+        let upstream = entry.source.clone();
+        let should_schedule = !upstream.is_empty() && upstream.as_ref() != "static";
+
+        if should_schedule {
+            if let Some(message) = response {
+                self.prefetch_manager.register_cdn_relations_from_message(
+                    &pipeline_id,
+                    &upstream,
+                    &qname,
+                    message,
+                );
+            } else {
+                self.prefetch_manager.register_cdn_relations_from_response(
+                    &pipeline_id,
+                    &upstream,
+                    &qname,
+                    entry.bytes.as_ref(),
+                );
+            }
+        }
+
+        self.cache.insert(dedupe_hash, entry);
+
+        if should_schedule {
+            self.schedule_prefetch_jobs(pipeline_id, qname, qtype, upstream);
+        }
+    }
+
+    fn schedule_prefetch_jobs(
+        &self,
+        pipeline_id: Arc<str>,
+        qname: Arc<str>,
+        qtype: hickory_proto::rr::RecordType,
+        upstream: Arc<str>,
+    ) {
+        if upstream.is_empty() || upstream.as_ref() == "static" {
+            return;
+        }
+
+        let jobs = self
+            .prefetch_manager
+            .related_jobs(&pipeline_id, &qname, qtype, &upstream);
+
+        for job in jobs {
+            if let Some(permit) = self.prefetch_manager.try_prepare_job(&job) {
+                let engine = self.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(err) = engine.execute_prefetch_job(job).await {
+                        tracing::debug!(target = "prefetch", error = %err, "prefetch job failed");
+                    }
+                });
+            }
+        }
+    }
+
+    async fn execute_prefetch_job(&self, job: PrefetchJob) -> anyhow::Result<()> {
+        let tx_id =
+            (self.request_id_counter.fetch_add(1, Ordering::Relaxed) as u16).wrapping_add(1);
+        let query_bytes = Self::build_prefetch_query(job.qname.as_ref(), job.qtype, tx_id)
+            .with_context(|| format!("build prefetch query for {}", job.qname))?;
+
+        let state = self.state.load();
+        let upstream_timeout = state.pipeline.upstream_timeout();
+        let min_ttl = state.pipeline.min_ttl();
+        drop(state);
+
+        match self
+            .forward_upstream(
+                query_bytes.as_ref(),
+                job.upstream.as_ref(),
+                upstream_timeout,
+                Transport::Udp,
+            )
+            .await
+        {
+            Ok(raw) => {
+                let (rcode, ttl_secs, message_for_prefetch) =
+                    if let Some(qr) = crate::proto_utils::parse_response_quick(&raw) {
+                        (qr.rcode, qr.min_ttl as u64, None)
+                    } else {
+                        let msg = Message::from_bytes(&raw).context("parse prefetch response")?;
+                        let ttl = extract_ttl(&msg);
+                        (msg.response_code(), ttl, Some(msg))
+                    };
+
+                if rcode != ResponseCode::NoError {
+                    tracing::debug!(
+                        target = "prefetch",
+                        pipeline = %job.pipeline_id,
+                        qname = %job.qname,
+                        qtype = ?job.qtype,
+                        upstream = %job.upstream,
+                        rcode = ?rcode,
+                        "prefetch skipped due to rcode"
+                    );
+                    return Ok(());
+                }
+
+                let effective_ttl_secs = ttl_secs.max(min_ttl.as_secs());
+                if effective_ttl_secs == 0 {
+                    tracing::debug!(
+                        target = "prefetch",
+                        pipeline = %job.pipeline_id,
+                        qname = %job.qname,
+                        qtype = ?job.qtype,
+                        upstream = %job.upstream,
+                        "prefetch response ttl zero"
+                    );
+                    return Ok(());
+                }
+
+                let entry = CacheEntry {
+                    bytes: raw.clone(),
+                    rcode,
+                    source: job.upstream.clone(),
+                    qname: job.qname.clone(),
+                    pipeline_id: job.pipeline_id.clone(),
+                    qtype: u16::from(job.qtype),
+                };
+                let hash =
+                    Self::calculate_cache_hash_for_dedupe(&job.pipeline_id, &job.qname, job.qtype);
+                self.insert_cache_with_prefetch(hash, entry, message_for_prefetch.as_ref());
+                tracing::debug!(
+                    target = "prefetch",
+                    pipeline = %job.pipeline_id,
+                    qname = %job.qname,
+                    qtype = ?job.qtype,
+                    upstream = %job.upstream,
+                    ttl_secs = effective_ttl_secs,
+                    "prefetch cached"
+                );
+                Ok(())
+            }
+            Err(err) => {
+                tracing::debug!(
+                    target = "prefetch",
+                    pipeline = %job.pipeline_id,
+                    qname = %job.qname,
+                    qtype = ?job.qtype,
+                    upstream = %job.upstream,
+                    error = %err,
+                    "prefetch upstream failed"
+                );
+                Err(err)
+            }
+        }
+    }
+
+    fn build_prefetch_query(
+        qname: &str,
+        record_type: hickory_proto::rr::RecordType,
+        tx_id: u16,
+    ) -> anyhow::Result<Bytes> {
+        let name = Name::from_str(qname)
+            .with_context(|| format!("invalid domain for prefetch: {}", qname))?;
+        let mut message = Message::new();
+        message.add_query(Query::query(name, record_type));
+        message.set_id(tx_id);
+        message.set_message_type(MessageType::Query);
+        message.set_op_code(OpCode::Query);
+        message.set_recursion_desired(true);
+
+        let mut buf = Vec::with_capacity(256);
+        {
+            let mut encoder = BinEncoder::new(&mut buf);
+            message.emit(&mut encoder)?;
+        }
+        Ok(Bytes::from(buf))
     }
 
     pub async fn handle_packet(&self, packet: &[u8], peer: SocketAddr) -> anyhow::Result<Bytes> {
@@ -552,20 +770,27 @@ impl Engine {
 
         // Lazy Parse: Use quick parse first / 延迟解析：首先使用快速解析
         let mut qname_buf = [0u8; 256];
-        let (qname_cow, qtype, qclass, tx_id, edns_present) = if let Some(q) = parse_quick(packet, &mut qname_buf) {
-            (std::borrow::Cow::Borrowed(q.qname), hickory_proto::rr::RecordType::from(q.qtype), DNSClass::from(q.qclass), q.tx_id, q.edns_present)
-        } else {
-            // Fallback to full parse if quick parse fails (unlikely for standard queries) / 如果快速解析失败则回退到完整解析（对于标准查询不太可能）
-            let req = Message::from_bytes(packet).context("parse request")?;
-            let question = req.queries().first().context("empty question")?;
-            (
-                std::borrow::Cow::Owned(question.name().to_lowercase().to_string()),
-                question.query_type(),
-                question.query_class(),
-                req.id(),
-                req.extensions().is_some(),
-            )
-        };
+        let (qname_cow, qtype, qclass, tx_id, edns_present) =
+            if let Some(q) = parse_quick(packet, &mut qname_buf) {
+                (
+                    std::borrow::Cow::Borrowed(q.qname),
+                    hickory_proto::rr::RecordType::from(q.qtype),
+                    DNSClass::from(q.qclass),
+                    q.tx_id,
+                    q.edns_present,
+                )
+            } else {
+                // Fallback to full parse if quick parse fails (unlikely for standard queries) / 如果快速解析失败则回退到完整解析（对于标准查询不太可能）
+                let req = Message::from_bytes(packet).context("parse request")?;
+                let question = req.queries().first().context("empty question")?;
+                (
+                    std::borrow::Cow::Owned(question.name().to_lowercase().to_string()),
+                    question.query_type(),
+                    question.query_class(),
+                    req.id(),
+                    req.extensions().is_some(),
+                )
+            };
         let qname_ref = &qname_cow;
 
         let start = std::time::Instant::now();
@@ -582,7 +807,10 @@ impl Engine {
         let dedupe_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, qname_ref, qtype);
         // moka 同步缓存自动处理过期，无需检查 expires_at / moka sync cache automatically handles expiration, no need to check expires_at
         if let Some(hit) = self.cache.get(&dedupe_hash) {
-            if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == *qname_ref && hit.pipeline_id == pipeline_id {
+            if hit.qtype == u16::from(qtype)
+                && hit.qname.as_ref() == *qname_ref
+                && hit.pipeline_id == pipeline_id
+            {
                 let latency = start.elapsed();
                 // clone bytes and rewrite transaction ID to match requester / 克隆字节并重写事务 ID 以匹配请求者
                 let mut resp_bytes = pool_acquire_buffer(hit.bytes.len());
@@ -612,12 +840,22 @@ impl Engine {
         let qname = qname_cow.into_owned();
         let mut skip_rules: HashSet<Arc<str>> = HashSet::new();
         let mut current_pipeline_id = pipeline_id.clone();
-        let mut dedupe_hash = Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, &qname, qtype);
+        let mut dedupe_hash =
+            Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, &qname, qtype);
         let mut dedupe_registered = false;
         let mut reused_response: Option<ResponseContext> = None;
 
         let mut decision = match pipeline_opt {
-            Some(p) => self.apply_rules(&state, p, peer.ip(), &qname, qtype, qclass, edns_present, None),
+            Some(p) => self.apply_rules(
+                &state,
+                p,
+                peer.ip(),
+                &qname,
+                qtype,
+                qclass,
+                edns_present,
+                None,
+            ),
             None => Decision::Forward {
                 upstream: Arc::from(cfg.settings.default_upstream.as_str()),
                 response_matchers: Vec::new(),
@@ -639,10 +877,19 @@ impl Engine {
         }
 
         impl InflightCleanupGuard {
-            fn new(inflight: Arc<DashMap<u64, Vec<oneshot::Sender<anyhow::Result<Bytes>>>, FxBuildHasher>>, hash: u64) -> Self {
-                Self { inflight, hash, active: true }
+            fn new(
+                inflight: Arc<
+                    DashMap<u64, Vec<oneshot::Sender<anyhow::Result<Bytes>>>, FxBuildHasher>,
+                >,
+                hash: u64,
+            ) -> Self {
+                Self {
+                    inflight,
+                    hash,
+                    active: true,
+                }
             }
-            
+
             fn defuse(&mut self) {
                 self.active = false;
             }
@@ -671,7 +918,11 @@ impl Engine {
                     }
                     if let Some(p) = cfg.pipelines.iter().find(|p| p.id == *pipeline) {
                         current_pipeline_id = p.id.clone();
-                        dedupe_hash = Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, &qname, qtype);
+                        dedupe_hash = Self::calculate_cache_hash_for_dedupe(
+                            &current_pipeline_id,
+                            &qname,
+                            qtype,
+                        );
                         dedupe_registered = false;
                         skip_rules.clear();
                         decision = self.apply_rules(
@@ -699,56 +950,101 @@ impl Engine {
             }
 
             match decision {
-            Decision::Jump { .. } => {
-                anyhow::bail!("unresolved pipeline jump");
-            }
-            Decision::Static { rcode, answers } => {
-                // Need full request for building response / 需要完整请求来构建响应
-                let req = Message::from_bytes(packet).context("parse request for static")?;
-                let resp_bytes = build_response(&req, rcode, answers)?;
-                if min_ttl > Duration::from_secs(0) {
-                    let entry = CacheEntry {
-                        bytes: resp_bytes.clone(),
-                        rcode,
-                        source: Arc::from("static"),
-                        qname: Arc::from(qname.as_str()),
-                        pipeline_id: current_pipeline_id.clone(),
-                        qtype: u16::from(qtype),
-                    };
-                    self.cache.insert(dedupe_hash, entry);
+                Decision::Jump { .. } => {
+                    anyhow::bail!("unresolved pipeline jump");
                 }
-                let latency = start.elapsed();
-                info!(
-                    event = "dns_response",
-                    upstream = "static",
-                    qname = %qname,
-                    qtype = ?qtype,
-                    rcode = ?rcode,
-                    latency_ms = latency.as_millis() as u64,
-                    client_ip = %peer.ip(),
-                    pipeline = %current_pipeline_id,
-                    cache = false,
-                    "static response"
-                );
-                return Ok(resp_bytes);
-            }
-            Decision::Forward {
-                upstream,
-                response_matchers,
-                response_matcher_operator: _response_matcher_operator,
-                response_actions_on_match,
-                response_actions_on_miss,
-                rule_name,
-                transport,
-                continue_on_match: _,
-                continue_on_miss: _,
-                allow_reuse,
-            } => {
-                let mut cleanup_guard = None;
-                let resp = if allow_reuse {
-                    if let Some(ctx) = reused_response.take() {
-                        Ok(ctx.raw)
+                Decision::Static { rcode, answers } => {
+                    // Need full request for building response / 需要完整请求来构建响应
+                    let req = Message::from_bytes(packet).context("parse request for static")?;
+                    let resp_bytes = build_response(&req, rcode, answers)?;
+                    if min_ttl > Duration::from_secs(0) {
+                        let entry = CacheEntry {
+                            bytes: resp_bytes.clone(),
+                            rcode,
+                            source: Arc::from("static"),
+                            qname: Arc::from(qname.as_str()),
+                            pipeline_id: current_pipeline_id.clone(),
+                            qtype: u16::from(qtype),
+                        };
+                        self.insert_cache_with_prefetch(dedupe_hash, entry, None);
+                    }
+                    let latency = start.elapsed();
+                    info!(
+                        event = "dns_response",
+                        upstream = "static",
+                        qname = %qname,
+                        qtype = ?qtype,
+                        rcode = ?rcode,
+                        latency_ms = latency.as_millis() as u64,
+                        client_ip = %peer.ip(),
+                        pipeline = %current_pipeline_id,
+                        cache = false,
+                        "static response"
+                    );
+                    return Ok(resp_bytes);
+                }
+                Decision::Forward {
+                    upstream,
+                    response_matchers,
+                    response_matcher_operator: _response_matcher_operator,
+                    response_actions_on_match,
+                    response_actions_on_miss,
+                    rule_name,
+                    transport,
+                    continue_on_match: _,
+                    continue_on_miss: _,
+                    allow_reuse,
+                } => {
+                    let mut cleanup_guard = None;
+                    let resp = if allow_reuse {
+                        if let Some(ctx) = reused_response.take() {
+                            Ok(ctx.raw)
+                        } else {
+                            if !dedupe_registered {
+                                use dashmap::mapref::entry::Entry;
+                                let rx = match self.inflight.entry(dedupe_hash) {
+                                    Entry::Occupied(mut entry) => {
+                                        let (tx, rx) = oneshot::channel();
+                                        entry.get_mut().push(tx);
+                                        Some(rx)
+                                    }
+                                    Entry::Vacant(entry) => {
+                                        entry.insert(Vec::new());
+                                        dedupe_registered = true;
+                                        cleanup_guard = Some(InflightCleanupGuard::new(
+                                            self.inflight.clone(),
+                                            dedupe_hash,
+                                        ));
+                                        None
+                                    }
+                                };
+
+                                if let Some(rx) = rx {
+                                    match rx.await {
+                                        Ok(Ok(bytes)) => {
+                                            // Zero-copy TX ID rewrite using BytesMut
+                                            let mut resp_mut = BytesMut::from(bytes.as_ref());
+                                            if resp_mut.len() >= 2 {
+                                                let id_bytes = tx_id.to_be_bytes();
+                                                resp_mut[0] = id_bytes[0];
+                                                resp_mut[1] = id_bytes[1];
+                                            }
+                                            return Ok(resp_mut.freeze());
+                                        }
+                                        Ok(Err(e)) => return Err(e),
+                                        Err(_) => {
+                                            // sender dropped, fallthrough to attempt upstream
+                                        }
+                                    }
+                                }
+                            }
+                            self.forward_upstream(packet, &upstream, upstream_timeout, transport)
+                                .await
+                        }
                     } else {
+                        // If reuse is not allowed (e.g. explicit Forward action), we must clear any reused response
+                        // and force a new request.
+
                         if !dedupe_registered {
                             use dashmap::mapref::entry::Entry;
                             let rx = match self.inflight.entry(dedupe_hash) {
@@ -760,7 +1056,10 @@ impl Engine {
                                 Entry::Vacant(entry) => {
                                     entry.insert(Vec::new());
                                     dedupe_registered = true;
-                                    cleanup_guard = Some(InflightCleanupGuard::new(self.inflight.clone(), dedupe_hash));
+                                    cleanup_guard = Some(InflightCleanupGuard::new(
+                                        self.inflight.clone(),
+                                        dedupe_hash,
+                                    ));
                                     None
                                 }
                             };
@@ -784,252 +1083,248 @@ impl Engine {
                                 }
                             }
                         }
-                        self.forward_upstream(packet, &upstream, upstream_timeout, transport).await
-                    }
-                } else {
-                    // If reuse is not allowed (e.g. explicit Forward action), we must clear any reused response
-                    // and force a new request.
-                    
-                    if !dedupe_registered {
-                        use dashmap::mapref::entry::Entry;
-                        let rx = match self.inflight.entry(dedupe_hash) {
-                            Entry::Occupied(mut entry) => {
-                                let (tx, rx) = oneshot::channel();
-                                entry.get_mut().push(tx);
-                                Some(rx)
-                            }
-                            Entry::Vacant(entry) => {
-                                entry.insert(Vec::new());
-                                dedupe_registered = true;
-                                cleanup_guard = Some(InflightCleanupGuard::new(self.inflight.clone(), dedupe_hash));
-                                None
-                            }
-                        };
+                        self.forward_upstream(packet, &upstream, upstream_timeout, transport)
+                            .await
+                    };
 
-                        if let Some(rx) = rx {
-                            match rx.await {
-                                Ok(Ok(bytes)) => {
-                                    // Zero-copy TX ID rewrite using BytesMut
-                                    let mut resp_mut = BytesMut::from(bytes.as_ref());
-                                    if resp_mut.len() >= 2 {
-                                        let id_bytes = tx_id.to_be_bytes();
-                                        resp_mut[0] = id_bytes[0];
-                                        resp_mut[1] = id_bytes[1];
-                                    }
-                                    return Ok(resp_mut.freeze());
+                    match resp {
+                        Ok(raw) => {
+                            // Optimization: Use quick response parse if no complex matching is needed
+                            let (rcode, ttl_secs, mut msg_opt) = if response_matchers.is_empty()
+                                && response_actions_on_match.is_empty()
+                                && response_actions_on_miss.is_empty()
+                            {
+                                if let Some(qr) = crate::proto_utils::parse_response_quick(&raw) {
+                                    (qr.rcode, qr.min_ttl as u64, None)
+                                } else {
+                                    // Fallback
+                                    let msg = Message::from_bytes(&raw)
+                                        .context("parse upstream response")?;
+                                    let ttl = extract_ttl(&msg);
+                                    (msg.response_code(), ttl, Some(msg))
                                 }
-                                Ok(Err(e)) => return Err(e),
-                                Err(_) => {
-                                    // sender dropped, fallthrough to attempt upstream
-                                }
-                            }
-                        }
-                    }
-                    self.forward_upstream(packet, &upstream, upstream_timeout, transport).await
-                };
-
-                match resp {
-                    Ok(raw) => {
-                        // Optimization: Use quick response parse if no complex matching is needed
-                        let (rcode, ttl_secs, msg_opt) = if response_matchers.is_empty() && response_actions_on_match.is_empty() && response_actions_on_miss.is_empty() {
-                            if let Some(qr) = crate::proto_utils::parse_response_quick(&raw) {
-                                (qr.rcode, qr.min_ttl as u64, None)
                             } else {
-                                // Fallback
-                                let msg = Message::from_bytes(&raw).context("parse upstream response")?;
+                                let msg =
+                                    Message::from_bytes(&raw).context("parse upstream response")?;
                                 let ttl = extract_ttl(&msg);
                                 (msg.response_code(), ttl, Some(msg))
-                            }
-                        } else {
-                            let msg = Message::from_bytes(&raw).context("parse upstream response")?;
-                            let ttl = extract_ttl(&msg);
-                            (msg.response_code(), ttl, Some(msg))
-                        };
+                            };
 
-                        let effective_ttl = Duration::from_secs(ttl_secs.max(min_ttl.as_secs()));
+                            let effective_ttl =
+                                Duration::from_secs(ttl_secs.max(min_ttl.as_secs()));
 
-                        let (resp_match_ok, msg) = if let Some(m) = msg_opt {
-                            let matched = eval_match_chain(
-                                &response_matchers,
-                                |m| m.operator,
-                                |matcher_op| matcher_op.matcher.matches(&upstream, &qname, qtype, qclass, &m),
-                            );
-                            (matched, m)
-                        } else {
-                            (false, Message::new()) // Dummy message, won't be used as actions are empty
-                        };
-
-                        let empty_actions = Vec::new();
-                        let actions_to_run = if !response_actions_on_match.is_empty()
-                            || !response_actions_on_miss.is_empty()
-                        {
-                            if resp_match_ok {
-                                &response_actions_on_match
+                            let resp_match_ok = if let Some(m) = msg_opt.as_ref() {
+                                eval_match_chain(
+                                    &response_matchers,
+                                    |m| m.operator,
+                                    |matcher_op| {
+                                        matcher_op
+                                            .matcher
+                                            .matches(&upstream, &qname, qtype, qclass, m)
+                                    },
+                                )
                             } else {
-                                &response_actions_on_miss
-                            }
-                        } else {
-                            &empty_actions
-                        };
+                                false
+                            };
 
-                        if actions_to_run.is_empty() {
-                            if effective_ttl > Duration::from_secs(0) {
-                                let entry = CacheEntry {
-                                    bytes: raw.clone(),
-                                    rcode,
-                                    source: upstream.clone(),
-                                    qname: Arc::from(qname.as_str()),
-                                    pipeline_id: pipeline_id.clone(),
-                                    qtype: u16::from(qtype),
-                                };
-                                self.cache.insert(dedupe_hash, entry);
-                            }
-                            if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
-                            self.notify_inflight_waiters(dedupe_hash, &raw).await;
-                            let latency = start.elapsed();
-                            info!(
-                                event = "dns_response",
-                                upstream = %upstream,
-                                qname = %qname,
-                                qtype = ?qtype,
-                                rcode = ?rcode,
-                                latency_ms = latency.as_millis() as u64,
-                                client_ip = %peer.ip(),
-                                pipeline = %pipeline_id,
-                                cache = effective_ttl > Duration::from_secs(0),
-                                resp_match = resp_match_ok,
-                                transport = ?transport,
-                                "forwarded"
-                            );
-                            return Ok(raw);
-                        }
-                        
-                        // If we have actions, we MUST have parsed the message fully above
-                        // Re-construct req if needed (it was lazily parsed or not)
-                        // But wait, `req` variable is now potentially uninitialized or moved?
-                        // Actually `req` was defined at top of function but we made it lazy.
-                        // We need to ensure `req` is available here if we need to run actions.
-                        let req_full = if let Ok(r) = Message::from_bytes(packet) { r } else { Message::new() }; // Re-parse if needed for actions
+                            let empty_actions = Vec::new();
+                            let actions_to_run = if !response_actions_on_match.is_empty()
+                                || !response_actions_on_miss.is_empty()
+                            {
+                                if resp_match_ok {
+                                    &response_actions_on_match
+                                } else {
+                                    &response_actions_on_miss
+                                }
+                            } else {
+                                &empty_actions
+                            };
 
-                        let ctx = ResponseContext {
-                            raw: raw.clone(),
-                            msg,
-                            upstream: upstream.clone(),  // upstream is already Arc<str>
-                            transport,
-                        };
-                        let action_result = self
-                            .apply_response_actions(
-                                actions_to_run,
-                                Some(ctx),
-                                &req_full,
-                                packet,
-                                upstream_timeout,
-                                &response_matchers,
-                                &qname,
-                                qtype,
-                                qclass,
-                                peer.ip(),
-                                cfg.settings.default_upstream.as_str(),
-                                &pipeline_id,
-                                &rule_name,
-                                response_jump_limit,
-                            )
-                            .await?;
-
-                        match action_result {
-                            ResponseActionResult::Upstream { ctx, resp_match } => {
-                                let ttl_secs = extract_ttl(&ctx.msg);
-                                let effective_ttl =
-                                    Duration::from_secs(ttl_secs.max(min_ttl.as_secs()));
+                            if actions_to_run.is_empty() {
                                 if effective_ttl > Duration::from_secs(0) {
                                     let entry = CacheEntry {
-                                        bytes: ctx.raw.clone(),
-                                        rcode: ctx.msg.response_code(),
-                                        source: ctx.upstream.clone(),
+                                        bytes: raw.clone(),
+                                        rcode,
+                                        source: upstream.clone(),
                                         qname: Arc::from(qname.as_str()),
                                         pipeline_id: pipeline_id.clone(),
                                         qtype: u16::from(qtype),
                                     };
-                                    self.cache.insert(dedupe_hash, entry);
+                                    self.insert_cache_with_prefetch(
+                                        dedupe_hash,
+                                        entry,
+                                        msg_opt.as_ref(),
+                                    );
                                 }
-                                if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
-                                self.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
+                                if let Some(g) = cleanup_guard.as_mut() {
+                                    g.defuse();
+                                }
+                                self.notify_inflight_waiters(dedupe_hash, &raw).await;
                                 let latency = start.elapsed();
                                 info!(
                                     event = "dns_response",
-                                    upstream = %ctx.upstream,
-                                    qname = %qname,
-                                    qtype = ?qtype,
-                                    rcode = ?ctx.msg.response_code(),
-                                    latency_ms = latency.as_millis() as u64,
-                                    client_ip = %peer.ip(),
-                                    pipeline = %pipeline_id,
-                                    cache = effective_ttl > Duration::from_secs(0),
-                                    resp_match = resp_match,
-                                    transport = ?ctx.transport,
-                                    "forwarded"
-                                );
-                                return Ok(ctx.raw);
-                            }
-                            ResponseActionResult::Static {
-                                bytes,
-                                rcode,
-                                source,
-                            } => {
-                                if min_ttl > Duration::from_secs(0) {
-                                    let entry = CacheEntry {
-                                        bytes: bytes.clone(),
-                                        rcode,
-                                        source: Arc::from(source),
-                                        qname: Arc::from(qname.as_str()),
-                                        pipeline_id: current_pipeline_id.clone(),
-                                        qtype: u16::from(qtype),
-                                    };
-                                    self.cache.insert(dedupe_hash, entry);
-                                }
-                                if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
-                                self.notify_inflight_waiters(dedupe_hash, &bytes).await;
-                                let latency = start.elapsed();
-                                info!(
-                                    event = "dns_response",
-                                    upstream = %source,
+                                    upstream = %upstream,
                                     qname = %qname,
                                     qtype = ?qtype,
                                     rcode = ?rcode,
                                     latency_ms = latency.as_millis() as u64,
                                     client_ip = %peer.ip(),
-                                    pipeline = %current_pipeline_id,
-                                    cache = min_ttl > Duration::from_secs(0),
-                                    resp_match = false,
+                                    pipeline = %pipeline_id,
+                                    cache = effective_ttl > Duration::from_secs(0),
+                                    resp_match = resp_match_ok,
                                     transport = ?transport,
-                                    "response_action_static"
+                                    "forwarded"
                                 );
-                                return Ok(bytes);
+                                return Ok(raw);
                             }
-                                ResponseActionResult::Jump { pipeline, remaining_jumps } => {
-                                let req = Message::from_bytes(packet).context("parse request")?;
-                                let resp_bytes = self
-                                    .process_response_jump(
-                                        &state,
-                                        pipeline,
-                                        remaining_jumps,
-                                        &req,
-                                        packet,
-                                        peer,
-                                        &qname,
-                                        qtype,
-                                        qclass,
-                                        edns_present,
-                                        min_ttl,
-                                        upstream_timeout,
-                                    )
-                                    .await?;
-                                if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
-                                self.notify_inflight_waiters(dedupe_hash, &resp_bytes).await;
-                                return Ok(resp_bytes);
-                            }
+
+                            // If we have actions, we MUST have parsed the message fully above
+                            // Re-construct req if needed (it was lazily parsed or not)
+                            // But wait, `req` variable is now potentially uninitialized or moved?
+                            // Actually `req` was defined at top of function but we made it lazy.
+                            // We need to ensure `req` is available here if we need to run actions.
+                            let req_full = if let Ok(r) = Message::from_bytes(packet) {
+                                r
+                            } else {
+                                Message::new()
+                            }; // Re-parse if needed for actions
+
+                            let msg = msg_opt.take().unwrap_or_else(Message::new);
+                            let ctx = ResponseContext {
+                                raw: raw.clone(),
+                                msg,
+                                upstream: upstream.clone(), // upstream is already Arc<str>
+                                transport,
+                            };
+                            let action_result = self
+                                .apply_response_actions(
+                                    actions_to_run,
+                                    Some(ctx),
+                                    &req_full,
+                                    packet,
+                                    upstream_timeout,
+                                    &response_matchers,
+                                    &qname,
+                                    qtype,
+                                    qclass,
+                                    peer.ip(),
+                                    cfg.settings.default_upstream.as_str(),
+                                    &pipeline_id,
+                                    &rule_name,
+                                    response_jump_limit,
+                                )
+                                .await?;
+
+                            match action_result {
+                                ResponseActionResult::Upstream { ctx, resp_match } => {
+                                    let ttl_secs = extract_ttl(&ctx.msg);
+                                    let effective_ttl =
+                                        Duration::from_secs(ttl_secs.max(min_ttl.as_secs()));
+                                    if effective_ttl > Duration::from_secs(0) {
+                                        let entry = CacheEntry {
+                                            bytes: ctx.raw.clone(),
+                                            rcode: ctx.msg.response_code(),
+                                            source: ctx.upstream.clone(),
+                                            qname: Arc::from(qname.as_str()),
+                                            pipeline_id: pipeline_id.clone(),
+                                            qtype: u16::from(qtype),
+                                        };
+                                        self.insert_cache_with_prefetch(
+                                            dedupe_hash,
+                                            entry,
+                                            Some(&ctx.msg),
+                                        );
+                                    }
+                                    if let Some(g) = cleanup_guard.as_mut() {
+                                        g.defuse();
+                                    }
+                                    self.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
+                                    let latency = start.elapsed();
+                                    info!(
+                                        event = "dns_response",
+                                        upstream = %ctx.upstream,
+                                        qname = %qname,
+                                        qtype = ?qtype,
+                                        rcode = ?ctx.msg.response_code(),
+                                        latency_ms = latency.as_millis() as u64,
+                                        client_ip = %peer.ip(),
+                                        pipeline = %pipeline_id,
+                                        cache = effective_ttl > Duration::from_secs(0),
+                                        resp_match = resp_match,
+                                        transport = ?ctx.transport,
+                                        "forwarded"
+                                    );
+                                    return Ok(ctx.raw);
+                                }
+                                ResponseActionResult::Static {
+                                    bytes,
+                                    rcode,
+                                    source,
+                                } => {
+                                    if min_ttl > Duration::from_secs(0) {
+                                        let entry = CacheEntry {
+                                            bytes: bytes.clone(),
+                                            rcode,
+                                            source: Arc::from(source),
+                                            qname: Arc::from(qname.as_str()),
+                                            pipeline_id: current_pipeline_id.clone(),
+                                            qtype: u16::from(qtype),
+                                        };
+                                        self.insert_cache_with_prefetch(dedupe_hash, entry, None);
+                                    }
+                                    if let Some(g) = cleanup_guard.as_mut() {
+                                        g.defuse();
+                                    }
+                                    self.notify_inflight_waiters(dedupe_hash, &bytes).await;
+                                    let latency = start.elapsed();
+                                    info!(
+                                        event = "dns_response",
+                                        upstream = %source,
+                                        qname = %qname,
+                                        qtype = ?qtype,
+                                        rcode = ?rcode,
+                                        latency_ms = latency.as_millis() as u64,
+                                        client_ip = %peer.ip(),
+                                        pipeline = %current_pipeline_id,
+                                        cache = min_ttl > Duration::from_secs(0),
+                                        resp_match = false,
+                                        transport = ?transport,
+                                        "response_action_static"
+                                    );
+                                    return Ok(bytes);
+                                }
+                                ResponseActionResult::Jump {
+                                    pipeline,
+                                    remaining_jumps,
+                                } => {
+                                    let req =
+                                        Message::from_bytes(packet).context("parse request")?;
+                                    let resp_bytes = self
+                                        .process_response_jump(
+                                            &state,
+                                            pipeline,
+                                            remaining_jumps,
+                                            &req,
+                                            packet,
+                                            peer,
+                                            &qname,
+                                            qtype,
+                                            qclass,
+                                            edns_present,
+                                            min_ttl,
+                                            upstream_timeout,
+                                        )
+                                        .await?;
+                                    if let Some(g) = cleanup_guard.as_mut() {
+                                        g.defuse();
+                                    }
+                                    self.notify_inflight_waiters(dedupe_hash, &resp_bytes).await;
+                                    return Ok(resp_bytes);
+                                }
                                 ResponseActionResult::Continue { ctx } => {
-                                    if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
+                                    if let Some(g) = cleanup_guard.as_mut() {
+                                        g.defuse();
+                                    }
                                     // Do NOT notify waiters yet, as we are continuing to find a better response.
                                     // Waiters will be notified when the final decision is reached.
 
@@ -1057,49 +1352,51 @@ impl Engine {
                                     );
                                     continue 'decision_loop;
                                 }
+                            }
                         }
-                    }
-                    Err(err) => {
-                        if response_actions_on_miss.is_empty() {
-                            let rcode = ResponseCode::ServFail;
-                            warn!(
-                                event = "dns_response",
-                                upstream = %upstream,
-                                qname = %qname,
-                                qtype = ?qtype,
-                                rcode = ?rcode,
-                                client_ip = %peer.ip(),
-                                error = %err,
-                                pipeline = %current_pipeline_id,
-                                transport = ?transport,
-                                "upstream failed"
-                            );
-                            let req = Message::from_bytes(packet).context("parse request")?;
-                            let resp_bytes = build_response(&req, rcode, Vec::new())?;
-                            if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
-                            self.notify_inflight_waiters(dedupe_hash, &resp_bytes).await;
-                            return Ok(resp_bytes);
-                        } else {
-                            let req = Message::from_bytes(packet).context("parse request")?;
-                            let action_result = self
-                                .apply_response_actions(
-                                    &response_actions_on_miss,
-                                    None,
-                                    &req,
-                                    packet,
-                                    upstream_timeout,
-                                    &response_matchers,
-                                    &qname,
-                                    qtype,
-                                    qclass,
-                                    peer.ip(),
-                                    cfg.settings.default_upstream.as_str(),
-                                    &pipeline_id,
-                                    &rule_name,
-                                    response_jump_limit,
-                                )
-                                .await?;
-                            match action_result {
+                        Err(err) => {
+                            if response_actions_on_miss.is_empty() {
+                                let rcode = ResponseCode::ServFail;
+                                warn!(
+                                    event = "dns_response",
+                                    upstream = %upstream,
+                                    qname = %qname,
+                                    qtype = ?qtype,
+                                    rcode = ?rcode,
+                                    client_ip = %peer.ip(),
+                                    error = %err,
+                                    pipeline = %current_pipeline_id,
+                                    transport = ?transport,
+                                    "upstream failed"
+                                );
+                                let req = Message::from_bytes(packet).context("parse request")?;
+                                let resp_bytes = build_response(&req, rcode, Vec::new())?;
+                                if let Some(g) = cleanup_guard.as_mut() {
+                                    g.defuse();
+                                }
+                                self.notify_inflight_waiters(dedupe_hash, &resp_bytes).await;
+                                return Ok(resp_bytes);
+                            } else {
+                                let req = Message::from_bytes(packet).context("parse request")?;
+                                let action_result = self
+                                    .apply_response_actions(
+                                        &response_actions_on_miss,
+                                        None,
+                                        &req,
+                                        packet,
+                                        upstream_timeout,
+                                        &response_matchers,
+                                        &qname,
+                                        qtype,
+                                        qclass,
+                                        peer.ip(),
+                                        cfg.settings.default_upstream.as_str(),
+                                        &pipeline_id,
+                                        &rule_name,
+                                        response_jump_limit,
+                                    )
+                                    .await?;
+                                match action_result {
                                     ResponseActionResult::Upstream { ctx, resp_match } => {
                                         let ttl_secs = extract_ttl(&ctx.msg);
                                         let effective_ttl =
@@ -1113,7 +1410,11 @@ impl Engine {
                                                 pipeline_id: pipeline_id.clone(),
                                                 qtype: u16::from(qtype),
                                             };
-                                            self.cache.insert(dedupe_hash, entry);
+                                            self.insert_cache_with_prefetch(
+                                                dedupe_hash,
+                                                entry,
+                                                Some(&ctx.msg),
+                                            );
                                         }
                                         self.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
                                         return Ok(ctx.raw);
@@ -1122,8 +1423,12 @@ impl Engine {
                                         self.notify_inflight_waiters(dedupe_hash, &bytes).await;
                                         return Ok(bytes);
                                     }
-                                    ResponseActionResult::Jump { pipeline, remaining_jumps } => {
-                                        let req = Message::from_bytes(packet).context("parse request")?;
+                                    ResponseActionResult::Jump {
+                                        pipeline,
+                                        remaining_jumps,
+                                    } => {
+                                        let req =
+                                            Message::from_bytes(packet).context("parse request")?;
                                         let resp_bytes = self
                                             .process_response_jump(
                                                 &state,
@@ -1140,11 +1445,14 @@ impl Engine {
                                                 upstream_timeout,
                                             )
                                             .await?;
-                                        self.notify_inflight_waiters(dedupe_hash, &resp_bytes).await;
+                                        self.notify_inflight_waiters(dedupe_hash, &resp_bytes)
+                                            .await;
                                         return Ok(resp_bytes);
                                     }
                                     ResponseActionResult::Continue { ctx } => {
-                                        if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
+                                        if let Some(g) = cleanup_guard.as_mut() {
+                                            g.defuse();
+                                        }
                                         reused_response = ctx;
                                         skip_rules.insert(rule_name.clone());
                                         let skip_ref = if skip_rules.is_empty() {
@@ -1169,6 +1477,7 @@ impl Engine {
                                         );
                                         continue 'decision_loop;
                                     }
+                                }
                             }
                         }
                     }
@@ -1176,7 +1485,6 @@ impl Engine {
             }
         }
     }
-}
 
     #[inline]
     fn apply_rules(
@@ -1194,7 +1502,7 @@ impl Engine {
         // Use hash for lookup to avoid cloning String for key on every lookup
         let rule_hash = calculate_rule_hash(&pipeline.id, qname, client_ip);
         let allow_rule_cache_lookup = skip_rules.map_or(true, |set| set.is_empty());
-        
+
         if allow_rule_cache_lookup {
             if let Some(entry) = self.rule_cache.get(&rule_hash) {
                 if entry.matches(&pipeline.id, qname, client_ip) {
@@ -1257,7 +1565,13 @@ impl Engine {
                                 rcode: code,
                                 answers: Vec::new(),
                             };
-                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
+                            self.insert_rule_cache(
+                                rule_hash,
+                                pipeline.id.clone(),
+                                qname,
+                                client_ip,
+                                d.clone(),
+                            );
                             return d;
                         }
                         Action::StaticIpResponse { ip } => {
@@ -1272,7 +1586,13 @@ impl Engine {
                                         rcode: ResponseCode::NoError,
                                         answers: vec![record],
                                     };
-                                    self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
+                                    self.insert_rule_cache(
+                                        rule_hash,
+                                        pipeline.id.clone(),
+                                        qname,
+                                        client_ip,
+                                        d.clone(),
+                                    );
                                     return d;
                                 }
                             }
@@ -1280,14 +1600,26 @@ impl Engine {
                                 rcode: ResponseCode::ServFail,
                                 answers: Vec::new(),
                             };
-                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
+                            self.insert_rule_cache(
+                                rule_hash,
+                                pipeline.id.clone(),
+                                qname,
+                                client_ip,
+                                d.clone(),
+                            );
                             return d;
                         }
                         Action::JumpToPipeline { pipeline: target } => {
                             let d = Decision::Jump {
                                 pipeline: Arc::from(target.as_str()),
                             };
-                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
+                            self.insert_rule_cache(
+                                rule_hash,
+                                pipeline.id.clone(),
+                                qname,
+                                client_ip,
+                                d.clone(),
+                            );
                             return d;
                         }
                         Action::Allow => {
@@ -1303,7 +1635,13 @@ impl Engine {
                                 continue_on_miss: false,
                                 allow_reuse: true,
                             };
-                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
+                            self.insert_rule_cache(
+                                rule_hash,
+                                pipeline.id.clone(),
+                                qname,
+                                client_ip,
+                                d.clone(),
+                            );
                             return d;
                         }
                         Action::Deny => {
@@ -1311,7 +1649,13 @@ impl Engine {
                                 rcode: ResponseCode::Refused,
                                 answers: Vec::new(),
                             };
-                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
+                            self.insert_rule_cache(
+                                rule_hash,
+                                pipeline.id.clone(),
+                                qname,
+                                client_ip,
+                                d.clone(),
+                            );
                             return d;
                         }
                         Action::Forward {
@@ -1322,8 +1666,10 @@ impl Engine {
                                 .as_ref()
                                 .map(|s| Arc::from(s.as_str()))
                                 .unwrap_or_else(|| Arc::from(upstream_default.as_str()));
-                            let continue_on_match = contains_continue(&rule.response_actions_on_match);
-                            let continue_on_miss = contains_continue(&rule.response_actions_on_miss);
+                            let continue_on_match =
+                                contains_continue(&rule.response_actions_on_match);
+                            let continue_on_miss =
+                                contains_continue(&rule.response_actions_on_miss);
                             let d = Decision::Forward {
                                 upstream: upstream_addr,
                                 response_matchers: rule.response_matchers.clone(),
@@ -1337,7 +1683,13 @@ impl Engine {
                                 allow_reuse: false,
                             };
                             if !continue_on_match && !continue_on_miss {
-                                self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
+                                self.insert_rule_cache(
+                                    rule_hash,
+                                    pipeline.id.clone(),
+                                    qname,
+                                    client_ip,
+                                    d.clone(),
+                                );
                             }
                             return d;
                         }
@@ -1389,14 +1741,17 @@ impl Engine {
             let dur = start.elapsed();
             let dur_ns = dur.as_nanos() as u64;
             self.metrics_upstream_calls.fetch_add(1, Ordering::Relaxed);
-            self.metrics_upstream_ns_total.fetch_add(dur_ns, Ordering::Relaxed);
+            self.metrics_upstream_ns_total
+                .fetch_add(dur_ns, Ordering::Relaxed);
             // 记录最新的延迟供自适应流控使用 / Record latest latency for adaptive flow control
-            self.metrics_last_upstream_latency_ns.store(dur_ns, Ordering::Relaxed);
+            self.metrics_last_upstream_latency_ns
+                .store(dur_ns, Ordering::Relaxed);
             tracing::debug!(upstream=%upstream, upstream_ns = dur_ns, "upstream call latency");
         } else if let Err(e) = &res {
             let dur = start.elapsed();
             let dur_ns = dur.as_nanos() as u64;
-            self.metrics_last_upstream_latency_ns.store(dur_ns, Ordering::Relaxed);
+            self.metrics_last_upstream_latency_ns
+                .store(dur_ns, Ordering::Relaxed);
             tracing::warn!(upstream=%upstream, error=%e, elapsed_ns = dur_ns, "upstream call failed");
         }
         res
@@ -1441,7 +1796,11 @@ impl Engine {
     }
 
     async fn notify_inflight_waiters(&self, dedupe_hash: u64, bytes: &Bytes) {
-        let waiters = self.inflight.remove(&dedupe_hash).map(|(_, v)| v).unwrap_or_default();
+        let waiters = self
+            .inflight
+            .remove(&dedupe_hash)
+            .map(|(_, v)| v)
+            .unwrap_or_default();
         for tx in waiters {
             let _ = tx.send(Ok(bytes.clone()));
         }
@@ -1509,7 +1868,10 @@ impl Engine {
                         let resp_match = eval_match_chain(
                             response_matchers,
                             |m| m.operator,
-                            |m| m.matcher.matches(&ctx.upstream, qname, qtype, qclass, &ctx.msg),
+                            |m| {
+                                m.matcher
+                                    .matches(&ctx.upstream, qname, qtype, qclass, &ctx.msg)
+                            },
                         );
                         return Ok(ResponseActionResult::Upstream { ctx, resp_match });
                     }
@@ -1554,12 +1916,15 @@ impl Engine {
                         });
                     }
 
-                    let upstream_addr: Arc<str> = upstream.as_ref().map(|s| Arc::from(s.as_str())).unwrap_or_else(|| {
-                        ctx_opt
-                            .as_ref()
-                            .map(|ctx| ctx.upstream.clone())
-                            .unwrap_or_else(|| Arc::from(upstream_default))
-                    });
+                    let upstream_addr: Arc<str> = upstream
+                        .as_ref()
+                        .map(|s| Arc::from(s.as_str()))
+                        .unwrap_or_else(|| {
+                            ctx_opt
+                                .as_ref()
+                                .map(|ctx| ctx.upstream.clone())
+                                .unwrap_or_else(|| Arc::from(upstream_default))
+                        });
                     let use_transport = transport.unwrap_or(Transport::Udp);
                     let raw = match self
                         .forward_upstream(packet, &upstream_addr, upstream_timeout, use_transport)
@@ -1590,7 +1955,7 @@ impl Engine {
                     ctx_opt = Some(ResponseContext {
                         raw,
                         msg,
-                        upstream: upstream_addr,  // upstream_addr is already Arc<str>
+                        upstream: upstream_addr, // upstream_addr is already Arc<str>
                         transport: use_transport,
                     });
                 }
@@ -1601,7 +1966,10 @@ impl Engine {
             let resp_match = eval_match_chain(
                 response_matchers,
                 |m| m.operator,
-                |m| m.matcher.matches(&ctx.upstream, qname, qtype, qclass, &ctx.msg),
+                |m| {
+                    m.matcher
+                        .matches(&ctx.upstream, qname, qtype, qclass, &ctx.msg)
+                },
             );
             return Ok(ResponseActionResult::Upstream { ctx, resp_match });
         }
@@ -1638,10 +2006,19 @@ impl Engine {
         }
 
         impl InflightCleanupGuard {
-            fn new(inflight: Arc<DashMap<u64, Vec<oneshot::Sender<anyhow::Result<Bytes>>>, FxBuildHasher>>, hash: u64) -> Self {
-                Self { inflight, hash, active: true }
+            fn new(
+                inflight: Arc<
+                    DashMap<u64, Vec<oneshot::Sender<anyhow::Result<Bytes>>>, FxBuildHasher>,
+                >,
+                hash: u64,
+            ) -> Self {
+                Self {
+                    inflight,
+                    hash,
+                    active: true,
+                }
             }
-            
+
             fn defuse(&mut self) {
                 self.active = false;
             }
@@ -1663,20 +2040,33 @@ impl Engine {
         loop {
             if remaining_jumps == 0 {
                 let resp_bytes = build_response(req, ResponseCode::ServFail, Vec::new())?;
-                for g in &mut cleanup_guards { g.defuse(); }
-                for h in &inflight_hashes { self.notify_inflight_waiters(*h, &resp_bytes).await; }
+                for g in &mut cleanup_guards {
+                    g.defuse();
+                }
+                for h in &inflight_hashes {
+                    self.notify_inflight_waiters(*h, &resp_bytes).await;
+                }
                 return Ok(resp_bytes);
             }
 
-            let Some(pipeline) = state.pipeline.pipelines.iter().find(|p| p.id == pipeline_id) else {
+            let Some(pipeline) = state
+                .pipeline
+                .pipelines
+                .iter()
+                .find(|p| p.id == pipeline_id)
+            else {
                 let resp_bytes = build_response(req, ResponseCode::ServFail, Vec::new())?;
-                for g in &mut cleanup_guards { g.defuse(); }
-                for h in &inflight_hashes { self.notify_inflight_waiters(*h, &resp_bytes).await; }
+                for g in &mut cleanup_guards {
+                    g.defuse();
+                }
+                for h in &inflight_hashes {
+                    self.notify_inflight_waiters(*h, &resp_bytes).await;
+                }
                 return Ok(resp_bytes);
             };
 
             let dedupe_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, qname, qtype);
-            
+
             let mut decision = self.apply_rules(
                 state,
                 pipeline,
@@ -1698,13 +2088,22 @@ impl Engine {
                 if let Decision::Jump { pipeline } = decision {
                     if local_jumps == 0 {
                         let resp_bytes = build_response(req, ResponseCode::ServFail, Vec::new())?;
-                        for g in &mut cleanup_guards { g.defuse(); }
-                        for h in &inflight_hashes { self.notify_inflight_waiters(*h, &resp_bytes).await; }
+                        for g in &mut cleanup_guards {
+                            g.defuse();
+                        }
+                        for h in &inflight_hashes {
+                            self.notify_inflight_waiters(*h, &resp_bytes).await;
+                        }
                         return Ok(resp_bytes);
                     }
                     pipeline_id = pipeline;
                     local_jumps -= 1;
-                    if let Some(next_pipeline) = state.pipeline.pipelines.iter().find(|p| p.id == pipeline_id) {
+                    if let Some(next_pipeline) = state
+                        .pipeline
+                        .pipelines
+                        .iter()
+                        .find(|p| p.id == pipeline_id)
+                    {
                         skip_rules.clear();
                         decision = self.apply_rules(
                             state,
@@ -1719,8 +2118,12 @@ impl Engine {
                         continue;
                     } else {
                         let resp_bytes = build_response(req, ResponseCode::ServFail, Vec::new())?;
-                        for g in &mut cleanup_guards { g.defuse(); }
-                        for h in &inflight_hashes { self.notify_inflight_waiters(*h, &resp_bytes).await; }
+                        for g in &mut cleanup_guards {
+                            g.defuse();
+                        }
+                        for h in &inflight_hashes {
+                            self.notify_inflight_waiters(*h, &resp_bytes).await;
+                        }
                         return Ok(resp_bytes);
                     }
                 }
@@ -1740,9 +2143,13 @@ impl Engine {
                         pipeline_id: pipeline_id.clone(),
                         qtype: u16::from(qtype),
                     };
-                    self.cache.insert(dedupe_hash, entry);
-                    for g in &mut cleanup_guards { g.defuse(); }
-                    for h in &inflight_hashes { self.notify_inflight_waiters(*h, &resp_bytes).await; }
+                    self.insert_cache_with_prefetch(dedupe_hash, entry, None);
+                    for g in &mut cleanup_guards {
+                        g.defuse();
+                    }
+                    for h in &inflight_hashes {
+                        self.notify_inflight_waiters(*h, &resp_bytes).await;
+                    }
                     return Ok(resp_bytes);
                 }
                 Decision::Forward {
@@ -1771,7 +2178,10 @@ impl Engine {
                                     }
                                     Entry::Vacant(entry) => {
                                         entry.insert(Vec::new());
-                                        cleanup_guards.push(InflightCleanupGuard::new(self.inflight.clone(), dedupe_hash));
+                                        cleanup_guards.push(InflightCleanupGuard::new(
+                                            self.inflight.clone(),
+                                            dedupe_hash,
+                                        ));
                                         inflight_hashes.push(dedupe_hash);
                                         None
                                     }
@@ -1789,8 +2199,12 @@ impl Engine {
                                             }
                                             let resp_bytes = resp_mut.freeze();
 
-                                            for g in &mut cleanup_guards { g.defuse(); }
-                                            for h in &inflight_hashes { self.notify_inflight_waiters(*h, &bytes).await; }
+                                            for g in &mut cleanup_guards {
+                                                g.defuse();
+                                            }
+                                            for h in &inflight_hashes {
+                                                self.notify_inflight_waiters(*h, &bytes).await;
+                                            }
                                             return Ok(resp_bytes);
                                         }
                                         Ok(Err(e)) => return Err(e),
@@ -1800,12 +2214,13 @@ impl Engine {
                                     }
                                 }
                             }
-                            self.forward_upstream(packet, &upstream, upstream_timeout, transport).await
+                            self.forward_upstream(packet, &upstream, upstream_timeout, transport)
+                                .await
                         }
                     } else {
                         // If reuse is not allowed (e.g. explicit Forward action), we must clear any reused response
                         // and force a new request.
-                        
+
                         {
                             use dashmap::mapref::entry::Entry;
                             let rx = match self.inflight.entry(dedupe_hash) {
@@ -1816,7 +2231,10 @@ impl Engine {
                                 }
                                 Entry::Vacant(entry) => {
                                     entry.insert(Vec::new());
-                                    cleanup_guards.push(InflightCleanupGuard::new(self.inflight.clone(), dedupe_hash));
+                                    cleanup_guards.push(InflightCleanupGuard::new(
+                                        self.inflight.clone(),
+                                        dedupe_hash,
+                                    ));
                                     inflight_hashes.push(dedupe_hash);
                                     None
                                 }
@@ -1834,8 +2252,12 @@ impl Engine {
                                         }
                                         let resp_bytes = resp_mut.freeze();
 
-                                        for g in &mut cleanup_guards { g.defuse(); }
-                                        for h in &inflight_hashes { self.notify_inflight_waiters(*h, &bytes).await; }
+                                        for g in &mut cleanup_guards {
+                                            g.defuse();
+                                        }
+                                        for h in &inflight_hashes {
+                                            self.notify_inflight_waiters(*h, &bytes).await;
+                                        }
                                         return Ok(resp_bytes);
                                     }
                                     Ok(Err(e)) => return Err(e),
@@ -1845,14 +2267,17 @@ impl Engine {
                                 }
                             }
                         }
-                        self.forward_upstream(packet, &upstream, upstream_timeout, transport).await
+                        self.forward_upstream(packet, &upstream, upstream_timeout, transport)
+                            .await
                     };
 
                     match resp {
                         Ok(raw) => {
-                            let msg = Message::from_bytes(&raw).context("parse upstream response")?;
+                            let msg =
+                                Message::from_bytes(&raw).context("parse upstream response")?;
                             let ttl_secs = extract_ttl(&msg);
-                            let effective_ttl = Duration::from_secs(ttl_secs.max(min_ttl.as_secs()));
+                            let effective_ttl =
+                                Duration::from_secs(ttl_secs.max(min_ttl.as_secs()));
 
                             let resp_match_ok = eval_match_chain(
                                 &response_matchers,
@@ -1882,17 +2307,21 @@ impl Engine {
                                         pipeline_id: pipeline_id.clone(),
                                         qtype: u16::from(qtype),
                                     };
-                                    self.cache.insert(dedupe_hash, entry);
+                                    self.insert_cache_with_prefetch(dedupe_hash, entry, Some(&msg));
                                 }
-                                for g in &mut cleanup_guards { g.defuse(); }
-                                for h in &inflight_hashes { self.notify_inflight_waiters(*h, &raw).await; }
+                                for g in &mut cleanup_guards {
+                                    g.defuse();
+                                }
+                                for h in &inflight_hashes {
+                                    self.notify_inflight_waiters(*h, &raw).await;
+                                }
                                 return Ok(raw);
                             }
 
                             let ctx = ResponseContext {
                                 raw,
                                 msg,
-                                upstream: upstream.clone(),  // upstream is already Arc<str>
+                                upstream: upstream.clone(), // upstream is already Arc<str>
                                 transport,
                             };
                             let action_result = self
@@ -1928,18 +2357,33 @@ impl Engine {
                                             pipeline_id: pipeline_id.clone(),
                                             qtype: u16::from(qtype),
                                         };
-                                        self.cache.insert(dedupe_hash, entry);
+                                        self.insert_cache_with_prefetch(
+                                            dedupe_hash,
+                                            entry,
+                                            Some(&ctx.msg),
+                                        );
                                     }
-                                    for g in &mut cleanup_guards { g.defuse(); }
-                                    for h in &inflight_hashes { self.notify_inflight_waiters(*h, &ctx.raw).await; }
+                                    for g in &mut cleanup_guards {
+                                        g.defuse();
+                                    }
+                                    for h in &inflight_hashes {
+                                        self.notify_inflight_waiters(*h, &ctx.raw).await;
+                                    }
                                     return Ok(ctx.raw);
                                 }
                                 ResponseActionResult::Static { bytes, .. } => {
-                                    for g in &mut cleanup_guards { g.defuse(); }
-                                    for h in &inflight_hashes { self.notify_inflight_waiters(*h, &bytes).await; }
+                                    for g in &mut cleanup_guards {
+                                        g.defuse();
+                                    }
+                                    for h in &inflight_hashes {
+                                        self.notify_inflight_waiters(*h, &bytes).await;
+                                    }
                                     return Ok(bytes);
                                 }
-                                ResponseActionResult::Jump { pipeline, remaining_jumps: next_remaining } => {
+                                ResponseActionResult::Jump {
+                                    pipeline,
+                                    remaining_jumps: next_remaining,
+                                } => {
                                     pipeline_id = pipeline;
                                     remaining_jumps = next_remaining;
                                     continue;
@@ -1952,9 +2396,14 @@ impl Engine {
                             }
                         }
                         Err(_err) => {
-                            let resp_bytes = build_response(req, ResponseCode::ServFail, Vec::new())?;
-                            for g in &mut cleanup_guards { g.defuse(); }
-                            for h in &inflight_hashes { self.notify_inflight_waiters(*h, &resp_bytes).await; }
+                            let resp_bytes =
+                                build_response(req, ResponseCode::ServFail, Vec::new())?;
+                            for g in &mut cleanup_guards {
+                                g.defuse();
+                            }
+                            for h in &inflight_hashes {
+                                self.notify_inflight_waiters(*h, &resp_bytes).await;
+                            }
                             return Ok(resp_bytes);
                         }
                     }
@@ -1986,10 +2435,17 @@ fn select_pipeline<'a>(
         let matched = eval_match_chain(
             &rule.matchers,
             |m| m.operator,
-            |m| m.matcher.matches(listener_label, client_ip, qname, qclass, edns_present),
+            |m| {
+                m.matcher
+                    .matches(listener_label, client_ip, qname, qclass, edns_present)
+            },
         );
         if matched {
-            if let Some(p) = cfg.pipelines.iter().find(|p| p.id.as_ref() == rule.pipeline) {
+            if let Some(p) = cfg
+                .pipelines
+                .iter()
+                .find(|p| p.id.as_ref() == rule.pipeline)
+            {
                 return (Some(p), p.id.clone());
             }
         }
@@ -2003,8 +2459,13 @@ fn select_pipeline<'a>(
 
 impl Engine {
     #[inline]
-    fn compiled_for<'a>(&self, state: &'a EngineInner, pipeline_id: &str) -> Option<&'a CompiledPipeline> {
-        state.compiled_pipelines
+    fn compiled_for<'a>(
+        &self,
+        state: &'a EngineInner,
+        pipeline_id: &str,
+    ) -> Option<&'a CompiledPipeline> {
+        state
+            .compiled_pipelines
             .iter()
             .find(|p| p.id.as_ref() == pipeline_id)
     }
@@ -2030,7 +2491,8 @@ impl UdpClient {
         if size > 0 {
             for _ in 0..size {
                 // Use socket2 to set buffer sizes
-                let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("create socket");
+                let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+                    .expect("create socket");
                 // Set buffer sizes to 4MB to prevent packet loss under load
                 if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
                     warn!("failed to set udp recv buffer size: {}", e);
@@ -2038,13 +2500,15 @@ impl UdpClient {
                 if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
                     warn!("failed to set udp send buffer size: {}", e);
                 }
-                socket.bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into()).expect("bind");
+                socket
+                    .bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into())
+                    .expect("bind");
                 socket.set_nonblocking(true).expect("set nonblocking");
-                
+
                 let std_sock: std::net::UdpSocket = socket.into();
                 let socket = Arc::new(tokio::net::UdpSocket::from_std(std_sock).expect("from_std"));
                 let inflight = Arc::new(DashMap::new());
-                
+
                 let state = UdpSocketState {
                     socket: socket.clone(),
                     inflight: inflight.clone(),
@@ -2063,7 +2527,9 @@ impl UdpClient {
                             Ok((len, src)) => {
                                 if len >= 2 {
                                     let id = u16::from_be_bytes([buf[0], buf[1]]);
-                                    if let Some((_, (original_id, expected_addr, tx))) = inflight_clone.remove(&id) {
+                                    if let Some((_, (original_id, expected_addr, tx))) =
+                                        inflight_clone.remove(&id)
+                                    {
                                         if src == expected_addr {
                                             // Zero-copy: modify in place and freeze
                                             let orig_bytes = original_id.to_be_bytes();
@@ -2103,14 +2569,17 @@ impl UdpClient {
             // Use a fresh socket for every request to avoid race conditions
             // caused by sharing sockets in the pool without a dispatcher.
             // Use socket2 to set buffer sizes
-            let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).context("create socket")?;
+            let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+                .context("create socket")?;
             if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
                 warn!("failed to set udp recv buffer size: {}", e);
             }
             if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
                 warn!("failed to set udp send buffer size: {}", e);
             }
-            socket.bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into()).context("bind")?;
+            socket
+                .bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into())
+                .context("bind")?;
             socket.set_nonblocking(true).context("set nonblocking")?;
             let sock = tokio::net::UdpSocket::from_std(socket.into()).context("from_std")?;
 
@@ -2163,8 +2632,14 @@ impl UdpClient {
             }
             attempts += 1;
             if attempts > 100 {
-                warn!("udp pool exhausted: socket_idx={} inflight_count={}", idx, state.inflight.len());
-                return Err(anyhow::anyhow!("udp pool exhausted (too many inflight requests)"));
+                warn!(
+                    "udp pool exhausted: socket_idx={} inflight_count={}",
+                    idx,
+                    state.inflight.len()
+                );
+                return Err(anyhow::anyhow!(
+                    "udp pool exhausted (too many inflight requests)"
+                ));
             }
         }
 
@@ -2226,7 +2701,11 @@ impl TcpMultiplexer {
             .entry(upstream_key.clone())
             .or_insert_with(|| {
                 let mut clients = Vec::with_capacity(self.pool_size);
-                let size = if self.pool_size == 0 { 1 } else { self.pool_size };
+                let size = if self.pool_size == 0 {
+                    1
+                } else {
+                    self.pool_size
+                };
                 for _ in 0..size {
                     clients.push(Arc::new(TcpMuxClient::new(upstream_key.clone())));
                 }
@@ -2236,7 +2715,7 @@ impl TcpMultiplexer {
                 })
             })
             .clone();
-        
+
         let idx = pool.next_idx.fetch_add(1, Ordering::Relaxed) % pool.clients.len();
         pool.clients[idx].send(packet, timeout_dur).await
     }
@@ -2317,7 +2796,7 @@ impl TcpMuxClient {
         if packet.len() < 2 {
             anyhow::bail!("dns packet too short for tcp");
         }
-        
+
         // 1. Acquire semaphore with timeout
         let _permit = timeout(timeout_dur, self.inflight_limit.acquire())
             .await
@@ -2325,7 +2804,7 @@ impl TcpMuxClient {
 
         let elapsed = start.elapsed();
         if elapsed >= timeout_dur {
-             anyhow::bail!("tcp timeout before processing");
+            anyhow::bail!("tcp timeout before processing");
         }
         let remaining = timeout_dur - elapsed;
 
@@ -2344,7 +2823,7 @@ impl TcpMuxClient {
 
             // Single lock acquisition - conn Mutex provides both connection management and write serialization
             let mut guard = self.conn.lock().await;
-            
+
             // Ensure connection exists
             if guard.is_none() {
                 let stream = TcpStream::connect(&*self.upstream).await?;
@@ -2353,11 +2832,12 @@ impl TcpMuxClient {
                 // Spawn reader while holding the lock to prevent races
                 self.spawn_reader(read_half).await;
             }
-            
+
             let writer = guard.as_mut().context("tcp write half missing")?;
             writer.write_all(&out).await?;
             Ok::<(), anyhow::Error>(())
-        }).await;
+        })
+        .await;
 
         match write_res {
             Ok(Ok(())) => {}
@@ -2529,11 +3009,11 @@ pub(crate) fn make_static_ip_answer(qname: &str, ip: &str) -> (ResponseCode, Vec
 mod tests {
     use super::*;
     use crate::config::{GlobalSettings, MatchOperator};
-    use hickory_proto::rr::RecordType;
-    use std::net::Ipv4Addr;
     use crate::matcher::RuntimeResponseMatcher;
     use futures::future::join_all;
-    use tokio::time::{timeout, Duration};
+    use hickory_proto::rr::RecordType;
+    use std::net::Ipv4Addr;
+    use tokio::time::{Duration, timeout};
 
     #[test]
     fn make_static_ip_answer_returns_ipv4_record() {
@@ -3085,8 +3565,9 @@ fn fast_hash_str(s: &str) -> u64 {
 }
 
 fn contains_continue(actions: &[Action]) -> bool {
-    actions.iter().any(|action| matches!(action, Action::Continue))
+    actions
+        .iter()
+        .any(|action| matches!(action, Action::Continue))
 }
-
 
 // Minimal fallback pipeline when none provided.
