@@ -63,33 +63,8 @@ impl ThreadLocalMetrics {
         }
     }
     
-    /// Flush thread-local metrics to global atomics if enough time has passed
-    fn maybe_flush(&mut self, engine: &Engine) {
-        let now = std::time::Instant::now();
-        // Flush periodically to reduce contention while still providing reasonable accuracy
-        if now.duration_since(self.last_flush) >= METRICS_FLUSH_INTERVAL {
-            if self.total_requests > 0 {
-                engine.metrics_total_requests.fetch_add(self.total_requests, Ordering::Relaxed);
-                self.total_requests = 0;
-            }
-            if self.fastpath_hits > 0 {
-                engine.metrics_fastpath_hits.fetch_add(self.fastpath_hits, Ordering::Relaxed);
-                self.fastpath_hits = 0;
-            }
-            if self.upstream_calls > 0 {
-                engine.metrics_upstream_calls.fetch_add(self.upstream_calls, Ordering::Relaxed);
-                self.upstream_calls = 0;
-            }
-            if self.upstream_ns_total > 0 {
-                engine.metrics_upstream_ns_total.fetch_add(self.upstream_ns_total, Ordering::Relaxed);
-                self.upstream_ns_total = 0;
-            }
-            self.last_flush = now;
-        }
-    }
-    
-    /// Force flush all pending metrics
-    fn force_flush(&mut self, engine: &Engine) {
+    /// Core flush logic - extract pending metrics to global counters
+    fn flush_metrics(&mut self, engine: &Engine) {
         if self.total_requests > 0 {
             engine.metrics_total_requests.fetch_add(self.total_requests, Ordering::Relaxed);
             self.total_requests = 0;
@@ -106,6 +81,21 @@ impl ThreadLocalMetrics {
             engine.metrics_upstream_ns_total.fetch_add(self.upstream_ns_total, Ordering::Relaxed);
             self.upstream_ns_total = 0;
         }
+    }
+    
+    /// Flush thread-local metrics to global atomics if enough time has passed
+    fn maybe_flush(&mut self, engine: &Engine) {
+        let now = std::time::Instant::now();
+        // Flush periodically to reduce contention while still providing reasonable accuracy
+        if now.duration_since(self.last_flush) >= METRICS_FLUSH_INTERVAL {
+            self.flush_metrics(engine);
+            self.last_flush = now;
+        }
+    }
+    
+    /// Force flush all pending metrics
+    fn force_flush(&mut self, engine: &Engine) {
+        self.flush_metrics(engine);
         self.last_flush = std::time::Instant::now();
     }
 }
@@ -361,9 +351,14 @@ impl Engine {
         // Using try_lock to avoid blocking - if another thread is adjusting, we skip
         let mut last_adjustment = match state.last_adjustment.try_lock() {
             Ok(guard) => guard,
-            Err(_) => {
+            Err(std::sync::TryLockError::WouldBlock) => {
                 // Another thread is adjusting, skip this attempt to avoid contention
                 tracing::debug!("flow control adjustment skipped - another thread adjusting");
+                return;
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                // Mutex is poisoned, skip to avoid propagating panic
+                tracing::warn!("flow control adjustment skipped - mutex poisoned");
                 return;
             }
         };
