@@ -38,14 +38,28 @@ pub struct CompiledMatcherWithOp {
 #[derive(Debug, Clone)]
 pub enum CompiledMatcher {
     #[allow(dead_code)]
-    DomainExact { domain: String },
-    DomainSuffix { suffix: String },
-    ClientIp { net: IpNet },
+    DomainExact {
+        domain: String,
+    },
+    DomainSuffix {
+        suffix: String,
+    },
+    ClientIp {
+        net: IpNet,
+    },
     #[allow(dead_code)]
-    QueryType { qtype: RecordType },
-    Qclass { qclass: DNSClass },
-    Regex { regex: Regex },
-    Complex { matcher: RuntimeMatcher },
+    QueryType {
+        qtype: RecordType,
+    },
+    Qclass {
+        qclass: DNSClass,
+    },
+    Regex {
+        regex: Regex,
+    },
+    Complex {
+        matcher: RuntimeMatcher,
+    },
 }
 
 #[derive(Debug, Clone)]

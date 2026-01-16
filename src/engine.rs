@@ -2092,7 +2092,7 @@ struct UdpSocketState {
     socket: Arc<UdpSocket>,
     // Key: Upstream ID (newly generated)
     // Value: (Original ID, Upstream Address, Sender)
-    inflight: Arc<DashMap<u16, (u16, SocketAddr, oneshot::Sender<anyhow::Result<Bytes>>)>>,
+    inflight: Arc<DashMap<u16, (u16, SocketAddr, oneshot::Sender<anyhow::Result<Bytes>>), FxBuildHasher>>,
     next_id: AtomicU16,
 }
 
@@ -2121,7 +2121,7 @@ impl UdpClient {
                 
                 let std_sock: std::net::UdpSocket = socket.into();
                 let socket = Arc::new(tokio::net::UdpSocket::from_std(std_sock).expect("from_std"));
-                let inflight = Arc::new(DashMap::new());
+                let inflight = Arc::new(DashMap::with_hasher(FxBuildHasher::default()));
                 
                 let state = UdpSocketState {
                     socket: socket.clone(),
@@ -2274,7 +2274,7 @@ impl UdpClient {
 
 /// TCP 连接复用器，使用 DashMap 管理连接池 / TCP connection multiplexer, managing connection pool with DashMap
 struct TcpMultiplexer {
-    pools: dashmap::DashMap<Arc<str>, Arc<TcpConnectionPool>>,
+    pools: dashmap::DashMap<Arc<str>, Arc<TcpConnectionPool>, FxBuildHasher>,
     pool_size: usize,
 }
 
@@ -2286,7 +2286,7 @@ struct TcpConnectionPool {
 impl TcpMultiplexer {
     fn new(pool_size: usize) -> Self {
         Self {
-            pools: dashmap::DashMap::new(),
+            pools: dashmap::DashMap::with_hasher(FxBuildHasher::default()),
             pool_size,
         }
     }
@@ -2324,7 +2324,7 @@ struct TcpMuxClient {
     upstream: Arc<str>,
     /// Write half protected by Mutex - serves as both connection storage and write serialization
     conn: Arc<Mutex<Option<OwnedWriteHalf>>>,
-    pending: Arc<dashmap::DashMap<u16, Pending>>,
+    pending: Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
     next_id: AtomicU16,
     inflight_limit: Arc<Semaphore>,
 }
@@ -2339,7 +2339,7 @@ impl TcpMuxClient {
         Self {
             upstream,
             conn: Arc::new(Mutex::new(None)),
-            pending: Arc::new(dashmap::DashMap::new()),
+            pending: Arc::new(dashmap::DashMap::with_hasher(FxBuildHasher::default())),
             next_id: AtomicU16::new(1),
             inflight_limit: Arc::new(Semaphore::new(128)),
         }
@@ -2499,7 +2499,7 @@ impl TcpMuxClient {
     }
 
     async fn fail_all_async(
-        pending: &Arc<dashmap::DashMap<u16, Pending>>,
+        pending: &Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
         err: anyhow::Error,
         conn: &Arc<Mutex<Option<OwnedWriteHalf>>>,
     ) {
