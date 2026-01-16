@@ -34,71 +34,9 @@ use crate::matcher::{
 };
 use crate::proto_utils::parse_quick;
 
-// Thread-local metrics counters to reduce CAS contention on hot path
-// These are aggregated periodically to global counters
-thread_local! {
-    static THREAD_METRICS: std::cell::RefCell<ThreadLocalMetrics> = std::cell::RefCell::new(ThreadLocalMetrics::new());
-}
-
-/// Interval for flushing thread-local metrics to global counters
-/// Configurable for testing and tuning in different environments
-const METRICS_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
-
-struct ThreadLocalMetrics {
-    total_requests: u64,
-    fastpath_hits: u64,
-    upstream_calls: u64,
-    upstream_ns_total: u64,
-    last_flush: std::time::Instant,
-}
-
-impl ThreadLocalMetrics {
-    fn new() -> Self {
-        Self {
-            total_requests: 0,
-            fastpath_hits: 0,
-            upstream_calls: 0,
-            upstream_ns_total: 0,
-            last_flush: std::time::Instant::now(),
-        }
-    }
-    
-    /// Core flush logic - extract pending metrics to global counters
-    fn flush_metrics(&mut self, engine: &Engine) {
-        if self.total_requests > 0 {
-            engine.metrics_total_requests.fetch_add(self.total_requests, Ordering::Relaxed);
-            self.total_requests = 0;
-        }
-        if self.fastpath_hits > 0 {
-            engine.metrics_fastpath_hits.fetch_add(self.fastpath_hits, Ordering::Relaxed);
-            self.fastpath_hits = 0;
-        }
-        if self.upstream_calls > 0 {
-            engine.metrics_upstream_calls.fetch_add(self.upstream_calls, Ordering::Relaxed);
-            self.upstream_calls = 0;
-        }
-        if self.upstream_ns_total > 0 {
-            engine.metrics_upstream_ns_total.fetch_add(self.upstream_ns_total, Ordering::Relaxed);
-            self.upstream_ns_total = 0;
-        }
-    }
-    
-    /// Flush thread-local metrics to global atomics if enough time has passed
-    fn maybe_flush(&mut self, engine: &Engine) {
-        let now = std::time::Instant::now();
-        // Flush periodically to reduce contention while still providing reasonable accuracy
-        if now.duration_since(self.last_flush) >= METRICS_FLUSH_INTERVAL {
-            self.flush_metrics(engine);
-            self.last_flush = now;
-        }
-    }
-    
-    /// Force flush all pending metrics
-    fn force_flush(&mut self, engine: &Engine) {
-        self.flush_metrics(engine);
-        self.last_flush = std::time::Instant::now();
-    }
-}
+// Metrics use simple atomic increments with Relaxed ordering.
+// On x86-64, Relaxed fetch_add compiles to a single `lock add` instruction,
+// which is faster than thread_local + RefCell + time checks.
 
 // Thread-local object pool removed as it was ineffective (buffers never returned)
 // relying on jemalloc/system allocator is cleaner than a broken custom pool.
@@ -150,11 +88,11 @@ pub struct Engine {
 pub struct FlowControlState {
     pub max_permits: AtomicUsize,
     pub min_permits: usize,
-    /// Last adjustment timestamp using monotonic Instant (stored behind Mutex)
-    /// Using Instant avoids clock rollback issues that can occur with SystemTime
-    last_adjustment: std::sync::Mutex<std::time::Instant>,
+    /// Last adjustment timestamp in milliseconds since UNIX_EPOCH
+    /// Clock rollback is handled by saturating_sub in adjust_flow_control
+    pub last_adjustment_ms: AtomicU64,
     pub critical_latency_threshold_ns: u64,
-    pub adjustment_interval: Duration,
+    pub adjustment_interval_ms: u64,
 }
 
 /// Permit manager for dynamic flow control feedback
@@ -257,9 +195,9 @@ impl Engine {
         let flow_control_state = Arc::new(FlowControlState {
             max_permits: AtomicUsize::new(flow_control_max_permits),
             min_permits: flow_control_min_permits,
-            last_adjustment: std::sync::Mutex::new(std::time::Instant::now()),
+            last_adjustment_ms: AtomicU64::new(0),
             critical_latency_threshold_ns: flow_control_latency_threshold_ms * 1_000_000,
-            adjustment_interval: Duration::from_secs(flow_control_adjustment_interval_secs),
+            adjustment_interval_ms: flow_control_adjustment_interval_secs * 1000,
         });
         let permit_manager = Arc::new(PermitManager::new(flow_control_initial_permits));
 
@@ -312,32 +250,33 @@ impl Engine {
     pub fn adjust_flow_control(&self) {
         let state = &self.flow_control_state;
 
-        // Use monotonic Instant to avoid clock rollback issues
-        let now = std::time::Instant::now();
+        // Get current time in milliseconds
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
 
-        // Try to acquire the lock to check and update adjustment time
-        // Using try_lock to avoid blocking - if another thread is adjusting, we skip
-        let mut last_adjustment = match state.last_adjustment.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::WouldBlock) => {
-                // Another thread is adjusting, skip this attempt to avoid contention
-                tracing::debug!("flow control adjustment skipped - another thread adjusting");
+        // Use compare_exchange_weak in a loop for lock-free synchronization
+        // saturating_sub handles clock rollback: if now < last, result is 0, we skip
+        let mut last_ms = state.last_adjustment_ms.load(Ordering::Acquire);
+        loop {
+            // Check if adjustment interval has passed
+            if now_ms.saturating_sub(last_ms) < state.adjustment_interval_ms {
                 return;
             }
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                // Mutex is poisoned, skip to avoid propagating panic
-                tracing::warn!("flow control adjustment skipped - mutex poisoned");
-                return;
-            }
-        };
 
-        // Check if adjustment interval has passed
-        if now.duration_since(*last_adjustment) < state.adjustment_interval {
-            return;
+            // Try to update timestamp - only one thread will succeed
+            match state.last_adjustment_ms.compare_exchange_weak(
+                last_ms, now_ms, Ordering::AcqRel, Ordering::Relaxed
+            ) {
+                Ok(_) => break,  // Successfully acquired adjustment right
+                Err(current) => {
+                    // Another thread updated timestamp, reload and recheck
+                    last_ms = current;
+                    continue;
+                }
+            }
         }
-
-        // Update last adjustment time
-        *last_adjustment = now;
 
         let inflight = self.permit_manager.inflight();
         let latest_latency = self.metrics_last_upstream_latency_ns.load(Ordering::Relaxed);
@@ -376,43 +315,23 @@ impl Engine {
         }
     }
 
-    /// Thread-local increment for total_requests counter (reduces CAS contention)
+    /// Increment total_requests counter using simple atomic operation
     #[inline]
     fn incr_total_requests(&self) {
-        THREAD_METRICS.with(|m| {
-            let mut metrics = m.borrow_mut();
-            metrics.total_requests += 1;
-            metrics.maybe_flush(self);
-        });
+        self.metrics_total_requests.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Thread-local increment for fastpath_hits counter (reduces CAS contention)
+    /// Increment fastpath_hits counter using simple atomic operation
     #[inline]
     fn incr_fastpath_hits(&self) {
-        THREAD_METRICS.with(|m| {
-            let mut metrics = m.borrow_mut();
-            metrics.fastpath_hits += 1;
-            metrics.maybe_flush(self);
-        });
+        self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Thread-local increment for upstream metrics (reduces CAS contention)
+    /// Increment upstream metrics using simple atomic operations
     #[inline]
     fn incr_upstream_metrics(&self, duration_ns: u64) {
-        THREAD_METRICS.with(|m| {
-            let mut metrics = m.borrow_mut();
-            metrics.upstream_calls += 1;
-            metrics.upstream_ns_total += duration_ns;
-            metrics.maybe_flush(self);
-        });
-    }
-
-    /// Force flush thread-local metrics (useful for testing or shutdown)
-    #[allow(dead_code)]
-    pub fn flush_thread_metrics(&self) {
-        THREAD_METRICS.with(|m| {
-            m.borrow_mut().force_flush(self);
-        });
+        self.metrics_upstream_calls.fetch_add(1, Ordering::Relaxed);
+        self.metrics_upstream_ns_total.fetch_add(duration_ns, Ordering::Relaxed);
     }
 
     #[inline]
@@ -430,9 +349,6 @@ impl Engine {
 
     #[allow(dead_code)]
     pub fn metrics_snapshot(&self) -> String {
-        // Flush thread-local metrics before reading to get accurate snapshot
-        self.flush_thread_metrics();
-        
         let inflight = self.metrics_inflight.load(Ordering::Relaxed);
         let total = self.metrics_total_requests.load(Ordering::Relaxed);
         let fast = self.metrics_fastpath_hits.load(Ordering::Relaxed);
