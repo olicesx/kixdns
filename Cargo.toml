@@ -23,6 +23,7 @@ moka = { version = "0.12", features = ["sync"] }
 socket2 = "0.5"
 libc = "0.2"
 rustc-hash = "2.1.1"
+smallvec = "1.13"
 [dev-dependencies]
 futures = "0.3"
 

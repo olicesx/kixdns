@@ -89,13 +89,18 @@ async fn main() -> anyhow::Result<()> {
         // Non-Unix: create a single shared socket and spawn workers that share it / 非 Unix：创建单个共享套接字并生成共享它的工作线程
         // Use socket2 to set buffer sizes / 使用 socket2 设置缓冲区大小
         use socket2::{Domain, Protocol, Socket, Type};
-        let domain = if bind_addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
-        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create socket")?;
+        let domain = if bind_addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket =
+            Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create socket")?;
         let _ = socket.set_recv_buffer_size(4 * 1024 * 1024);
         let _ = socket.set_send_buffer_size(4 * 1024 * 1024);
         socket.set_nonblocking(true).context("set nonblocking")?;
         socket.bind(&bind_addr.into()).context("bind socket")?;
-        
+
         let udp_socket = Arc::new(UdpSocket::from_std(socket.into()).context("from_std")?);
         for worker_id in 0..udp_workers {
             let engine = engine.clone();
@@ -172,7 +177,9 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
         )
     };
     if ret != 0 {
-        // non-fatal: continue without reuseport / 非致命错误：不使用 reuseport 继续
+        // Log warning if SO_REUSEPORT fails / SO_REUSEPORT 失败时记录警告
+        let err = std::io::Error::last_os_error();
+        tracing::warn!("SO_REUSEPORT failed: {}, falling back to shared socket", err);
     }
     let _ = socket.set_recv_buffer_size(4 * 1024 * 1024);
     let _ = socket.set_send_buffer_size(4 * 1024 * 1024);
@@ -183,7 +190,7 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
 
 /// 高性能 UDP worker：直接在接收循环中处理请求，避免 spawn 开销 / High-performance UDP worker: process requests directly in receive loop, avoiding spawn overhead
 async fn run_udp_worker(
-    _worker_id: usize,
+    worker_id: usize,
     socket: Arc<UdpSocket>,
     engine: Engine,
 ) -> anyhow::Result<()> {
@@ -193,30 +200,32 @@ async fn run_udp_worker(
     let mut buf = BytesMut::with_capacity(4096);
     // 复用发送缓冲区：用于缓存命中时 patch TXID，避免每包堆分配 / Reuse send buffer to patch TXID on cache hits, avoiding per-packet heap allocation
     let mut send_buf = BytesMut::with_capacity(512);
-    
+
     // 自适应流控：每 100 个请求检查一次是否需要调整 permits
     // Adaptive flow control: check if adjustment needed every 100 requests
     let mut request_count = 0u32;
+    
+    info!(worker_id, "UDP worker started");
 
     loop {
         // 确保有足够的空间 / Ensure sufficient space
         if buf.capacity() < 4096 {
             buf.reserve(4096 - buf.len());
         }
-        
+
         // 使用 tokio 的 recv_buf_from 配合 BytesMut，实现安全且零拷贝的接收 / Use tokio's recv_buf_from with BytesMut for safe and zero-copy reception
         match socket.recv_buf_from(&mut buf).await {
             Ok((_len, peer)) => {
                 // 零拷贝获取 Bytes / Zero-copy obtain Bytes
                 let packet_bytes = buf.split().freeze();
-                
+
                 // 每 100 个请求检查一次流控调整 / Check flow control adjustment every 100 requests
                 request_count += 1;
                 if request_count >= 100 {
                     request_count = 0;
-                    engine.adjust_flow_control();  // Now synchronous with atomic CAS
+                    engine.adjust_flow_control(); // Now synchronous with atomic CAS
                 }
-                
+
                 // 快速路径：尝试同步处理（缓存命中等场景） / Fast path: try synchronous handling (cache hit scenarios, etc.)
                 match engine.handle_packet_fast(&packet_bytes, peer) {
                     Ok(Some(resp)) => match resp {
@@ -243,7 +252,7 @@ async fn run_udp_worker(
                         // 需要异步处理（上游转发），尝试获取 permit 以限制并发任务数
                         // Need async processing, try to acquire permit for backpressure
                         let permit_mgr = Arc::clone(&engine.permit_manager);
-                        
+
                         // 非阻塞式尝试获取 permit，避免 async 等待导致的延迟
                         // Non-blocking try_acquire to avoid async waiting in the hot path
                         if let Some(permit) = permit_mgr.try_acquire() {
@@ -263,7 +272,7 @@ async fn run_udp_worker(
                         // 解析错误，忽略 / Parse error, ignore
                     }
                 }
-                
+
                 // 重置 buffer 供下次使用 (split 后 buf 为空，需要 reserve) / Reset buffer for next use (buf is empty after split, need reserve)
                 // 实际上 split() 拿走了所有权，buf 变为空。 / Actually split() takes ownership, buf becomes empty
                 // 下次循环开头会 reserve。 / Will reserve at the beginning of next loop
@@ -294,6 +303,8 @@ async fn handle_tcp_conn(
 ) -> anyhow::Result<()> {
     const MAX_TCP_FRAME: usize = 64 * 1024;
     let mut len_buf = [0u8; 2];
+    // Reuse buffer across requests on the same connection
+    let mut buf = Vec::with_capacity(512);
 
     loop {
         if let Err(err) = stream.read_exact(&mut len_buf).await {
@@ -307,7 +318,9 @@ async fn handle_tcp_conn(
             return Ok(());
         }
 
-        let mut buf = vec![0u8; frame_len];
+        // Resize buffer only if needed, reuse capacity
+        buf.clear();
+        buf.resize(frame_len, 0);
         if stream.read_exact(&mut buf).await.is_err() {
             return Ok(());
         }

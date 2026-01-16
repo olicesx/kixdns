@@ -125,6 +125,10 @@ impl RuntimePipelineConfig {
         if cfg.settings.cache_capacity == 0 {
             anyhow::bail!("cache_capacity must be greater than 0");
         }
+        let shards = cfg.settings.dashmap_shards;
+        if shards > 0 && !shards.is_power_of_two() {
+            anyhow::bail!("dashmap_shards must be a power of two");
+        }
         if cfg.settings.cache_capacity > 1_000_000 {
             tracing::warn!(
                 cache_capacity = cfg.settings.cache_capacity,
