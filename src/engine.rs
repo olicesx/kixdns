@@ -116,10 +116,11 @@ pub struct Engine {
 pub struct FlowControlState {
     pub max_permits: AtomicUsize,
     pub min_permits: usize,
-    /// Last adjustment timestamp in milliseconds since UNIX_EPOCH
-    pub last_adjustment_ms: AtomicU64,
+    /// Last adjustment timestamp using monotonic Instant (stored behind Mutex)
+    /// Using Instant avoids clock rollback issues that can occur with SystemTime
+    last_adjustment: std::sync::Mutex<std::time::Instant>,
     pub critical_latency_threshold_ns: u64,
-    pub adjustment_interval_ms: u64,
+    pub adjustment_interval: Duration,
 }
 
 /// Permit manager for dynamic flow control feedback
@@ -222,9 +223,9 @@ impl Engine {
         let flow_control_state = Arc::new(FlowControlState {
             max_permits: AtomicUsize::new(flow_control_max_permits),
             min_permits: flow_control_min_permits,
-            last_adjustment_ms: AtomicU64::new(0),
+            last_adjustment: std::sync::Mutex::new(std::time::Instant::now()),
             critical_latency_threshold_ns: flow_control_latency_threshold_ms * 1_000_000,
-            adjustment_interval_ms: flow_control_adjustment_interval_secs * 1000,
+            adjustment_interval: Duration::from_secs(flow_control_adjustment_interval_secs),
         });
         let permit_manager = Arc::new(PermitManager::new(flow_control_initial_permits));
 
@@ -277,34 +278,23 @@ impl Engine {
     pub fn adjust_flow_control(&self) {
         let state = &self.flow_control_state;
 
-        // Get current time in milliseconds
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        // Use monotonic Instant to avoid clock rollback issues
+        let now = std::time::Instant::now();
 
-        // Use compare_exchange_weak in a loop for better concurrency
-        // This follows Rust's best practice for lock-free synchronization
-        let mut last_ms = state.last_adjustment_ms.load(Ordering::Acquire);
-        loop {
-            // Check if adjustment interval has passed
-            if now_ms.saturating_sub(last_ms) < state.adjustment_interval_ms {
-                return;
-            }
+        // Try to acquire the lock to check and update adjustment time
+        // Using try_lock to avoid blocking - if another thread is adjusting, we skip
+        let mut last_adjustment = match state.last_adjustment.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => return, // Another thread is adjusting, skip this attempt
+        };
 
-            // Try to update timestamp - only one thread will succeed
-            // Using weak variant is acceptable in a loop as it can spuriously fail
-            match state.last_adjustment_ms.compare_exchange_weak(
-                last_ms, now_ms, Ordering::AcqRel, Ordering::Relaxed
-            ) {
-                Ok(_) => break,  // Successfully acquired adjustment right
-                Err(current) => {
-                    // Another thread updated timestamp, reload and recheck
-                    last_ms = current;
-                    continue;
-                }
-            }
+        // Check if adjustment interval has passed
+        if now.duration_since(*last_adjustment) < state.adjustment_interval {
+            return;
         }
+
+        // Update last adjustment time
+        *last_adjustment = now;
 
         let inflight = self.permit_manager.inflight();
         let latest_latency = self.metrics_last_upstream_latency_ns.load(Ordering::Relaxed);
