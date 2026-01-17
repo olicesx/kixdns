@@ -11,6 +11,7 @@ use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use rustc_hash::{FxHasher, FxBuildHasher};
+use smallvec::SmallVec;
 use socket2::{Domain, Protocol, Socket, Type};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA};
@@ -34,40 +35,12 @@ use crate::matcher::{
 };
 use crate::proto_utils::parse_quick;
 
-// Thread-local object pool for reusing BytesMut buffers to reduce heap allocations
-thread_local! {
-    static BUFFER_POOL: std::cell::RefCell<Vec<bytes::BytesMut>> = std::cell::RefCell::new(Vec::with_capacity(8));
-}
+// Metrics use simple atomic increments with Relaxed ordering.
+// On x86-64, Relaxed fetch_add compiles to a single `lock add` instruction,
+// which is faster than thread_local + RefCell + time checks.
 
-/// Get or create a BytesMut buffer from thread-local pool
-#[inline]
-fn pool_acquire_buffer(capacity: usize) -> bytes::BytesMut {
-    BUFFER_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
-        if let Some(mut buf) = pool.pop() {
-            if buf.capacity() < capacity {
-                buf.reserve(capacity - buf.capacity());
-            } else {
-                buf.clear();
-            }
-            buf
-        } else {
-            bytes::BytesMut::with_capacity(capacity)
-        }
-    })
-}
-
-/// Return a BytesMut buffer to the thread-local pool
-#[inline]
-#[allow(dead_code)]
-fn pool_release_buffer(buf: bytes::BytesMut) {
-    BUFFER_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
-        if pool.len() < 8 {
-            pool.push(buf);
-        }
-    })
-}
+// Thread-local object pool removed as it was ineffective (buffers never returned)
+// relying on jemalloc/system allocator is cleaner than a broken custom pool.
 
 /// Fast-path response for UDP workers.
 ///
@@ -103,7 +76,8 @@ pub struct Engine {
     // Per-request id generator for tracing / 每个请求的 ID 生成器用于追踪
     pub request_id_counter: Arc<AtomicU64>,
     // In-flight dedupe map: cache_hash -> waiters / 进行中的去重映射：缓存哈希 -> 等待者
-    pub inflight: Arc<DashMap<u64, Vec<oneshot::Sender<anyhow::Result<Bytes>>>, FxBuildHasher>>,
+    // SmallVec<[_; 8]> avoids heap allocation for typical Singleflight scenarios (<=8 waiters)
+    pub inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>,
     // Semaphore to limit concurrent handle_packet async tasks / 用于限制并发 handle_packet 异步任务数量
     pub permit_manager: Arc<PermitManager>,
     // Latest upstream latency for adaptive flow control / 用于自适应流控的最新上游延迟
@@ -117,6 +91,7 @@ pub struct FlowControlState {
     pub max_permits: AtomicUsize,
     pub min_permits: usize,
     /// Last adjustment timestamp in milliseconds since UNIX_EPOCH
+    /// Clock rollback is handled by saturating_sub in adjust_flow_control
     pub last_adjustment_ms: AtomicU64,
     pub critical_latency_threshold_ns: u64,
     pub adjustment_interval_ms: u64,
@@ -126,21 +101,22 @@ pub struct FlowControlState {
 /// 动态流控的 Permit 管理器
 pub struct PermitManager {
     // Current active permits (acquired) / 当前活跃 permits（已获得）
-    active_permits: Arc<AtomicUsize>,
+    active_permits: AtomicUsize,
     // Maximum permits that can be granted / 可授予的最大 permits
-    max_permits: Arc<AtomicUsize>,
+    max_permits: AtomicUsize,
 }
 
 impl PermitManager {
     pub fn new(initial_permits: usize) -> Self {
         Self {
-            active_permits: Arc::new(AtomicUsize::new(0)),
-            max_permits: Arc::new(AtomicUsize::new(initial_permits)),
+            active_permits: AtomicUsize::new(0),
+            max_permits: AtomicUsize::new(initial_permits),
         }
     }
     
     /// Try to acquire a permit without blocking / 非阻塞地尝试获取 permit
-    pub fn try_acquire(&self) -> Option<PermitGuard> {
+    /// Returns a guard that holds Arc<PermitManager> to ensure permit is released
+    pub fn try_acquire(self: &Arc<Self>) -> Option<PermitGuard> {
         loop {
             let active = self.active_permits.load(Ordering::Acquire);
             let max = self.max_permits.load(Ordering::Acquire);
@@ -156,7 +132,7 @@ impl PermitManager {
                 Ordering::Acquire,
             ) {
                 Ok(_) => return Some(PermitGuard {
-                    active_permits: Arc::clone(&self.active_permits),
+                    manager: Arc::clone(self),
                 }),
                 Err(_) => continue, // Retry on CAS failure / CAS 失败时重试
             }
@@ -181,12 +157,12 @@ impl PermitManager {
 
 /// RAII guard for automatic permit release / RAII 守卫用于自动 permit 释放
 pub struct PermitGuard {
-    active_permits: Arc<AtomicUsize>,
+    manager: Arc<PermitManager>,
 }
 
 impl Drop for PermitGuard {
     fn drop(&mut self) {
-        self.active_permits.fetch_sub(1, Ordering::Release);
+        self.manager.active_permits.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -283,8 +259,8 @@ impl Engine {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
-        // Use compare_exchange_weak in a loop for better concurrency
-        // This follows Rust's best practice for lock-free synchronization
+        // Use compare_exchange_weak in a loop for lock-free synchronization
+        // saturating_sub handles clock rollback: if now < last, result is 0, we skip
         let mut last_ms = state.last_adjustment_ms.load(Ordering::Acquire);
         loop {
             // Check if adjustment interval has passed
@@ -293,7 +269,6 @@ impl Engine {
             }
 
             // Try to update timestamp - only one thread will succeed
-            // Using weak variant is acceptable in a loop as it can spuriously fail
             match state.last_adjustment_ms.compare_exchange_weak(
                 last_ms, now_ms, Ordering::AcqRel, Ordering::Relaxed
             ) {
@@ -343,6 +318,25 @@ impl Engine {
         }
     }
 
+    /// Increment total_requests counter using simple atomic operation
+    #[inline]
+    fn incr_total_requests(&self) {
+        self.metrics_total_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment fastpath_hits counter using simple atomic operation
+    #[inline]
+    fn incr_fastpath_hits(&self) {
+        self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment upstream metrics using simple atomic operations
+    #[inline]
+    fn incr_upstream_metrics(&self, duration_ns: u64) {
+        self.metrics_upstream_calls.fetch_add(1, Ordering::Relaxed);
+        self.metrics_upstream_ns_total.fetch_add(duration_ns, Ordering::Relaxed);
+    }
+
     #[inline]
     fn calculate_cache_hash_for_dedupe(pipeline_id: &str, qname: &str, qtype: hickory_proto::rr::RecordType) -> u64 {
         let mut h = FxHasher::default();
@@ -386,20 +380,15 @@ impl Engine {
         // 快速解析，避免完整 Message 解析和大量分配 / Quick parsing, avoiding full Message parsing and massive allocations
         // 使用栈上缓冲区避免 String 分配 / Use stack buffer to avoid String allocation
         let mut qname_buf = [0u8; 256];
-        let req_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
-        let t_start = std::time::Instant::now();
         let q = match parse_quick(packet, &mut qname_buf) {
             Some(q) => q,
             None => {
-                // quick parse failed / 快速解析失败
-                let elapsed = t_start.elapsed().as_nanos();
-                tracing::debug!(request_id = req_id, phase = "parse_quick_fail", elapsed_ns = elapsed, "fastpath parse failed");
+                // quick parse failed, fallback to async path / 快速解析失败，回退到异步路径
                 return Ok(None);
             }
         };
         // Count incoming quick-parsed requests / 计数进入的快速解析请求
-        self.metrics_total_requests.fetch_add(1, Ordering::Relaxed);
-        let t_after_parse = t_start.elapsed();
+        self.incr_total_requests();
         
         // 获取 pipeline ID / Get pipeline ID
         let state = self.state.load();
@@ -407,7 +396,7 @@ impl Engine {
         let qclass = DNSClass::from(q.qclass);
         let (_pipeline_opt, pipeline_id) = select_pipeline(
             cfg,
-            q.qname,
+            q.qname.as_ref(),
             peer.ip(),
             qclass,
             q.edns_present,
@@ -415,18 +404,13 @@ impl Engine {
         );
         
         // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
-        // TODO: Optimize CacheKey to avoid Arc allocation on lookup? / TODO：优化 CacheKey 以避免查找时的 Arc 分配？
-        // Currently we still allocate Arc<str> in CacheKey::new. / 目前我们仍然在 CacheKey::new 中分配 Arc<str>
-        // But we saved the String allocation in parse_quick. / 但我们在 parse_quick 中节省了 String 分配
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
-        let cache_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, q.qname, qtype);
+        let cache_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, q.qname.as_ref(), qtype);
         
         if let Some(hit) = self.cache.get(&cache_hash) {
             // Verify collision / 验证冲突
-            if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == q.qname && hit.pipeline_id == pipeline_id {
-                self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
-                let elapsed = t_after_parse.as_nanos();
-                tracing::debug!(request_id = req_id, phase = "cache_hit", elapsed_ns = elapsed, "fastpath cache hit");
+            if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == q.qname.as_ref() && hit.pipeline_id == pipeline_id {
+                self.incr_fastpath_hits();
                 return Ok(Some(FastPathResponse::CacheHit {
                     cached: hit.bytes.clone(),
                     tx_id: q.tx_id,
@@ -439,7 +423,7 @@ impl Engine {
             let qclass = DNSClass::from(q.qclass);
             if let Some(decision) = fast_static_match(
                 &compiled,
-                q.qname,
+                q.qname.as_ref(),
                 qtype,
                 qclass,
                 peer.ip(),
@@ -448,15 +432,13 @@ impl Engine {
                 if let Decision::Static { rcode, answers } = decision {
                     let resp = build_fast_static_response(
                         q.tx_id,
-                        q.qname,
+                        q.qname.as_ref(),
                         q.qtype,
                         q.qclass,
                         rcode,
                         &answers,
                     )?;
-                    self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
-                    let elapsed_ns = t_start.elapsed().as_nanos();
-                    tracing::debug!(request_id = req_id, phase = "fast_static", elapsed_ns = elapsed_ns, "fast static match");
+                    self.incr_fastpath_hits();
                     return Ok(Some(FastPathResponse::Direct(resp)));
                 }
             }
@@ -464,28 +446,23 @@ impl Engine {
 
         // 3. Check Rule Cache (L1) for Static Responses / 3. 检查规则缓存（L1）的静态响应
         // Zero-allocation lookup using hash / 使用哈希的零分配查找
-        let rule_hash = calculate_rule_hash(&pipeline_id, q.qname, peer.ip());
+        let rule_hash = calculate_rule_hash(&pipeline_id, q.qname.as_ref(), peer.ip());
         if let Some(entry) = self.rule_cache.get(&rule_hash) {
-            if entry.matches(&pipeline_id, q.qname, peer.ip()) {
+            if entry.matches(&pipeline_id, q.qname.as_ref(), peer.ip()) {
                 if let Decision::Static { rcode, answers } = entry.decision.as_ref() {
                     let resp = build_fast_static_response(
                         q.tx_id,
-                        q.qname,
+                        q.qname.as_ref(),
                         q.qtype,
                         q.qclass,
                         *rcode,
                         answers,
                     )?;
-                    self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
-                    let elapsed_ns = t_start.elapsed().as_nanos();
-                    tracing::debug!(request_id = req_id, phase = "rule_cache_hit", elapsed_ns = elapsed_ns, "rule cache hit");
+                    self.incr_fastpath_hits();
                     return Ok(Some(FastPathResponse::Direct(resp)));
                 }
             }
         }
-        // Log timing up to fastpath checks / 记录到快速路径检查的时间
-        let elapsed_ns = t_start.elapsed().as_nanos();
-        tracing::debug!(request_id = req_id, phase = "fastpath_checks_done", elapsed_ns = elapsed_ns, "fastpath checks done, falling back to async path");
         
         // 缓存未命中，需要异步处理 / Cache miss, need async processing
         Ok(None)
@@ -507,15 +484,15 @@ impl Engine {
     pub async fn handle_packet(&self, packet: &[u8], peer: SocketAddr) -> anyhow::Result<Bytes> {
         // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
         let _req_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
-        self.metrics_total_requests.fetch_add(1, Ordering::Relaxed);
-        struct InflightGuard(Arc<AtomicUsize>);
-        impl Drop for InflightGuard {
+        self.incr_total_requests();
+        struct InflightGuard<'a>(&'a AtomicUsize);
+        impl<'a> Drop for InflightGuard<'a> {
             fn drop(&mut self) {
                 self.0.fetch_sub(1, Ordering::Relaxed);
             }
         }
         self.metrics_inflight.fetch_add(1, Ordering::Relaxed);
-        let _inflight_guard = InflightGuard(self.metrics_inflight.clone());
+        let _inflight_guard = InflightGuard(&self.metrics_inflight);
         let state = self.state.load();
         let cfg = &state.pipeline;
         let min_ttl = cfg.min_ttl();
@@ -525,7 +502,7 @@ impl Engine {
         // Lazy Parse: Use quick parse first / 延迟解析：首先使用快速解析
         let mut qname_buf = [0u8; 256];
         let (qname_cow, qtype, qclass, tx_id, edns_present) = if let Some(q) = parse_quick(packet, &mut qname_buf) {
-            (std::borrow::Cow::Borrowed(q.qname), hickory_proto::rr::RecordType::from(q.qtype), DNSClass::from(q.qclass), q.tx_id, q.edns_present)
+            (q.qname, hickory_proto::rr::RecordType::from(q.qtype), DNSClass::from(q.qclass), q.tx_id, q.edns_present)
         } else {
             // Fallback to full parse if quick parse fails (unlikely for standard queries) / 如果快速解析失败则回退到完整解析（对于标准查询不太可能）
             let req = Message::from_bytes(packet).context("parse request")?;
@@ -557,7 +534,7 @@ impl Engine {
             if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == *qname_ref && hit.pipeline_id == pipeline_id {
                 let latency = start.elapsed();
                 // clone bytes and rewrite transaction ID to match requester / 克隆字节并重写事务 ID 以匹配请求者
-                let mut resp_bytes = pool_acquire_buffer(hit.bytes.len());
+                let mut resp_bytes = BytesMut::with_capacity(hit.bytes.len());
                 resp_bytes.extend_from_slice(&hit.bytes);
                 if resp_bytes.len() >= 2 {
                     let id_bytes = tx_id.to_be_bytes();
@@ -605,13 +582,13 @@ impl Engine {
         };
 
         struct InflightCleanupGuard {
-            inflight: Arc<DashMap<u64, Vec<oneshot::Sender<anyhow::Result<Bytes>>>, FxBuildHasher>>,
+            inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>,
             hash: u64,
             active: bool,
         }
 
         impl InflightCleanupGuard {
-            fn new(inflight: Arc<DashMap<u64, Vec<oneshot::Sender<anyhow::Result<Bytes>>>, FxBuildHasher>>, hash: u64) -> Self {
+            fn new(inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>, hash: u64) -> Self {
                 Self { inflight, hash, active: true }
             }
             
@@ -730,7 +707,7 @@ impl Engine {
                                     Some(rx)
                                 }
                                 Entry::Vacant(entry) => {
-                                    entry.insert(Vec::new());
+                                    entry.insert(SmallVec::new());
                                     dedupe_registered = true;
                                     cleanup_guard = Some(InflightCleanupGuard::new(self.inflight.clone(), dedupe_hash));
                                     None
@@ -771,7 +748,7 @@ impl Engine {
                                 Some(rx)
                             }
                             Entry::Vacant(entry) => {
-                                entry.insert(Vec::new());
+                                entry.insert(SmallVec::new());
                                 dedupe_registered = true;
                                 cleanup_guard = Some(InflightCleanupGuard::new(self.inflight.clone(), dedupe_hash));
                                 None
@@ -1026,11 +1003,19 @@ impl Engine {
                                     } else {
                                         Some(&skip_rules)
                                     };
-                                    let pipeline = cfg
-                                        .pipelines
-                                        .iter()
-                                        .find(|p| p.id == current_pipeline_id)
-                                        .expect("pipeline missing while continuing");
+                                    // Safely handle missing pipeline (e.g., config reload race)
+                                    let pipeline = if let Some(p) = cfg.pipelines.iter().find(|p| p.id == current_pipeline_id) {
+                                        p
+                                    } else {
+                                        warn!("pipeline missing while continuing: {}", current_pipeline_id);
+                                        let req = Message::from_bytes(packet).context("parse request")?;
+                                        let resp_bytes = build_response(&req, ResponseCode::ServFail, Vec::new())?;
+                                        if let Some(g) = cleanup_guard.as_mut() {
+                                            g.defuse();
+                                        }
+                                        self.notify_inflight_waiters(dedupe_hash, &resp_bytes).await;
+                                        return Ok(resp_bytes);
+                                    };
                                     decision = self.apply_rules(
                                         &state,
                                         pipeline,
@@ -1138,11 +1123,16 @@ impl Engine {
                                         } else {
                                             Some(&skip_rules)
                                         };
-                                        let pipeline = cfg
-                                            .pipelines
-                                            .iter()
-                                            .find(|p| p.id == current_pipeline_id)
-                                            .expect("pipeline missing while continuing");
+                                        let pipeline = if let Some(p) = cfg.pipelines.iter().find(|p| p.id == current_pipeline_id) {
+                                            p
+                                        } else {
+                                            warn!("pipeline missing while continuing: {}", current_pipeline_id);
+                                            let req = Message::from_bytes(packet).context("parse request")?;
+                                            let resp_bytes = build_response(&req, ResponseCode::ServFail, Vec::new())?;
+                                            if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
+                                            self.notify_inflight_waiters(dedupe_hash, &resp_bytes).await;
+                                            return Ok(resp_bytes);
+                                        };
                                         decision = self.apply_rules(
                                             &state,
                                             pipeline,
@@ -1192,10 +1182,11 @@ impl Engine {
         let upstream_default = state.pipeline.settings.default_upstream.clone();
 
         // 2. Candidate Selection (compiled index if available)
-        let mut candidate_indices = if let Some(compiled) = self.compiled_for(state, &pipeline.id) {
+        // SmallVec<[usize; 32]> avoids heap allocation for typical rule sets (<= 32 candidates)
+        let mut candidate_indices: SmallVec<[usize; 32]> = if let Some(compiled) = self.compiled_for(state, &pipeline.id) {
             compiled.index.get_candidates(qname, qtype)
         } else {
-            Vec::new()
+            SmallVec::new()
         };
 
         if candidate_indices.is_empty() {
@@ -1374,8 +1365,7 @@ impl Engine {
         if let Ok(_) = &res {
             let dur = start.elapsed();
             let dur_ns = dur.as_nanos() as u64;
-            self.metrics_upstream_calls.fetch_add(1, Ordering::Relaxed);
-            self.metrics_upstream_ns_total.fetch_add(dur_ns, Ordering::Relaxed);
+            self.incr_upstream_metrics(dur_ns);
             // 记录最新的延迟供自适应流控使用 / Record latest latency for adaptive flow control
             self.metrics_last_upstream_latency_ns.store(dur_ns, Ordering::Relaxed);
             tracing::debug!(upstream=%upstream, upstream_ns = dur_ns, "upstream call latency");
@@ -1627,13 +1617,13 @@ impl Engine {
     ) -> anyhow::Result<Bytes> {
         let cfg = &state.pipeline;
         struct InflightCleanupGuard {
-            inflight: Arc<DashMap<u64, Vec<oneshot::Sender<anyhow::Result<Bytes>>>, FxBuildHasher>>,
+            inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>,
             hash: u64,
             active: bool,
         }
 
         impl InflightCleanupGuard {
-            fn new(inflight: Arc<DashMap<u64, Vec<oneshot::Sender<anyhow::Result<Bytes>>>, FxBuildHasher>>, hash: u64) -> Self {
+            fn new(inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>, hash: u64) -> Self {
                 Self { inflight, hash, active: true }
             }
             
@@ -1765,7 +1755,7 @@ impl Engine {
                                         Some(rx)
                                     }
                                     Entry::Vacant(entry) => {
-                                        entry.insert(Vec::new());
+                                        entry.insert(SmallVec::new());
                                         cleanup_guards.push(InflightCleanupGuard::new(self.inflight.clone(), dedupe_hash));
                                         inflight_hashes.push(dedupe_hash);
                                         None
@@ -1810,7 +1800,7 @@ impl Engine {
                                     Some(rx)
                                 }
                                 Entry::Vacant(entry) => {
-                                    entry.insert(Vec::new());
+                                    entry.insert(SmallVec::new());
                                     cleanup_guards.push(InflightCleanupGuard::new(self.inflight.clone(), dedupe_hash));
                                     inflight_hashes.push(dedupe_hash);
                                     None
@@ -2009,7 +1999,7 @@ struct UdpSocketState {
     socket: Arc<UdpSocket>,
     // Key: Upstream ID (newly generated)
     // Value: (Original ID, Upstream Address, Sender)
-    inflight: Arc<DashMap<u16, (u16, SocketAddr, oneshot::Sender<anyhow::Result<Bytes>>)>>,
+    inflight: Arc<DashMap<u16, (u16, SocketAddr, oneshot::Sender<anyhow::Result<Bytes>>), FxBuildHasher>>,
     next_id: AtomicU16,
 }
 
@@ -2021,65 +2011,66 @@ struct UdpClient {
 
 impl UdpClient {
     fn new(size: usize) -> Self {
-        let mut pool = Vec::with_capacity(size);
-        if size > 0 {
-            for _ in 0..size {
-                // Use socket2 to set buffer sizes
-                let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("create socket");
-                // Set buffer sizes to 4MB to prevent packet loss under load
-                if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
-                    warn!("failed to set udp recv buffer size: {}", e);
-                }
-                if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
-                    warn!("failed to set udp send buffer size: {}", e);
-                }
-                socket.bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into()).expect("bind");
-                socket.set_nonblocking(true).expect("set nonblocking");
-                
-                let std_sock: std::net::UdpSocket = socket.into();
-                let socket = Arc::new(tokio::net::UdpSocket::from_std(std_sock).expect("from_std"));
-                let inflight = Arc::new(DashMap::new());
-                
-                let state = UdpSocketState {
-                    socket: socket.clone(),
-                    inflight: inflight.clone(),
-                    next_id: AtomicU16::new(0),
-                };
-                pool.push(state);
+        // Prevent port exhaustion by enforcing minimum pool size
+        let effective_size = if size == 0 { 1 } else { size };
+        let mut pool = Vec::with_capacity(effective_size);
+        for _ in 0..effective_size {
+            // Use socket2 to set buffer sizes
+            let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("create socket");
+            // Set buffer sizes to 4MB to prevent packet loss under load
+            if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
+                warn!("failed to set udp recv buffer size: {}", e);
+            }
+            if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
+                warn!("failed to set udp send buffer size: {}", e);
+            }
+            socket.bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into()).expect("bind");
+            socket.set_nonblocking(true).expect("set nonblocking");
+            
+            let std_sock: std::net::UdpSocket = socket.into();
+            let socket = Arc::new(tokio::net::UdpSocket::from_std(std_sock).expect("from_std"));
+            let inflight = Arc::new(DashMap::with_hasher(FxBuildHasher::default()));
+            
+            let state = UdpSocketState {
+                socket: socket.clone(),
+                inflight: inflight.clone(),
+                next_id: AtomicU16::new(0),
+            };
+            pool.push(state);
 
-                let socket_clone = socket.clone();
-                let inflight_clone = inflight.clone();
-                tokio::spawn(async move {
-                    // Use BytesMut for efficient buffer management and zero-copy ID rewrite
-                    let mut buf = BytesMut::with_capacity(4096);
-                    buf.resize(4096, 0);
-                    loop {
-                        match socket_clone.recv_from(&mut buf).await {
-                            Ok((len, src)) => {
-                                if len >= 2 {
-                                    let id = u16::from_be_bytes([buf[0], buf[1]]);
-                                    if let Some((_, (original_id, expected_addr, tx))) = inflight_clone.remove(&id) {
-                                        if src == expected_addr {
-                                            // Zero-copy: modify in place and freeze
-                                            let orig_bytes = original_id.to_be_bytes();
-                                            buf[0] = orig_bytes[0];
-                                            buf[1] = orig_bytes[1];
-                                            let response = buf.split_to(len).freeze();
-                                            let _ = tx.send(Ok(response));
-                                            // Reset buffer for next iteration
-                                            buf.resize(4096, 0);
-                                        }
+            let socket_clone = socket.clone();
+            let inflight_clone = inflight.clone();
+            tokio::spawn(async move {
+                // Use BytesMut for efficient buffer management
+                let mut buf = BytesMut::with_capacity(4096);
+                buf.resize(4096, 0);
+                loop {
+                    match socket_clone.recv_from(&mut buf).await {
+                        Ok((len, src)) => {
+                            if len >= 2 {
+                                let id = u16::from_be_bytes([buf[0], buf[1]]);
+                                if let Some((_, (original_id, expected_addr, tx))) = inflight_clone.remove(&id) {
+                                    if src == expected_addr {
+                                        // Restore original ID and copy logic
+                                        // Avoiding split_to/freeze to prevent reallocation of the main buffer
+                                        let orig_bytes = original_id.to_be_bytes();
+                                        buf[0] = orig_bytes[0];
+                                        buf[1] = orig_bytes[1];
+                                        
+                                        // Allocate exactly what we need for the response, separate from the recv buffer
+                                        let response = Bytes::copy_from_slice(&buf[..len]);
+                                        let _ = tx.send(Ok(response));
                                     }
                                 }
                             }
-                            Err(e) => {
-                                tracing::error!("UDP pool recv error: {}", e);
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("UDP pool recv error: {}", e);
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                     }
-                });
-            }
+                }
+            });
         }
         Self {
             pool,
@@ -2095,47 +2086,7 @@ impl UdpClient {
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
         if self.pool.is_empty() {
-            // Use a fresh socket for every request to avoid race conditions
-            // caused by sharing sockets in the pool without a dispatcher.
-            // Use socket2 to set buffer sizes
-            let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).context("create socket")?;
-            if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
-                warn!("failed to set udp recv buffer size: {}", e);
-            }
-            if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
-                warn!("failed to set udp send buffer size: {}", e);
-            }
-            socket.bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into()).context("bind")?;
-            socket.set_nonblocking(true).context("set nonblocking")?;
-            let sock = tokio::net::UdpSocket::from_std(socket.into()).context("from_std")?;
-
-            let addr: SocketAddr = upstream.parse().context("invalid upstream address")?;
-            sock.connect(addr).await?;
-            sock.send(packet).await?;
-
-            let mut buf = [0u8; 4096];
-            let recv_res = timeout(timeout_dur, async {
-                loop {
-                    let size = sock.recv(&mut buf).await?;
-                    // Since we connected to the upstream, we only receive packets from it.
-                    // And since it's a fresh socket, any packet is likely our response.
-                    if size >= 2 && packet.len() >= 2 {
-                        if buf[0] == packet[0] && buf[1] == packet[1] {
-                            return Ok::<_, anyhow::Error>(Bytes::copy_from_slice(&buf[..size]));
-                        }
-                    } else {
-                        // Fallback for weird packets, though DNS should have ID.
-                        return Ok::<_, anyhow::Error>(Bytes::copy_from_slice(&buf[..size]));
-                    }
-                }
-            })
-            .await;
-
-            return match recv_res {
-                Ok(Ok(bytes)) => Ok(bytes),
-                Ok(Err(err)) => Err(err),
-                Err(_) => anyhow::bail!("udp timeout"),
-            };
+            return Err(anyhow::anyhow!("UDP pool not initialized"));
         }
 
         // Pool logic
@@ -2148,23 +2099,27 @@ impl UdpClient {
         }
         let original_id = u16::from_be_bytes([packet[0], packet[1]]);
 
-        // Find a free ID
+        // Find a free ID using atomic entry API to avoid race conditions and double locking
         let mut attempts = 0;
         let mut new_id;
+        let (tx, rx) = oneshot::channel();
+        
         loop {
             new_id = state.next_id.fetch_add(1, Ordering::Relaxed);
-            if !state.inflight.contains_key(&new_id) {
-                break;
-            }
-            attempts += 1;
-            if attempts > 100 {
-                warn!("udp pool exhausted: socket_idx={} inflight_count={}", idx, state.inflight.len());
-                return Err(anyhow::anyhow!("udp pool exhausted (too many inflight requests)"));
+            match state.inflight.entry(new_id) {
+                dashmap::mapref::entry::Entry::Vacant(e) => {
+                    e.insert((original_id, addr, tx));
+                    break;
+                }
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    attempts += 1;
+                    if attempts > 100 {
+                        warn!("udp pool exhausted: socket_idx={} inflight_count={}", idx, state.inflight.len());
+                        return Err(anyhow::anyhow!("udp pool exhausted (too many inflight requests)"));
+                    }
+                }
             }
         }
-
-        let (tx, rx) = oneshot::channel();
-        state.inflight.insert(new_id, (original_id, addr, tx));
 
         // Rewrite packet with new ID using BytesMut to avoid full copy
         let mut new_packet = BytesMut::with_capacity(packet.len());
@@ -2191,7 +2146,7 @@ impl UdpClient {
 
 /// TCP 连接复用器，使用 DashMap 管理连接池 / TCP connection multiplexer, managing connection pool with DashMap
 struct TcpMultiplexer {
-    pools: dashmap::DashMap<Arc<str>, Arc<TcpConnectionPool>>,
+    pools: dashmap::DashMap<Arc<str>, Arc<TcpConnectionPool>, FxBuildHasher>,
     pool_size: usize,
 }
 
@@ -2203,7 +2158,7 @@ struct TcpConnectionPool {
 impl TcpMultiplexer {
     fn new(pool_size: usize) -> Self {
         Self {
-            pools: dashmap::DashMap::new(),
+            pools: dashmap::DashMap::with_hasher(FxBuildHasher::default()),
             pool_size,
         }
     }
@@ -2241,7 +2196,7 @@ struct TcpMuxClient {
     upstream: Arc<str>,
     /// Write half protected by Mutex - serves as both connection storage and write serialization
     conn: Arc<Mutex<Option<OwnedWriteHalf>>>,
-    pending: Arc<dashmap::DashMap<u16, Pending>>,
+    pending: Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
     next_id: AtomicU16,
     inflight_limit: Arc<Semaphore>,
 }
@@ -2256,7 +2211,7 @@ impl TcpMuxClient {
         Self {
             upstream,
             conn: Arc::new(Mutex::new(None)),
-            pending: Arc::new(dashmap::DashMap::new()),
+            pending: Arc::new(dashmap::DashMap::with_hasher(FxBuildHasher::default())),
             next_id: AtomicU16::new(1),
             inflight_limit: Arc::new(Semaphore::new(128)),
         }
@@ -2416,7 +2371,7 @@ impl TcpMuxClient {
     }
 
     async fn fail_all_async(
-        pending: &Arc<dashmap::DashMap<u16, Pending>>,
+        pending: &Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
         err: anyhow::Error,
         conn: &Arc<Mutex<Option<OwnedWriteHalf>>>,
     ) {

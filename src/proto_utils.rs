@@ -1,9 +1,9 @@
-use std::str::from_utf8;
+use std::borrow::Cow;
 
 /// 快速解析结果，尽可能零拷贝 / Quick parse result with zero-copy where possible
 pub struct QuickQuery<'a> {
     pub tx_id: u16,
-    pub qname: &'a str,
+    pub qname: Cow<'a, str>,
     pub qtype: u16,
     pub qclass: u16,
     pub edns_present: bool,
@@ -88,15 +88,32 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
 
         let label_bytes = &packet[current_pos..current_pos + label_len];
 
-        // Optimize: process bytes directly to avoid UTF-8 validation per label / 优化：直接处理字节以避免每个标签的 UTF-8 验证
-        // DNS labels are typically ASCII (or Punycode). / DNS 标签通常是 ASCII（或 Punycode）
-        // If raw UTF-8 is used, to_ascii_lowercase on bytes is safe (leaves non-ASCII bytes unchanged). / 如果使用原始 UTF-8，字节上的 to_ascii_lowercase 是安全的（保留非 ASCII 字节不变）
+        // Performance optimization: Check if label needs lowercasing
+        // Most DNS labels are already lowercase, so we can avoid the copy in common case
+        // Use simple loop for better cache locality and early break
+        let mut needs_lowercase = false;
         for &b in label_bytes {
-            if buf_pos >= buf.len() {
-                return None;
+            if b.is_ascii_uppercase() {
+                needs_lowercase = true;
+                break;
             }
-            buf[buf_pos] = b.to_ascii_lowercase();
-            buf_pos += 1;
+        }
+        
+        // Copy label bytes to buffer
+        if buf_pos + label_len > buf.len() {
+            return None;
+        }
+        
+        if needs_lowercase {
+            // Only lowercase if necessary
+            for &b in label_bytes {
+                buf[buf_pos] = b.to_ascii_lowercase();
+                buf_pos += 1;
+            }
+        } else {
+            // Zero-copy: just copy the bytes as-is
+            buf[buf_pos..buf_pos + label_len].copy_from_slice(label_bytes);
+            buf_pos += label_len;
         }
 
         current_pos += label_len;
@@ -120,7 +137,9 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
         // 这在非标准消息（例如 UPDATE，或被误当作查询处理的响应）中可能漏检 EDNS。
         let mut ar_pos = pos;
         for _ in 0..ar_count {
-            if ar_pos >= packet.len() { break; }
+            if ar_pos >= packet.len() {
+                break;
+            }
             let name_byte = packet[ar_pos];
             let next_pos = if name_byte == 0 {
                 ar_pos + 1
@@ -128,25 +147,36 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
                 skip_name(packet, ar_pos).unwrap_or(packet.len())
             };
 
-            if next_pos + 10 > packet.len() { break; }
+            if next_pos + 10 > packet.len() {
+                break;
+            }
             let rr_type = u16::from_be_bytes([packet[next_pos], packet[next_pos + 1]]);
-            if rr_type == 41 { // OPT
+            if rr_type == 41 {
+                // OPT
                 edns_present = true;
                 break;
             }
             let rd_len = u16::from_be_bytes([packet[next_pos + 8], packet[next_pos + 9]]);
-            
+
             // Validate arithmetic to prevent overflow and ensure entire record fits in packet
             let rd_len_usize = rd_len as usize;
             // Check packet length first to avoid underflow in subsequent arithmetic
-            if packet.len() < 10 + rd_len_usize { break; }
-            if next_pos > packet.len() - 10 - rd_len_usize { break; }
+            if packet.len() < 10 + rd_len_usize {
+                break;
+            }
+            if next_pos > packet.len() - 10 - rd_len_usize {
+                break;
+            }
             ar_pos = next_pos + 10 + rd_len_usize;
         }
     }
 
-    // Return slice of buf / 返回缓冲区的切片
-    let qname = from_utf8(&buf[..buf_pos]).ok()?;
+    // Return slice of buf as string
+    // RFC 1035-compliant: DNS labels are octet strings, not necessarily valid UTF-8.
+    // We use from_utf8_lossy to avoid rejecting non-UTF-8 labels while maintaining
+    // case-insensitive ASCII comparison behavior. Invalid UTF-8 bytes are replaced
+    // with the Unicode replacement character (U+FFFD).
+    let qname = String::from_utf8_lossy(&buf[..buf_pos]);
 
     Some(QuickQuery {
         tx_id,
@@ -164,33 +194,45 @@ const MAX_COMPRESSION_JUMPS: u32 = 5;
 fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
     let packet_len = packet.len();
     let mut max_jumps = MAX_COMPRESSION_JUMPS;
-    
+
     loop {
-        if pos >= packet_len { return None; }
+        if pos >= packet_len {
+            return None;
+        }
         let len = packet[pos];
-        if len == 0 { return Some(pos + 1); }
-        
+        if len == 0 {
+            return Some(pos + 1);
+        }
+
         if (len & 0xC0) == 0xC0 {
             // Compression pointer - check bounds before returning
-            if pos + 2 > packet_len { return None; }
-            
+            if pos + 2 > packet_len {
+                return None;
+            }
+
             // Follow compression pointer to prevent infinite loops
             max_jumps -= 1;
-            if max_jumps == 0 { return None; }
-            
+            if max_jumps == 0 {
+                return None;
+            }
+
             let offset = (((len as u16) & 0x3F) << 8) | (packet[pos + 1] as u16);
             let offset_usize = offset as usize;
-            
+
             // Validate that compression pointer offset is within packet bounds
-            if offset_usize >= packet_len { return None; }
-            
+            if offset_usize >= packet_len {
+                return None;
+            }
+
             pos = offset_usize;
             continue;
         }
-        
+
         // Regular label - check bounds before advancing
         let new_pos = pos + 1 + len as usize;
-        if new_pos > packet_len { return None; }
+        if new_pos > packet_len {
+            return None;
+        }
         pos = new_pos;
     }
 }
@@ -237,19 +279,31 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     for _ in 0..qd_count {
         // Skip Name / 跳过名称
         loop {
-            if pos >= packet_len { return None; }
+            if pos >= packet_len {
+                return None;
+            }
             let len = packet[pos];
             if len == 0 {
                 pos += 1;
                 break;
             }
             if (len & 0xC0) == 0xC0 {
+                if pos + 2 > packet_len {
+                    return None;
+                }
                 pos += 2;
                 break;
             }
-            pos += 1 + (len as usize);
+            let jump_len = 1 + (len as usize);
+            if pos + jump_len > packet_len {
+                return None;
+            }
+            pos += jump_len;
         }
         // Skip Type(2) + Class(2) / 跳过类型(2) + 类别(2)
+        if pos + 4 > packet_len {
+            return None;
+        }
         pos += 4;
     }
 
@@ -259,28 +313,44 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     for _ in 0..an_count {
         // Skip Name / 跳过名称
         loop {
-            if pos >= packet_len { return None; }
+            if pos >= packet_len {
+                return None;
+            }
             let len = packet[pos];
             if len == 0 {
                 pos += 1;
                 break;
             }
             if (len & 0xC0) == 0xC0 {
+                if pos + 2 > packet_len {
+                    return None;
+                }
                 pos += 2;
                 break;
             }
-            pos += 1 + (len as usize);
+            let jump_len = 1 + (len as usize);
+            if pos + jump_len > packet_len {
+                return None;
+            }
+            pos += jump_len;
         }
 
-        if pos + 10 > packet_len { return None; }
-        
+        if pos + 10 > packet_len {
+            return None;
+        }
+
         // Type(2) Class(2) TTL(4) RDLen(2) / 类型(2) 类别(2) TTL(4) 数据长度(2)
         // Offset 0: Type / 偏移量 0：类型
         // Offset 2: Class / 偏移量 2：类别
         // Offset 4: TTL / 偏移量 4：TTL
         // Offset 8: RDLen / 偏移量 8：数据长度
-        
-        let ttl = u32::from_be_bytes([packet[pos + 4], packet[pos + 5], packet[pos + 6], packet[pos + 7]]);
+
+        let ttl = u32::from_be_bytes([
+            packet[pos + 4],
+            packet[pos + 5],
+            packet[pos + 6],
+            packet[pos + 7],
+        ]);
         if ttl < min_ttl {
             min_ttl = ttl;
         }
