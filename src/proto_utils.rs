@@ -195,11 +195,15 @@ fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
     }
 }
 
-/// 快速解析响应包，仅提取 RCODE 和最小 TTL / Quick parse response packet, extracting only RCODE and minimum TTL
+/// 快速解析响应包，仅提取 RCODE、TC 标志和最小 TTL / Quick parse response packet, extracting only RCODE, TC flag and minimum TTL
 /// 避免全量解析 Message / Avoid full Message parsing
+#[derive(Debug, Clone)]
 pub struct QuickResponse {
     pub rcode: hickory_proto::op::ResponseCode,
     pub min_ttl: u32,
+    /// TC (Truncated) flag - 响应被截断，应使用 TCP 重试 / Response was truncated, retry with TCP
+    #[allow(dead_code)]
+    pub truncated: bool,
 }
 
 pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
@@ -207,9 +211,12 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
         return None;
     }
 
-    // 1. RCODE (Flags at offset 2-3) / RCODE（偏移量 2-3 的标志位）
-    // Flags: QR(1) Opcode(4) AA(1) TC(1) RD(1) RA(1) Z(3) RCODE(4) / 标志位：QR(1) Opcode(4) AA(1) TC(1) RD(1) RA(1) Z(3) RCODE(4)
-    // Byte 3 (index 3) contains RCODE in lower 4 bits / 字节 3（索引 3）在低 4 位包含 RCODE
+    // 1. Flags (Byte 2-3) / 标志位（字节 2-3）
+    // Byte 2: QR(1) Opcode(4) AA(1) TC(1) RD(1)
+    // Byte 3: RA(1) Z(3) RCODE(4)
+    let flags_byte2 = packet[2];
+    let truncated = (flags_byte2 & 0x02) != 0;  // TC bit at position 1
+
     let rcode_u8 = packet[3] & 0x0F;
     let rcode = hickory_proto::op::ResponseCode::from(0, rcode_u8);
 
@@ -218,9 +225,9 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     let an_count = u16::from_be_bytes([packet[6], packet[7]]);
     // We don't strictly need NS and AR counts for TTL, but we iterate through them if we want to be thorough. / 对于 TTL，我们并不严格需要 NS 和 AR 计数，但如果想彻底，可以遍历它们
     // For caching, we usually care about Answer section TTLs. / 对于缓存，我们通常关心 Answer 部分的 TTL
-    
+
     if an_count == 0 {
-        return Some(QuickResponse { rcode, min_ttl: 0 });
+        return Some(QuickResponse { rcode, min_ttl: 0, truncated });
     }
 
     let mut pos = 12;
@@ -286,5 +293,5 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
         min_ttl = 0;
     }
 
-    Some(QuickResponse { rcode, min_ttl })
+    Some(QuickResponse { rcode, min_ttl, truncated })
 }

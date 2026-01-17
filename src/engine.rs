@@ -803,20 +803,34 @@ impl Engine {
                 match resp {
                     Ok(raw) => {
                         // Optimization: Use quick response parse if no complex matching is needed
-                        let (rcode, ttl_secs, msg_opt) = if response_matchers.is_empty() && response_actions_on_match.is_empty() && response_actions_on_miss.is_empty() {
+                        // Also handles TC (Truncated) flag check for RFC 1035 compliance
+                        let (rcode, ttl_secs, msg_opt, truncated) = if response_matchers.is_empty() && response_actions_on_match.is_empty() && response_actions_on_miss.is_empty() {
                             if let Some(qr) = crate::proto_utils::parse_response_quick(&raw) {
-                                (qr.rcode, qr.min_ttl as u64, None)
+                                (qr.rcode, qr.min_ttl as u64, None, qr.truncated)
                             } else {
-                                // Fallback
+                                // Fallback: parse full message, extract TC from raw bytes
                                 let msg = Message::from_bytes(&raw).context("parse upstream response")?;
                                 let ttl = extract_ttl(&msg);
-                                (msg.response_code(), ttl, Some(msg))
+                                let tc = raw.len() >= 3 && (raw[2] & 0x02) != 0;
+                                (msg.response_code(), ttl, Some(msg), tc)
                             }
                         } else {
                             let msg = Message::from_bytes(&raw).context("parse upstream response")?;
                             let ttl = extract_ttl(&msg);
-                            (msg.response_code(), ttl, Some(msg))
+                            let tc = raw.len() >= 3 && (raw[2] & 0x02) != 0;
+                            (msg.response_code(), ttl, Some(msg), tc)
                         };
+
+                        // RFC 1035: If TC bit is set, retry over TCP / 如果 TC 标志设置，使用 TCP 重试
+                        if truncated && transport == Transport::Udp {
+                            tracing::debug!(event = "tc_flag_retry", upstream = %upstream, "response truncated, retrying with tcp");
+                            drop(cleanup_guard);
+                            let tcp_resp = self.forward_upstream(packet, &upstream, upstream_timeout, Transport::Tcp).await?;
+                            if let Some(_g) = self.inflight.get(&dedupe_hash) {
+                                self.notify_inflight_waiters(dedupe_hash, &tcp_resp).await;
+                            }
+                            return Ok(tcp_resp);
+                        }
 
                         let effective_ttl = Duration::from_secs(ttl_secs.max(min_ttl.as_secs()));
 
@@ -1389,7 +1403,16 @@ impl Engine {
 
         for (idx, dur) in attempts.iter().enumerate() {
             match self.udp_client.send(packet, upstream, *dur).await {
-                Ok(bytes) => return Ok(bytes),
+                Ok(bytes) => {
+                    // RFC 1035: Check TC (Truncated) flag using quick parse - 使用快速解析检查 TC 标志
+                    if let Some(qr) = crate::proto_utils::parse_response_quick(&bytes) {
+                        if qr.truncated {
+                            debug!(event = "tc_flag_fallback", upstream = %upstream, "udp response truncated, retrying with tcp");
+                            return self.tcp_mux.send(packet, upstream, timeout_dur).await;
+                        }
+                    }
+                    return Ok(bytes);
+                }
                 Err(err) => {
                     debug!(
                         event = "udp_forward_retry",
