@@ -486,6 +486,7 @@ impl Engine {
 
     #[inline]
     fn insert_rule_cache(&self, hash: u64, pipeline_id: Arc<str>, qname: &str, client_ip: IpAddr, decision: Decision, uses_client_ip: bool) {
+        let state = self.state.load();
         let ttl = match &decision {
             Decision::Static { answers, .. } => {
                 let min_ttl = answers.iter().map(|r| r.ttl()).min();
@@ -498,18 +499,25 @@ impl Engine {
                 ..
             } => {
                 // If it has response-phase logic, it is not "static" in the user's terms.
-                // Give it a 60s default TTL to allow periodic re-evaluation if needed.
+                // It should expire based on the configured min_ttl.
                 if !response_matchers.is_empty()
                     || !response_actions_on_match.is_empty()
                     || !response_actions_on_miss.is_empty()
                 {
-                    Some(Duration::from_secs(60))
+                    Some(Duration::from_secs(state.pipeline.settings.min_ttl as u64))
                 } else {
                     None // Permanent
                 }
             }
             _ => None, // Jump, Allow, Deny are permanent
         };
+
+        // If TTL is 0, do not cache / 如果 TTL 为 0，则不缓存
+        if let Some(d) = ttl {
+            if d.as_secs() == 0 {
+                return;
+            }
+        }
 
         let expires_at = ttl.map(|d| Instant::now() + d);
 
