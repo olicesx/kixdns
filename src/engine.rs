@@ -417,12 +417,17 @@ impl Engine {
         if let Some(hit) = self.cache.get(&cache_hash) {
             // Verify collision / 验证冲突
             if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == q.qname.as_ref() && hit.pipeline_id == pipeline_id {
-                self.incr_fastpath_hits();
-                return Ok(Some(FastPathResponse::CacheHit {
-                    cached: hit.bytes.clone(),
-                    tx_id: q.tx_id,
-                    inserted_at: hit.inserted_at,
-                }));
+                // Check if expired / 检查是否已过期
+                if hit.inserted_at.elapsed().as_secs() >= hit.original_ttl as u64 {
+                    self.cache.invalidate(&cache_hash);
+                } else {
+                    self.incr_fastpath_hits();
+                    return Ok(Some(FastPathResponse::CacheHit {
+                        cached: hit.bytes.clone(),
+                        tx_id: q.tx_id,
+                        inserted_at: hit.inserted_at,
+                    }));
+                }
             }
         }
 
@@ -542,38 +547,43 @@ impl Engine {
         // moka 同步缓存自动处理过期，无需检查 expires_at / moka sync cache automatically handles expiration, no need to check expires_at
         if let Some(hit) = self.cache.get(&dedupe_hash) {
             if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == *qname_ref && hit.pipeline_id == pipeline_id {
-                let latency = start.elapsed();
-                // clone bytes and rewrite transaction ID to match requester / 克隆字节并重写事务 ID 以匹配请求者
-                let mut resp_bytes = BytesMut::with_capacity(hit.bytes.len());
-                resp_bytes.extend_from_slice(&hit.bytes);
+                let elapsed_secs = hit.inserted_at.elapsed().as_secs();
+                if elapsed_secs >= hit.original_ttl as u64 {
+                    self.cache.invalidate(&dedupe_hash);
+                } else {
+                    let latency = start.elapsed();
+                    // clone bytes and rewrite transaction ID to match requester / 克隆字节并重写事务 ID 以匹配请求者
+                    let mut resp_bytes = BytesMut::with_capacity(hit.bytes.len());
+                    resp_bytes.extend_from_slice(&hit.bytes);
 
-                // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
-                let elapsed = hit.inserted_at.elapsed().as_secs() as u32;
-                if elapsed > 0 {
-                    crate::proto_utils::patch_all_ttls(&mut resp_bytes, elapsed);
-                }
+                    // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
+                    let elapsed = elapsed_secs as u32;
+                    if elapsed > 0 {
+                        crate::proto_utils::patch_all_ttls(&mut resp_bytes, elapsed);
+                    }
 
-                if resp_bytes.len() >= 2 {
-                    let id_bytes = tx_id.to_be_bytes();
-                    resp_bytes[0] = id_bytes[0];
-                    resp_bytes[1] = id_bytes[1];
+                    if resp_bytes.len() >= 2 {
+                        let id_bytes = tx_id.to_be_bytes();
+                        resp_bytes[0] = id_bytes[0];
+                        resp_bytes[1] = id_bytes[1];
+                    }
+                    let resp_bytes = resp_bytes.freeze();
+                    debug!(
+                        event = "dns_response",
+                        upstream = %hit.source,
+                        qname = %qname_ref,
+                        qtype = ?qtype,
+                        rcode = ?hit.rcode,
+                        original_ttl = hit.original_ttl,
+                        elapsed_secs = elapsed,
+                        latency_ms = latency.as_millis() as u64,
+                        client_ip = %peer.ip(),
+                        pipeline = %pipeline_id,
+                        cache = true,
+                        "cache hit"
+                    );
+                    return Ok(resp_bytes);
                 }
-                let resp_bytes = resp_bytes.freeze();
-                debug!(
-                    event = "dns_response",
-                    upstream = %hit.source,
-                    qname = %qname_ref,
-                    qtype = ?qtype,
-                    rcode = ?hit.rcode,
-                    original_ttl = hit.original_ttl,
-                    elapsed_secs = elapsed,
-                    latency_ms = latency.as_millis() as u64,
-                    client_ip = %peer.ip(),
-                    pipeline = %pipeline_id,
-                    cache = true,
-                    "cache hit"
-                );
-                return Ok(resp_bytes);
             }
         }
 
@@ -2947,6 +2957,41 @@ mod tests {
         
         // Hash with IP should differ from hash without IP
         assert_ne!(h1_no_ip, h1_with_ip, "Hash with IP should differ from hash without IP");
+    }
+
+    #[tokio::test]
+    async fn test_cache_expiration_triggers_requery() {
+        let engine = build_test_engine();
+        let pipeline_id = Arc::from("default");
+        let qname = "expire.com";
+        let qtype = RecordType::A;
+        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(&pipeline_id, qname, qtype);
+
+        // Insert an entry that expired 1 second ago
+        let entry = CacheEntry {
+            bytes: Bytes::from_static(b"old_resp"),
+            rcode: ResponseCode::NoError,
+            source: Arc::from("old_source"),
+            qname: Arc::from(qname),
+            pipeline_id: pipeline_id.clone(),
+            qtype: u16::from(qtype),
+            inserted_at: Instant::now() - Duration::from_secs(10),
+            original_ttl: 5, // Expired 5 seconds ago
+        };
+        engine.cache.insert(dedupe_hash, entry);
+
+        // handle_packet_fast should return None (cache miss due to expiration)
+        let mut packet = vec![0u8; 12];
+        packet[0] = 0xAA; packet[1] = 0xBB; // TXID
+        packet[5] = 1; // QDCOUNT
+        packet.extend_from_slice(b"\x06expire\x03com\x00\x00\x01\x00\x01");
+
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        let fast_res = engine.handle_packet_fast(&packet, peer).unwrap();
+        assert!(fast_res.is_none(), "Expired cache should result in None from handle_packet_fast");
+        
+        // Cache should have been invalidated
+        assert!(engine.cache.get(&dedupe_hash).is_none(), "Cache entry should be removed after expiration check");
     }
 
     #[test]
