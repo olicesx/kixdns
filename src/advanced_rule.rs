@@ -216,10 +216,29 @@ fn compile_matcher(m: &RuntimeMatcher) -> CompiledMatcher {
         RuntimeMatcher::DomainRegex { regex } => CompiledMatcher::Regex {
             regex: regex.clone(),
         },
+        RuntimeMatcher::GeoipCountry { country_codes } => CompiledMatcher::Complex {
+            matcher: RuntimeMatcher::GeoipCountry {
+                country_codes: country_codes.clone(),
+            },
+        },
+        RuntimeMatcher::GeoipPrivate { expect } => CompiledMatcher::Complex {
+            matcher: RuntimeMatcher::GeoipPrivate { expect: *expect },
+        },
         RuntimeMatcher::Qclass { value } => CompiledMatcher::Qclass { qclass: *value },
         RuntimeMatcher::EdnsPresent { expect } => CompiledMatcher::Complex {
             matcher: RuntimeMatcher::EdnsPresent { expect: *expect },
         },
+        RuntimeMatcher::GeoSite { tag } => CompiledMatcher::Complex {
+            matcher: RuntimeMatcher::GeoSite {
+                tag: tag.clone(),
+            },
+        },
+        RuntimeMatcher::GeoSiteNot { tag } => CompiledMatcher::Complex {
+            matcher: RuntimeMatcher::GeoSiteNot {
+                tag: tag.clone(),
+            },
+        },
+        RuntimeMatcher::Qtype { value } => CompiledMatcher::QueryType { qtype: *value },
     }
 }
 
@@ -300,8 +319,29 @@ fn compiled_matcher_matches(
             RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value),
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
+            RuntimeMatcher::GeoipCountry { country_codes: _ } => {
+                // GeoIP matching requires GeoIpManager integration
+                // For now, return false (will be implemented in Engine integration)
+                false
+            }
+            RuntimeMatcher::GeoipPrivate { expect: _ } => {
+                // GeoIP private IP detection requires GeoIpManager integration
+                // For now, return false (will be implemented in Engine integration)
+                false
+            }
             RuntimeMatcher::Qclass { value } => *value == qclass,
             RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
+            RuntimeMatcher::GeoSite { tag: _ } => {
+                // GeoSite matching requires GeoSiteManager integration
+                // For now, return false (will be implemented in Engine integration)
+                false
+            }
+            RuntimeMatcher::GeoSiteNot { tag: _ } => {
+                // GeoSite negation matching requires GeoSiteManager integration
+                // For now, return false (will be implemented in Engine integration)
+                false
+            }
+            RuntimeMatcher::Qtype { value } => *value == qtype,
         },
     }
 }

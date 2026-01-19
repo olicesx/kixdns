@@ -285,6 +285,23 @@
                 <div v-if="hasField(m.type, 'expect')" class="input-group-text bg-white">
                     <input type="checkbox" class="form-check-input mt-0" v-model="m.expect"> &nbsp;Expect
                 </div>
+                
+                <!-- GeoIP Country Codes -->
+                <input v-if="hasField(m.type, 'country_codes')" type="text" class="form-control" v-model="m.country_codes" placeholder="逗号分隔的国家代码 (e.g. CN,US,JP)">
+                
+                <!-- QType Dropdown -->
+                <select v-if="hasField(m.type, 'value') && m.type === 'qtype'" class="form-select" v-model="m.value">
+                    <option value="A">A</option>
+                    <option value="AAAA">AAAA</option>
+                    <option value="CNAME">CNAME</option>
+                    <option value="MX">MX</option>
+                    <option value="TXT">TXT</option>
+                    <option value="NS">NS</option>
+                    <option value="PTR">PTR</option>
+                    <option value="SOA">SOA</option>
+                    <option value="SRV">SRV</option>
+                    <option value="OPT">OPT</option>
+                </select>
 
                 <button class="btn btn-outline-danger" @click="matchers.splice(idx, 1)">×</button>
             </div>
@@ -359,6 +376,11 @@
             'domain_regex': ['value'],
             'qclass': ['value'],
             'edns_present': ['expect'],
+            'geosite': ['value'],
+            'geosite_not': ['value'],
+            'geoip_country': ['country_codes'],
+            'geoip_private': ['expect'],
+            'qtype': ['value'],
             'upstream_equals': ['value'],
             'request_domain_suffix': ['value'],
             'request_domain_regex': ['value'],
@@ -396,9 +418,16 @@
                     // Keep type, clear others
                     const type = m.type;
                     for (const key in m) { if (key !== 'type' && key !== 'operator') delete m[key]; }
-                    if (hasField(type, 'value')) m.value = '';
+                    if (hasField(type, 'value')) {
+                        if (type === 'qtype') {
+                            m.value = 'A'; // Default QType
+                        } else {
+                            m.value = '';
+                        }
+                    }
                     if (hasField(type, 'cidr')) m.cidr = '';
                     if (hasField(type, 'expect')) m.expect = true;
+                    if (hasField(type, 'country_codes')) m.country_codes = '';
                     if (!m.operator) m.operator = DEFAULT_MATCH_OPERATOR;
                 };
                 return { addMatcher, hasField, resetMatcherFields };
@@ -491,7 +520,12 @@
                     'domain_regex': 'Domain Regex',
                     'any': 'Any',
                     'qclass': 'QClass',
-                    'edns_present': 'EDNS Present'
+                    'edns_present': 'EDNS Present',
+                    'geosite': 'GeoSite',
+                    'geosite_not': 'GeoSite Not',
+                    'geoip_country': 'GeoIP Country',
+                    'geoip_private': 'GeoIP Private',
+                    'qtype': 'QType'
                 };
                 const requestMatcherTypes = {
                     'any': 'Any',
@@ -499,7 +533,12 @@
                     'domain_regex': 'Domain Regex',
                     'client_ip': 'Client IP',
                     'qclass': 'QClass',
-                    'edns_present': 'EDNS Present'
+                    'edns_present': 'EDNS Present',
+                    'geosite': 'GeoSite',
+                    'geosite_not': 'GeoSite Not',
+                    'geoip_country': 'GeoIP Country',
+                    'geoip_private': 'GeoIP Private',
+                    'qtype': 'QType'
                 };
                 const responseMatcherTypes = {
                     'upstream_equals': 'Upstream Equals',

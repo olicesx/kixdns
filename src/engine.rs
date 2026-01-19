@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicUsize, AtomicU64, Ordering};
@@ -34,6 +35,7 @@ use crate::matcher::{
     RuntimePipeline, RuntimePipelineConfig, RuntimeResponseMatcherWithOp, eval_match_chain,
 };
 use crate::proto_utils::parse_quick;
+use crate::geoip::GeoIpManager;
 
 // Metrics use simple atomic increments with Relaxed ordering.
 // On x86-64, Relaxed fetch_add compiles to a single `lock add` instruction,
@@ -94,6 +96,11 @@ pub struct Engine {
     cache_background_refresh: bool,
     cache_refresh_threshold_percent: u8,
     cache_refresh_min_ttl: u32,
+    // GeoIP manager for geographic IP-based routing / GeoIP 管理器用于基于地理位置的 IP 路由
+    pub geoip_manager: Arc<GeoIpManager>,
+    // GeoSite manager for domain category-based routing / GeoSite 管理器用于域名分类路由
+    // 使用 Mutex 以支持热重载时的线程安全更新 / Use Mutex for thread-safe updates during hot reload
+    pub geosite_manager: Arc<std::sync::Mutex<crate::geosite::GeoSiteManager>>,
 }
 
 /// Adaptive flow control state for dynamic semaphore adjustment
@@ -203,12 +210,70 @@ impl Engine {
         let cache_refresh_threshold_percent = cfg.settings.cache_refresh_threshold_percent;
         let cache_refresh_min_ttl = cfg.settings.cache_refresh_min_ttl;
         
+        // Extract GeoIP settings before moving cfg / 在 move cfg 之前提取 GeoIP 设置
+        let geoip_db_path = cfg.settings.geoip_db_path.clone();
+        let geoip_cache_capacity = cfg.settings.geoip_cache_capacity;
+        let geoip_cache_ttl = cfg.settings.geoip_cache_ttl;
+        
+        // Extract GeoSite settings before moving cfg / 在 move cfg 之前提取 GeoSite 设置
+        let geosite_data_paths = cfg.settings.geosite_data_paths.clone();
+        
         let compiled = compile_pipelines(&cfg);
         
         let state = Arc::new(ArcSwap::from_pointee(EngineInner {
             pipeline: cfg,
             compiled_pipelines: compiled,
         }));
+
+        // Initialize GeoIpManager / 初始化 GeoIpManager
+        let geoip_manager = match GeoIpManager::new(
+            geoip_db_path,
+            geoip_cache_capacity,
+            geoip_cache_ttl,
+        ) {
+            Ok(manager) => Arc::new(manager),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to initialize GeoIpManager, running without GeoIP support");
+                // Create a dummy manager that always returns empty results
+                Arc::new(GeoIpManager::new(None, 1, 1).unwrap())
+            }
+        };
+
+        // Initialize GeoSiteManager / 初始化 GeoSiteManager
+        // GeoSiteManager starts empty and is populated via add_entry() calls
+        // Default capacity: 10000 entries, TTL: 3600 seconds
+        let geosite_manager = Arc::new(std::sync::Mutex::new(
+            crate::geosite::GeoSiteManager::new(10000, 3600)
+        ));
+        
+        // Load GeoSite data from configured files / 从配置的文件加载 GeoSite 数据
+        let mut geosite_paths_for_watcher = Vec::new();
+        for path_str in &geosite_data_paths {
+            let path = PathBuf::from(path_str);
+            if path.exists() {
+                // Load data from file / 从文件加载数据
+                let mut manager_guard = geosite_manager.lock().unwrap();
+                match manager_guard.load_from_v2ray_file(&path) {
+                    Ok(count) => {
+                        info!(path = %path.display(), loaded_count = count, "loaded GeoSite data from file");
+                        geosite_paths_for_watcher.push(path);
+                    }
+                    Err(e) => {
+                        warn!(path = %path.display(), error = %e, "failed to load GeoSite data, skipping");
+                    }
+                }
+            } else {
+                warn!(path = %path.display(), "GeoSite data file not found, skipping");
+            }
+        }
+        
+        // Start GeoSite watcher for hot-reload / 启动 GeoSite watcher 用于热重载
+        if !geosite_paths_for_watcher.is_empty() {
+            crate::geosite::spawn_geosite_watcher(
+                geosite_paths_for_watcher,
+                Arc::clone(&geosite_manager),
+            );
+        }
 
         let flow_control_state = Arc::new(FlowControlState {
             max_permits: AtomicUsize::new(flow_control_max_permits),
@@ -254,6 +319,10 @@ impl Engine {
             cache_background_refresh,
             cache_refresh_threshold_percent,
             cache_refresh_min_ttl,
+            // GeoIP manager / GeoIP 管理器
+            geoip_manager,
+            // GeoSite manager / GeoSite 管理器
+            geosite_manager,
         }
     }
 
@@ -357,7 +426,7 @@ impl Engine {
     }
 
     #[inline]
-    fn calculate_cache_hash_for_dedupe(pipeline_id: &str, qname: &str, qtype: hickory_proto::rr::RecordType) -> u64 {
+    pub fn calculate_cache_hash_for_dedupe(pipeline_id: &str, qname: &str, qtype: hickory_proto::rr::RecordType, qclass: hickory_proto::rr::DNSClass) -> u64 {
         let mut h = FxHasher::default();
         pipeline_id.hash(&mut h);
         // Hash qname case-insensitively without allocation / 不分配内存地进行不区分大小写的 qname 哈希
@@ -366,6 +435,8 @@ impl Engine {
         }
         // RecordType implements Copy+Debug, hash by its u16 representation / RecordType 实现了 Copy+Debug，使用其 u16 表示进行哈希
         u16::from(qtype).hash(&mut h);
+        // DNSClass implements Copy+Debug, hash by its u16 representation / DNSClass 实现了 Copy+Debug，使用其 u16 表示进行哈希
+        u16::from(qclass).hash(&mut h);
         h.finish()
     }
 
@@ -413,18 +484,22 @@ impl Engine {
         let state = self.state.load();
         let cfg = &state.pipeline;
         let qclass = DNSClass::from(q.qclass);
+        let qtype = hickory_proto::rr::RecordType::from(q.qtype);
+        let geosite_mgr = self.geosite_manager.lock().unwrap();
         let (pipeline_opt, pipeline_id) = select_pipeline(
             cfg,
             q.qname.as_ref(),
             peer.ip(),
             qclass,
             q.edns_present,
+            qtype,
             &self.listener_label,
+            Some(&*geosite_mgr),
         );
         
         // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
-        let cache_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, q.qname.as_ref(), qtype);
+        let cache_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, q.qname.as_ref(), qtype, qclass);
         
         if let Some(hit) = self.cache.get(&cache_hash) {
             // Verify collision / 验证冲突
@@ -602,16 +677,23 @@ impl Engine {
 
         let start = std::time::Instant::now();
 
-        let (pipeline_opt, pipeline_id) = select_pipeline(
-            cfg,
-            qname_ref,
-            peer.ip(),
-            qclass,
-            edns_present,
-            &self.listener_label,
-        );
+        // 限制 geosite_mgr 的作用域，确保在 await 之前释放锁
+        // Scope geosite_mgr to ensure lock is released before await
+        let (pipeline_opt, pipeline_id) = {
+            let geosite_mgr = self.geosite_manager.lock().unwrap();
+            select_pipeline(
+                cfg,
+                qname_ref,
+                peer.ip(),
+                qclass,
+                edns_present,
+                qtype,
+                &self.listener_label,
+                Some(&*geosite_mgr),
+            )
+        }; // geosite_mgr 在这里释放 / geosite_mgr released here
 
-        let dedupe_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, qname_ref, qtype);
+        let dedupe_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, qname_ref, qtype, qclass);
         // moka 同步缓存自动处理过期，无需检查 expires_at / moka sync cache automatically handles expiration, no need to check expires_at
         if let Some(hit) = self.cache.get(&dedupe_hash) {
             if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == *qname_ref && hit.pipeline_id == pipeline_id {
@@ -658,7 +740,7 @@ impl Engine {
         let qname = qname_cow.into_owned();
         let mut skip_rules: HashSet<Arc<str>> = HashSet::new();
         let mut current_pipeline_id = pipeline_id.clone();
-        let mut dedupe_hash = Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, &qname, qtype);
+        let mut dedupe_hash = Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, &qname, qtype, qclass);
         let mut dedupe_registered = false;
         let mut reused_response: Option<ResponseContext> = None;
 
@@ -717,7 +799,7 @@ impl Engine {
                     }
                     if let Some(p) = cfg.pipelines.iter().find(|p| p.id == *pipeline) {
                         current_pipeline_id = p.id.clone();
-                        dedupe_hash = Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, &qname, qtype);
+                        dedupe_hash = Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, &qname, qtype, qclass);
                         dedupe_registered = false;
                         skip_rules.clear();
                         decision = self.apply_rules(
@@ -1329,7 +1411,10 @@ impl Engine {
             let req_match = eval_match_chain(
                 &rule.matchers,
                 |m| m.operator,
-                |m| matcher_matches(&m.matcher, qname, qclass, client_ip, edns_present),
+                |m| {
+                    let geosite_mgr = self.geosite_manager.lock().unwrap();
+                    matcher_matches(&m.matcher, qname, qclass, client_ip, edns_present, qtype, Some(&self.geoip_manager), Some(&*geosite_mgr))
+                },
             );
 
             if req_match {
@@ -1957,7 +2042,7 @@ impl Engine {
                 return Ok(resp_bytes);
             };
 
-            let dedupe_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, qname, qtype);
+            let dedupe_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, qname, qtype, qclass);
             
             let mut decision = self.apply_rules(
                 state,
@@ -2262,19 +2347,21 @@ impl Engine {
     }
 }
 
-fn select_pipeline<'a>(
+pub fn select_pipeline<'a>(
     cfg: &'a RuntimePipelineConfig,
     qname: &str,
     client_ip: IpAddr,
     qclass: DNSClass,
     edns_present: bool,
+    qtype: hickory_proto::rr::RecordType,
     listener_label: &str,
+    geosite_manager: Option<&crate::geosite::GeoSiteManager>,
 ) -> (Option<&'a RuntimePipeline>, Arc<str>) {
     for rule in &cfg.pipeline_select {
         let matched = eval_match_chain(
             &rule.matchers,
             |m| m.operator,
-            |m| m.matcher.matches(listener_label, client_ip, qname, qclass, edns_present),
+            |m| m.matcher.matches_with_qtype(listener_label, client_ip, qname, qclass, edns_present, qtype, geosite_manager),
         );
         if matched {
             if let Some(p) = cfg.pipelines.iter().find(|p| p.id.as_ref() == rule.pipeline) {
@@ -2700,8 +2787,11 @@ fn matcher_matches(
     qclass: DNSClass,
     client_ip: IpAddr,
     edns_present: bool,
+    qtype: hickory_proto::rr::RecordType,
+    geoip_manager: Option<&crate::geoip::GeoIpManager>,
+    geosite_manager: Option<&crate::geosite::GeoSiteManager>,
 ) -> bool {
-    matcher.matches(qname, qclass, client_ip, edns_present)
+    matcher.matches_with_qtype(qname, qclass, client_ip, edns_present, qtype, geoip_manager, geosite_manager)
 }
 
 fn log_match(level: Option<&str>, rule_name: &str, qname: &str, client_ip: IpAddr) {
@@ -2868,7 +2958,9 @@ mod tests {
             "127.0.0.1".parse().unwrap(),
             hickory_proto::rr::DNSClass::IN,
             false,
+            hickory_proto::rr::RecordType::A,
             "edge",
+            None,
         );
         assert!(opt.is_some());
         assert_eq!(id.as_ref(), "p2");
@@ -2902,7 +2994,9 @@ mod tests {
             "127.0.0.1".parse().unwrap(),
             hickory_proto::rr::DNSClass::IN,
             false,
+            hickory_proto::rr::RecordType::A,
             "edge",
+            None,
         );
         assert!(opt.is_some());
         assert_eq!(id.as_ref(), "p2");
@@ -3223,7 +3317,8 @@ mod tests {
         let pipeline_id = Arc::from("default");
         let qname = "expire.com";
         let qtype = RecordType::A;
-        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(&pipeline_id, qname, qtype);
+        let qclass = DNSClass::IN;
+        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(&pipeline_id, qname, qtype, qclass);
 
         // Insert an entry that expired 1 second ago
         let entry = CacheEntry {
@@ -3319,6 +3414,152 @@ mod tests {
             expires_at: Some(Instant::now() + Duration::from_secs(60)),
         };
         assert!(entry_fresh.matches("test_p", qname, ip, false), "Fresh entry should match");
+    }
+
+    /// 测试 DNS 响应缓存键包含 QCLASS
+    #[test]
+    fn test_cache_hash_includes_qclass() {
+        let pipeline_id = "default";
+        let qname = "example.com";
+        let qtype = RecordType::A;
+        let qclass_in = DNSClass::IN;
+        let qclass_ch = DNSClass::CH;
+
+        // 计算相同 QNAME+QTYPE 但不同 QCLASS 的哈希
+        let hash_in = Engine::calculate_cache_hash_for_dedupe(
+            &pipeline_id, 
+            qname, 
+            qtype, 
+            qclass_in
+        );
+        let hash_ch = Engine::calculate_cache_hash_for_dedupe(
+            &pipeline_id, 
+            qname, 
+            qtype, 
+            qclass_ch
+        );
+
+        // 验证不同 QCLASS 产生不同的哈希
+        assert_ne!(
+            hash_in, 
+            hash_ch, 
+            "Different QCLASS should produce different cache hashes"
+        );
+
+        // 验证相同 QCLASS 产生相同的哈希
+        let hash_in2 = Engine::calculate_cache_hash_for_dedupe(
+            &pipeline_id, 
+            qname, 
+            qtype, 
+            qclass_in
+        );
+        assert_eq!(
+            hash_in, 
+            hash_in2, 
+            "Same QCLASS should produce same cache hash"
+        );
+    }
+
+    /// 测试域名大小写不敏感
+    #[test]
+    fn test_cache_hash_case_insensitive() {
+        let pipeline_id = "default";
+        let qname_lower = "example.com";
+        let qname_upper = "EXAMPLE.COM";
+        let qname_mixed = "ExAmPlE.cOm";
+        let qtype = RecordType::A;
+        let qclass = DNSClass::IN;
+
+        let hash1 = Engine::calculate_cache_hash_for_dedupe(
+            &pipeline_id, 
+            qname_lower, 
+            qtype, 
+            qclass
+        );
+        let hash2 = Engine::calculate_cache_hash_for_dedupe(
+            &pipeline_id, 
+            qname_upper, 
+            qtype, 
+            qclass
+        );
+        let hash3 = Engine::calculate_cache_hash_for_dedupe(
+            &pipeline_id, 
+            qname_mixed, 
+            qtype, 
+            qclass
+        );
+
+        // 验证大小写不同的域名产生相同的哈希
+        assert_eq!(
+            hash1, 
+            hash2, 
+            "QNAME hash should be case-insensitive"
+        );
+        assert_eq!(
+            hash1, 
+            hash3, 
+            "QNAME hash should be case-insensitive"
+        );
+    }
+
+    /// 测试不同 QTYPE 的哈希也不同
+    #[test]
+    fn test_cache_hash_different_qtype() {
+        let pipeline_id = "default";
+        let qname = "example.com";
+        let qtype_a = RecordType::A;
+        let qtype_aaaa = RecordType::AAAA;
+        let qclass = DNSClass::IN;
+
+        let hash_a = Engine::calculate_cache_hash_for_dedupe(
+            &pipeline_id, 
+            qname, 
+            qtype_a, 
+            qclass
+        );
+        let hash_aaaa = Engine::calculate_cache_hash_for_dedupe(
+            &pipeline_id, 
+            qname, 
+            qtype_aaaa, 
+            qclass
+        );
+
+        // 验证不同 QTYPE 产生不同的哈希
+        assert_ne!(
+            hash_a, 
+            hash_aaaa, 
+            "Different QTYPE should produce different cache hashes"
+        );
+    }
+
+    /// 测试不同 QNAME 的哈希也不同
+    #[test]
+    fn test_cache_hash_different_qname() {
+        let pipeline_id = "default";
+        let qname1 = "example.com";
+        let qname2 = "test.com";
+        let qtype = RecordType::A;
+        let qclass = DNSClass::IN;
+
+        let hash1 = Engine::calculate_cache_hash_for_dedupe(
+            &pipeline_id, 
+            qname1, 
+            qtype, 
+            qclass
+        );
+        let hash2 = Engine::calculate_cache_hash_for_dedupe(
+            &pipeline_id, 
+            qname2, 
+            qtype, 
+            qclass
+        );
+
+        // 验证不同 QNAME 产生不同的哈希
+        assert_ne!(
+            hash1, 
+            hash2, 
+            "Different QNAME should produce different cache hashes"
+        );
     }
 }
 

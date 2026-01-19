@@ -79,7 +79,17 @@ pub struct GlobalSettings {
     /// 缓存后台刷新最小TTL（秒，默认5）。防止TTL过短导致无限循环刷新 / Cache background refresh minimum TTL (seconds, default 5). Prevent infinite refresh loop for very short TTLs
     #[serde(default = "default_cache_refresh_min_ttl")]
     pub cache_refresh_min_ttl: u32,
-}
+    /// GeoIP 数据库文件路径（MMDB 格式） / GeoIP database file path (MMDB format)
+    #[serde(default)]
+    pub geoip_db_path: Option<String>,
+    /// GeoIP 查询结果缓存容量（默认 10000） / GeoIP query result cache capacity (default 10000)
+    #[serde(default = "default_geoip_cache_capacity")]
+    pub geoip_cache_capacity: u64,
+    /// GeoIP 查询结果缓存 TTL（秒，默认 3600） / GeoIP query result cache TTL (seconds, default 3600)
+    #[serde(default = "default_geoip_cache_ttl")]
+    pub geoip_cache_ttl: u64,    /// GeoSite 数据文件路径列表（V2Ray 格式，支持多个文件） / GeoSite data file paths (V2Ray format, supports multiple files)
+    #[serde(default)]
+    pub geosite_data_paths: Vec<String>,}
 
 impl Default for GlobalSettings {
     fn default() -> Self {
@@ -103,6 +113,10 @@ impl Default for GlobalSettings {
             cache_background_refresh: default_cache_background_refresh(),
             cache_refresh_threshold_percent: default_cache_refresh_threshold_percent(),
             cache_refresh_min_ttl: default_cache_refresh_min_ttl(),
+            geoip_db_path: None,
+            geoip_cache_capacity: default_geoip_cache_capacity(),
+            geoip_cache_ttl: default_geoip_cache_ttl(),
+            geosite_data_paths: Vec::new(),
         }
     }
 }
@@ -164,6 +178,14 @@ pub enum Matcher {
     ClientIp {
         cidr: String,
     },
+    /// 匹配客户端IP的GeoIP国家代码（大小写不敏感）。 / Match client IP GeoIP country code (case insensitive)
+    GeoipCountry {
+        country_codes: Vec<String>,
+    },
+    /// 匹配客户端IP是否为私有IP（内网）。 / Match whether client IP is private (internal network)
+    GeoipPrivate {
+        expect: bool,
+    },
     /// 匹配查询 QCLASS（如 IN/CH/HS）。 / Match query QCLASS (e.g., IN/CH/HS)
     Qclass {
         value: String,
@@ -172,6 +194,16 @@ pub enum Matcher {
     EdnsPresent {
         expect: bool,
     },
+    /// GeoSite 分类匹配（如 "cn", "google", "category-ads"）。 / GeoSite category matching (e.g., "cn", "google", "category-ads")
+    GeoSite {
+        value: String,
+    },
+    /// GeoSite 否定匹配（匹配不在该分类的域名）。 / GeoSite negation matching (match domains NOT in category)
+    GeoSiteNot {
+        value: String,
+    },
+    /// 请求 QTYPE（如 A/AAAA/CNAME/TXT/MX 等）。 / Request QTYPE (e.g., A/AAAA/CNAME/TXT/MX, etc.)
+    Qtype { value: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -191,6 +223,16 @@ pub enum PipelineSelectorMatcher {
     Qclass { value: String },
     /// 请求是否携带 EDNS。 / Whether request carries EDNS
     EdnsPresent { expect: bool },
+    /// GeoSite 分类匹配（如 "cn", "google", "category-ads"）。 / GeoSite category matching (e.g., "cn", "google", "category-ads")
+    GeoSite {
+        value: String,
+    },
+    /// GeoSite 否定匹配（匹配不在该分类的域名）。 / GeoSite negation matching (match domains NOT in category)
+    GeoSiteNot {
+        value: String,
+    },
+    /// 请求 QTYPE（如 A/AAAA/CNAME/TXT/MX 等）。 / Request QTYPE (e.g., A/AAAA/CNAME/TXT/MX, etc.)
+    Qtype { value: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -516,6 +558,14 @@ fn default_cache_refresh_threshold_percent() -> u8 {
 
 fn default_cache_refresh_min_ttl() -> u32 {
     5
+}
+
+fn default_geoip_cache_capacity() -> u64 {
+    10000
+}
+
+fn default_geoip_cache_ttl() -> u64 {
+    3600
 }
 
 /// 反序列化 upstream 字段，支持字符串、逗号分隔字符串或数组格式

@@ -2,6 +2,8 @@ mod advanced_rule;
 mod cache;
 mod config;
 mod engine;
+mod geoip;
+mod geosite;
 mod matcher;
 mod proto_utils;
 mod watcher;
