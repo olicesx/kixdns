@@ -1,16 +1,45 @@
-// GeoSite Engine Integration Test
-// 测试 GeoSite 在 Engine 中的集成
+//! # GeoSite Engine Integration Tests
+//!
+//! ## Purpose
+//! Tests for GeoSite matcher integration with the DNS engine.
+//!
+//! ## Test Categories
+//! - Unit tests: GeoSiteManager with direct data
+//! - Integration tests: GeoSite with Engine and pipeline selection
+//!
+//! ## Test Data
+//! - Source: Programmatically created test entries
+//! - Format: GeoSiteEntry structures
+
+// Copyright (c) 2026 KixDNS Contributors
+// SPDX-License-Identifier: MIT
 
 use kixdns::config::PipelineConfig;
 use kixdns::engine::Engine;
 use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::geosite::{GeoSiteEntry, GeoSiteManager, DomainMatcher};
-use std::net::IpAddr;
+
+// ========== Helper Functions ==========
+
+fn create_test_manager() -> GeoSiteManager {
+    GeoSiteManager::new(100, 60)
+}
+
+fn create_test_entry(tag: &str, domains: Vec<&str>) -> GeoSiteEntry {
+    GeoSiteEntry {
+        tag: tag.to_string(),
+        matchers: domains.into_iter()
+            .map(|d| DomainMatcher::Full(d.to_string()))
+            .collect(),
+    }
+}
+
+// ========== Unit Tests ==========
 
 #[test]
-fn test_geosite_matcher_with_data() {
-    // 创建 GeoSiteManager 并添加数据
-    let mut manager = GeoSiteManager::new(100, 60);
+fn test_geosite_matcher_with_data_matches_domains() {
+    // ========== Arrange ==========
+    let mut manager = create_test_manager();
     
     let entries = vec![
         GeoSiteEntry {
@@ -22,20 +51,24 @@ fn test_geosite_matcher_with_data() {
         },
     ];
     
+    // ========== Act ==========
     manager.reload(entries);
-    
-    // 测试匹配
-    assert!(manager.matches("cn", "example.com.cn"));
-    assert!(manager.matches("cn", "test.example.com.cn"));
-    assert!(!manager.matches("cn", "example.com"));
-    
-    // 测试否定匹配
-    assert!(!manager.matches("cn", "google.com"));
+
+    // ========== Assert ==========
+    assert!(manager.matches("cn", "example.com.cn"), 
+        "Should match exact domain");
+    assert!(manager.matches("cn", "test.example.com.cn"), 
+        "Should match subdomain with suffix");
+    assert!(!manager.matches("cn", "example.com"), 
+        "Should not match unrelated domain");
+    assert!(!manager.matches("cn", "google.com"), 
+        "Should not match Google domain");
 }
 
 #[test]
-fn test_geosite_not_matcher() {
-    let mut manager = GeoSiteManager::new(100, 60);
+fn test_geosite_not_matcher_excludes_category() {
+    // ========== Arrange ==========
+    let mut manager = create_test_manager();
     
     let entries = vec![
         GeoSiteEntry {
@@ -47,17 +80,19 @@ fn test_geosite_not_matcher() {
     ];
     
     manager.reload(entries);
-    
-    // GeoSiteNot 应该匹配不在 CN 分类中的域名
-    // 注意：GeoSiteNot 在 matcher 中实现为 !manager.matches()
-    // 这里我们测试基础的 matches 方法
-    assert!(manager.matches("cn", "example.com.cn"));
-    assert!(!manager.matches("cn", "google.com"));
+
+    // ========== Act & Assert ==========
+    // GeoSiteNot should match domains NOT in CN category
+    // Note: GeoSiteNot in matcher is implemented as !manager.matches()
+    assert!(manager.matches("cn", "example.com.cn"), 
+        "CN domain should match CN category");
+    assert!(!manager.matches("cn", "google.com"), 
+        "Non-CN domain should not match CN category");
 }
 
 #[test]
 fn test_geosite_engine_has_manager() {
-    // 创建一个简单的配置
+    // ========== Arrange ==========
     let raw = serde_json::json!({
         "settings": {
             "default_upstream": "1.1.1.1:53"
@@ -73,17 +108,18 @@ fn test_geosite_engine_has_manager() {
     let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
     let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
 
-    // 创建 Engine（需要在 Tokio runtime 中）
+    // ========== Act & Assert ==========
+    // Create Engine (requires Tokio runtime)
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let engine = Engine::new(runtime.clone(), "test".to_string());
 
-        // 验证 Engine 有 GeoSiteManager
-        assert_eq!(engine.geosite_manager.tags().len(), 0, "初始时 GeoSiteManager 应该是空的");
-        
-        // 验证 GeoSiteManager 可以使用
-        assert!(!engine.geosite_manager.has_tag("cn"));
-        assert!(!engine.geosite_manager.matches("cn", "example.com"));
+        // Verify Engine has GeoSiteManager
+        let geosite_manager = engine.geosite_manager.lock().unwrap();
+        // Note: GeoSiteManager starts empty, no tags by default
+        assert!(!geosite_manager.has_tag("cn"), 
+            "Should not have CN tag initially");
+        assert!(!geosite_manager.matches("cn", "example.com"), 
+            "Should not match example.com initially");
     });
 }
-

@@ -190,39 +190,50 @@ impl GeoSiteManager {
     }
 }
 
+// GeoSite tests / GeoSite 测试
+// Tests for GeoSite domain matching, manager functionality, and caching
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_domain_matcher_full() {
+        // Arrange: Create a full domain matcher
         let matcher = DomainMatcher::Full("google.com".to_string());
-        assert!(matcher.matches("google.com"));
-        assert!(matcher.matches("GOOGLE.COM"));
-        assert!(!matcher.matches("www.google.com"));
+        
+        // Act & Assert: Verify exact match
+        assert!(matcher.matches("google.com"), "Should match exact domain");
+        assert!(matcher.matches("GOOGLE.COM"), "Should match case-insensitively");
+        assert!(!matcher.matches("www.google.com"), "Should not match subdomain");
     }
 
     #[test]
     fn test_domain_matcher_suffix() {
+        // Arrange: Create a suffix domain matcher
         let matcher = DomainMatcher::Suffix(".google.com".to_string());
-        assert!(matcher.matches("www.google.com"));
-        assert!(matcher.matches("mail.google.com"));
-        assert!(!matcher.matches("google.com.hk"));
+        
+        // Act & Assert: Verify suffix matching
+        assert!(matcher.matches("www.google.com"), "Should match subdomain with suffix");
+        assert!(matcher.matches("mail.google.com"), "Should match subdomain with suffix");
+        assert!(!matcher.matches("google.com.hk"), "Should not match different TLD");
     }
 
     #[test]
     fn test_domain_matcher_keyword() {
+        // Arrange: Create a keyword domain matcher
         let matcher = DomainMatcher::Keyword("google".to_string());
-        assert!(matcher.matches("www.google.com"));
-        assert!(matcher.matches("googleapis.com"));
-        assert!(!matcher.matches("www.bing.com"));
+        
+        // Act & Assert: Verify keyword matching
+        assert!(matcher.matches("www.google.com"), "Should match domain containing keyword");
+        assert!(matcher.matches("googleapis.com"), "Should match domain containing keyword");
+        assert!(!matcher.matches("www.bing.com"), "Should not match domain without keyword");
     }
 
     #[test]
     fn test_geosite_manager() {
+        // Arrange: Create GeoSite manager and add Google category
         let mut manager = GeoSiteManager::new(1000, 3600);
         
-        // Add Google category
         manager.add_entry(GeoSiteEntry {
             tag: "google".to_string(),
             matchers: vec![
@@ -232,16 +243,22 @@ mod tests {
             ],
         });
 
-        // Test matches
-        assert!(manager.matches("google", "google.com"));
-        assert!(manager.matches("google", "www.google.com"));
-        assert!(manager.matches("google", "mail.google.com"));
-        assert!(manager.matches("google", "dns.googleapis.com"));
-        assert!(!manager.matches("google", "www.bing.com"));
+        // Act & Assert: Test Google domain matches
+        assert!(manager.matches("google", "google.com"), 
+            "Should match exact Google domain");
+        assert!(manager.matches("google", "www.google.com"), 
+            "Should match Google subdomain");
+        assert!(manager.matches("google", "mail.google.com"), 
+            "Should match Google subdomain");
+        assert!(manager.matches("google", "dns.googleapis.com"), 
+            "Should match Google APIs domain");
+        assert!(!manager.matches("google", "www.bing.com"), 
+            "Should not match non-Google domain");
     }
 
     #[test]
     fn test_geosite_manager_cache() {
+        // Arrange: Create GeoSite manager and add test entry
         let mut manager = GeoSiteManager::new(1000, 3600);
         
         manager.add_entry(GeoSiteEntry {
@@ -251,15 +268,18 @@ mod tests {
             ],
         });
 
-        // First call - not cached
-        assert!(manager.matches("test", "example.com"));
+        // Act & Assert: First call - not cached
+        assert!(manager.matches("test", "example.com"), 
+            "Should match domain on first call");
         
-        // Second call - should use cache
-        assert!(manager.matches("test", "example.com"));
+        // Act & Assert: Second call - should use cache
+        assert!(manager.matches("test", "example.com"), 
+            "Should match domain from cache");
     }
 
     #[test]
     fn test_geosite_manager_multiple_tags() {
+        // Arrange: Create GeoSite manager and add multiple categories
         let mut manager = GeoSiteManager::new(1000, 3600);
         
         // Add CN category
@@ -281,15 +301,21 @@ mod tests {
             ],
         });
 
-        // Test CN matches
-        assert!(manager.matches("cn", "www.baidu.com"));
-        assert!(manager.matches("cn", "example.com.cn"));
-        assert!(!manager.matches("cn", "www.google.com"));
+        // Act & Assert: Test CN matches
+        assert!(manager.matches("cn", "www.baidu.com"), 
+            "Should match CN domain with baidu keyword");
+        assert!(manager.matches("cn", "example.com.cn"), 
+            "Should match CN domain with .com.cn suffix");
+        assert!(!manager.matches("cn", "www.google.com"), 
+            "Should not match non-CN domain");
 
-        // Test ads matches
-        assert!(manager.matches("category-ads", "ads.google.com"));
-        assert!(manager.matches("category-ads", "tracker.adserver.com"));
-        assert!(!manager.matches("category-ads", "www.google.com"));
+        // Act & Assert: Test ads matches
+        assert!(manager.matches("category-ads", "ads.google.com"), 
+            "Should match ads domain with ads keyword");
+        assert!(manager.matches("category-ads", "tracker.adserver.com"), 
+            "Should match ads domain with .adserver.com suffix");
+        assert!(!manager.matches("category-ads", "www.google.com"), 
+            "Should not match non-ads domain");
     }
 }
 
@@ -323,7 +349,8 @@ impl GeoSiteManager {
     /// 
     /// # 示例 / Example
     /// ```no_run
-    /// let manager = GeoSiteManager::new(10000, 3600);
+    /// use kixdns::geosite::GeoSiteManager;
+    /// let mut manager = GeoSiteManager::new(10000, 3600);
     /// let count = manager.load_from_v2ray_file("geosite.json").unwrap();
     /// println!("Loaded {} GeoSite entries", count);
     /// ```

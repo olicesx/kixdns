@@ -2867,6 +2867,9 @@ pub(crate) fn make_static_ip_answer(qname: &str, ip: &str) -> (ResponseCode, Vec
     (ResponseCode::ServFail, Vec::new())
 }
 
+// Engine tests / 引擎测试
+// Tests for DNS engine functionality, including static responses, pipeline selection,
+// cache behavior, and upstream communication
 #[cfg(test)]
 #[allow(unnameable_test_items)]
 mod tests {
@@ -2880,23 +2883,37 @@ mod tests {
 
     #[test]
     fn make_static_ip_answer_returns_ipv4_record() {
-        let (rcode, answers) = make_static_ip_answer("example.com", "1.2.3.4");
-        assert_eq!(rcode, ResponseCode::NoError);
-        assert_eq!(answers.len(), 1);
-        assert_eq!(answers[0].record_type(), RecordType::A);
+        // Arrange: Define test domain and IPv4 address
+        let domain = "example.com";
+        let ipv4 = "1.2.3.4";
+        
+        // Act: Generate static IP answer
+        let (rcode, answers) = make_static_ip_answer(domain, ipv4);
+        
+        // Assert: Verify response code and record type
+        assert_eq!(rcode, ResponseCode::NoError, "Should return NoError for valid IP");
+        assert_eq!(answers.len(), 1, "Should have exactly one answer");
+        assert_eq!(answers[0].record_type(), RecordType::A, "Should be A record for IPv4");
     }
 
     #[test]
     fn make_static_ip_answer_returns_ipv6_record() {
-        let (rcode, answers) = make_static_ip_answer("example.com", "2001:db8::1");
-        assert_eq!(rcode, ResponseCode::NoError);
-        assert_eq!(answers.len(), 1);
-        assert_eq!(answers[0].record_type(), RecordType::AAAA);
+        // Arrange: Define test domain and IPv6 address
+        let domain = "example.com";
+        let ipv6 = "2001:db8::1";
+        
+        // Act: Generate static IP answer
+        let (rcode, answers) = make_static_ip_answer(domain, ipv6);
+        
+        // Assert: Verify response code and record type
+        assert_eq!(rcode, ResponseCode::NoError, "Should return NoError for valid IP");
+        assert_eq!(answers.len(), 1, "Should have exactly one answer");
+        assert_eq!(answers[0].record_type(), RecordType::AAAA, "Should be AAAA record for IPv6");
     }
 
     #[tokio::test]
     async fn tcp_mux_rewrite_id_no_deadlock_under_contention() {
-        // Prepare a client with many pending IDs to force contention on the pending lock.
+        // Arrange: Prepare a TCP client with many pending IDs to force contention
         let client = Arc::new(TcpMuxClient::new(Arc::from("127.0.0.1:0")));
         for id in 1u16..200u16 {
             client.pending.insert(
@@ -2908,7 +2925,7 @@ mod tests {
             );
         }
 
-        // Spawn many concurrent rewrite_id calls; they must all complete quickly and yield unique IDs.
+        // Act: Spawn many concurrent rewrite_id calls to test contention handling
         let tasks = (0..64)
             .map(|_| {
                 let client = Arc::clone(&client);
@@ -2923,6 +2940,7 @@ mod tests {
             .await
             .expect("rewrite_id stalled under contention");
 
+        // Assert: Verify all IDs are unique (no duplicates under contention)
         let mut ids = std::collections::HashSet::new();
         for r in results {
             let id = r.expect("rewrite_id failed");
@@ -2932,13 +2950,21 @@ mod tests {
 
     #[test]
     fn make_static_ip_answer_rejects_invalid_input() {
-        let (rcode, answers) = make_static_ip_answer("example.com", "not-an-ip");
-        assert_eq!(rcode, ResponseCode::ServFail);
-        assert!(answers.is_empty());
+        // Arrange: Define test domain and invalid IP
+        let domain = "example.com";
+        let invalid_ip = "not-an-ip";
+        
+        // Act: Generate static IP answer with invalid input
+        let (rcode, answers) = make_static_ip_answer(domain, invalid_ip);
+        
+        // Assert: Verify ServFail response and empty answers
+        assert_eq!(rcode, ResponseCode::ServFail, "Should return ServFail for invalid IP");
+        assert!(answers.is_empty(), "Should have no answers for invalid IP");
     }
 
     #[test]
     fn pipeline_select_picks_matching_pipeline() {
+        // Arrange: Create configuration with pipeline selection rules
         let raw = serde_json::json!({
             "pipelines": [
                 { "id": "p1", "rules": [] },
@@ -2949,9 +2975,11 @@ mod tests {
             ]
         });
 
+        // Act: Parse and compile configuration
         let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse");
         let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime");
 
+        // Act: Select pipeline for edge listener
         let (opt, id) = select_pipeline(
             &runtime,
             "any.example.com",
@@ -2962,12 +2990,15 @@ mod tests {
             "edge",
             None,
         );
-        assert!(opt.is_some());
-        assert_eq!(id.as_ref(), "p2");
+        
+        // Assert: Verify correct pipeline was selected
+        assert!(opt.is_some(), "Should find matching pipeline");
+        assert_eq!(id.as_ref(), "p2", "Should select p2 pipeline for edge listener");
     }
 
     #[test]
     fn pipeline_select_respects_match_operator_or() {
+        // Arrange: Create configuration with OR operator in pipeline selector
         let raw = serde_json::json!({
             "pipelines": [
                 { "id": "p1", "rules": [] },
@@ -2985,9 +3016,11 @@ mod tests {
             ]
         });
 
+        // Act: Parse and compile configuration
         let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse");
         let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime");
 
+        // Act: Select pipeline for edge listener
         let (opt, id) = select_pipeline(
             &runtime,
             "example.com",
@@ -2998,14 +3031,16 @@ mod tests {
             "edge",
             None,
         );
-        assert!(opt.is_some());
-        assert_eq!(id.as_ref(), "p2");
+        
+        // Assert: Verify correct pipeline was selected
+        assert!(opt.is_some(), "Should find matching pipeline");
+        assert_eq!(id.as_ref(), "p2", "Should select p2 pipeline for edge listener");
     }
 
     #[allow(dead_code)]
     #[tokio::test]
     async fn apply_rules_static_and_forward_allow_jump() {
-        // build a config with rules exercising StaticResponse, Forward, Allow, Jump
+        // Arrange: Build a config with rules exercising StaticResponse, Forward, Allow, Jump
         let raw = serde_json::json!({
             "settings": { "default_upstream": "1.1.1.1:53" },
             "pipelines": [
@@ -3022,13 +3057,13 @@ mod tests {
             ]
         });
 
+        // Act: Parse configuration and create engine
         let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse");
         let runtime = RuntimePipelineConfig::from_config(cfg.clone()).expect("runtime");
-
         let engine = Engine::new(runtime.clone(), "lbl".to_string());
         let state = engine.state.load();
 
-        // StaticResponse should return Static decision
+        // Act: Apply rules - StaticResponse should return Static decision
         let decision = engine.apply_rules(
             &state,
             &state.pipeline.pipelines[0],
@@ -3039,12 +3074,14 @@ mod tests {
             false,
             None,
         );
+
+        // Assert: Verify StaticResponse returns NXDOMAIN
         match decision {
-            Decision::Static { rcode, .. } => assert_eq!(rcode, ResponseCode::NXDomain),
-            _ => panic!("expected static"),
+            Decision::Static { rcode, .. } => assert_eq!(rcode, ResponseCode::NXDomain, "StaticResponse should return NXDOMAIN"),
+            _ => panic!("expected static decision"),
         }
 
-        // Now test Forward action returns Forward with provided upstream and response matchers
+        // Arrange: Test Forward action with provided upstream and response matchers
         let raw2 = serde_json::json!({
             "settings": { "default_upstream": "1.1.1.1:53" },
             "pipelines": [
@@ -3067,6 +3104,7 @@ mod tests {
         let engine2 = Engine::new(runtime2.clone(), "lbl".to_string());
         let state2 = engine2.state.load();
 
+        // Act: Apply rules - Forward should return Forward decision with upstream and matchers
         let decision2 = engine2.apply_rules(
             &state2,
             &state2.pipeline.pipelines[0],
@@ -3077,6 +3115,8 @@ mod tests {
             false,
             None,
         );
+
+        // Assert: Verify Forward action returns correct upstream and matchers
         match decision2 {
             Decision::Forward {
                 upstream,
@@ -3084,14 +3124,14 @@ mod tests {
                 response_matcher_operator,
                 ..
             } => {
-                assert_eq!(upstream.as_ref(), "8.8.8.8:53");
-                assert_eq!(response_matchers.len(), 1);
-                assert_eq!(response_matcher_operator, crate::config::MatchOperator::And);
+                assert_eq!(upstream.as_ref(), "8.8.8.8:53", "Forward should use configured upstream");
+                assert_eq!(response_matchers.len(), 1, "Forward should have one response matcher");
+                assert_eq!(response_matcher_operator, crate::config::MatchOperator::And, "Forward should use AND operator");
             }
-            _ => panic!("expected forward"),
+            _ => panic!("expected forward decision"),
         }
 
-        // Allow action -> forward to default upstream
+        // Arrange: Test Allow action - should forward to default upstream
         let raw3 = serde_json::json!({
             "settings": { "default_upstream": "1.2.3.4:53" },
             "pipelines": [ { "id": "p3", "rules": [ { "name": "a", "matchers": [ { "type": "any" } ], "actions": [ { "type": "allow" } ] } ] } ]
@@ -3101,6 +3141,7 @@ mod tests {
         let engine3 = Engine::new(runtime3.clone(), "lbl".to_string());
         let state3 = engine3.state.load();
 
+        // Act: Apply rules - Allow should forward to default upstream
         let decision3 = engine3.apply_rules(
             &state3,
             &state3.pipeline.pipelines[0],
@@ -3111,12 +3152,14 @@ mod tests {
             false,
             None,
         );
+
+        // Assert: Verify Allow action forwards to default upstream
         match decision3 {
-            Decision::Forward { upstream, .. } => assert_eq!(upstream.as_ref(), "1.2.3.4:53"),
-            _ => panic!("expected forward from allow"),
+            Decision::Forward { upstream, .. } => assert_eq!(upstream.as_ref(), "1.2.3.4:53", "Allow should forward to default upstream"),
+            _ => panic!("expected forward decision from allow"),
         }
 
-        // JumpToPipeline
+        // Arrange: Test JumpToPipeline action
         let raw4 = serde_json::json!({
             "pipelines": [ { "id": "p4", "rules": [ { "name": "j", "matchers": [ { "type": "any" } ], "actions": [ { "type": "jump_to_pipeline", "pipeline": "other" } ] } ] } ]
         });
@@ -3125,6 +3168,7 @@ mod tests {
         let engine4 = Engine::new(runtime4.clone(), "lbl".to_string());
         let state4 = engine4.state.load();
 
+        // Act: Apply rules - JumpToPipeline should return Jump decision
         let decision4 = engine4.apply_rules(
             &state4,
             &state4.pipeline.pipelines[0],
@@ -3135,9 +3179,11 @@ mod tests {
             false,
             None,
         );
+
+        // Assert: Verify JumpToPipeline returns correct target pipeline
         match decision4 {
-            Decision::Jump { pipeline } => assert_eq!(pipeline.as_ref(), "other"),
-            _ => panic!("expected jump"),
+            Decision::Jump { pipeline } => assert_eq!(pipeline.as_ref(), "other", "JumpToPipeline should jump to target pipeline"),
+            _ => panic!("expected jump decision"),
         }
     }
 
@@ -3171,6 +3217,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_actions_allow_returns_upstream_on_match() {
+        // Arrange: Build test engine and response context
         let engine = build_test_engine();
         let ctx = build_response_context();
         let req = Message::new();
@@ -3182,6 +3229,7 @@ mod tests {
         let packet = [0u8];
         let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
 
+        // Act: Apply response actions with Allow action
         let result = engine
             .apply_response_actions(
                 &actions,
@@ -3202,10 +3250,11 @@ mod tests {
             .await
             .expect("response actions allow should succeed");
 
+        // Assert: Verify Allow action returns upstream result with match=true
         match result {
             ResponseActionResult::Upstream { ctx, resp_match } => {
-                assert!(resp_match);
-                assert_eq!(ctx.upstream.as_ref(), TEST_UPSTREAM);
+                assert!(resp_match, "Allow action should match response type");
+                assert_eq!(ctx.upstream.as_ref(), TEST_UPSTREAM, "Allow should use test upstream");
             }
             _ => panic!("expected upstream result"),
         }
@@ -3213,6 +3262,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_actions_allow_reports_miss_when_matchers_fail() {
+        // Arrange: Build test engine and response context with non-matching response matcher
         let engine = build_test_engine();
         let ctx = build_response_context();
         let req = Message::new();
@@ -3226,6 +3276,7 @@ mod tests {
         let packet = [0u8];
         let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
 
+        // Act: Apply response actions with Allow action and non-matching matcher
         let result = engine
             .apply_response_actions(
                 &actions,
@@ -3246,14 +3297,16 @@ mod tests {
             .await
             .expect("response actions allow should succeed even on miss");
 
+        // Assert: Verify Allow action reports match failure
         match result {
-            ResponseActionResult::Upstream { resp_match, .. } => assert!(!resp_match),
+            ResponseActionResult::Upstream { resp_match, .. } => assert!(!resp_match, "Allow should report matcher miss"),
             _ => panic!("expected upstream result"),
         }
     }
 
     #[tokio::test]
     async fn response_actions_deny_returns_refused() {
+        // Arrange: Build test engine with Deny action
         let engine = build_test_engine();
         let req = Message::new();
         let actions = [Action::Deny];
@@ -3261,6 +3314,7 @@ mod tests {
         let packet = [0u8];
         let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
 
+        // Act: Apply response actions with Deny action
         let result = engine
             .apply_response_actions(
                 &actions,
@@ -3281,10 +3335,11 @@ mod tests {
             .await
             .expect("response actions deny should return static");
 
+        // Assert: Verify Deny action returns Refused response code
         match result {
             ResponseActionResult::Static { rcode, source, .. } => {
-                assert_eq!(rcode, ResponseCode::Refused);
-                assert_eq!(source, "response_action");
+                assert_eq!(rcode, ResponseCode::Refused, "Deny should return Refused");
+                assert_eq!(source, "response_action", "Source should be response_action");
             }
             _ => panic!("expected static refused"),
         }
@@ -3292,27 +3347,29 @@ mod tests {
 
     #[test]
     fn test_calculate_rule_hash_respects_uses_client_ip() {
+        // Arrange: Define test data with different IPs
         let pipeline_id = "test_p";
         let qname = "example.com";
         let ip1 = "1.2.3.4".parse::<IpAddr>().unwrap();
         let ip2 = "5.6.7.8".parse::<IpAddr>().unwrap();
 
-        // When uses_client_ip is false, both IPs should result in the same hash
+        // Act & Assert: When uses_client_ip is false, both IPs should result in the same hash
         let h1_no_ip = calculate_rule_hash(pipeline_id, qname, ip1, false);
         let h2_no_ip = calculate_rule_hash(pipeline_id, qname, ip2, false);
         assert_eq!(h1_no_ip, h2_no_ip, "Hashes should match when IP is ignored");
 
-        // When uses_client_ip is true, different IPs should result in different hashes
+        // Act & Assert: When uses_client_ip is true, different IPs should result in different hashes
         let h1_with_ip = calculate_rule_hash(pipeline_id, qname, ip1, true);
         let h2_with_ip = calculate_rule_hash(pipeline_id, qname, ip2, true);
         assert_ne!(h1_with_ip, h2_with_ip, "Hashes should differ when IP is included");
         
-        // Hash with IP should differ from hash without IP
+        // Assert: Hash with IP should differ from hash without IP
         assert_ne!(h1_no_ip, h1_with_ip, "Hash with IP should differ from hash without IP");
     }
 
     #[tokio::test]
     async fn test_cache_expiration_triggers_requery() {
+        // Arrange: Build engine and insert expired cache entry
         let engine = build_test_engine();
         let pipeline_id = Arc::from("default");
         let qname = "expire.com";
@@ -3320,7 +3377,7 @@ mod tests {
         let qclass = DNSClass::IN;
         let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(&pipeline_id, qname, qtype, qclass);
 
-        // Insert an entry that expired 1 second ago
+        // Insert an entry that expired 5 seconds ago
         let entry = CacheEntry {
             bytes: Bytes::from_static(b"old_resp"),
             rcode: ResponseCode::NoError,
@@ -3333,7 +3390,7 @@ mod tests {
         };
         engine.cache.insert(dedupe_hash, entry);
 
-        // handle_packet_fast should return None (cache miss due to expiration)
+        // Act: Create DNS query packet and check fast path
         let mut packet = vec![0u8; 12];
         packet[0] = 0xAA; packet[1] = 0xBB; // TXID
         packet[5] = 1; // QDCOUNT
@@ -3341,21 +3398,24 @@ mod tests {
 
         let peer = "127.0.0.1:12345".parse().unwrap();
         let fast_res = engine.handle_packet_fast(&packet, peer).unwrap();
+
+        // Assert: Verify expired cache results in None (cache miss)
         assert!(fast_res.is_none(), "Expired cache should result in None from handle_packet_fast");
         
-        // Cache should have been invalidated
+        // Assert: Verify cache entry was invalidated
         assert!(engine.cache.get(&dedupe_hash).is_none(), "Cache entry should be removed after expiration check");
     }
 
     #[test]
     fn test_rule_cache_entry_matches_respects_uses_client_ip() {
+        // Arrange: Define test data with different IPs
         let pipeline_id: Arc<str> = Arc::from("test_p");
         let qname = "example.com";
         let ip1 = "1.2.3.4".parse::<IpAddr>().unwrap();
         let ip2 = "5.6.7.8".parse::<IpAddr>().unwrap();
         let decision = Arc::new(Decision::Static { rcode: ResponseCode::NoError, answers: vec![] });
 
-        // Entry created WITHOUT IP
+        // Arrange: Entry created WITHOUT IP
         let entry_no_ip = RuleCacheEntry {
             pipeline_id: pipeline_id.clone(),
             qname_hash: fast_hash_str(qname),
@@ -3364,14 +3424,14 @@ mod tests {
             expires_at: None,
         };
 
-        // Should match any IP if we don't care about it
-        assert!(entry_no_ip.matches("test_p", qname, ip1, false));
-        assert!(entry_no_ip.matches("test_p", qname, ip2, false));
+        // Act & Assert: Should match any IP if we don't care about it
+        assert!(entry_no_ip.matches("test_p", qname, ip1, false), "Entry without IP should match any IP when uses_client_ip is false");
+        assert!(entry_no_ip.matches("test_p", qname, ip2, false), "Entry without IP should match any IP when uses_client_ip is false");
         
-        // Should NOT match if we now care about IP (since entry doesn't have it)
-        assert!(!entry_no_ip.matches("test_p", qname, ip1, true));
+        // Act & Assert: Should NOT match if we now care about IP (since entry doesn't have it)
+        assert!(!entry_no_ip.matches("test_p", qname, ip1, true), "Entry without IP should not match when uses_client_ip is true");
 
-        // Entry created WITH IP
+        // Arrange: Entry created WITH IP
         let entry_with_ip = RuleCacheEntry {
             pipeline_id: pipeline_id.clone(),
             qname_hash: fast_hash_str(qname),
@@ -3380,22 +3440,23 @@ mod tests {
             expires_at: None,
         };
 
-        // Should match same IP if we care
-        assert!(entry_with_ip.matches("test_p", qname, ip1, true));
-        // Should NOT match different IP if we care
-        assert!(!entry_with_ip.matches("test_p", qname, ip2, true));
-        // Should NOT match even same IP if we don't care now (safety check)
-        assert!(!entry_with_ip.matches("test_p", qname, ip1, false));
+        // Act & Assert: Should match same IP if we care
+        assert!(entry_with_ip.matches("test_p", qname, ip1, true), "Entry with IP should match same IP when uses_client_ip is true");
+        // Act & Assert: Should NOT match different IP if we care
+        assert!(!entry_with_ip.matches("test_p", qname, ip2, true), "Entry with IP should not match different IP when uses_client_ip is true");
+        // Act & Assert: Should NOT match even same IP if we don't care now (safety check)
+        assert!(!entry_with_ip.matches("test_p", qname, ip1, false), "Entry with IP should not match when uses_client_ip is false");
     }
 
     #[test]
     fn test_rule_cache_expiration() {
+        // Arrange: Define test data
         let pipeline_id: Arc<str> = Arc::from("test_p");
         let qname = "expire.com";
         let ip = "1.2.3.4".parse::<IpAddr>().unwrap();
         let decision = Arc::new(Decision::Static { rcode: ResponseCode::NoError, answers: vec![] });
 
-        // Expired entry
+        // Arrange: Expired entry
         let entry_expired = RuleCacheEntry {
             pipeline_id: pipeline_id.clone(),
             qname_hash: fast_hash_str(qname),
@@ -3403,9 +3464,11 @@ mod tests {
             decision: decision.clone(),
             expires_at: Some(Instant::now() - Duration::from_secs(1)),
         };
+        
+        // Act & Assert: Expired entry should not match
         assert!(!entry_expired.matches("test_p", qname, ip, false), "Expired entry should not match");
 
-        // Fresh entry
+        // Arrange: Fresh entry
         let entry_fresh = RuleCacheEntry {
             pipeline_id: pipeline_id.clone(),
             qname_hash: fast_hash_str(qname),
@@ -3413,19 +3476,22 @@ mod tests {
             decision: decision,
             expires_at: Some(Instant::now() + Duration::from_secs(60)),
         };
+        
+        // Act & Assert: Fresh entry should match
         assert!(entry_fresh.matches("test_p", qname, ip, false), "Fresh entry should match");
     }
 
     /// 测试 DNS 响应缓存键包含 QCLASS
     #[test]
     fn test_cache_hash_includes_qclass() {
+        // Arrange: Define test data
         let pipeline_id = "default";
         let qname = "example.com";
         let qtype = RecordType::A;
         let qclass_in = DNSClass::IN;
         let qclass_ch = DNSClass::CH;
 
-        // 计算相同 QNAME+QTYPE 但不同 QCLASS 的哈希
+        // Act: Calculate hashes for same QNAME+QTYPE but different QCLASS
         let hash_in = Engine::calculate_cache_hash_for_dedupe(
             &pipeline_id, 
             qname, 
@@ -3439,20 +3505,22 @@ mod tests {
             qclass_ch
         );
 
-        // 验证不同 QCLASS 产生不同的哈希
+        // Assert: Verify different QCLASS produces different hashes
         assert_ne!(
             hash_in, 
             hash_ch, 
             "Different QCLASS should produce different cache hashes"
         );
 
-        // 验证相同 QCLASS 产生相同的哈希
+        // Act: Calculate hash for same QCLASS to verify consistency
         let hash_in2 = Engine::calculate_cache_hash_for_dedupe(
             &pipeline_id, 
             qname, 
             qtype, 
             qclass_in
         );
+
+        // Assert: Verify same QCLASS produces same hash
         assert_eq!(
             hash_in, 
             hash_in2, 
@@ -3463,6 +3531,7 @@ mod tests {
     /// 测试域名大小写不敏感
     #[test]
     fn test_cache_hash_case_insensitive() {
+        // Arrange: Define test data with different case variations
         let pipeline_id = "default";
         let qname_lower = "example.com";
         let qname_upper = "EXAMPLE.COM";
@@ -3470,6 +3539,7 @@ mod tests {
         let qtype = RecordType::A;
         let qclass = DNSClass::IN;
 
+        // Act: Calculate hashes for different case variations
         let hash1 = Engine::calculate_cache_hash_for_dedupe(
             &pipeline_id, 
             qname_lower, 
@@ -3489,7 +3559,7 @@ mod tests {
             qclass
         );
 
-        // 验证大小写不同的域名产生相同的哈希
+        // Assert: Verify case-insensitive hashing produces same results
         assert_eq!(
             hash1, 
             hash2, 
@@ -3505,12 +3575,14 @@ mod tests {
     /// 测试不同 QTYPE 的哈希也不同
     #[test]
     fn test_cache_hash_different_qtype() {
+        // Arrange: Define test data with different query types
         let pipeline_id = "default";
         let qname = "example.com";
         let qtype_a = RecordType::A;
         let qtype_aaaa = RecordType::AAAA;
         let qclass = DNSClass::IN;
 
+        // Act: Calculate hashes for different QTYPE values
         let hash_a = Engine::calculate_cache_hash_for_dedupe(
             &pipeline_id, 
             qname, 
@@ -3524,7 +3596,7 @@ mod tests {
             qclass
         );
 
-        // 验证不同 QTYPE 产生不同的哈希
+        // Assert: Verify different QTYPE produces different hashes
         assert_ne!(
             hash_a, 
             hash_aaaa, 
@@ -3535,12 +3607,14 @@ mod tests {
     /// 测试不同 QNAME 的哈希也不同
     #[test]
     fn test_cache_hash_different_qname() {
+        // Arrange: Define test data with different domain names
         let pipeline_id = "default";
         let qname1 = "example.com";
         let qname2 = "test.com";
         let qtype = RecordType::A;
         let qclass = DNSClass::IN;
 
+        // Act: Calculate hashes for different QNAME values
         let hash1 = Engine::calculate_cache_hash_for_dedupe(
             &pipeline_id, 
             qname1, 
@@ -3554,7 +3628,7 @@ mod tests {
             qclass
         );
 
-        // 验证不同 QNAME 产生不同的哈希
+        // Assert: Verify different QNAME produces different hashes
         assert_ne!(
             hash1, 
             hash2, 
@@ -3727,6 +3801,8 @@ fn contains_continue(actions: &[Action]) -> bool {
     actions.iter().any(|action| matches!(action, Action::Continue))
 }
 
+// Multi-upstream parsing tests / 多上游解析测试
+// Tests for parsing and validating multi-upstream configurations
 #[cfg(test)]
 #[allow(unnameable_test_items)]
 mod tests_multi_upstream {
@@ -3734,6 +3810,7 @@ mod tests_multi_upstream {
 
     #[test]
     fn test_parse_multi_upstream_comma_separated() {
+        // Arrange: Create configuration with comma-separated upstream list
         let raw = serde_json::json!({
             "pipelines": [
                 {
@@ -3752,12 +3829,14 @@ mod tests_multi_upstream {
             ]
         });
 
+        // Act: Parse configuration
         let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse");
         let rule = &cfg.pipelines[0].rules[0];
         
+        // Assert: Verify upstream is parsed correctly as comma-separated string
         match &rule.actions[0] {
             Action::Forward { upstream, .. } => {
-                assert_eq!(upstream.as_ref().map(|s| s.as_str()), Some("1.1.1.1:53,8.8.8.8:53,9.9.9.9:53"));
+                assert_eq!(upstream.as_ref().map(|s| s.as_str()), Some("1.1.1.1:53,8.8.8.8:53,9.9.9.9:53"), "Comma-separated upstream should be preserved");
             }
             _ => panic!("expected forward action"),
         }
@@ -3765,6 +3844,7 @@ mod tests_multi_upstream {
 
     #[test]
     fn test_parse_multi_upstream_array() {
+        // Arrange: Create configuration with array of upstreams
         let raw = serde_json::json!({
             "pipelines": [
                 {
@@ -3783,12 +3863,14 @@ mod tests_multi_upstream {
             ]
         });
 
+        // Act: Parse configuration
         let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse");
         let rule = &cfg.pipelines[0].rules[0];
         
+        // Assert: Verify upstream array is converted to comma-separated string
         match &rule.actions[0] {
             Action::Forward { upstream, .. } => {
-                assert_eq!(upstream.as_ref().map(|s| s.as_str()), Some("1.1.1.1:53,8.8.8.8:53,9.9.9.9:53"));
+                assert_eq!(upstream.as_ref().map(|s| s.as_str()), Some("1.1.1.1:53,8.8.8.8:53,9.9.9.9:53"), "Array upstream should be joined with commas");
             }
             _ => panic!("expected forward action"),
         }
@@ -3796,6 +3878,7 @@ mod tests_multi_upstream {
 
     #[test]
     fn test_parse_multi_upstream_empty_array() {
+        // Arrange: Create configuration with empty upstream array
         let raw = serde_json::json!({
             "pipelines": [
                 {
@@ -3814,12 +3897,14 @@ mod tests_multi_upstream {
             ]
         });
 
+        // Act: Parse configuration
         let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse");
         let rule = &cfg.pipelines[0].rules[0];
         
+        // Assert: Verify empty array results in None upstream
         match &rule.actions[0] {
             Action::Forward { upstream, .. } => {
-                assert!(*upstream == None);
+                assert!(*upstream == None, "Empty upstream array should result in None");
             }
             _ => panic!("expected forward action"),
         }
@@ -3827,6 +3912,7 @@ mod tests_multi_upstream {
 
     #[test]
     fn test_parse_multi_upstream_single_element() {
+        // Arrange: Create configuration with single-element upstream array
         let raw = serde_json::json!({
             "pipelines": [
                 {
@@ -3845,12 +3931,14 @@ mod tests_multi_upstream {
             ]
         });
 
+        // Act: Parse configuration
         let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse");
         let rule = &cfg.pipelines[0].rules[0];
         
+        // Assert: Verify single-element array is converted to string
         match &rule.actions[0] {
             Action::Forward { upstream, .. } => {
-                assert_eq!(upstream.as_ref().map(|s| s.as_str()), Some("1.1.1.1:53"));
+                assert_eq!(upstream.as_ref().map(|s| s.as_str()), Some("1.1.1.1:53"), "Single-element array should be converted to string");
             }
             _ => panic!("expected forward action"),
         }

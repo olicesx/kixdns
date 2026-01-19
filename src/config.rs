@@ -398,6 +398,8 @@ pub fn load_config(path: &Path) -> Result<PipelineConfig> {
     Ok(cfg)
 }
 
+// Configuration tests / 配置测试
+// Tests for configuration parsing, validation, and default values
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +407,7 @@ mod tests {
 
     #[test]
     fn response_action_fields_default_to_empty() {
+        // Arrange: Create a minimal pipeline config with only log action
         let raw = json!({
             "pipelines": [
                 {
@@ -418,14 +421,21 @@ mod tests {
                 }
             ]
         });
+        
+        // Act: Parse the configuration
         let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
         let rule = &cfg.pipelines[0].rules[0];
-        assert!(rule.response_actions_on_match.is_empty());
-        assert!(rule.response_actions_on_miss.is_empty());
+        
+        // Assert: Verify response action fields default to empty vectors
+        assert!(rule.response_actions_on_match.is_empty(), 
+            "response_actions_on_match should default to empty vector");
+        assert!(rule.response_actions_on_miss.is_empty(), 
+            "response_actions_on_miss should default to empty vector");
     }
 
     #[test]
     fn rule_operator_defaults_to_and_when_omitted() {
+        // Arrange: Create a pipeline config without explicit operator settings
         let raw = serde_json::json!({
             "pipelines": [
                 {
@@ -441,15 +451,20 @@ mod tests {
             ]
         });
 
+        // Act: Parse the configuration
         let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
         let rule = &cfg.pipelines[0].rules[0];
-        // default should be MatchOperator::And / 默认应为 MatchOperator::And
-        assert_eq!(rule.matcher_operator, MatchOperator::And);
-        assert_eq!(rule.response_matcher_operator, MatchOperator::And);
+        
+        // Assert: Verify operators default to MatchOperator::And
+        assert_eq!(rule.matcher_operator, MatchOperator::And,
+            "matcher_operator should default to And");
+        assert_eq!(rule.response_matcher_operator, MatchOperator::And,
+            "response_matcher_operator should default to And");
     }
 
     #[test]
     fn flow_control_settings_default_when_omitted() {
+        // Arrange: Create a minimal pipeline config without flow control settings
         let raw = serde_json::json!({
             "pipelines": [
                 {
@@ -459,17 +474,25 @@ mod tests {
             ]
         });
 
+        // Act: Parse the configuration
         let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        // Verify flow control settings have correct defaults
-        assert_eq!(cfg.settings.flow_control_initial_permits, 500);
-        assert_eq!(cfg.settings.flow_control_min_permits, 100);
-        assert_eq!(cfg.settings.flow_control_max_permits, 800);
-        assert_eq!(cfg.settings.flow_control_latency_threshold_ms, 100);
-        assert_eq!(cfg.settings.flow_control_adjustment_interval_secs, 5);
+        
+        // Assert: Verify flow control settings have correct defaults
+        assert_eq!(cfg.settings.flow_control_initial_permits, 500,
+            "flow_control_initial_permits should default to 500");
+        assert_eq!(cfg.settings.flow_control_min_permits, 100,
+            "flow_control_min_permits should default to 100");
+        assert_eq!(cfg.settings.flow_control_max_permits, 800,
+            "flow_control_max_permits should default to 800");
+        assert_eq!(cfg.settings.flow_control_latency_threshold_ms, 100,
+            "flow_control_latency_threshold_ms should default to 100");
+        assert_eq!(cfg.settings.flow_control_adjustment_interval_secs, 5,
+            "flow_control_adjustment_interval_secs should default to 5");
     }
 
     #[test]
     fn flow_control_settings_can_be_customized() {
+        // Arrange: Create a pipeline config with custom flow control settings
         let raw = serde_json::json!({
             "settings": {
                 "flow_control_initial_permits": 200,
@@ -486,13 +509,20 @@ mod tests {
             ]
         });
 
+        // Act: Parse the configuration
         let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        // Verify custom flow control settings
-        assert_eq!(cfg.settings.flow_control_initial_permits, 200);
-        assert_eq!(cfg.settings.flow_control_min_permits, 50);
-        assert_eq!(cfg.settings.flow_control_max_permits, 400);
-        assert_eq!(cfg.settings.flow_control_latency_threshold_ms, 150);
-        assert_eq!(cfg.settings.flow_control_adjustment_interval_secs, 10);
+        
+        // Assert: Verify custom flow control settings
+        assert_eq!(cfg.settings.flow_control_initial_permits, 200,
+            "flow_control_initial_permits should match configured value");
+        assert_eq!(cfg.settings.flow_control_min_permits, 50,
+            "flow_control_min_permits should match configured value");
+        assert_eq!(cfg.settings.flow_control_max_permits, 400,
+            "flow_control_max_permits should match configured value");
+        assert_eq!(cfg.settings.flow_control_latency_threshold_ms, 150,
+            "flow_control_latency_threshold_ms should match configured value");
+        assert_eq!(cfg.settings.flow_control_adjustment_interval_secs, 10,
+            "flow_control_adjustment_interval_secs should match configured value");
     }
 }
 

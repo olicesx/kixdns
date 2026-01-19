@@ -799,6 +799,8 @@ impl RuntimeResponseMatcher {
     }
 }
 
+// Tests for runtime matcher functionality
+// 运行时匹配器功能测试
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,6 +812,8 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::str::FromStr;
 
+    // Helper function to build test DNS messages
+    // 构建测试DNS消息的辅助函数
     fn build_message(rcode: ResponseCode, edns_present: bool) -> Message {
         let mut msg = Message::new();
         msg.set_response_code(rcode);
@@ -822,6 +826,8 @@ mod tests {
         msg
     }
 
+    // Helper function to build test DNS messages with IPv6
+    // 构建包含IPv6的测试DNS消息的辅助函数
     fn build_message_with_ipv6(rcode: ResponseCode, edns_present: bool) -> Message {
         let mut msg = Message::new();
         msg.set_response_code(rcode);
@@ -839,56 +845,66 @@ mod tests {
     }
 
     #[test]
-    fn runtime_response_matchers_cover_readme_cases() {
+    fn test_runtime_response_matchers_cover_readme_cases() {
+        // Arrange: Setup test data
         let qname = "sub.example.com";
         let upstream = "1.1.1.1:53".to_string();
         let qtype = RecordType::A;
         let qclass = DNSClass::IN;
         let msg = build_message(ResponseCode::NoError, true);
 
+        // Act & Assert: Test various response matchers
         assert!(
             RuntimeResponseMatcher::UpstreamEquals {
                 value: upstream.clone()
             }
-            .matches(&upstream, qname, qtype, qclass, &msg)
+            .matches(&upstream, qname, qtype, qclass, &msg),
+            "UpstreamEquals matcher should match when upstream values are equal"
         );
         assert!(
             RuntimeResponseMatcher::RequestDomainSuffix {
                 value: "example.com".into()
             }
-            .matches(&upstream, qname, qtype, qclass, &msg)
+            .matches(&upstream, qname, qtype, qclass, &msg),
+            "RequestDomainSuffix matcher should match domain suffix"
         );
         assert!(
             RuntimeResponseMatcher::RequestDomainRegex {
                 regex: Regex::new(".*example\\.com$").unwrap()
             }
-            .matches(&upstream, qname, qtype, qclass, &msg)
+            .matches(&upstream, qname, qtype, qclass, &msg),
+            "RequestDomainRegex matcher should match regex pattern"
         );
         assert!(
             RuntimeResponseMatcher::ResponseType { value: "A".into() }
-                .matches(&upstream, qname, qtype, qclass, &msg)
+                .matches(&upstream, qname, qtype, qclass, &msg),
+            "ResponseType matcher should match A record type"
         );
         assert!(
             RuntimeResponseMatcher::ResponseRcode {
                 value: "NOERROR".into()
             }
-            .matches(&upstream, qname, qtype, qclass, &msg)
+            .matches(&upstream, qname, qtype, qclass, &msg),
+            "ResponseRcode matcher should match NOERROR response code"
         );
         assert!(
             RuntimeResponseMatcher::ResponseQclass {
                 value: DNSClass::IN
             }
-            .matches(&upstream, qname, qtype, qclass, &msg)
+            .matches(&upstream, qname, qtype, qclass, &msg),
+            "ResponseQclass matcher should match IN class"
         );
         assert!(
             RuntimeResponseMatcher::ResponseEdnsPresent { expect: true }
-                .matches(&upstream, qname, qtype, qclass, &msg)
+                .matches(&upstream, qname, qtype, qclass, &msg),
+            "ResponseEdnsPresent matcher should detect EDNS presence"
         );
         assert!(
             RuntimeResponseMatcher::ResponseUpstreamIp {
                 nets: vec!["1.1.1.0/24".parse().unwrap()],
             }
-            .matches(&upstream, qname, qtype, qclass, &msg)
+            .matches(&upstream, qname, qtype, qclass, &msg),
+            "ResponseUpstreamIp matcher should match upstream IP CIDR"
         );
 
         let msg_no_edns = build_message(ResponseCode::NXDomain, false);
@@ -899,7 +915,8 @@ mod tests {
                 qtype,
                 qclass,
                 &msg_no_edns
-            )
+            ),
+            "ResponseEdnsPresent matcher should detect absence of EDNS"
         );
 
         let msg_ipv6 = build_message_with_ipv6(ResponseCode::NoError, true);
@@ -907,17 +924,21 @@ mod tests {
             RuntimeResponseMatcher::ResponseType {
                 value: "AAAA".into()
             }
-            .matches(&upstream, qname, RecordType::AAAA, qclass, &msg_ipv6)
+            .matches(&upstream, qname, RecordType::AAAA, qclass, &msg_ipv6),
+            "ResponseType matcher should match AAAA record type"
         );
     }
 
     #[test]
-    fn apply_match_operator_request_matchers() {
+    fn test_apply_match_operator_request_matchers() {
         use std::net::IpAddr;
+        
+        // Arrange: Setup test data
         let qname = "a.sub.example.com";
         let client_ip = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
         let qclass = DNSClass::IN;
 
+        // Act & Assert: Test AND operator with matching conditions
         let m_and_true = vec![
             RuntimeMatcher::DomainSuffix {
                 value: "example.com".into(),
@@ -929,8 +950,12 @@ mod tests {
         let res_and = m_and_true
             .iter()
             .map(|m| m.matches(qname, qclass, client_ip, true));
-        assert!(apply_match_operator(&MatchOperator::And, res_and));
+        assert!(
+            apply_match_operator(&MatchOperator::And, res_and),
+            "AND operator should return true when all matchers return true"
+        );
 
+        // Act & Assert: Test AND operator with non-matching conditions
         let m_and_false = vec![
             RuntimeMatcher::DomainSuffix {
                 value: "example.com".into(),
@@ -942,8 +967,12 @@ mod tests {
         let res_and_false = m_and_false
             .iter()
             .map(|m| m.matches(qname, qclass, client_ip, true));
-        assert!(!apply_match_operator(&MatchOperator::And, res_and_false));
+        assert!(
+            !apply_match_operator(&MatchOperator::And, res_and_false),
+            "AND operator should return false when any matcher returns false"
+        );
 
+        // Act & Assert: Test OR operator with one matching condition
         let m_or = vec![
             RuntimeMatcher::DomainSuffix {
                 value: "nomatch.local".into(),
@@ -955,8 +984,12 @@ mod tests {
         let res_or = m_or
             .iter()
             .map(|m| m.matches(qname, qclass, client_ip, true));
-        assert!(apply_match_operator(&MatchOperator::Or, res_or));
+        assert!(
+            apply_match_operator(&MatchOperator::Or, res_or),
+            "OR operator should return true when any matcher returns true"
+        );
 
+        // Act & Assert: Test NOT operator with all false matchers
         let m_not_all_false = vec![
             RuntimeMatcher::DomainSuffix {
                 value: "nomatch.local".into(),
@@ -968,9 +1001,12 @@ mod tests {
         let res_not = m_not_all_false
             .iter()
             .map(|m| m.matches(qname, qclass, client_ip, true));
-        // none match -> NOT should be true
-        assert!(apply_match_operator(&MatchOperator::Not, res_not));
+        assert!(
+            apply_match_operator(&MatchOperator::Not, res_not),
+            "NOT operator should return true when all matchers return false"
+        );
 
+        // Act & Assert: Test NOT operator with one true matcher
         let m_not_one_true = vec![
             RuntimeMatcher::DomainSuffix {
                 value: "example.com".into(),
@@ -982,18 +1018,22 @@ mod tests {
         let res_not_false = m_not_one_true
             .iter()
             .map(|m| m.matches(qname, qclass, client_ip, true));
-        // one matches -> NOT should be false
-        assert!(!apply_match_operator(&MatchOperator::Not, res_not_false));
+        assert!(
+            !apply_match_operator(&MatchOperator::Not, res_not_false),
+            "NOT operator should return false when any matcher returns true"
+        );
     }
 
     #[test]
-    fn apply_match_operator_response_matchers() {
+    fn test_apply_match_operator_response_matchers() {
+        // Arrange: Setup test data
         let qname = "sub.example.com";
         let upstream = "9.9.9.9:53".to_string();
         let qtype = RecordType::A;
         let qclass = DNSClass::IN;
         let msg = build_message(ResponseCode::NoError, true);
 
+        // Act & Assert: Test AND operator
         let rm_and_true = vec![
             RuntimeResponseMatcher::UpstreamEquals {
                 value: upstream.clone(),
@@ -1005,8 +1045,12 @@ mod tests {
         let res_and = rm_and_true
             .iter()
             .map(|m| m.matches(&upstream, qname, qtype, qclass, &msg));
-        assert!(apply_match_operator(&MatchOperator::And, res_and));
+        assert!(
+            apply_match_operator(&MatchOperator::And, res_and),
+            "AND operator should return true when all response matchers return true"
+        );
 
+        // Act & Assert: Test OR operator
         let rm_or = vec![
             RuntimeResponseMatcher::UpstreamEquals {
                 value: "nope:53".into(),
@@ -1018,8 +1062,12 @@ mod tests {
         let res_or = rm_or
             .iter()
             .map(|m| m.matches(&upstream, qname, qtype, qclass, &msg));
-        assert!(apply_match_operator(&MatchOperator::Or, res_or));
+        assert!(
+            apply_match_operator(&MatchOperator::Or, res_or),
+            "OR operator should return true when any response matcher returns true"
+        );
 
+        // Act & Assert: Test NOT operator with all false matchers
         let rm_not_all_false = vec![
             RuntimeResponseMatcher::UpstreamEquals {
                 value: "nope:53".into(),
@@ -1031,8 +1079,12 @@ mod tests {
         let res_not = rm_not_all_false
             .iter()
             .map(|m| m.matches(&upstream, qname, qtype, qclass, &msg));
-        assert!(apply_match_operator(&MatchOperator::Not, res_not));
+        assert!(
+            apply_match_operator(&MatchOperator::Not, res_not),
+            "NOT operator should return true when all response matchers return false"
+        );
 
+        // Act & Assert: Test NOT operator with one true matcher
         let rm_not_one_true = vec![
             RuntimeResponseMatcher::UpstreamEquals {
                 value: upstream.clone(),
@@ -1044,150 +1096,188 @@ mod tests {
         let res_not_false = rm_not_one_true
             .iter()
             .map(|m| m.matches(&upstream, qname, qtype, qclass, &msg));
-        assert!(!apply_match_operator(&MatchOperator::Not, res_not_false));
+        assert!(
+            !apply_match_operator(&MatchOperator::Not, res_not_false),
+            "NOT operator should return false when any response matcher returns true"
+        );
     }
 
     #[test]
-    fn apply_match_operator_empty_iterator_boundary() {
+    fn test_apply_match_operator_empty_iterator_boundary() {
+        // Arrange: Setup empty iterator
         let empty: Vec<bool> = vec![];
         let it = empty.into_iter();
-        // And over empty iterator -> true (all true)
-        assert!(apply_match_operator(&MatchOperator::And, it.clone()));
+        
+        // Act & Assert: And over empty iterator -> true (all true)
+        assert!(
+            apply_match_operator(&MatchOperator::And, it.clone()),
+            "AND operator should return true for empty iterator (all true)"
+        );
 
+        // Act & Assert: Or over empty iterator -> false (any false)
         let it2 = std::iter::empty::<bool>();
-        // Or over empty iterator -> false (any false)
-        assert!(!apply_match_operator(&MatchOperator::Or, it2));
+        assert!(
+            !apply_match_operator(&MatchOperator::Or, it2),
+            "OR operator should return false for empty iterator (any false)"
+        );
 
+        // Act & Assert: Not over empty iterator -> true (!any(empty) == true)
         let it3 = std::iter::empty::<bool>();
-        // Not over empty iterator -> true (!any(empty) == true)
-        assert!(apply_match_operator(&MatchOperator::Not, it3));
+        assert!(
+            apply_match_operator(&MatchOperator::Not, it3),
+            "NOT operator should return true for empty iterator (!any(empty) == true)"
+        );
     }
 
     #[test]
-    fn runtime_pipeline_selector_matchers() {
+    fn test_runtime_pipeline_selector_matchers() {
         use std::net::IpAddr;
+        
+        // Arrange: Setup test data
         let listener_label = "edge-internal";
         let client_ip = IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 2, 3));
         let qname = "svc.example.com";
 
+        // Act & Assert: Test ListenerLabel matcher
         assert!(
             RuntimePipelineSelectorMatcher::ListenerLabel {
                 value: "edge-internal".into()
             }
-            .matches(listener_label, client_ip, qname, DNSClass::IN, false, None)
+            .matches(listener_label, client_ip, qname, DNSClass::IN, false, None),
+            "ListenerLabel matcher should match when listener labels are equal"
         );
 
+        // Act & Assert: Test ClientIp matcher
         assert!(
             RuntimePipelineSelectorMatcher::ClientIp {
                 net: "10.1.2.0/24".parse().unwrap()
             }
-            .matches(listener_label, client_ip, qname, DNSClass::IN, false, None)
+            .matches(listener_label, client_ip, qname, DNSClass::IN, false, None),
+            "ClientIp matcher should match when client IP is in CIDR range"
         );
 
+        // Act & Assert: Test DomainSuffix matcher
         assert!(
             RuntimePipelineSelectorMatcher::DomainSuffix {
                 value: "example.com".into()
             }
-            .matches(listener_label, client_ip, qname, DNSClass::IN, false, None)
+            .matches(listener_label, client_ip, qname, DNSClass::IN, false, None),
+            "DomainSuffix matcher should match domain suffix"
         );
     }
 
     #[test]
-    fn runtime_matcher_basic_behaviors() {
+    fn test_runtime_matcher_basic_behaviors() {
         use std::net::IpAddr;
+        
+        // Arrange: Setup test data
         let qname = "Foo.Example.COM".to_ascii_lowercase();
         let client_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 5));
         let qclass = DNSClass::IN;
 
-        // Any always matches
-        assert!(RuntimeMatcher::Any.matches(&qname, qclass, client_ip, false));
+        // Act & Assert: Any always matches
+        assert!(
+            RuntimeMatcher::Any.matches(&qname, qclass, client_ip, false),
+            "Any matcher should always match"
+        );
 
-        // DomainSuffix should match when suffix equals
+        // Act & Assert: DomainSuffix should match when suffix equals
         assert!(
             RuntimeMatcher::DomainSuffix {
                 value: "example.com".into()
             }
-            .matches(&qname, qclass, client_ip, false)
+            .matches(&qname, qclass, client_ip, false),
+            "DomainSuffix matcher should match when suffix equals"
         );
 
-        // ClientIp CIDR
+        // Act & Assert: ClientIp CIDR
         assert!(
             RuntimeMatcher::ClientIp {
                 net: "192.0.2.0/24".parse().unwrap()
             }
-            .matches(&qname, qclass, client_ip, false)
+            .matches(&qname, qclass, client_ip, false),
+            "ClientIp matcher should match when client IP is in CIDR range"
         );
 
-        // Qclass
+        // Act & Assert: Qclass
         assert!(
             RuntimeMatcher::Qclass {
                 value: DNSClass::IN
             }
-            .matches(&qname, qclass, client_ip, false)
+            .matches(&qname, qclass, client_ip, false),
+            "Qclass matcher should match when QCLASS equals"
         );
 
-        // EdnsPresent
+        // Act & Assert: EdnsPresent
         assert!(
-            RuntimeMatcher::EdnsPresent { expect: false }.matches(&qname, qclass, client_ip, false)
+            RuntimeMatcher::EdnsPresent { expect: false }.matches(&qname, qclass, client_ip, false),
+            "EdnsPresent matcher should match when EDNS presence matches expectation"
         );
     }
 
     #[test]
-    fn response_upstream_ip_parsing_and_nonparseable() {
+    fn test_response_upstream_ip_parsing_and_nonparseable() {
+        // Arrange: Setup test data
         let qname = "sub.example.com";
         let qtype = RecordType::A;
         let qclass = DNSClass::IN;
         let msg = build_message(ResponseCode::NoError, false);
 
-        // With port
+        // Act & Assert: With port
         assert!(
             RuntimeResponseMatcher::ResponseUpstreamIp {
                 nets: vec!["1.2.3.0/24".parse().unwrap()]
             }
-            .matches("1.2.3.4:53", qname, qtype, qclass, &msg)
+            .matches("1.2.3.4:53", qname, qtype, qclass, &msg),
+            "ResponseUpstreamIp matcher should match upstream with port"
         );
 
-        // Plain ip
+        // Act & Assert: Plain ip
         assert!(
             RuntimeResponseMatcher::ResponseUpstreamIp {
                 nets: vec!["1.2.3.0/24".parse().unwrap()]
             }
-            .matches("1.2.3.4", qname, qtype, qclass, &msg)
+            .matches("1.2.3.4", qname, qtype, qclass, &msg),
+            "ResponseUpstreamIp matcher should match plain IP"
         );
 
-        // Non-parseable upstream should return false
+        // Act & Assert: Non-parseable upstream should return false
         assert!(
             !RuntimeResponseMatcher::ResponseUpstreamIp {
                 nets: vec!["1.2.3.0/24".parse().unwrap()]
             }
-            .matches("not-an-upstream", qname, qtype, qclass, &msg)
+            .matches("not-an-upstream", qname, qtype, qclass, &msg),
+            "ResponseUpstreamIp matcher should return false for non-parseable upstream"
         );
     }
 
     #[test]
-    fn domain_regex_case_insensitive_flag() {
+    fn test_domain_regex_case_insensitive_flag() {
+        // Arrange: Setup test data
         let qname = "Foo.Example.COM";
-        // Without (?i) should not match assuming case-sensitive regex
+        
+        // Act & Assert: Without (?i) should not match assuming case-sensitive regex
         let re_cs = Regex::new("example\\.com$").unwrap();
         assert!(!RuntimeMatcher::DomainRegex { regex: re_cs }.matches(
             &qname,
             DNSClass::IN,
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
             false
-        ));
+        ), "Case-sensitive regex should not match different case");
 
-        // With (?i) should match
+        // Act & Assert: With (?i) should match
         let re_ci = Regex::new("(?i)example\\.com$").unwrap();
         assert!(RuntimeMatcher::DomainRegex { regex: re_ci }.matches(
             &qname,
             DNSClass::IN,
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
             false
-        ));
+        ), "Case-insensitive regex should match different case");
     }
 
     #[test]
-    fn response_type_no_answers_uses_qtype_fallback() {
+    fn test_response_type_no_answers_uses_qtype_fallback() {
+        // Arrange: Setup message with no answers
         let mut msg = Message::new();
         msg.set_response_code(ResponseCode::NoError);
         // no answers added
@@ -1196,6 +1286,7 @@ mod tests {
         let qtype = RecordType::A;
         let qclass = DNSClass::IN;
 
+        // Act & Assert: Should use qtype fallback when no answers present
         assert!(
             RuntimeResponseMatcher::ResponseType { value: "A".into() }.matches(
                 "1.2.3.4:53",
@@ -1203,14 +1294,17 @@ mod tests {
                 qtype,
                 qclass,
                 &msg
-            )
+            ),
+            "ResponseType matcher should use qtype fallback when no answers present"
         );
     }
 
-    // ========== Integration Tests for New Matchers ==========
+    // Integration Tests for New Matchers
+    // 新匹配器的集成测试
     
     #[test]
     fn test_qtype_matcher_all_types() {
+        // Arrange: Setup test data with all supported DNS record types
         let qtypes = vec![
             ("A", RecordType::A),
             ("AAAA", RecordType::AAAA),
@@ -1225,26 +1319,39 @@ mod tests {
         ];
         
         for (type_str, expected_type) in qtypes {
-            // Test parsing
+            // Act & Assert: Test parsing
             let parsed = parse_dns_type(type_str);
-            assert!(parsed.is_ok(), "Failed to parse qtype: {}", type_str);
-            assert_eq!(parsed.unwrap(), expected_type, "Qtype mismatch for: {}", type_str);
+            assert!(
+                parsed.is_ok(), 
+                "Failed to parse qtype: {}", 
+                type_str
+            );
+            assert_eq!(
+                parsed.unwrap(), 
+                expected_type, 
+                "Qtype mismatch for: {}", 
+                type_str
+            );
             
-            // Test matcher
+            // Act & Assert: Test matcher
             let matcher = RuntimeMatcher::Qtype {
                 value: expected_type,
             };
             
-            // Test matching
-            assert!(matcher.matches_with_qtype(
-                "example.com",
-                DNSClass::IN,
-                IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-                false,
-                expected_type,
-                None,
-                None,
-            ), "Qtype {} should match itself", type_str);
+            // Act & Assert: Test matching
+            assert!(
+                matcher.matches_with_qtype(
+                    "example.com",
+                    DNSClass::IN,
+                    IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                    false,
+                    expected_type,
+                    None,
+                    None,
+                ), 
+                "Qtype {} should match itself", 
+                type_str
+            );
         }
     }
 }

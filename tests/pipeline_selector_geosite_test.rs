@@ -1,7 +1,7 @@
 // 测试 Pipeline Selector 中的 GeoSite 匹配器集成
 // Test GeoSite matcher integration in Pipeline Selector
 
-use kixdns::config::{GlobalSettings, PipelineConfig};
+use kixdns::config::PipelineConfig;
 use kixdns::geosite::GeoSiteManager;
 use kixdns::matcher::RuntimePipelineConfig;
 use serde_json::json;
@@ -84,12 +84,13 @@ fn test_pipeline_selector_geosite_matcher() {
         "127.0.0.1".parse().unwrap(),
         hickory_proto::rr::DNSClass::IN,
         false,
+        hickory_proto::rr::RecordType::A,
         "default",
         Some(&geosite_manager),
     );
     println!("Selected pipeline: {:?}", id);
-    assert!(opt.is_some());
-    assert_eq!(id.as_ref(), "p2");
+    assert!(opt.is_some(), "Should select a pipeline");
+    assert_eq!(id.as_ref(), "p2", "Should select p2 for CN domain");
 
     // 测试 Google 域名应该选择 p3
     // Test Google domains should select p3
@@ -99,11 +100,12 @@ fn test_pipeline_selector_geosite_matcher() {
         "127.0.0.1".parse().unwrap(),
         hickory_proto::rr::DNSClass::IN,
         false,
+        hickory_proto::rr::RecordType::A,
         "default",
         Some(&geosite_manager),
     );
-    assert!(opt.is_some());
-    assert_eq!(id.as_ref(), "p3");
+    assert!(opt.is_some(), "Should select a pipeline");
+    assert_eq!(id.as_ref(), "p3", "Should select p3 for Google domain");
 
     // 测试其他域名应该选择默认 pipeline (p1)
     // Test other domains should select default pipeline (p1)
@@ -113,11 +115,12 @@ fn test_pipeline_selector_geosite_matcher() {
         "127.0.0.1".parse().unwrap(),
         hickory_proto::rr::DNSClass::IN,
         false,
+        hickory_proto::rr::RecordType::A,
         "default",
         Some(&geosite_manager),
     );
-    assert!(opt.is_some());
-    assert_eq!(id.as_ref(), "p1");
+    assert!(opt.is_some(), "Should select a pipeline");
+    assert_eq!(id.as_ref(), "p1", "Should select p1 for other domains");
 }
 
 #[test]
@@ -170,6 +173,7 @@ fn test_pipeline_selector_geosite_not_matcher() {
         "127.0.0.1".parse().unwrap(),
         hickory_proto::rr::DNSClass::IN,
         false,
+        hickory_proto::rr::RecordType::A,
         "default",
         Some(&geosite_manager),
     );
@@ -184,6 +188,7 @@ fn test_pipeline_selector_geosite_not_matcher() {
         "127.0.0.1".parse().unwrap(),
         hickory_proto::rr::DNSClass::IN,
         false,
+        hickory_proto::rr::RecordType::A,
         "default",
         Some(&geosite_manager),
     );
@@ -244,6 +249,7 @@ fn test_pipeline_selector_geosite_with_or_operator() {
         "127.0.0.1".parse().unwrap(),
         hickory_proto::rr::DNSClass::IN,
         false,
+        hickory_proto::rr::RecordType::A,
         "default",
         Some(&geosite_manager),
     );
@@ -258,6 +264,7 @@ fn test_pipeline_selector_geosite_with_or_operator() {
         "127.0.0.1".parse().unwrap(),
         hickory_proto::rr::DNSClass::IN,
         false,
+        hickory_proto::rr::RecordType::A,
         "default",
         Some(&geosite_manager),
     );
@@ -272,6 +279,7 @@ fn test_pipeline_selector_geosite_with_or_operator() {
         "127.0.0.1".parse().unwrap(),
         hickory_proto::rr::DNSClass::IN,
         false,
+        hickory_proto::rr::RecordType::A,
         "default",
         Some(&geosite_manager),
     );
