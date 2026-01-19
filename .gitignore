@@ -5,3 +5,5 @@ claude.md
 # Audit and report documents
 *_report*.md
 diff_review.txt
+# Local AI coding agent instructions (not for repository)
+.github/copilot-instructions.md
