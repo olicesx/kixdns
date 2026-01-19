@@ -389,7 +389,15 @@ pub fn patch_all_ttls(packet: &mut [u8], decrement: u32) {
         packet[ttl_offset..ttl_offset + 4].copy_from_slice(&ttl_bytes);
 
         let rd_len = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
-        pos += 10 + rd_len;
+        
+        // Ensure the entire record (10 bytes header + RData) fits within remaining packet
+        // and handle potential overflow for the next iteration's position
+        let record_total_len = 10usize.saturating_add(rd_len);
+        if pos.saturating_add(record_total_len) > packet_len {
+            return;
+        }
+        
+        pos += record_total_len;
     }
 }
 
