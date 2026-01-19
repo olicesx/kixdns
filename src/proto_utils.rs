@@ -187,14 +187,9 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     })
 }
 
-/// Maximum number of compression pointer jumps allowed to prevent infinite loops
-const MAX_COMPRESSION_JUMPS: u32 = 5;
-
 /// 跳过 DNS 名称并返回下一个位置 / Skip DNS name and return next position
 fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
     let packet_len = packet.len();
-    let mut max_jumps = MAX_COMPRESSION_JUMPS;
-
     loop {
         if pos >= packet_len {
             return None;
@@ -203,37 +198,13 @@ fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
         if len == 0 {
             return Some(pos + 1);
         }
-
         if (len & 0xC0) == 0xC0 {
-            // Compression pointer - check bounds before returning
             if pos + 2 > packet_len {
                 return None;
             }
-
-            // Follow compression pointer to prevent infinite loops
-            max_jumps -= 1;
-            if max_jumps == 0 {
-                return None;
-            }
-
-            let offset = (((len as u16) & 0x3F) << 8) | (packet[pos + 1] as u16);
-            let offset_usize = offset as usize;
-
-            // Validate that compression pointer offset is within packet bounds
-            if offset_usize >= packet_len {
-                return None;
-            }
-
-            pos = offset_usize;
-            continue;
+            return Some(pos + 2);
         }
-
-        // Regular label - check bounds before advancing
-        let new_pos = pos + 1 + len as usize;
-        if new_pos > packet_len {
-            return None;
-        }
-        pos = new_pos;
+        pos += 1 + len as usize;
     }
 }
 
@@ -364,4 +335,144 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     }
 
     Some(QuickResponse { rcode, min_ttl, truncated })
+}
+
+/// 批量修正 DNS 响应包中的 TTL 值 / Batch patch TTL values in a DNS response packet
+/// decrement: 需要减少的秒数 / seconds to decrement
+pub fn patch_all_ttls(packet: &mut [u8], decrement: u32) {
+    if decrement == 0 || packet.len() < 12 {
+        return;
+    }
+
+    let qd_count = u16::from_be_bytes([packet[4], packet[5]]);
+    let an_count = u16::from_be_bytes([packet[6], packet[7]]);
+    let ns_count = u16::from_be_bytes([packet[8], packet[9]]);
+    let ar_count = u16::from_be_bytes([packet[10], packet[11]]);
+
+    let mut pos = 12;
+    let packet_len = packet.len();
+
+    // 1. Skip Questions
+    for _ in 0..qd_count {
+        if let Some(next) = skip_name(packet, pos) {
+            pos = next + 4;
+        } else {
+            return;
+        }
+    }
+
+    // 2. Patch Answer, Authority, and Additional sections
+    let total_records = an_count as usize + ns_count as usize + ar_count as usize;
+    for _ in 0..total_records {
+        if let Some(next) = skip_name(packet, pos) {
+            pos = next;
+        } else {
+            return;
+        }
+
+        if pos + 10 > packet_len {
+            return;
+        }
+
+        // Type(2) Class(2) TTL(4) RDLen(2)
+        let ttl_offset = pos + 4;
+        let old_ttl = u32::from_be_bytes([
+            packet[ttl_offset],
+            packet[ttl_offset + 1],
+            packet[ttl_offset + 2],
+            packet[ttl_offset + 3],
+        ]);
+        
+        // RFC 1035: Decrement TTL, floor at 0
+        let new_ttl = old_ttl.saturating_sub(decrement);
+        let ttl_bytes = new_ttl.to_be_bytes();
+        packet[ttl_offset..ttl_offset + 4].copy_from_slice(&ttl_bytes);
+
+        let rd_len = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
+        pos += 10 + rd_len;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_patch_all_ttls_basic() {
+        // Construct a simple DNS response with 1 answer
+        // Header: ID=0, QR=1, QDCOUNT=1, ANCOUNT=1
+        let mut packet = vec![0u8; 12];
+        packet[2] = 0x80; // QR=1
+        packet[5] = 1;    // QDCOUNT=1
+        packet[7] = 1;    // ANCOUNT=1
+        
+        // Question: example.com (7example3com0), Type A, Class IN
+        packet.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+        
+        // Answer: same name (compressed), Type A, Class IN, TTL=600, RDLen=4, IP=1.2.3.4
+        let answer_start = packet.len();
+        packet.extend_from_slice(b"\xc0\x0c\x00\x01\x00\x01");
+        packet.extend_from_slice(&600u32.to_be_bytes()); // TTL at answer_start + 6
+        packet.extend_from_slice(b"\x00\x04\x01\x02\x03\x04");
+        
+        let ttl_offset = answer_start + 6;
+        assert_eq!(u32::from_be_bytes([packet[ttl_offset], packet[ttl_offset+1], packet[ttl_offset+2], packet[ttl_offset+3]]), 600);
+        
+        patch_all_ttls(&mut packet, 100);
+        
+        assert_eq!(u32::from_be_bytes([packet[ttl_offset], packet[ttl_offset+1], packet[ttl_offset+2], packet[ttl_offset+3]]), 500);
+    }
+
+    #[test]
+    fn test_patch_all_ttls_saturating() {
+        let mut packet = vec![0u8; 12];
+        packet[5] = 1; // QDCOUNT=1
+        packet[7] = 1; // ANCOUNT=1
+        packet.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01"); // Question
+        let answer_start = packet.len();
+        packet.extend_from_slice(b"\xc0\x0c\x00\x01\x00\x01"); // Answer
+        packet.extend_from_slice(&50u32.to_be_bytes()); // TTL=50
+        packet.extend_from_slice(b"\x00\x04\x01\x02\x03\x04");
+        
+        patch_all_ttls(&mut packet, 100); // 50 - 100 should floor at 0
+        
+        let ttl_offset = answer_start + 6;
+        assert_eq!(u32::from_be_bytes([packet[ttl_offset], packet[ttl_offset+1], packet[ttl_offset+2], packet[ttl_offset+3]]), 0);
+    }
+
+    #[test]
+    fn test_patch_all_ttls_multiple_sections() {
+        // 1 Answer, 1 NS, 1 Addtl
+        let mut packet = vec![0u8; 12];
+        packet[5] = 1; // QDCOUNT=1
+        packet[7] = 1; // AN
+        packet[9] = 1; // NS
+        packet[11] = 1; // AR
+        
+        packet.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01"); // Question
+        
+        // AN
+        let an_ttl_off = packet.len() + 6;
+        packet.extend_from_slice(b"\xc0\x0c\x00\x01\x00\x01");
+        packet.extend_from_slice(&1000u32.to_be_bytes());
+        packet.extend_from_slice(b"\x00\x04\x01\x02\x03\x04");
+        
+        // NS
+        let ns_ttl_off = packet.len() + 6;
+        packet.extend_from_slice(b"\xc0\x0c\x00\x02\x00\x01");
+        packet.extend_from_slice(&2000u32.to_be_bytes());
+        packet.extend_from_slice(b"\x00\x04\x01\x02\x03\x04");
+        
+        // AR
+        let ar_ttl_off = packet.len() + 6;
+        packet.extend_from_slice(b"\xc0\x0c\x00\x01\x00\x01");
+        packet.extend_from_slice(&3000u32.to_be_bytes());
+        packet.extend_from_slice(b"\x00\x04\x01\x02\x03\x04");
+        
+        patch_all_ttls(&mut packet, 500);
+        
+        assert_eq!(u32::from_be_bytes([packet[an_ttl_off], packet[an_ttl_off+1], packet[an_ttl_off+2], packet[an_ttl_off+3]]), 500);
+        assert_eq!(u32::from_be_bytes([packet[ns_ttl_off], packet[ns_ttl_off+1], packet[ns_ttl_off+2], packet[ns_ttl_off+3]]), 1500);
+        assert_eq!(u32::from_be_bytes([packet[ar_ttl_off], packet[ar_ttl_off+1], packet[ar_ttl_off+2], packet[ar_ttl_off+3]]), 2500);
+    }
 }

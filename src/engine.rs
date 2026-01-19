@@ -4,7 +4,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicUsize, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
@@ -46,10 +46,16 @@ use crate::proto_utils::parse_quick;
 ///
 /// - `Direct`: already has correct TXID and can be sent as-is.
 /// - `CacheHit`: carries cached bytes (with an old TXID) and the request TXID to patch.
+///   Also includes insertion time and original TTL for RFC 1035 §5.2 compliance.
 #[derive(Debug, Clone)]
 pub enum FastPathResponse {
     Direct(Bytes),
-    CacheHit { cached: Bytes, tx_id: u16 },
+    CacheHit { 
+        cached: Bytes, 
+        tx_id: u16,
+        /// Insertion time for TTL calculation / 用于TTL计算的插入时间
+        inserted_at: Instant,
+    },
 }
 
 pub struct EngineInner {
@@ -168,10 +174,11 @@ impl Drop for PermitGuard {
 
 impl Engine {
     pub fn new(cfg: RuntimePipelineConfig, listener_label: String) -> Self {
-        // moka 缓存：容量由配置控制（默认 10000 条），默认 TTL 300 秒（会被实际 TTL 覆盖）
-        // moka cache capacity is configurable via settings.cache_capacity (default 10000)
+        // moka 缓存：容量由配置控制（默认 10000 条），最大生存时间由 cache_max_ttl 控制
+        // moka cache capacity and max TTL are configurable via settings
         let cache_capacity = cfg.settings.cache_capacity;
-        let cache = new_cache(cache_capacity, 300);
+        let cache_max_ttl = cfg.settings.cache_max_ttl;
+        let cache = new_cache(cache_capacity, cache_max_ttl);
         // Rule cache: 10k entries, 60s TTL / 规则缓存：1万条，60秒 TTL
         let rule_cache = Cache::builder()
             .max_capacity(10_000)
@@ -394,7 +401,7 @@ impl Engine {
         let state = self.state.load();
         let cfg = &state.pipeline;
         let qclass = DNSClass::from(q.qclass);
-        let (_pipeline_opt, pipeline_id) = select_pipeline(
+        let (pipeline_opt, pipeline_id) = select_pipeline(
             cfg,
             q.qname.as_ref(),
             peer.ip(),
@@ -414,6 +421,7 @@ impl Engine {
                 return Ok(Some(FastPathResponse::CacheHit {
                     cached: hit.bytes.clone(),
                     tx_id: q.tx_id,
+                    inserted_at: hit.inserted_at,
                 }));
             }
         }
@@ -446,20 +454,22 @@ impl Engine {
 
         // 3. Check Rule Cache (L1) for Static Responses / 3. 检查规则缓存（L1）的静态响应
         // Zero-allocation lookup using hash / 使用哈希的零分配查找
-        let rule_hash = calculate_rule_hash(&pipeline_id, q.qname.as_ref(), peer.ip());
-        if let Some(entry) = self.rule_cache.get(&rule_hash) {
-            if entry.matches(&pipeline_id, q.qname.as_ref(), peer.ip()) {
-                if let Decision::Static { rcode, answers } = entry.decision.as_ref() {
-                    let resp = build_fast_static_response(
-                        q.tx_id,
-                        q.qname.as_ref(),
-                        q.qtype,
-                        q.qclass,
-                        *rcode,
-                        answers,
-                    )?;
-                    self.incr_fastpath_hits();
-                    return Ok(Some(FastPathResponse::Direct(resp)));
+        if let Some(p) = pipeline_opt {
+            let rule_hash = calculate_rule_hash(&pipeline_id, q.qname.as_ref(), peer.ip(), p.uses_client_ip);
+            if let Some(entry) = self.rule_cache.get(&rule_hash) {
+                if entry.matches(&pipeline_id, q.qname.as_ref(), peer.ip(), p.uses_client_ip) {
+                    if let Decision::Static { rcode, answers } = entry.decision.as_ref() {
+                        let resp = build_fast_static_response(
+                            q.tx_id,
+                            q.qname.as_ref(),
+                            q.qtype,
+                            q.qclass,
+                            *rcode,
+                            answers,
+                        )?;
+                        self.incr_fastpath_hits();
+                        return Ok(Some(FastPathResponse::Direct(resp)));
+                    }
                 }
             }
         }
@@ -469,13 +479,13 @@ impl Engine {
     }
 
     #[inline]
-    fn insert_rule_cache(&self, hash: u64, pipeline_id: Arc<str>, qname: &str, client_ip: IpAddr, decision: Decision) {
+    fn insert_rule_cache(&self, hash: u64, pipeline_id: Arc<str>, qname: &str, client_ip: IpAddr, decision: Decision, uses_client_ip: bool) {
         self.rule_cache.insert(
             hash,
             RuleCacheEntry {
                 pipeline_id,
                 qname_hash: fast_hash_str(qname),
-                client_ip,
+                client_ip: if uses_client_ip { Some(client_ip) } else { None },
                 decision: Arc::new(decision),
             },
         );
@@ -536,6 +546,13 @@ impl Engine {
                 // clone bytes and rewrite transaction ID to match requester / 克隆字节并重写事务 ID 以匹配请求者
                 let mut resp_bytes = BytesMut::with_capacity(hit.bytes.len());
                 resp_bytes.extend_from_slice(&hit.bytes);
+
+                // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
+                let elapsed = hit.inserted_at.elapsed().as_secs() as u32;
+                if elapsed > 0 {
+                    crate::proto_utils::patch_all_ttls(&mut resp_bytes, elapsed);
+                }
+
                 if resp_bytes.len() >= 2 {
                     let id_bytes = tx_id.to_be_bytes();
                     resp_bytes[0] = id_bytes[0];
@@ -548,6 +565,8 @@ impl Engine {
                     qname = %qname_ref,
                     qtype = ?qtype,
                     rcode = ?hit.rcode,
+                    original_ttl = hit.original_ttl,
+                    elapsed_secs = elapsed,
                     latency_ms = latency.as_millis() as u64,
                     client_ip = %peer.ip(),
                     pipeline = %pipeline_id,
@@ -663,6 +682,8 @@ impl Engine {
                         qname: Arc::from(qname.as_str()),
                         pipeline_id: current_pipeline_id.clone(),
                         qtype: u16::from(qtype),
+                        inserted_at: Instant::now(),
+                        original_ttl: min_ttl.as_secs() as u32,
                     };
                     self.cache.insert(dedupe_hash, entry);
                 }
@@ -844,6 +865,8 @@ impl Engine {
                                     qname: Arc::from(qname.as_str()),
                                     pipeline_id: pipeline_id.clone(),
                                     qtype: u16::from(qtype),
+                                    inserted_at: Instant::now(),
+                                    original_ttl: ttl_secs as u32,
                                 };
                                 self.cache.insert(dedupe_hash, entry);
                             }
@@ -912,6 +935,8 @@ impl Engine {
                                         qname: Arc::from(qname.as_str()),
                                         pipeline_id: pipeline_id.clone(),
                                         qtype: u16::from(qtype),
+                                        inserted_at: Instant::now(),
+                                        original_ttl: ttl_secs as u32,
                                     };
                                     self.cache.insert(dedupe_hash, entry);
                                 }
@@ -947,6 +972,8 @@ impl Engine {
                                         qname: Arc::from(qname.as_str()),
                                         pipeline_id: current_pipeline_id.clone(),
                                         qtype: u16::from(qtype),
+                                        inserted_at: Instant::now(),
+                                        original_ttl: min_ttl.as_secs() as u32,
                                     };
                                     self.cache.insert(dedupe_hash, entry);
                                 }
@@ -1083,6 +1110,8 @@ impl Engine {
                                                 qname: Arc::from(qname.as_str()),
                                                 pipeline_id: pipeline_id.clone(),
                                                 qtype: u16::from(qtype),
+                                                inserted_at: Instant::now(),
+                                                original_ttl: ttl_secs as u32,
                                             };
                                             self.cache.insert(dedupe_hash, entry);
                                         }
@@ -1168,12 +1197,12 @@ impl Engine {
     ) -> Decision {
         // 1. Check Rule Cache
         // Use hash for lookup to avoid cloning String for key on every lookup
-        let rule_hash = calculate_rule_hash(&pipeline.id, qname, client_ip);
+        let rule_hash = calculate_rule_hash(&pipeline.id, qname, client_ip, pipeline.uses_client_ip);
         let allow_rule_cache_lookup = skip_rules.map_or(true, |set| set.is_empty());
         
         if allow_rule_cache_lookup {
             if let Some(entry) = self.rule_cache.get(&rule_hash) {
-                if entry.matches(&pipeline.id, qname, client_ip) {
+                if entry.matches(&pipeline.id, qname, client_ip, pipeline.uses_client_ip) {
                     return (*entry.decision).clone();
                 }
             }
@@ -1234,7 +1263,7 @@ impl Engine {
                                 rcode: code,
                                 answers: Vec::new(),
                             };
-                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
+                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
                             return d;
                         }
                         Action::StaticIpResponse { ip } => {
@@ -1249,7 +1278,7 @@ impl Engine {
                                         rcode: ResponseCode::NoError,
                                         answers: vec![record],
                                     };
-                                    self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
+                                    self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
                                     return d;
                                 }
                             }
@@ -1257,14 +1286,14 @@ impl Engine {
                                 rcode: ResponseCode::ServFail,
                                 answers: Vec::new(),
                             };
-                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
+                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
                             return d;
                         }
                         Action::JumpToPipeline { pipeline: target } => {
                             let d = Decision::Jump {
                                 pipeline: Arc::from(target.as_str()),
                             };
-                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
+                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
                             return d;
                         }
                         Action::Allow => {
@@ -1280,7 +1309,7 @@ impl Engine {
                                 continue_on_miss: false,
                                 allow_reuse: true,
                             };
-                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
+                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
                             return d;
                         }
                         Action::Deny => {
@@ -1288,7 +1317,7 @@ impl Engine {
                                 rcode: ResponseCode::Refused,
                                 answers: Vec::new(),
                             };
-                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
+                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
                             return d;
                         }
                         Action::Forward {
@@ -1314,7 +1343,7 @@ impl Engine {
                                 allow_reuse: false,
                             };
                             if !continue_on_match && !continue_on_miss {
-                                self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
+                                self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
                             }
                             return d;
                         }
@@ -1346,7 +1375,7 @@ impl Engine {
             continue_on_miss: false,
             allow_reuse: false,
         };
-        self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone());
+        self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
         d
     }
 
@@ -1724,6 +1753,8 @@ impl Engine {
                         qname: Arc::from(qname),
                         pipeline_id: pipeline_id.clone(),
                         qtype: u16::from(qtype),
+                        inserted_at: Instant::now(),
+                        original_ttl: min_ttl.as_secs() as u32,
                     };
                     self.cache.insert(dedupe_hash, entry);
                     for g in &mut cleanup_guards { g.defuse(); }
@@ -1866,6 +1897,8 @@ impl Engine {
                                         qname: Arc::from(qname),
                                         pipeline_id: pipeline_id.clone(),
                                         qtype: u16::from(qtype),
+                                        inserted_at: Instant::now(),
+                                        original_ttl: ttl_secs as u32,
                                     };
                                     self.cache.insert(dedupe_hash, entry);
                                 }
@@ -1912,6 +1945,8 @@ impl Engine {
                                             qname: Arc::from(qname),
                                             pipeline_id: pipeline_id.clone(),
                                             qtype: u16::from(qtype),
+                                            inserted_at: Instant::now(),
+                                            original_ttl: ttl_secs as u32,
                                         };
                                         self.cache.insert(dedupe_hash, entry);
                                     }
@@ -2892,6 +2927,66 @@ mod tests {
             _ => panic!("expected static refused"),
         }
     }
+
+    #[test]
+    fn test_calculate_rule_hash_respects_uses_client_ip() {
+        let pipeline_id = "test_p";
+        let qname = "example.com";
+        let ip1 = "1.2.3.4".parse::<IpAddr>().unwrap();
+        let ip2 = "5.6.7.8".parse::<IpAddr>().unwrap();
+
+        // When uses_client_ip is false, both IPs should result in the same hash
+        let h1_no_ip = calculate_rule_hash(pipeline_id, qname, ip1, false);
+        let h2_no_ip = calculate_rule_hash(pipeline_id, qname, ip2, false);
+        assert_eq!(h1_no_ip, h2_no_ip, "Hashes should match when IP is ignored");
+
+        // When uses_client_ip is true, different IPs should result in different hashes
+        let h1_with_ip = calculate_rule_hash(pipeline_id, qname, ip1, true);
+        let h2_with_ip = calculate_rule_hash(pipeline_id, qname, ip2, true);
+        assert_ne!(h1_with_ip, h2_with_ip, "Hashes should differ when IP is included");
+        
+        // Hash with IP should differ from hash without IP
+        assert_ne!(h1_no_ip, h1_with_ip, "Hash with IP should differ from hash without IP");
+    }
+
+    #[test]
+    fn test_rule_cache_entry_matches_respects_uses_client_ip() {
+        let pipeline_id: Arc<str> = Arc::from("test_p");
+        let qname = "example.com";
+        let ip1 = "1.2.3.4".parse::<IpAddr>().unwrap();
+        let ip2 = "5.6.7.8".parse::<IpAddr>().unwrap();
+        let decision = Arc::new(Decision::Static { rcode: ResponseCode::NoError, answers: vec![] });
+
+        // Entry created WITHOUT IP
+        let entry_no_ip = RuleCacheEntry {
+            pipeline_id: pipeline_id.clone(),
+            qname_hash: fast_hash_str(qname),
+            client_ip: None,
+            decision: decision.clone(),
+        };
+
+        // Should match any IP if we don't care about it
+        assert!(entry_no_ip.matches("test_p", qname, ip1, false));
+        assert!(entry_no_ip.matches("test_p", qname, ip2, false));
+        
+        // Should NOT match if we now care about IP (since entry doesn't have it)
+        assert!(!entry_no_ip.matches("test_p", qname, ip1, true));
+
+        // Entry created WITH IP
+        let entry_with_ip = RuleCacheEntry {
+            pipeline_id: pipeline_id.clone(),
+            qname_hash: fast_hash_str(qname),
+            client_ip: Some(ip1),
+            decision: decision,
+        };
+
+        // Should match same IP if we care
+        assert!(entry_with_ip.matches("test_p", qname, ip1, true));
+        // Should NOT match different IP if we care
+        assert!(!entry_with_ip.matches("test_p", qname, ip2, true));
+        // Should NOT match even same IP if we don't care now (safety check)
+        assert!(!entry_with_ip.matches("test_p", qname, ip1, false));
+    }
 }
 
 fn parse_rcode(rcode: &str) -> Option<ResponseCode> {
@@ -3002,11 +3097,13 @@ enum ResponseActionResult {
 }
 
 #[inline]
-fn calculate_rule_hash(pipeline_id: &str, qname: &str, client_ip: IpAddr) -> u64 {
+fn calculate_rule_hash(pipeline_id: &str, qname: &str, client_ip: IpAddr, uses_client_ip: bool) -> u64 {
     let mut hasher = FxHasher::default();
     pipeline_id.hash(&mut hasher);
     qname.hash(&mut hasher);
-    client_ip.hash(&mut hasher);
+    if uses_client_ip {
+        client_ip.hash(&mut hasher);
+    }
     hasher.finish()
 }
 
@@ -3014,15 +3111,24 @@ fn calculate_rule_hash(pipeline_id: &str, qname: &str, client_ip: IpAddr) -> u64
 struct RuleCacheEntry {
     pipeline_id: Arc<str>,
     qname_hash: u64,
-    client_ip: IpAddr,
+    client_ip: Option<IpAddr>,
     decision: Arc<Decision>,
 }
 
 impl RuleCacheEntry {
     #[inline]
-    fn matches(&self, pipeline_id: &str, qname: &str, client_ip: IpAddr) -> bool {
-        self.client_ip == client_ip
-            && self.pipeline_id.as_ref() == pipeline_id
+    fn matches(&self, pipeline_id: &str, qname: &str, client_ip: IpAddr, uses_client_ip: bool) -> bool {
+        if uses_client_ip {
+            if self.client_ip != Some(client_ip) {
+                return false;
+            }
+        } else if self.client_ip.is_some() {
+            // Entry has IP but we don't care now? 
+            // This case shouldn't happen if we use the same uses_client_ip for both hash and entry.
+            return false;
+        }
+
+        self.pipeline_id.as_ref() == pipeline_id
             && self.qname_hash == fast_hash_str(qname)
     }
 }

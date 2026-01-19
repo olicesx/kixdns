@@ -84,12 +84,21 @@
                             </div>
                             <div class="col-md-3">
                                 <label class="form-label">UDP 连接池大小</label>
-                                <input type="number" class="form-control" v-model.number="config.settings.udp_pool_size" placeholder="0=禁用">
+                                <input type="number" class="form-control" v-model.number="config.settings.udp_pool_size" placeholder="64">
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">TCP 连接池大小</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.tcp_pool_size" placeholder="64">
                             </div>
                                 <div class="col-md-3">
                                     <label class="form-label">缓存容量 (entries)</label>
                                     <input type="number" class="form-control" v-model.number="config.settings.cache_capacity" placeholder="10000">
                                     <div class="form-text small">moka 缓存最大条目数 (默认 10000)</div>
+                                </div>
+                                <div class="col-md-3">
+                                    <label class="form-label">缓存失效时间 (TTL)</label>
+                                    <input type="number" class="form-control" v-model.number="config.settings.cache_max_ttl" placeholder="86400">
+                                    <div class="form-text small">moka 缓存强制失效时间 (秒，默认 86400)</div>
                                 </div>
                                 <div class="col-md-3">
                                     <label class="form-label">DashMap Shards</label>
@@ -429,13 +438,15 @@
                         default_upstream: "1.1.1.1:53",
                         upstream_timeout_ms: 2000,
                         response_jump_limit: 10,
-                        udp_pool_size: 0,
+                        udp_pool_size: 64,
+                        tcp_pool_size: 64,
                         flow_control_initial_permits: 500,
                         flow_control_min_permits: 100,
                         flow_control_max_permits: 800,
                         flow_control_latency_threshold_ms: 100,
                         flow_control_adjustment_interval_secs: 5,
                         cache_capacity: 10000,
+                        cache_max_ttl: 86400,
                         dashmap_shards: 0
                     },
                     pipeline_select: [],

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use hickory_proto::op::ResponseCode;
@@ -14,6 +14,10 @@ pub struct CacheEntry {
     pub qname: Arc<str>,
     pub pipeline_id: Arc<str>,
     pub qtype: u16,
+    /// RFC 1035 §5.2: Record insertion time for TTL decrement / RFC 1035 §5.2：记录插入时间用于TTL递减
+    pub inserted_at: Instant,
+    /// Original minimum TTL from upstream response / 上游响应的原始最小TTL
+    pub original_ttl: u32,
 }
 
 /// Use u64 hash as key to avoid allocation during lookup / 使用 u64 哈希作为键以避免查找时的内存分配

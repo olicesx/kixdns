@@ -20,6 +20,8 @@ pub struct RuntimePipelineConfig {
 pub struct RuntimePipeline {
     pub id: Arc<str>,
     pub rules: Vec<RuntimeRule>,
+    /// 是否包含依赖客户端 IP 的匹配规则 / Whether it contains rules that match based on client IP
+    pub uses_client_ip: bool,
     // Indices for O(1) lookup
     // Maps domain suffix -> list of rule indices that MUST be checked
     pub domain_suffix_index: FxHashMap<String, Vec<usize>>,
@@ -224,9 +226,21 @@ impl RuntimePipelineConfig {
                 }
             }
 
+            let mut pipeline_uses_client_ip = false;
+            for r in &rules {
+                for m in &r.matchers {
+                    if matches!(m.matcher, RuntimeMatcher::ClientIp { .. }) {
+                        pipeline_uses_client_ip = true;
+                        break;
+                    }
+                }
+                if pipeline_uses_client_ip { break; }
+            }
+
             pipelines.push(RuntimePipeline {
                 id: Arc::from(p.id),
                 rules,
+                uses_client_ip: pipeline_uses_client_ip,
                 domain_suffix_index,
                 always_check_rules,
             });

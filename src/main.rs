@@ -233,13 +233,20 @@ async fn run_udp_worker(
                             // 已包含正确 TXID，可直接发送 / Already contains correct TXID
                             let _ = socket.send_to(&bytes, peer).await;
                         }
-                        FastPathResponse::CacheHit { cached, tx_id } => {
+                        FastPathResponse::CacheHit { cached, tx_id, inserted_at } => {
                             // 复用 send_buf：copy + patch TXID / Reuse send_buf: copy + patch TXID
                             send_buf.clear();
                             if send_buf.capacity() < cached.len() {
                                 send_buf.reserve(cached.len() - send_buf.capacity());
                             }
                             send_buf.extend_from_slice(&cached);
+                            
+                            // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
+                            let elapsed = inserted_at.elapsed().as_secs() as u32;
+                            if elapsed > 0 {
+                                crate::proto_utils::patch_all_ttls(&mut send_buf, elapsed);
+                            }
+
                             if send_buf.len() >= 2 {
                                 let id_bytes = tx_id.to_be_bytes();
                                 send_buf[0] = id_bytes[0];
