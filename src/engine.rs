@@ -179,10 +179,11 @@ impl Engine {
         let cache_capacity = cfg.settings.cache_capacity;
         let cache_max_ttl = cfg.settings.cache_max_ttl;
         let cache = new_cache(cache_capacity, cache_max_ttl);
-        // Rule cache: 10k entries, 60s TTL / 规则缓存：1万条，60秒 TTL
+        // Rule cache: 10k entries, long default TTL (managed manually per-entry)
+        // 规则缓存：1万条，默认长 TTL（通过条目内部 expires_at 手动管理）
         let rule_cache = Cache::builder()
             .max_capacity(10_000)
-            .time_to_live(Duration::from_secs(60))
+            .time_to_live(Duration::from_secs(3600))
             .build();
 
         // Extract flow control settings before moving cfg / 在 move cfg 之前提取流控设置
@@ -485,6 +486,33 @@ impl Engine {
 
     #[inline]
     fn insert_rule_cache(&self, hash: u64, pipeline_id: Arc<str>, qname: &str, client_ip: IpAddr, decision: Decision, uses_client_ip: bool) {
+        let ttl = match &decision {
+            Decision::Static { answers, .. } => {
+                let min_ttl = answers.iter().map(|r| r.ttl()).min();
+                min_ttl.map(|t| Duration::from_secs(t as u64))
+            }
+            Decision::Forward {
+                response_matchers,
+                response_actions_on_match,
+                response_actions_on_miss,
+                ..
+            } => {
+                // If it has response-phase logic, it is not "static" in the user's terms.
+                // Give it a 60s default TTL to allow periodic re-evaluation if needed.
+                if !response_matchers.is_empty()
+                    || !response_actions_on_match.is_empty()
+                    || !response_actions_on_miss.is_empty()
+                {
+                    Some(Duration::from_secs(60))
+                } else {
+                    None // Permanent
+                }
+            }
+            _ => None, // Jump, Allow, Deny are permanent
+        };
+
+        let expires_at = ttl.map(|d| Instant::now() + d);
+
         self.rule_cache.insert(
             hash,
             RuleCacheEntry {
@@ -492,6 +520,7 @@ impl Engine {
                 qname_hash: fast_hash_str(qname),
                 client_ip: if uses_client_ip { Some(client_ip) } else { None },
                 decision: Arc::new(decision),
+                expires_at,
             },
         );
     }
@@ -3008,6 +3037,7 @@ mod tests {
             qname_hash: fast_hash_str(qname),
             client_ip: None,
             decision: decision.clone(),
+            expires_at: None,
         };
 
         // Should match any IP if we don't care about it
@@ -3023,6 +3053,7 @@ mod tests {
             qname_hash: fast_hash_str(qname),
             client_ip: Some(ip1),
             decision: decision,
+            expires_at: None,
         };
 
         // Should match same IP if we care
@@ -3031,6 +3062,34 @@ mod tests {
         assert!(!entry_with_ip.matches("test_p", qname, ip2, true));
         // Should NOT match even same IP if we don't care now (safety check)
         assert!(!entry_with_ip.matches("test_p", qname, ip1, false));
+    }
+
+    #[test]
+    fn test_rule_cache_expiration() {
+        let pipeline_id: Arc<str> = Arc::from("test_p");
+        let qname = "expire.com";
+        let ip = "1.2.3.4".parse::<IpAddr>().unwrap();
+        let decision = Arc::new(Decision::Static { rcode: ResponseCode::NoError, answers: vec![] });
+
+        // Expired entry
+        let entry_expired = RuleCacheEntry {
+            pipeline_id: pipeline_id.clone(),
+            qname_hash: fast_hash_str(qname),
+            client_ip: None,
+            decision: decision.clone(),
+            expires_at: Some(Instant::now() - Duration::from_secs(1)),
+        };
+        assert!(!entry_expired.matches("test_p", qname, ip, false), "Expired entry should not match");
+
+        // Fresh entry
+        let entry_fresh = RuleCacheEntry {
+            pipeline_id: pipeline_id.clone(),
+            qname_hash: fast_hash_str(qname),
+            client_ip: None,
+            decision: decision,
+            expires_at: Some(Instant::now() + Duration::from_secs(60)),
+        };
+        assert!(entry_fresh.matches("test_p", qname, ip, false), "Fresh entry should match");
     }
 }
 
@@ -3158,11 +3217,20 @@ struct RuleCacheEntry {
     qname_hash: u64,
     client_ip: Option<IpAddr>,
     decision: Arc<Decision>,
+    /// Expiration time based on DNS TTL / 基于 DNS TTL 的过期时间
+    expires_at: Option<Instant>,
 }
 
 impl RuleCacheEntry {
     #[inline]
     fn matches(&self, pipeline_id: &str, qname: &str, client_ip: IpAddr, uses_client_ip: bool) -> bool {
+        // Check expiration first / 首先检查过期
+        if let Some(expires) = self.expires_at {
+            if Instant::now() > expires {
+                return false;
+            }
+        }
+
         if uses_client_ip {
             if self.client_ip != Some(client_ip) {
                 return false;
