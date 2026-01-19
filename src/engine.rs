@@ -1697,13 +1697,15 @@ impl Engine {
     ) {
         use dashmap::mapref::entry::Entry;
         
-        // 使用 DashMap 的 entry API 确保同一时间只有一个刷新任务
-        // Use DashMap entry API to ensure only one refresh task at a time
-        let refresh_key = format!("refresh_{}", cache_hash);
+        // 使用 u64 高位标记刷新键，避免与正常 inflight 键冲突
+        // Use high bit to mark refresh keys, avoiding conflicts with normal inflight keys
+        // 正常 inflight 键: 0x0000_0000_0000_0000 到 0x7fff_ffff_ffff_ffff
+        // 刷新键: 0x8000_0000_0000_0000 到 0xffff_ffff_ffff_ffff
+        let refresh_key = cache_hash | 0x8000_0000_0000_0000;
         
         // 尝试插入刷新标志，如果已存在则说明已有刷新任务在进行
         // Try to insert refresh flag, if exists means refresh task already in progress
-        let should_spawn = match self.inflight.entry(refresh_key.parse().unwrap()) {
+        let should_spawn = match self.inflight.entry(refresh_key) {
             Entry::Vacant(_) => {
                 // 成功插入，可以执行刷新
                 true
@@ -1796,7 +1798,7 @@ impl Engine {
             
             // 无论成功失败，都移除刷新标志
             // Whether success or failure, remove refresh flag
-            engine.inflight.remove(&refresh_key.parse().unwrap());
+            engine.inflight.remove(&refresh_key);
             
             if let Err(e) = result {
                 tracing::error!("background refresh error: {}", e);

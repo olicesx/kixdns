@@ -194,10 +194,11 @@ pub fn is_private_ip(ip: IpAddr) -> bool {
                 || ipv4.is_broadcast()
         }
         IpAddr::V6(ipv6) => {
+            let seg0 = ipv6.segments()[0];
             ipv6.is_loopback()
                 || ipv6.is_unspecified()
-                || ipv6.segments()[0] == 0xfe80 // ULA (Unique Local Address)
-                || (ipv6.segments()[0] == 0xfc00 || ipv6.segments()[0] == 0xfd00) // Reserved for documentation
+                || (seg0 & 0xffc0) == 0xfe80  // Link-local addresses (fe80::/10)
+                || (seg0 & 0xfe00) == 0xfc00  // Unique Local Addresses (fc00::/7)
         }
     }
 }
