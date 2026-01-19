@@ -7,3 +7,7 @@ claude.md
 diff_review.txt
 # Local AI coding agent instructions (not for repository)
 .github/copilot-instructions.md
+/docs
+*.md
+*.json
+.gitignore

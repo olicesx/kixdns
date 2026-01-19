@@ -70,6 +70,15 @@ pub struct GlobalSettings {
     /// 流控调整间隔（秒）。 / Flow control adjustment interval (seconds)
     #[serde(default = "default_flow_control_adjustment_interval_secs")]
     pub flow_control_adjustment_interval_secs: u64,
+    /// 缓存后台刷新是否启用（默认false） / Enable cache background refresh (default false)
+    #[serde(default = "default_cache_background_refresh")]
+    pub cache_background_refresh: bool,
+    /// 缓存后台刷新阈值（百分比，默认10）。当剩余TTL低于此百分比时触发后台刷新 / Cache background refresh threshold (percentage, default 10). Trigger background refresh when remaining TTL below this percentage
+    #[serde(default = "default_cache_refresh_threshold_percent")]
+    pub cache_refresh_threshold_percent: u8,
+    /// 缓存后台刷新最小TTL（秒，默认5）。防止TTL过短导致无限循环刷新 / Cache background refresh minimum TTL (seconds, default 5). Prevent infinite refresh loop for very short TTLs
+    #[serde(default = "default_cache_refresh_min_ttl")]
+    pub cache_refresh_min_ttl: u32,
 }
 
 impl Default for GlobalSettings {
@@ -91,6 +100,9 @@ impl Default for GlobalSettings {
             cache_capacity: default_cache_capacity(),
             cache_max_ttl: default_cache_max_ttl(),
             dashmap_shards: default_dashmap_shards(),
+            cache_background_refresh: default_cache_background_refresh(),
+            cache_refresh_threshold_percent: default_cache_refresh_threshold_percent(),
+            cache_refresh_min_ttl: default_cache_refresh_min_ttl(),
         }
     }
 }
@@ -252,8 +264,9 @@ pub enum Action {
     Allow,
     /// 终止并丢弃（返回 REFUSED）。 / Terminate and drop (return REFUSED)
     Deny,
-    /// 透传上游；upstream为空则使用全局默认；transport缺省udp。 / Forward to upstream; use global default if upstream is empty; transport defaults to udp
+    /// 透传上游；upstream为空则使用全局默认；支持逗号分隔或数组格式的多个上游（并发请求取最快结果）；transport缺省udp。 / Forward to upstream; use global default if upstream is empty; supports comma-separated or array format for multiple upstreams (concurrent requests, take fastest result); transport defaults to udp
     Forward {
+        #[serde(deserialize_with = "deserialize_upstream")]
         upstream: Option<String>,
         #[serde(default)]
         transport: Option<Transport>,
@@ -491,4 +504,46 @@ fn default_flow_control_latency_threshold_ms() -> u64 {
 
 fn default_flow_control_adjustment_interval_secs() -> u64 {
     5
+}
+
+fn default_cache_background_refresh() -> bool {
+    false
+}
+
+fn default_cache_refresh_threshold_percent() -> u8 {
+    10
+}
+
+fn default_cache_refresh_min_ttl() -> u32 {
+    5
+}
+
+/// 反序列化 upstream 字段，支持字符串、逗号分隔字符串或数组格式
+/// Deserialize upstream field, supports string, comma-separated string, or array format
+fn deserialize_upstream<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum UpstreamInput {
+        String(String),
+        Array(Vec<String>),
+    }
+    
+    let input = Option::<UpstreamInput>::deserialize(deserializer)?;
+    
+    match input {
+        None => Ok(None),
+        Some(UpstreamInput::String(s)) => Ok(Some(s)),
+        Some(UpstreamInput::Array(arr)) => {
+            if arr.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(arr.join(",")))
+            }
+        }
+    }
 }
