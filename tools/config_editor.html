@@ -108,6 +108,29 @@
                         </div>
 
                         <hr>
+                        <h6 class="fw-bold mb-2 text-warning">缓存后台刷新配置 (Cache Background Refresh)</h6>
+                        <div class="row g-3">
+                            <div class="col-md-4">
+                                <label class="form-label">启用后台刷新</label>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" v-model="config.settings.cache_background_refresh">
+                                    <label class="form-check-label">启用缓存后台刷新</label>
+                                </div>
+                                <div class="form-text small">当TTL即将过期时异步刷新缓存条目</div>
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label">刷新阈值 (%)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.cache_refresh_threshold_percent" placeholder="10" min="1" max="90">
+                                <div class="form-text small">当剩余TTL低于此百分比时触发刷新（1-90，默认10）</div>
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label">最小TTL (秒)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.cache_refresh_min_ttl" placeholder="5" min="1">
+                                <div class="form-text small">防止TTL过短导致无限循环刷新（默认5秒）</div>
+                            </div>
+                        </div>
+
+                        <hr>
                         <h6 class="fw-bold mb-2 text-success">自适应流量控制配置 (Flow Control)</h6>
                         <div class="row g-3">
                             <div class="col-md-6">
@@ -447,7 +470,11 @@
                         flow_control_adjustment_interval_secs: 5,
                         cache_capacity: 10000,
                         cache_max_ttl: 86400,
-                        dashmap_shards: 0
+                        dashmap_shards: 0,
+                        cache_rule_include_client_ip: false,
+                        cache_background_refresh: false,
+                        cache_refresh_threshold_percent: 10,
+                        cache_refresh_min_ttl: 5,
                     },
                     pipeline_select: [],
                     pipelines: []

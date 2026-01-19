@@ -90,6 +90,10 @@ pub struct Engine {
     pub metrics_last_upstream_latency_ns: Arc<AtomicU64>,
     // Adaptive flow control state / 自适应流控状态
     pub flow_control_state: Arc<FlowControlState>,
+    // Cache background refresh settings / 缓存后台刷新设置
+    cache_background_refresh: bool,
+    cache_refresh_threshold_percent: u8,
+    cache_refresh_min_ttl: u32,
 }
 
 /// Adaptive flow control state for dynamic semaphore adjustment
@@ -195,6 +199,9 @@ impl Engine {
         let flow_control_latency_threshold_ms = cfg.settings.flow_control_latency_threshold_ms;
         let flow_control_adjustment_interval_secs = cfg.settings.flow_control_adjustment_interval_secs;
         let dashmap_shards = cfg.settings.dashmap_shards;
+        let cache_background_refresh = cfg.settings.cache_background_refresh;
+        let cache_refresh_threshold_percent = cfg.settings.cache_refresh_threshold_percent;
+        let cache_refresh_min_ttl = cfg.settings.cache_refresh_min_ttl;
         
         let compiled = compile_pipelines(&cfg);
         
@@ -243,6 +250,10 @@ impl Engine {
             },
             permit_manager,
             flow_control_state,
+            // Cache background refresh settings / 缓存后台刷新设置
+            cache_background_refresh,
+            cache_refresh_threshold_percent,
+            cache_refresh_min_ttl,
         }
     }
 
@@ -419,9 +430,22 @@ impl Engine {
             // Verify collision / 验证冲突
             if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == q.qname.as_ref() && hit.pipeline_id == pipeline_id {
                 // Check if expired / 检查是否已过期
-                if hit.inserted_at.elapsed().as_secs() >= hit.original_ttl as u64 {
+                let elapsed_secs = hit.inserted_at.elapsed().as_secs() as u32;
+                if elapsed_secs >= hit.original_ttl {
                     self.cache.invalidate(&cache_hash);
                 } else {
+                    // 缓存后台刷新：当TTL < 阈值百分比时，触发异步刷新
+                    // Cache background refresh: trigger async refresh when TTL < threshold percentage
+                    if self.cache_background_refresh && hit.original_ttl >= self.cache_refresh_min_ttl {
+                        let remaining_ttl = hit.original_ttl.saturating_sub(elapsed_secs);
+                        let threshold = (hit.original_ttl as u64 * self.cache_refresh_threshold_percent as u64) / 100;
+                        if remaining_ttl as u64 <= threshold && remaining_ttl >= self.cache_refresh_min_ttl as u32 {
+                            // 触发后台刷新，避免无限循环：使用标志位防止重复刷新
+                            // Trigger background refresh, prevent infinite loop: use flag to prevent duplicate refresh
+                            self.spawn_background_refresh(cache_hash, &pipeline_id, q.qname.as_ref(), qtype, qclass);
+                        }
+                    }
+                    
                     self.incr_fastpath_hits();
                     return Ok(Some(FastPathResponse::CacheHit {
                         cached: hit.bytes.clone(),
@@ -461,9 +485,12 @@ impl Engine {
         // 3. Check Rule Cache (L1) for Static Responses / 3. 检查规则缓存（L1）的静态响应
         // Zero-allocation lookup using hash / 使用哈希的零分配查找
         if let Some(p) = pipeline_opt {
-            let rule_hash = calculate_rule_hash(&pipeline_id, q.qname.as_ref(), peer.ip(), p.uses_client_ip);
+            // 优化：仅当规则使用client_ip匹配器或配置要求时才包含IP在哈希中
+            // Optimization: only include IP in hash when rule uses client_ip matcher or config requires it
+            let include_ip_in_hash = p.uses_client_ip || self.cache_background_refresh;
+            let rule_hash = calculate_rule_hash(&pipeline_id, q.qname.as_ref(), peer.ip(), include_ip_in_hash);
             if let Some(entry) = self.rule_cache.get(&rule_hash) {
-                if entry.matches(&pipeline_id, q.qname.as_ref(), peer.ip(), p.uses_client_ip) {
+                if entry.matches(&pipeline_id, q.qname.as_ref(), peer.ip(), include_ip_in_hash) {
                     if let Decision::Static { rcode, answers } = entry.decision.as_ref() {
                         let resp = build_fast_static_response(
                             q.tx_id,
@@ -521,12 +548,16 @@ impl Engine {
 
         let expires_at = ttl.map(|d| Instant::now() + d);
 
+        // 优化：根据配置决定是否包含client_ip
+        // Optimization: only include client_ip in cache entry when configured or required by rule
+        let include_ip = uses_client_ip || self.cache_background_refresh;
+
         self.rule_cache.insert(
             hash,
             RuleCacheEntry {
                 pipeline_id,
                 qname_hash: fast_hash_str(qname),
-                client_ip: if uses_client_ip { Some(client_ip) } else { None },
+                client_ip: if include_ip { Some(client_ip) } else { None },
                 decision: Arc::new(decision),
                 expires_at,
             },
@@ -1433,25 +1464,80 @@ impl Engine {
         timeout_dur: Duration,
         transport: Transport,
     ) -> anyhow::Result<Bytes> {
-        let start = std::time::Instant::now();
-        let res = match transport {
-            Transport::Udp => self.forward_udp_smart(packet, upstream, timeout_dur).await,
-            Transport::Tcp => self.tcp_mux.send(packet, upstream, timeout_dur).await,
-        };
-        if let Ok(_) = &res {
-            let dur = start.elapsed();
-            let dur_ns = dur.as_nanos() as u64;
-            self.incr_upstream_metrics(dur_ns);
-            // 记录最新的延迟供自适应流控使用 / Record latest latency for adaptive flow control
-            self.metrics_last_upstream_latency_ns.store(dur_ns, Ordering::Relaxed);
-            tracing::debug!(upstream=%upstream, upstream_ns = dur_ns, "upstream call latency");
-        } else if let Err(e) = &res {
-            let dur = start.elapsed();
-            let dur_ns = dur.as_nanos() as u64;
-            self.metrics_last_upstream_latency_ns.store(dur_ns, Ordering::Relaxed);
-            tracing::warn!(upstream=%upstream, error=%e, elapsed_ns = dur_ns, "upstream call failed");
+        // 支持多个上游（逗号分隔）：并发请求取最快结果 / Support multiple upstreams (comma-separated): concurrent requests, take fastest result
+        let upstreams: Vec<&str> = upstream.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        
+        if upstreams.len() == 1 {
+            // 单个上游：直接转发 / Single upstream: direct forward
+            let start = std::time::Instant::now();
+            let res = match transport {
+                Transport::Udp => self.forward_udp_smart(packet, upstream, timeout_dur).await,
+                Transport::Tcp => self.tcp_mux.send(packet, upstream, timeout_dur).await,
+            };
+            if let Ok(_) = &res {
+                let dur = start.elapsed();
+                let dur_ns = dur.as_nanos() as u64;
+                self.incr_upstream_metrics(dur_ns);
+                // 记录最新的延迟供自适应流控使用 / Record latest latency for adaptive flow control
+                self.metrics_last_upstream_latency_ns.store(dur_ns, Ordering::Relaxed);
+                tracing::debug!(upstream=%upstream, upstream_ns = dur_ns, "upstream call latency");
+            } else if let Err(e) = &res {
+                let dur = start.elapsed();
+                let dur_ns = dur.as_nanos() as u64;
+                self.metrics_last_upstream_latency_ns.store(dur_ns, Ordering::Relaxed);
+                tracing::warn!(upstream=%upstream, error=%e, elapsed_ns = dur_ns, "upstream call failed");
+            }
+            return res;
         }
-        res
+        
+        // 多个上游：并发请求取最快结果 / Multiple upstreams: concurrent requests, take fastest result
+        tracing::debug!(upstreams = ?upstreams, "concurrent upstream requests");
+        
+        // 使用 futures::future::select_all 等待第一个成功响应
+        // Use futures::future::select_all to wait for first successful response
+        let mut tasks = Vec::with_capacity(upstreams.len());
+        for &up in &upstreams {
+            let engine = self.clone();
+            let packet = packet.to_vec();
+            let up = up.to_string();
+            tasks.push(tokio::spawn(async move {
+                let start = std::time::Instant::now();
+                let res = match transport {
+                    Transport::Udp => engine.forward_udp_smart(&packet, &up, timeout_dur).await,
+                    Transport::Tcp => engine.tcp_mux.send(&packet, &up, timeout_dur).await,
+                };
+                let dur = start.elapsed();
+                (up, res, dur)
+            }));
+        }
+        
+        // 等待第一个成功响应 / Wait for first successful response
+        let mut results = Vec::new();
+        for task in tasks {
+            match task.await {
+                Ok((up, res, dur)) => {
+                    if res.is_ok() {
+                        // 第一个成功响应，取消其他任务 / First successful response, cancel other tasks
+                        tracing::debug!(upstream=%up, upstream_ns = dur.as_nanos() as u64, "upstream call succeeded (first)");
+                        return res;
+                    } else {
+                        // 记录失败，继续等待其他上游 / Record failure, continue waiting for other upstreams
+                        results.push((up, res, dur));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "upstream task join error");
+                }
+            }
+        }
+        
+        // 所有上游都失败，返回第一个错误 / All upstreams failed, return first error
+        if let Some((up, Err(e), dur)) = results.into_iter().next() {
+            tracing::warn!(upstream=%up, error=%e, elapsed_ns = dur.as_nanos() as u64, "all upstreams failed");
+            Err(e)
+        } else {
+            anyhow::bail!("no upstream results")
+        }
     }
 
     /// UDP forwarder with hedged retry and TCP fallback for better tail latency.
@@ -1506,6 +1592,141 @@ impl Engine {
         for tx in waiters {
             let _ = tx.send(Ok(bytes.clone()));
         }
+    }
+
+    /// 缓存后台刷新：当TTL即将过期时，异步刷新缓存条目
+    /// Cache background refresh: asynchronously refresh cache entry when TTL is about to expire
+    /// 
+    /// 防止无限循环的保护措施：
+    /// Protection against infinite loops:
+    /// 1. 检查 original_ttl >= cache_refresh_min_ttl（默认5秒）
+    /// 2. 使用 DashMap 的 entry API 确保同一时间只有一个刷新任务
+    /// 3. 刷新失败不会删除现有缓存条目
+    fn spawn_background_refresh(
+        &self,
+        cache_hash: u64,
+        pipeline_id: &str,
+        qname: &str,
+        qtype: hickory_proto::rr::RecordType,
+        qclass: DNSClass,
+    ) {
+        use dashmap::mapref::entry::Entry;
+        
+        // 使用 DashMap 的 entry API 确保同一时间只有一个刷新任务
+        // Use DashMap entry API to ensure only one refresh task at a time
+        let refresh_key = format!("refresh_{}", cache_hash);
+        
+        // 尝试插入刷新标志，如果已存在则说明已有刷新任务在进行
+        // Try to insert refresh flag, if exists means refresh task already in progress
+        let should_spawn = match self.inflight.entry(refresh_key.parse().unwrap()) {
+            Entry::Vacant(_) => {
+                // 成功插入，可以执行刷新
+                true
+            }
+            Entry::Occupied(_) => {
+                // 已有刷新任务，跳过
+                false
+            }
+        };
+        
+        if !should_spawn {
+            return;
+        }
+        
+        // 克隆必要的数据到 'static 生命周期
+        // Clone necessary data to 'static lifetime
+        let engine = self.clone();
+        let pipeline_id: Arc<str> = Arc::from(pipeline_id);
+        let qname = qname.to_string();
+        let upstream_default = self.state.load().pipeline.settings.default_upstream.clone();
+        let upstream_timeout = self.state.load().pipeline.upstream_timeout();
+        
+        tokio::spawn(async move {
+            // 执行后台刷新
+            // Perform background refresh
+            let result = async {
+                // 构造DNS查询请求
+                // Construct DNS query request
+                let mut req_bytes = Vec::new();
+                // TXID (临时值，会被上游重写)
+                req_bytes.extend_from_slice(&0u16.to_be_bytes());
+                // Flags: 标准查询
+                req_bytes.extend_from_slice(&0x0100u16.to_be_bytes()); 
+                // QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+                req_bytes.extend_from_slice(&1u16.to_be_bytes());
+                // QNAME
+                for label in qname.split('.') {
+                    if label.is_empty() { break; }
+                    req_bytes.push(label.len() as u8);
+                    req_bytes.extend_from_slice(label.as_bytes());
+                }
+                req_bytes.push(0); // 结束符
+                // QTYPE, QCLASS
+                req_bytes.extend_from_slice(&u16::from(qtype).to_be_bytes());
+                req_bytes.extend_from_slice(&u16::from(qclass).to_be_bytes());
+                
+                // 发送上游查询
+                // Send upstream query
+                match engine.forward_upstream(&req_bytes, &upstream_default, upstream_timeout, Transport::Udp).await {
+                    Ok(resp) => {
+                        // 验证响应并更新缓存
+                        // Verify response and update cache
+                        if let Ok(msg) = Message::from_bytes(&resp) {
+                            let ttl = engine.extract_ttl_from_msg(&msg);
+                            if ttl > 0 {
+                                let entry = crate::cache::CacheEntry {
+                                    bytes: resp.clone(),
+                                    rcode: msg.response_code(),
+                                    source: Arc::from("background_refresh"),
+                                    qname: Arc::from(qname.as_str()),
+                                    pipeline_id: pipeline_id.clone(),
+                                    qtype: u16::from(qtype),
+                                    inserted_at: Instant::now(),
+                                    original_ttl: ttl as u32,
+                                };
+                                engine.cache.insert(cache_hash, entry);
+                                tracing::debug!(
+                                    event = "cache_background_refresh_success",
+                                    qname = %qname,
+                                    qtype = ?qtype,
+                                    ttl = ttl,
+                                    "background cache refresh completed"
+                                );
+                            }
+                        }
+                        Ok(())
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            event = "cache_background_refresh_failed",
+                            qname = %qname,
+                            qtype = ?qtype,
+                            error = %e,
+                            "background cache refresh failed"
+                        );
+                        Err(e)
+                    }
+                }
+            }.await;
+            
+            // 无论成功失败，都移除刷新标志
+            // Whether success or failure, remove refresh flag
+            engine.inflight.remove(&refresh_key.parse().unwrap());
+            
+            if let Err(e) = result {
+                tracing::error!("background refresh error: {}", e);
+            }
+        });
+    }
+    
+    /// 从Message中提取TTL（辅助函数）
+    /// Extract TTL from Message (helper function)
+    fn extract_ttl_from_msg(&self, msg: &Message) -> u64 {
+        msg.answers()
+            .iter()
+            .map(|r| r.ttl() as u64)
+            .min()
+            .unwrap_or(0)
     }
 
     async fn apply_response_actions(
@@ -3263,6 +3484,136 @@ fn fast_hash_str(s: &str) -> u64 {
 
 fn contains_continue(actions: &[Action]) -> bool {
     actions.iter().any(|action| matches!(action, Action::Continue))
+}
+
+#[cfg(test)]
+#[allow(unnameable_test_items)]
+mod tests_multi_upstream {
+    use super::*;
+
+    #[test]
+    fn test_parse_multi_upstream_comma_separated() {
+        let raw = serde_json::json!({
+            "pipelines": [
+                {
+                    "id": "p1",
+                    "rules": [
+                        {
+                            "name": "multi",
+                            "matchers": [ { "type": "any" } ],
+                            "actions": [ { 
+                                "type": "forward", 
+                                "upstream": "1.1.1.1:53,8.8.8.8:53,9.9.9.9:53" 
+                            } ]
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse");
+        let rule = &cfg.pipelines[0].rules[0];
+        
+        match &rule.actions[0] {
+            Action::Forward { upstream, .. } => {
+                assert_eq!(upstream.as_ref().map(|s| s.as_str()), Some("1.1.1.1:53,8.8.8.8:53,9.9.9.9:53"));
+            }
+            _ => panic!("expected forward action"),
+        }
+    }
+
+    #[test]
+    fn test_parse_multi_upstream_array() {
+        let raw = serde_json::json!({
+            "pipelines": [
+                {
+                    "id": "p1",
+                    "rules": [
+                        {
+                            "name": "multi",
+                            "matchers": [ { "type": "any" } ],
+                            "actions": [ { 
+                                "type": "forward", 
+                                "upstream": ["1.1.1.1:53", "8.8.8.8:53", "9.9.9.9:53"]
+                            } ]
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse");
+        let rule = &cfg.pipelines[0].rules[0];
+        
+        match &rule.actions[0] {
+            Action::Forward { upstream, .. } => {
+                assert_eq!(upstream.as_ref().map(|s| s.as_str()), Some("1.1.1.1:53,8.8.8.8:53,9.9.9.9:53"));
+            }
+            _ => panic!("expected forward action"),
+        }
+    }
+
+    #[test]
+    fn test_parse_multi_upstream_empty_array() {
+        let raw = serde_json::json!({
+            "pipelines": [
+                {
+                    "id": "p1",
+                    "rules": [
+                        {
+                            "name": "empty",
+                            "matchers": [ { "type": "any" } ],
+                            "actions": [ { 
+                                "type": "forward", 
+                                "upstream": []
+                            } ]
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse");
+        let rule = &cfg.pipelines[0].rules[0];
+        
+        match &rule.actions[0] {
+            Action::Forward { upstream, .. } => {
+                assert!(*upstream == None);
+            }
+            _ => panic!("expected forward action"),
+        }
+    }
+
+    #[test]
+    fn test_parse_multi_upstream_single_element() {
+        let raw = serde_json::json!({
+            "pipelines": [
+                {
+                    "id": "p1",
+                    "rules": [
+                        {
+                            "name": "single",
+                            "matchers": [ { "type": "any" } ],
+                            "actions": [ { 
+                                "type": "forward", 
+                                "upstream": ["1.1.1.1:53"]
+                            } ]
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse");
+        let rule = &cfg.pipelines[0].rules[0];
+        
+        match &rule.actions[0] {
+            Action::Forward { upstream, .. } => {
+                assert_eq!(upstream.as_ref().map(|s| s.as_str()), Some("1.1.1.1:53"));
+            }
+            _ => panic!("expected forward action"),
+        }
+    }
 }
 
 
