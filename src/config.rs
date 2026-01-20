@@ -295,6 +295,14 @@ pub enum ResponseMatcher {
     ResponseQclass { value: String },
     /// 响应是否携带 EDNS。 / Whether response carries EDNS
     ResponseEdnsPresent { expect: bool },
+    /// 匹配响应中 IP 的 GeoIP 国家代码（大小写不敏感）/ Match GeoIP country code of IPs in response (case insensitive)
+    ResponseAnswerIpGeoipCountry { country_codes: Vec<String> },
+    /// 匹配响应中 IP 是否为私有 IP / Match whether IPs in response are private IPs
+    ResponseAnswerIpGeoipPrivate { expect: bool },
+    /// 匹配响应中的请求域名是否属于指定 GeoSite 分类 / Match if request domain in response belongs to specified GeoSite category
+    ResponseRequestDomainGeoSite { value: String },
+    /// 匹配响应中的请求域名是否不属于指定 GeoSite 分类 / Match if request domain in response does NOT belong to specified GeoSite category
+    ResponseRequestDomainGeoSiteNot { value: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]

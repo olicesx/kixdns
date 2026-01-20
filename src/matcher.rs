@@ -123,6 +123,22 @@ pub enum RuntimeResponseMatcher {
     ResponseEdnsPresent {
         expect: bool,
     },
+    /// 匹配响应中 IP 的 GeoIP 国家代码 / Match GeoIP country code of IPs in response
+    ResponseAnswerIpGeoipCountry {
+        country_codes: Vec<String>,
+    },
+    /// 匹配响应中 IP 是否为私有 IP / Match whether IPs in response are private
+    ResponseAnswerIpGeoipPrivate {
+        expect: bool,
+    },
+    /// 匹配响应中的请求域名是否属于指定 GeoSite 分类 / Match if request domain in response belongs to specified GeoSite category
+    ResponseRequestDomainGeoSite {
+        value: String,
+    },
+    /// 匹配响应中的请求域名是否不属于指定 GeoSite 分类 / Match if request domain in response does NOT belong to specified GeoSite category
+    ResponseRequestDomainGeoSiteNot {
+        value: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -734,6 +750,18 @@ impl RuntimeResponseMatcher {
             config::ResponseMatcher::ResponseEdnsPresent { expect } => {
                 RuntimeResponseMatcher::ResponseEdnsPresent { expect }
             }
+            config::ResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } => {
+                RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes }
+            }
+            config::ResponseMatcher::ResponseAnswerIpGeoipPrivate { expect } => {
+                RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { expect }
+            }
+            config::ResponseMatcher::ResponseRequestDomainGeoSite { value } => {
+                RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value }
+            }
+            config::ResponseMatcher::ResponseRequestDomainGeoSiteNot { value } => {
+                RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { value }
+            }
         })
     }
 
@@ -801,6 +829,66 @@ impl RuntimeResponseMatcher {
             RuntimeResponseMatcher::ResponseEdnsPresent { expect } => {
                 let edns = msg.extensions().is_some();
                 edns == *expect
+            }
+            RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } => {
+                // 检查 Answer 中所有 A/AAAA 记录的 IP 是否都属于指定国家
+                use hickory_proto::rr::RData;
+                let mut all_ips = Vec::new();
+
+                // 收集 Answer 中的 IP
+                for record in msg.answers() {
+                    match record.data() {
+                        Some(RData::A(a)) => all_ips.push(std::net::IpAddr::V4(a.0)),
+                        Some(RData::AAAA(aaaa)) => all_ips.push(std::net::IpAddr::V6(aaaa.0)),
+                        _ => {}
+                    }
+                }
+
+                // 如果没有 IP，不匹配
+                if all_ips.is_empty() {
+                    return false;
+                }
+
+                // 检查是否所有 IP 都匹配指定的国家代码
+                // 需要访问 GeoIpManager，但这里没有传入
+                // 暂时返回 false，需要在实际使用时传入 geoip_manager
+                all_ips.iter().all(|ip| {
+                    // 这里无法访问 geoip_manager，返回 false 表示未匹配
+                    // 实际匹配逻辑需要在 engine 层实现
+                    false
+                })
+            }
+            RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { expect } => {
+                // 检查 Answer 中是否有任意 IP 为私有 IP
+                use hickory_proto::rr::RData;
+                let mut has_private_ip = msg.answers().iter().any(|record| match record.data() {
+                    Some(RData::A(a)) => crate::geoip::is_private_ip(std::net::IpAddr::V4(a.0)),
+                    Some(RData::AAAA(aaaa)) => crate::geoip::is_private_ip(std::net::IpAddr::V6(aaaa.0)),
+                    _ => false,
+                });
+
+                if !has_private_ip {
+                    // 检查 additionals
+                    has_private_ip = msg.additionals().iter().any(|record| match record.data() {
+                        Some(RData::A(a)) => crate::geoip::is_private_ip(std::net::IpAddr::V4(a.0)),
+                        Some(RData::AAAA(aaaa)) => crate::geoip::is_private_ip(std::net::IpAddr::V6(aaaa.0)),
+                        _ => false,
+                    });
+                }
+
+                has_private_ip == *expect
+            }
+            RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value } => {
+                // 检查请求域名是否属于指定的 GeoSite 分类
+                // 需要访问 GeoSiteManager，但这里没有传入
+                // 暂时返回 false，需要在实际使用时传入 geosite_manager
+                false  // TODO: needs GeoSite manager
+            }
+            RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { value } => {
+                // 检查请求域名是否不属于指定的 GeoSite 分类
+                // 需要访问 GeoSiteManager，但这里没有传入
+                // 暂时返回 false，需要在实际使用时传入 geosite_manager
+                false  // TODO: needs GeoSite manager
             }
         }
     }

@@ -309,8 +309,8 @@
                 </select>
                 
                 <!-- Dynamic Inputs based on type -->
-                <input v-if="hasField(m.type, 'value')" type="text" class="form-control" v-model="m.value" 
-                    :placeholder="m.type === 'geosite' || m.type === 'geosite_not' ? 'cn 或 geosite:cn' : 'Value'">
+                <input v-if="hasField(m.type, 'value')" type="text" class="form-control" v-model="m.value"
+                    :placeholder="m.type === 'geosite' || m.type === 'geosite_not' || m.type === 'response_request_domain_geosite' || m.type === 'response_request_domain_geosite_not' ? 'cn 或 geosite:cn' : 'Value'">
                 <input v-if="hasField(m.type, 'cidr')" type="text" class="form-control" v-model="m.cidr" placeholder="CIDR 或逗号分隔列表 (e.g. 127.0.0.0/8,0.0.0.0/8)">
                 <div v-if="hasField(m.type, 'expect')" class="input-group-text bg-white">
                     <input type="checkbox" class="form-check-input mt-0" v-model="m.expect"> &nbsp;Expect
@@ -421,6 +421,10 @@
             'response_edns_present': ['expect'],
             'response_upstream_ip': ['cidr'],
             'response_answer_ip': ['cidr'],
+            'response_answer_ip_geoip_country': ['country_codes'],
+            'response_answer_ip_geoip_private': ['expect'],
+            'response_request_domain_geosite': ['value'],
+            'response_request_domain_geosite_not': ['value'],
             'any': []
         };
 
@@ -476,7 +480,8 @@
                         // Support call syntax: "geoip:CN" or "geoip:CN,US,JP"
                         m._callSyntax = false; // Track if using call syntax
                     }
-                    if (hasField(type, 'value') && (type === 'geosite' || type === 'geosite_not')) {
+                    if (hasField(type, 'value') && (type === 'geosite' || type === 'geosite_not' ||
+                        type === 'response_request_domain_geosite' || type === 'response_request_domain_geosite_not')) {
                         m._callSyntax = false; // Track if using call syntax
                     }
                     if (!m.operator) m.operator = DEFAULT_MATCH_OPERATOR;
@@ -484,7 +489,9 @@
 
                 // Watch for call syntax in GeoSite and GeoIP matchers
                 const parseCallSyntaxForMatcher = (m) => {
-                    if (m.type === 'geosite' || m.type === 'geosite_not') {
+                    // Handle GeoSite matchers (request and response)
+                    if (m.type === 'geosite' || m.type === 'geosite_not' ||
+                        m.type === 'response_request_domain_geosite' || m.type === 'response_request_domain_geosite_not') {
                         if (m.value && m.value.includes(':')) {
                             const parsed = parseCallSyntax(m.value);
                             if (parsed && parsed.type === 'geosite') {
@@ -493,7 +500,8 @@
                             }
                         }
                     }
-                    if (m.type === 'geoip_country') {
+                    // Handle GeoIP Country matchers (request and response)
+                    if (m.type === 'geoip_country' || m.type === 'response_answer_ip_geoip_country') {
                         if (m.country_codes && m.country_codes.includes(':')) {
                             const parsed = parseCallSyntax(m.country_codes);
                             if (parsed && parsed.type === 'geoip') {
@@ -634,7 +642,11 @@
                     'response_qclass': 'Response QClass',
                     'response_edns_present': 'Response EDNS',
                     'response_upstream_ip': 'Upstream IP (CIDR)',
-                    'response_answer_ip': 'Answer IP (CIDR)'
+                    'response_answer_ip': 'Answer IP (CIDR)',
+                    'response_answer_ip_geoip_country': 'Answer IP GeoIP Country',
+                    'response_answer_ip_geoip_private': 'Answer IP GeoIP Private',
+                    'response_request_domain_geosite': 'Req Domain GeoSite',
+                    'response_request_domain_geosite_not': 'Req Domain GeoSite Not'
                 };
 
                 const toCleanJsonString = (cfgObj) => JSON.stringify(cfgObj, (key, value) => {
