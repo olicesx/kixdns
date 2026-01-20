@@ -41,7 +41,14 @@ impl DomainMatcher {
                 domain.eq_ignore_ascii_case(suffix) || domain.ends_with(suffix)
             }
             DomainMatcher::Keyword(keyword) => {
-                domain.to_ascii_lowercase().contains(&keyword.to_ascii_lowercase())
+                // 智能检查：先看是否需要转换 / Smart check: see if conversion is needed
+                if domain.bytes().all(|b| !b.is_ascii_uppercase()) {
+                    // domain 已经是小写，零分配比较 / domain already lowercase, zero-allocation
+                    domain.contains(keyword)
+                } else {
+                    // 需要转换 / Need conversion
+                    domain.to_ascii_lowercase().contains(&keyword.to_ascii_lowercase())
+                }
             }
             DomainMatcher::Regex(regex) => {
                 regex.is_match(domain)
@@ -55,6 +62,22 @@ impl DomainMatcher {
 pub struct GeoSiteEntry {
     pub tag: String,
     pub matchers: Vec<DomainMatcher>,
+}
+
+impl GeoSiteEntry {
+    /// 标准化：将所有匹配器转换为小写（配置加载时调用）
+    /// Normalization: convert all matchers to lowercase (called during config loading)
+    pub fn normalized(mut self) -> Self {
+        for matcher in &mut self.matchers {
+            match matcher {
+                DomainMatcher::Full(domain) => *domain = domain.to_ascii_lowercase(),
+                DomainMatcher::Suffix(suffix) => *suffix = suffix.to_ascii_lowercase(),
+                DomainMatcher::Keyword(keyword) => *keyword = keyword.to_ascii_lowercase(),
+                DomainMatcher::Regex(_) => {}  // 正则不转换 / Regex not converted
+            }
+        }
+        self
+    }
 }
 
 /// GeoSite 数据库管理器 / GeoSite database manager
@@ -106,10 +129,12 @@ impl GeoSiteManager {
 
     /// 添加 GeoSite 条目 / Add GeoSite entry
     pub fn add_entry(&mut self, entry: GeoSiteEntry) {
-        let tag = entry.tag.clone();
-        
+        // 在添加时自动标准化 / Auto-normalize on add
+        let normalized = entry.normalized();
+        let tag = normalized.tag.clone();
+
         // Build suffix index
-        for matcher in &entry.matchers {
+        for matcher in &normalized.matchers {
             if let DomainMatcher::Suffix(suffix) = matcher {
                 self.suffix_index
                     .entry(suffix.clone())
@@ -117,8 +142,8 @@ impl GeoSiteManager {
                     .push(tag.clone());
             }
         }
-        
-        self.database.insert(tag, entry.matchers);
+
+        self.database.insert(tag, normalized.matchers);
     }
 
     /// 检查域名是否匹配指定的 GeoSite 标签 / Check if domain matches specified GeoSite tag
@@ -169,17 +194,30 @@ impl GeoSiteManager {
         match matcher {
             DomainMatcher::Full(d) => {
                 // 完全匹配，不区分大小写 / Full match, case insensitive
+                // d 已经在加载时预小写 / d already lowercased during loading
                 domain.eq_ignore_ascii_case(d)
             }
             DomainMatcher::Suffix(s) => {
                 // 后缀匹配，不区分大小写 / Suffix match, case insensitive
-                let domain_lower = domain.to_ascii_lowercase();
-                let suffix_lower = s.to_ascii_lowercase();
-                domain_lower.ends_with(&suffix_lower)
+                // s 已经在加载时预小写 / s already lowercased during loading
+                // 先尝试不转换（快速路径） / Try without conversion first (fast path)
+                if domain.ends_with(s) {
+                    return true;
+                }
+                // 兜底：转换后比较 / Fallback: compare after conversion
+                domain.to_ascii_lowercase().ends_with(s)
             }
             DomainMatcher::Keyword(k) => {
                 // 关键词匹配，不区分大小写 / Keyword match, case insensitive
-                domain.to_ascii_lowercase().contains(&k.to_ascii_lowercase())
+                // k 已经在加载时预小写 / k already lowercased during loading
+                // 智能检查：先看是否需要转换 / Smart check: see if conversion is needed
+                if domain.bytes().all(|b| !b.is_ascii_uppercase()) {
+                    // domain 已经是小写，零分配比较 / domain already lowercase, zero-allocation compare
+                    domain.contains(k)
+                } else {
+                    // 需要转换 / Need conversion
+                    domain.to_ascii_lowercase().contains(k)
+                }
             }
             DomainMatcher::Regex(re) => {
                 // 正则匹配 / Regex match
@@ -1046,14 +1084,14 @@ impl GeoSiteManager {
 }
 
 /// 启动 GeoSite 数据文件热重载监控 / Start GeoSite data file hot-reload monitoring
-/// 
+///
 /// # 参数 / Parameters
 /// - `paths`: GeoSite 数据文件路径列表 / GeoSite data file path list
 /// - `manager`: GeoSiteManager 实例（通过 Arc 共享）/ GeoSiteManager instance (shared via Arc)
 /// - `tags`: 需要加载的 tag 列表（空表示全部加载）/ List of tags to load (empty means load all)
 pub fn spawn_geosite_watcher(
-    paths: Vec<PathBuf>, 
-    manager: Arc<std::sync::Mutex<GeoSiteManager>>,
+    paths: Vec<PathBuf>,
+    manager: Arc<std::sync::RwLock<GeoSiteManager>>,
     tags: Vec<String>
 ) {
     if paths.is_empty() {
@@ -1072,7 +1110,7 @@ pub fn spawn_geosite_watcher(
 /// 运行 GeoSite watcher / Run GeoSite watcher
 fn run_geosite_watcher(
     paths: Vec<PathBuf>,
-    manager: Arc<std::sync::Mutex<GeoSiteManager>>,
+    manager: Arc<std::sync::RwLock<GeoSiteManager>>,
     tags: Vec<String>,
 ) -> notify::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1107,7 +1145,7 @@ fn run_geosite_watcher(
                 while retries > 0 {
                     let load_result = if is_dat {
                         // 加载 .dat 格式 / Load .dat format
-                        let mut manager_guard = manager.lock().unwrap();
+                        let mut manager_guard = manager.write().unwrap();
                         if tags.is_empty() {
                             // 加载所有 tags / Load all tags
                             manager_guard.load_from_dat_file(path)
@@ -1124,7 +1162,7 @@ fn run_geosite_watcher(
                                     .with_context(|| "parse V2Ray GeoSite JSON format")
                             })
                             .and_then(|v2ray_data| {
-                                let mut manager_guard = manager.lock().unwrap();
+                                let mut manager_guard = manager.write().unwrap();
                                 let entries = manager_guard.convert_v2ray_to_entries(v2ray_data);
                                 let loaded_count = entries.len();
                                 manager_guard.reload(entries);

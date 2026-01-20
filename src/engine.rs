@@ -104,7 +104,9 @@ pub struct Engine {
     // Per-request id generator for tracing / 每个请求的 ID 生成器用于追踪
     pub request_id_counter: Arc<AtomicU64>,
     // In-flight dedupe map: cache_hash -> waiters / 进行中的去重映射：缓存哈希 -> 等待者
-    // SmallVec<[_; 8]> avoids heap allocation for typical Singleflight scenarios (<=8 waiters)
+    // 优化：SmallVec<[_; 8]>避免典型Singleflight场景的堆分配（<=8个等待者）
+    // Optimization: SmallVec<[_; 8]> avoids heap allocation for typical Singleflight scenarios (<=8 waiters)
+    // 使用 FxBuildHasher 提供更快的哈希计算 / Use FxBuildHasher for faster hashing
     pub inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>,
     // Semaphore to limit concurrent handle_packet async tasks / 用于限制并发 handle_packet 异步任务数量
     pub permit_manager: Arc<PermitManager>,
@@ -117,10 +119,10 @@ pub struct Engine {
     cache_refresh_threshold_percent: u8,
     cache_refresh_min_ttl: u32,
     // GeoIP manager for geographic IP-based routing / GeoIP 管理器用于基于地理位置的 IP 路由
-    pub geoip_manager: Arc<std::sync::Mutex<crate::geoip::GeoIpManager>>,
+    pub geoip_manager: Arc<std::sync::RwLock<crate::geoip::GeoIpManager>>,
     // GeoSite manager for domain category-based routing / GeoSite 管理器用于域名分类路由
-    // 使用 DashMap 实现无锁并发访问，但保留 Mutex 用于热重载 / Uses DashMap for lock-free concurrent access, keeps Mutex for hot reload
-    pub geosite_manager: Arc<std::sync::Mutex<crate::geosite::GeoSiteManager>>,
+    // 使用 RwLock 允许并发读操作，写操作独占 / Uses RwLock for concurrent reads, exclusive writes
+    pub geosite_manager: Arc<std::sync::RwLock<crate::geosite::GeoSiteManager>>,
 }
 
 /// Adaptive flow control state for dynamic semaphore adjustment
@@ -212,16 +214,17 @@ impl Drop for PermitGuard {
 fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<String> {
     use std::collections::HashSet;
 
-    let mut tags_set = HashSet::new();
+    // 使用 HashSet<Arc<str>> 避免中间分配 / Use HashSet<Arc<str>> to avoid intermediate allocations
+    let mut tags_set: HashSet<Arc<str>> = HashSet::new();
 
     // Scan pipeline_select rules / 扫描 pipeline_select 规则
     for rule in &cfg.pipeline_select {
         for matcher in &rule.matchers {
             if let crate::matcher::RuntimePipelineSelectorMatcher::GeoSite { tag } = &matcher.matcher {
-                tags_set.insert(tag.clone());
+                tags_set.insert(Arc::clone(tag));  // Arc::clone 避免分配 / Arc::clone avoids allocation
             }
             if let crate::matcher::RuntimePipelineSelectorMatcher::GeoSiteNot { tag } = &matcher.matcher {
-                tags_set.insert(tag.clone());
+                tags_set.insert(Arc::clone(tag));  // Arc::clone 避免分配 / Arc::clone avoids allocation
             }
         }
     }
@@ -232,26 +235,27 @@ fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<String> 
             // Scan request matchers / 扫描请求匹配器
             for matcher in &rule.matchers {
                 if let crate::matcher::RuntimeMatcher::GeoSite { tag } = &matcher.matcher {
-                    tags_set.insert(tag.clone());
+                    tags_set.insert(Arc::clone(tag));  // Arc::clone 避免分配 / Arc::clone avoids allocation
                 }
                 if let crate::matcher::RuntimeMatcher::GeoSiteNot { tag } = &matcher.matcher {
-                    tags_set.insert(tag.clone());
+                    tags_set.insert(Arc::clone(tag));  // Arc::clone 避免分配 / Arc::clone avoids allocation
                 }
             }
 
             // Scan response matchers / 扫描响应匹配器
             for matcher in &rule.response_matchers {
                 if let crate::matcher::RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value } = &matcher.matcher {
-                    tags_set.insert(value.clone());
+                    tags_set.insert(Arc::from(value.as_str()));  // 将 String 转为 Arc<str> / Convert String to Arc<str>
                 }
                 if let crate::matcher::RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { value } = &matcher.matcher {
-                    tags_set.insert(value.clone());
+                    tags_set.insert(Arc::from(value.as_str()));  // 将 String 转为 Arc<str> / Convert String to Arc<str>
                 }
             }
         }
     }
 
-    tags_set.into_iter().collect()
+    // 转换回 Vec<String> 用于向后兼容 / Convert back to Vec<String> for backward compatibility
+    tags_set.into_iter().map(|s| s.to_string()).collect()
 }
 
 /// Check if configuration uses GeoIP matchers / 检查配置是否使用 GeoIP 匹配器
@@ -395,12 +399,12 @@ impl Engine {
             }
         }
 
-        let geoip_manager = Arc::new(std::sync::Mutex::new(geoip_manager));
+        let geoip_manager = Arc::new(std::sync::RwLock::new(geoip_manager));
 
         // Initialize GeoSiteManager / 初始化 GeoSiteManager
         // GeoSiteManager starts empty and is populated via add_entry() calls
         // Cache will be automatically rebuilt after loading data
-        let geosite_manager = Arc::new(std::sync::Mutex::new(
+        let geosite_manager = Arc::new(std::sync::RwLock::new(
             crate::geosite::GeoSiteManager::new(),
         ));
         
@@ -421,7 +425,7 @@ impl Engine {
                 
                 let load_result = if is_dat {
                     // 使用按需加载 / Use selective loading
-                    let mut manager = geosite_manager.lock().unwrap();
+                    let mut manager = geosite_manager.write().unwrap();
                     if used_geosite_tags.is_empty() {
                         // 没有使用 GeoSite 标签，跳过加载 / No GeoSite tags used, skip loading
                         info!("No GeoSite tags used in config, skipping GeoSite data loading");
@@ -431,7 +435,7 @@ impl Engine {
                     }
                 } else {
                     // JSON 格式：全量加载 / JSON format: load all
-                    let mut manager = geosite_manager.lock().unwrap();
+                    let mut manager = geosite_manager.write().unwrap();
                     manager.load_from_v2ray_file(&path)
                 };
                 
@@ -629,6 +633,33 @@ impl Engine {
         // DNSClass implements Copy+Debug, hash by its u16 representation / DNSClass 实现了 Copy+Debug，使用其 u16 表示进行哈希
         u16::from(qclass).hash(&mut h);
         h.finish()
+    }
+
+    /// 辅助函数：创建并插入 DNS 缓存条目 / Helper: create and insert DNS cache entry
+    /// 消除重复的 CacheEntry 构造代码 / Eliminate duplicate CacheEntry construction code
+    #[inline]
+    fn insert_dns_cache_entry(
+        &self,
+        cache_hash: u64,
+        bytes: Bytes,
+        rcode: ResponseCode,
+        source: Arc<str>,
+        qname: &str,
+        pipeline_id: Arc<str>,
+        qtype: hickory_proto::rr::RecordType,
+        original_ttl: u32,
+    ) {
+        let entry = CacheEntry {
+            bytes,
+            rcode,
+            source,
+            qname: Arc::from(qname),  // 一次 Arc::from，避免多次
+            pipeline_id,
+            qtype: u16::from(qtype),
+            inserted_at: Instant::now(),
+            original_ttl,
+        };
+        self.cache.insert(cache_hash, entry);
     }
 
     #[allow(dead_code)]
@@ -1194,8 +1225,8 @@ impl Engine {
                             // Get manager references for GeoIP/GeoSite matching in response matchers
                             // 获取 manager 引用以用于响应匹配器中的 GeoIP/GeoSite 匹配
                             // 使用作用域确保锁在使用后立即释放 / Use scope to ensure locks are released immediately after use
-                            let geoip_manager = self.geoip_manager.try_lock().ok();
-                            let geosite_manager = self.geosite_manager.try_lock().ok();
+                            let geoip_manager = self.geoip_manager.try_read().ok();
+                            let geosite_manager = self.geosite_manager.try_read().ok();
                             let geoip_manager_ref = geoip_manager.as_deref();
                             let geosite_manager_ref = geosite_manager.as_deref();
 
@@ -1226,17 +1257,17 @@ impl Engine {
 
                         if actions_to_run.is_empty() {
                             if effective_ttl > Duration::from_secs(0) {
-                                let entry = CacheEntry {
-                                    bytes: raw.clone(),
+                                // 使用辅助函数避免重复代码 / Use helper function to avoid duplication
+                                self.insert_dns_cache_entry(
+                                    dedupe_hash,
+                                    raw.clone(),
                                     rcode,
-                                    source: upstream.clone(),
-                                    qname: Arc::from(qname.as_str()),
-                                    pipeline_id: pipeline_id.clone(),
-                                    qtype: u16::from(qtype),
-                                    inserted_at: Instant::now(),
-                                    original_ttl: ttl_secs as u32,
-                                };
-                                self.cache.insert(dedupe_hash, entry);
+                                    upstream.clone(),
+                                    &qname,
+                                    pipeline_id.clone(),
+                                    qtype,
+                                    ttl_secs as u32,
+                                );
                             }
                             if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
                             self.notify_inflight_waiters(dedupe_hash, &raw).await;
@@ -1296,17 +1327,17 @@ impl Engine {
                                 let effective_ttl =
                                     Duration::from_secs(ttl_secs.max(min_ttl.as_secs()));
                                 if effective_ttl > Duration::from_secs(0) {
-                                    let entry = CacheEntry {
-                                        bytes: ctx.raw.clone(),
-                                        rcode: ctx.msg.response_code(),
-                                        source: ctx.upstream.clone(),
-                                        qname: Arc::from(qname.as_str()),
-                                        pipeline_id: pipeline_id.clone(),
-                                        qtype: u16::from(qtype),
-                                        inserted_at: Instant::now(),
-                                        original_ttl: ttl_secs as u32,
-                                    };
-                                    self.cache.insert(dedupe_hash, entry);
+                                    // 使用辅助函数避免重复代码 / Use helper function to avoid duplication
+                                    self.insert_dns_cache_entry(
+                                        dedupe_hash,
+                                        ctx.raw.clone(),
+                                        ctx.msg.response_code(),
+                                        ctx.upstream.clone(),
+                                        &qname,
+                                        pipeline_id.clone(),
+                                        qtype,
+                                        ttl_secs as u32,
+                                    );
                                 }
                                 if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
                                 self.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
@@ -1333,17 +1364,17 @@ impl Engine {
                                 source,
                             } => {
                                 if min_ttl > Duration::from_secs(0) {
-                                    let entry = CacheEntry {
-                                        bytes: bytes.clone(),
+                                    // 使用辅助函数避免重复代码 / Use helper function to avoid duplication
+                                    self.insert_dns_cache_entry(
+                                        dedupe_hash,
+                                        bytes.clone(),
                                         rcode,
-                                        source: Arc::from(source),
-                                        qname: Arc::from(qname.as_str()),
-                                        pipeline_id: current_pipeline_id.clone(),
-                                        qtype: u16::from(qtype),
-                                        inserted_at: Instant::now(),
-                                        original_ttl: min_ttl.as_secs() as u32,
-                                    };
-                                    self.cache.insert(dedupe_hash, entry);
+                                        Arc::from(source),
+                                        &qname,
+                                        current_pipeline_id.clone(),
+                                        qtype,
+                                        min_ttl.as_secs() as u32,
+                                    );
                                 }
                                 if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
                                 self.notify_inflight_waiters(dedupe_hash, &bytes).await;
@@ -1471,17 +1502,17 @@ impl Engine {
                                         let effective_ttl =
                                             Duration::from_secs(ttl_secs.max(min_ttl.as_secs()));
                                         if resp_match && effective_ttl > Duration::from_secs(0) {
-                                            let entry = CacheEntry {
-                                                bytes: ctx.raw.clone(),
-                                                rcode: ctx.msg.response_code(),
-                                                source: ctx.upstream.clone(),
-                                                qname: Arc::from(qname.as_str()),
-                                                pipeline_id: pipeline_id.clone(),
-                                                qtype: u16::from(qtype),
-                                                inserted_at: Instant::now(),
-                                                original_ttl: ttl_secs as u32,
-                                            };
-                                            self.cache.insert(dedupe_hash, entry);
+                                            // 使用辅助函数避免重复代码 / Use helper function to avoid duplication
+                                            self.insert_dns_cache_entry(
+                                                dedupe_hash,
+                                                ctx.raw.clone(),
+                                                ctx.msg.response_code(),
+                                                ctx.upstream.clone(),
+                                                &qname,
+                                                pipeline_id.clone(),
+                                                qtype,
+                                                ttl_secs as u32,
+                                            );
                                         }
                                         self.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
                                         return Ok(ctx.raw);
@@ -1590,8 +1621,20 @@ impl Engine {
             // Fallback to runtime indices
             candidate_indices.extend_from_slice(&pipeline.always_check_rules);
 
+            // 最高优先级：完全域名匹配（O(1)查找）/ Highest priority: exact domain match (O(1) lookup)
+            if let Some(indices) = pipeline.domain_exact_index.get(qname) {
+                candidate_indices.extend_from_slice(indices);
+            }
+
+            // 高频优化：使用 query_type 索引快速过滤
+            // High-frequency optimization: use query_type index for fast filtering
+            if let Some(indices) = pipeline.query_type_index.get(&qtype) {
+                candidate_indices.extend_from_slice(indices);
+            }
+
             let mut search_name = qname;
             loop {
+                // 零拷贝优化：Arc<str>可以通过&str查找 / Zero-copy: Arc<str> can be looked up by &str
                 if let Some(indices) = pipeline.domain_suffix_index.get(search_name) {
                     candidate_indices.extend_from_slice(indices);
                 }
@@ -2173,8 +2216,8 @@ impl Engine {
                     if let Some(ctx) = ctx_opt {
                         // Get manager references for GeoIP/GeoSite matching
                         // 获取 manager 引用以用于 GeoIP/GeoSite 匹配
-                        let geoip_manager = self.geoip_manager.try_lock().ok();
-                        let geosite_manager = self.geosite_manager.try_lock().ok();
+                        let geoip_manager = self.geoip_manager.try_read().ok();
+                        let geosite_manager = self.geosite_manager.try_read().ok();
                         let geoip_manager_ref = geoip_manager.as_deref();
                         let geosite_manager_ref = geosite_manager.as_deref();
 
@@ -2273,8 +2316,8 @@ impl Engine {
         if let Some(ctx) = ctx_opt {
             // Get manager references for GeoIP/GeoSite matching
             // 获取 manager 引用以用于 GeoIP/GeoSite 匹配
-            let geoip_manager = self.geoip_manager.try_lock().ok();
-            let geosite_manager = self.geosite_manager.try_lock().ok();
+            let geoip_manager = self.geoip_manager.try_read().ok();
+            let geosite_manager = self.geosite_manager.try_read().ok();
             let geoip_manager_ref = geoip_manager.as_deref();
             let geosite_manager_ref = geosite_manager.as_deref();
 
@@ -2541,8 +2584,8 @@ impl Engine {
                             // 获取 manager 引用以用于响应匹配器中的 GeoIP/GeoSite 匹配
                             // 使用作用域确保锁在使用后立即释放 / Use scope to ensure locks are released immediately after use
                             let resp_match_ok = {
-                                let geoip_manager = self.geoip_manager.try_lock().ok();
-                                let geosite_manager = self.geosite_manager.try_lock().ok();
+                                let geoip_manager = self.geoip_manager.try_read().ok();
+                                let geosite_manager = self.geosite_manager.try_read().ok();
                                 let geoip_manager_ref = geoip_manager.as_deref();
                                 let geosite_manager_ref = geosite_manager.as_deref();
 
@@ -2679,8 +2722,8 @@ pub fn select_pipeline<'a>(
     edns_present: bool,
     qtype: hickory_proto::rr::RecordType,
     listener_label: &str,
-    geosite_manager: Option<&Arc<std::sync::Mutex<crate::geosite::GeoSiteManager>>>,
-    geoip_manager: Option<&Arc<std::sync::Mutex<crate::geoip::GeoIpManager>>>,
+    geosite_manager: Option<&Arc<std::sync::RwLock<crate::geosite::GeoSiteManager>>>,
+    geoip_manager: Option<&Arc<std::sync::RwLock<crate::geoip::GeoIpManager>>>,
 ) -> (Option<&'a RuntimePipeline>, Arc<str>) {
     for rule in &cfg.pipeline_select {
         let matched = eval_match_chain(
@@ -2688,9 +2731,9 @@ pub fn select_pipeline<'a>(
             |m| m.operator,
             |m| {
                 // 获取 GeoSiteManager 和 GeoIpManager 的引用 / Get GeoSiteManager and GeoIpManager references
-                let geosite_mgr_ref = geosite_manager.map(|m| m.lock().unwrap());
+                let geosite_mgr_ref = geosite_manager.map(|m| m.read().unwrap());
                 let geosite_mgr_ref_deref = geosite_mgr_ref.as_deref();
-                let geoip_mgr_ref = geoip_manager.map(|m| m.lock().unwrap());
+                let geoip_mgr_ref = geoip_manager.map(|m| m.read().unwrap());
                 let geoip_mgr_ref_deref = geoip_mgr_ref.as_deref();
                 m.matcher.matches_with_qtype(listener_label, client_ip, qname, qclass, edns_present, qtype, geoip_mgr_ref_deref, geosite_mgr_ref_deref)
             },
@@ -2773,14 +2816,14 @@ impl UdpClient {
                                 let id = u16::from_be_bytes([buf[0], buf[1]]);
                                 if let Some((_, (original_id, expected_addr, tx))) = inflight_clone.remove(&id) {
                                     if src == expected_addr {
-                                        // Restore original ID and copy logic
-                                        // Avoiding split_to/freeze to prevent reallocation of the main buffer
+                                        // Restore original TXID
                                         let orig_bytes = original_id.to_be_bytes();
                                         buf[0] = orig_bytes[0];
                                         buf[1] = orig_bytes[1];
-                                        
-                                        // Allocate exactly what we need for the response, separate from the recv buffer
-                                        let response = Bytes::copy_from_slice(&buf[..len]);
+
+                                        // 零拷贝优化：使用 split_to 复用已有容量，避免分配新内存
+                                        // Zero-copy optimization: use split_to to reuse existing capacity, avoid allocation
+                                        let response = buf.split_to(len).freeze();
                                         let _ = tx.send(Ok(response));
                                     }
                                 }
@@ -3120,14 +3163,14 @@ fn matcher_matches(
     client_ip: IpAddr,
     edns_present: bool,
     qtype: hickory_proto::rr::RecordType,
-    geoip_manager: Option<&Arc<std::sync::Mutex<crate::geoip::GeoIpManager>>>,
-    geosite_manager: Option<&Arc<std::sync::Mutex<crate::geosite::GeoSiteManager>>>,
+    geoip_manager: Option<&Arc<std::sync::RwLock<crate::geoip::GeoIpManager>>>,
+    geosite_manager: Option<&Arc<std::sync::RwLock<crate::geosite::GeoSiteManager>>>,
 ) -> bool {
     // 获取 GeoSiteManager 的引用 / Get GeoSiteManager reference
-    let geosite_mgr_ref = geosite_manager.map(|m| m.lock().unwrap());
+    let geosite_mgr_ref = geosite_manager.map(|m| m.read().unwrap());
     let geosite_mgr_deref = geosite_mgr_ref.as_deref();
     // 获取 GeoIpManager 的引用 / Get GeoIpManager reference
-    let geoip_mgr_ref = geoip_manager.map(|m| m.lock().unwrap());
+    let geoip_mgr_ref = geoip_manager.map(|m| m.read().unwrap());
     let geoip_mgr_deref = geoip_mgr_ref.as_deref();
     matcher.matches_with_qtype(qname, qclass, client_ip, edns_present, qtype, geoip_mgr_deref, geosite_mgr_deref)
 }

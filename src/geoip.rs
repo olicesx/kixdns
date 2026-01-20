@@ -75,7 +75,8 @@ pub struct GeoIpManager {
 #[derive(Debug, Clone)]
 pub struct GeoIpResult {
     /// ISO 3166-1 alpha-2 国家代码（如 "CN", "US"） / ISO 3166-1 alpha-2 country code (e.g., "CN", "US")
-    pub country_code: Option<String>,
+    /// 使用 Arc<str> 实现零拷贝 clone / Use Arc<str> for zero-copy clone
+    pub country_code: Option<Arc<str>>,
     /// 是否为私有 IP 地址 / Whether it's a private IP address
     pub is_private: bool,
 }
@@ -182,12 +183,14 @@ impl GeoIpManager {
                 // 尝试从多个字段获取国家代码 / Try to get country code from multiple fields
                 // 优先级: country > registered_country > represented_country
                 // Priority: country > registered_country > represented_country
+                // 零拷贝优化：使用 Arc<str> 避免克隆时的内存分配
+                // Zero-copy optimization: use Arc<str> to avoid allocation on clone
                 let country_code = record
                     .country
                     .or(record.registered_country)
                     .or(record.represented_country)
                     .and_then(|c| c.iso_code)
-                    .map(|s| s.to_uppercase());
+                    .map(|s| Arc::from(s.to_uppercase().as_str()));
 
                 GeoIpResult {
                     country_code,
@@ -231,7 +234,9 @@ impl GeoIpManager {
                 let range = &self.ip_ranges[idx];
                 if ip_u32 <= range.end {
                     return GeoIpResult {
-                        country_code: Some(range.country_code.clone()),
+                        // 零拷贝优化：将 String 转为 Arc<str> 以便后续 clone 无需分配
+                        // Zero-copy: convert String to Arc<str> for clone without allocation
+                        country_code: Some(Arc::from(range.country_code.as_str())),
                         is_private: crate::geoip::is_private_ip(ip),
                     };
                 }
@@ -242,7 +247,7 @@ impl GeoIpManager {
                     let range = &self.ip_ranges[idx - 1];
                     if ip_u32 >= range.start && ip_u32 <= range.end {
                         return GeoIpResult {
-                            country_code: Some(range.country_code.clone()),
+                            country_code: Some(Arc::from(range.country_code.as_str())),
                             is_private: crate::geoip::is_private_ip(ip),
                         };
                     }
@@ -251,7 +256,7 @@ impl GeoIpManager {
                     let range = &self.ip_ranges[idx];
                     if ip_u32 >= range.start && ip_u32 <= range.end {
                         return GeoIpResult {
-                            country_code: Some(range.country_code.clone()),
+                            country_code: Some(Arc::from(range.country_code.as_str())),
                             is_private: crate::geoip::is_private_ip(ip),
                         };
                     }
@@ -804,7 +809,7 @@ mod tests {
 /// Watches .dat file changes and automatically reloads GeoIP data
 pub fn spawn_geoip_watcher(
     dat_path: Option<PathBuf>,
-    manager: Arc<std::sync::Mutex<GeoIpManager>>,
+    manager: Arc<std::sync::RwLock<GeoIpManager>>,
 ) {
     let path = match dat_path {
         Some(p) => p,
@@ -823,7 +828,7 @@ pub fn spawn_geoip_watcher(
 /// 运行 GeoIP watcher / Run GeoIP watcher
 fn run_geoip_watcher(
     path: PathBuf,
-    manager: Arc<std::sync::Mutex<GeoIpManager>>,
+    manager: Arc<std::sync::RwLock<GeoIpManager>>,
 ) -> notify::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher: notify::RecommendedWatcher = notify::Watcher::new(tx, notify::Config::default())?;
@@ -855,11 +860,11 @@ fn run_geoip_watcher(
                 while retries > 0 {
                     let load_result = if is_dat {
                         // 加载 .dat 格式 / Load .dat format
-                        let mut manager_guard = manager.lock().unwrap();
+                        let mut manager_guard = manager.write().unwrap();
                         manager_guard.load_from_dat_file(event_path)
                     } else {
                         // 加载 V2Ray JSON 格式 / Load V2Ray JSON format
-                        let mut manager_guard = manager.lock().unwrap();
+                        let mut manager_guard = manager.write().unwrap();
                         manager_guard.load_from_v2ray_file(event_path)
                     };
                     

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -6,6 +5,7 @@ use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{DNSClass, RecordType};
 use ipnet::IpNet;
 use regex::Regex;
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::config::{Action, MatchOperator};
@@ -40,10 +40,10 @@ pub struct CompiledMatcherWithOp {
 pub enum CompiledMatcher {
     #[allow(dead_code)]
     DomainExact {
-        domain: String,
+        domain: Arc<str>,  // 零拷贝优化 / Zero-copy optimization
     },
     DomainSuffix {
-        suffix: String,
+        suffix: Arc<str>,  // 零拷贝优化 / Zero-copy optimization
     },
     ClientIp {
         net: IpNet,
@@ -71,9 +71,9 @@ pub enum PrecomputedAction {
 
 #[derive(Debug, Clone, Default)]
 pub struct RuleIndex {
-    pub domain_exact: HashMap<String, Vec<usize>>,
-    pub domain_suffix: HashMap<String, Vec<usize>>,
-    pub query_type: HashMap<RecordType, Vec<usize>>,
+    pub domain_exact: FxHashMap<Arc<str>, Vec<usize>>,
+    pub domain_suffix: FxHashMap<Arc<str>, Vec<usize>>,
+    pub query_type: FxHashMap<RecordType, Vec<usize>>,
     pub always_check: Vec<usize>,
 }
 
@@ -99,7 +99,7 @@ impl RuleIndex {
             match &m.matcher {
                 CompiledMatcher::DomainExact { domain } if !domain.is_empty() => {
                     self.domain_exact
-                        .entry(domain.clone())
+                        .entry(Arc::clone(domain))  // Arc::clone 而不是 domain.clone()
                         .or_default()
                         .push(rule_idx);
                     indexed = true;
@@ -107,7 +107,7 @@ impl RuleIndex {
                 }
                 CompiledMatcher::DomainSuffix { suffix } if !suffix.is_empty() => {
                     self.domain_suffix
-                        .entry(suffix.clone())
+                        .entry(Arc::clone(suffix))  // Arc::clone 而不是 suffix.clone()
                         .or_default()
                         .push(rule_idx);
                     indexed = true;
@@ -207,10 +207,13 @@ fn compile_rule(rule: &RuntimeRule, rule_idx: usize) -> CompiledRule {
 fn compile_matcher(m: &RuntimeMatcher) -> CompiledMatcher {
     match m {
         RuntimeMatcher::Any => CompiledMatcher::DomainSuffix {
-            suffix: String::new(),
+            suffix: Arc::from(""),  // 使用 Arc::from 而不是 String::new() / Use Arc::from instead of String::new()
+        },
+        RuntimeMatcher::DomainExact { value } => CompiledMatcher::DomainExact {
+            domain: Arc::clone(value),  // Arc::clone 而不是 value.clone() / Arc::clone instead of value.clone()
         },
         RuntimeMatcher::DomainSuffix { value } => CompiledMatcher::DomainSuffix {
-            suffix: value.clone(),
+            suffix: Arc::clone(value),  // Arc::clone 而不是 value.clone() / Arc::clone instead of value.clone()
         },
         RuntimeMatcher::ClientIp { net } => CompiledMatcher::ClientIp { net: net.clone() },
         RuntimeMatcher::DomainRegex { regex } => CompiledMatcher::Regex {
@@ -302,12 +305,12 @@ fn compiled_matcher_matches(
     edns_present: bool,
 ) -> bool {
     match matcher {
-        CompiledMatcher::DomainExact { domain } => qname.eq_ignore_ascii_case(domain),
+        CompiledMatcher::DomainExact { domain } => qname.eq_ignore_ascii_case(domain.as_ref()),  // 使用 as_ref() 获取 &str / Use as_ref() to get &str
         CompiledMatcher::DomainSuffix { suffix } => {
             if suffix.is_empty() {
                 true
             } else {
-                qname.ends_with(suffix)
+                qname.ends_with(suffix.as_ref())  // 使用 as_ref() 进行字符串匹配 / Use as_ref() for string matching
             }
         }
         CompiledMatcher::ClientIp { net } => net.contains(&client_ip),
@@ -316,7 +319,8 @@ fn compiled_matcher_matches(
         CompiledMatcher::Regex { regex } => regex.is_match(qname),
         CompiledMatcher::Complex { matcher } => match matcher {
             RuntimeMatcher::Any => true,
-            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value),
+            RuntimeMatcher::DomainExact { value } => qname.eq_ignore_ascii_case(value.as_ref()),  // 使用 as_ref()
+            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value.as_ref()),  // 使用 as_ref()
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes: _ } => {
