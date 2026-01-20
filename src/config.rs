@@ -334,9 +334,29 @@ pub enum Action {
         upstream: Option<String>,
         #[serde(default)]
         transport: Option<Transport>,
+        /// 预分割的 upstream 列表（性能优化）/ Pre-split upstream list (performance optimization)
+        #[serde(skip)]
+        pre_split_upstreams: Option<std::sync::Arc<Vec<String>>>,
     },
     /// 继续匹配后续规则。响应阶段会复用当前响应结果。 / Continue matching subsequent rules. Response phase will reuse current response result
     Continue,
+}
+
+/// Action 辅助函数 / Action helper functions
+impl Action {
+    /// 预分割 upstream 字符串以优化性能（在配置加载时调用）/ Pre-split upstream string for performance (call during config loading)
+    pub fn pre_split_upstreams(&mut self) {
+        if let Action::Forward { upstream, pre_split_upstreams, .. } = self {
+            if let Some(upstream_str) = upstream {
+                let split: Vec<String> = upstream_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                *pre_split_upstreams = Some(std::sync::Arc::new(split));
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Copy, PartialEq, Eq, Hash)]

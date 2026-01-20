@@ -426,6 +426,21 @@ impl RuntimePipelineConfig {
             });
         }
 
+        // 预处理所有 Forward action 的 upstream 字段（性能优化）/ Pre-process all Forward upstreams (performance optimization)
+        for pipeline in &mut pipelines {
+            for rule in &mut pipeline.rules {
+                for action in &mut rule.actions {
+                    action.pre_split_upstreams();
+                }
+                for action in &mut rule.response_actions_on_match {
+                    action.pre_split_upstreams();
+                }
+                for action in &mut rule.response_actions_on_miss {
+                    action.pre_split_upstreams();
+                }
+            }
+        }
+
         Ok(Self {
             settings: cfg.settings,
             pipeline_select,

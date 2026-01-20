@@ -943,6 +943,7 @@ impl Engine {
             Some(p) => self.apply_rules(&state, p, peer.ip(), &qname, qtype, qclass, edns_present, None),
             None => Decision::Forward {
                 upstream: Arc::from(cfg.settings.default_upstream.as_str()),
+                pre_split_upstreams: None,
                 response_matchers: Vec::new(),
                 response_matcher_operator: crate::config::MatchOperator::And,
                 response_actions_on_match: Vec::new(),
@@ -1059,6 +1060,7 @@ impl Engine {
             }
             Decision::Forward {
                 upstream,
+                pre_split_upstreams,
                 response_matchers,
                 response_matcher_operator: _response_matcher_operator,
                 response_actions_on_match,
@@ -1110,7 +1112,7 @@ impl Engine {
                                 }
                             }
                         }
-                        self.forward_upstream(packet, &upstream, upstream_timeout, transport).await
+                        self.forward_upstream(packet, &upstream, upstream_timeout, transport, pre_split_upstreams.as_ref()).await
                     }
                 } else {
                     // If reuse is not allowed (e.g. explicit Forward action), we must clear any reused response
@@ -1151,7 +1153,7 @@ impl Engine {
                             }
                         }
                     }
-                    self.forward_upstream(packet, &upstream, upstream_timeout, transport).await
+                    self.forward_upstream(packet, &upstream, upstream_timeout, transport, pre_split_upstreams.as_ref()).await
                 };
 
                 match resp {
@@ -1179,7 +1181,7 @@ impl Engine {
                         if truncated && transport == Transport::Udp {
                             tracing::debug!(event = "tc_flag_retry", upstream = %upstream, "response truncated, retrying with tcp");
                             drop(cleanup_guard);
-                            let tcp_resp = self.forward_upstream(packet, &upstream, upstream_timeout, Transport::Tcp).await?;
+                            let tcp_resp = self.forward_upstream(packet, &upstream, upstream_timeout, Transport::Tcp, pre_split_upstreams.as_ref()).await?;
                             if let Some(_g) = self.inflight.get(&dedupe_hash) {
                                 self.notify_inflight_waiters(dedupe_hash, &tcp_resp).await;
                             }
@@ -1630,7 +1632,7 @@ impl Engine {
                 // 检查是否有多个 forward action / Check for multiple forward actions
                 let forward_actions: Vec<_> = rule.actions.iter()
                     .filter_map(|a| match a {
-                        Action::Forward { upstream, transport } => Some((upstream, transport)),
+                        Action::Forward { upstream, transport, pre_split_upstreams } => Some((upstream, transport, pre_split_upstreams.clone())),
                         _ => None,
                     })
                     .collect();
@@ -1638,12 +1640,21 @@ impl Engine {
                 if forward_actions.len() > 1 {
                     // 多个 forward action：收集所有 upstream 到单个 Forward decision / Multiple forward actions: collect all upstreams into single Forward decision
                     let mut all_upstreams = String::new();
-                    for (idx, (upstream, _)) in forward_actions.iter().enumerate() {
+                    // 合并所有 pre_split_upstreams / Merge all pre_split_upstreams
+                    let mut merged_pre_split: Vec<String> = Vec::new();
+                    for (idx, (upstream, _, pre_split)) in forward_actions.iter().enumerate() {
                         if idx > 0 {
                             all_upstreams.push(',');
                         }
                         if let Some(u) = upstream {
                             all_upstreams.push_str(u);
+                            // 如果有预分割数据，合并它们 / If pre-split data exists, merge them
+                            if let Some(pre) = pre_split {
+                                merged_pre_split.extend(pre.iter().cloned());
+                            } else {
+                                // 否则分割字符串 / Otherwise split string
+                                merged_pre_split.extend(u.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+                            }
                         }
                     }
 
@@ -1656,6 +1667,7 @@ impl Engine {
 
                     let d = Decision::Forward {
                         upstream: Arc::from(all_upstreams.as_str()),
+                        pre_split_upstreams: if merged_pre_split.is_empty() { None } else { Some(std::sync::Arc::new(merged_pre_split)) },
                         response_matchers: rule.response_matchers.clone(),
                         response_matcher_operator: rule.response_matcher_operator,
                         response_actions_on_match: rule.response_actions_on_match.clone(),
@@ -1715,6 +1727,7 @@ impl Engine {
                         Action::Allow => {
                             let d = Decision::Forward {
                                 upstream: Arc::from(upstream_default.as_str()),
+                                pre_split_upstreams: None,
                                 response_matchers: Vec::new(),
                                 response_matcher_operator: crate::config::MatchOperator::And,
                                 response_actions_on_match: Vec::new(),
@@ -1739,6 +1752,7 @@ impl Engine {
                         Action::Forward {
                             upstream,
                             transport,
+                            pre_split_upstreams,
                         } => {
                             let upstream_addr: Arc<str> = upstream
                                 .as_ref()
@@ -1748,6 +1762,7 @@ impl Engine {
                             let continue_on_miss = contains_continue(&rule.response_actions_on_miss);
                             let d = Decision::Forward {
                                 upstream: upstream_addr,
+                                pre_split_upstreams: pre_split_upstreams.clone(),
                                 response_matchers: rule.response_matchers.clone(),
                                 response_matcher_operator: rule.response_matcher_operator,
                                 response_actions_on_match: rule.response_actions_on_match.clone(),
@@ -1781,6 +1796,7 @@ impl Engine {
 
         let d = Decision::Forward {
             upstream: Arc::from(upstream_default.as_str()),
+            pre_split_upstreams: None,
             response_matchers: Vec::new(),
             response_matcher_operator: crate::config::MatchOperator::And,
             response_actions_on_match: Vec::new(),
@@ -1801,9 +1817,12 @@ impl Engine {
         upstream: &str,
         timeout_dur: Duration,
         transport: Transport,
+        pre_split_upstreams: Option<&std::sync::Arc<Vec<String>>>,
     ) -> anyhow::Result<Bytes> {
-        // 优化：先检查是否有逗号，避免不必要的字符串分割 / Optimize: check for comma first to avoid unnecessary string splitting
-        if !upstream.contains(',') {
+        // 使用预分割数据或动态分割 / Use pre-split data or dynamic splitting
+        let upstreams: Vec<&str> = if let Some(pre_split) = pre_split_upstreams {
+            pre_split.iter().map(|s| s.as_str()).collect()
+        } else if !upstream.contains(',') {
             // 单个上游：直接转发 / Single upstream: direct forward
             let start = std::time::Instant::now();
             let res = match transport {
@@ -1824,10 +1843,12 @@ impl Engine {
                 tracing::warn!(upstream=%upstream, error=%e, elapsed_ns = dur_ns, "upstream call failed");
             }
             return res;
-        }
+        } else {
+            // 回退：动态分割 / Fallback: dynamic splitting
+            upstream.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
+        };
 
         // 多个上游：并发请求取最快结果 / Multiple upstreams: concurrent requests, take fastest result
-        let upstreams: Vec<&str> = upstream.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
         tracing::info!(upstreams = ?upstreams, "concurrent upstream requests - spawning tasks");
 
         // 使用 FuturesUnordered 真正并发地等待所有任务
@@ -2029,7 +2050,7 @@ impl Engine {
                 
                 // 发送上游查询
                 // Send upstream query
-                match engine.forward_upstream(&req_bytes, &upstream_default, upstream_timeout, Transport::Udp).await {
+                match engine.forward_upstream(&req_bytes, &upstream_default, upstream_timeout, Transport::Udp, None).await {
                     Ok(resp) => {
                         // 验证响应并更新缓存
                         // Verify response and update cache
@@ -2185,6 +2206,7 @@ impl Engine {
                 Action::Forward {
                     upstream,
                     transport,
+                    pre_split_upstreams,
                 } => {
                     forward_attempts += 1;
                     if forward_attempts > MAX_RESPONSE_FORWARDS {
@@ -2213,7 +2235,7 @@ impl Engine {
                     });
                     let use_transport = transport.unwrap_or(Transport::Udp);
                     let raw = match self
-                        .forward_upstream(packet, &upstream_addr, upstream_timeout, use_transport)
+                        .forward_upstream(packet, &upstream_addr, upstream_timeout, use_transport, pre_split_upstreams.as_ref())
                         .await
                     {
                         Ok(bytes) => bytes,
@@ -2407,6 +2429,7 @@ impl Engine {
                 }
                 Decision::Forward {
                     upstream,
+                    pre_split_upstreams,
                     response_matchers,
                     response_matcher_operator: _response_matcher_operator,
                     response_actions_on_match,
@@ -2460,7 +2483,7 @@ impl Engine {
                                     }
                                 }
                             }
-                            self.forward_upstream(packet, &upstream, upstream_timeout, transport).await
+                            self.forward_upstream(packet, &upstream, upstream_timeout, transport, pre_split_upstreams.as_ref()).await
                         }
                     } else {
                         // If reuse is not allowed (e.g. explicit Forward action), we must clear any reused response
@@ -2505,7 +2528,7 @@ impl Engine {
                                 }
                             }
                         }
-                        self.forward_upstream(packet, &upstream, upstream_timeout, transport).await
+                        self.forward_upstream(packet, &upstream, upstream_timeout, transport, pre_split_upstreams.as_ref()).await
                     };
 
                     match resp {
@@ -4098,6 +4121,9 @@ pub(crate) enum Decision {
     },
     Forward {
         upstream: Arc<str>,
+        /// 预分割的 upstream 列表（性能优化）/ Pre-split upstream list (performance optimization)
+        #[allow(dead_code)]
+        pre_split_upstreams: Option<std::sync::Arc<Vec<String>>>,
         response_matchers: Vec<RuntimeResponseMatcherWithOp>,
         response_matcher_operator: crate::config::MatchOperator,
         response_actions_on_match: Vec<Action>,
