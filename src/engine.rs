@@ -1802,10 +1802,8 @@ impl Engine {
         timeout_dur: Duration,
         transport: Transport,
     ) -> anyhow::Result<Bytes> {
-        // 支持多个上游（逗号分隔）：并发请求取最快结果 / Support multiple upstreams (comma-separated): concurrent requests, take fastest result
-        let upstreams: Vec<&str> = upstream.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-        
-        if upstreams.len() == 1 {
+        // 优化：先检查是否有逗号，避免不必要的字符串分割 / Optimize: check for comma first to avoid unnecessary string splitting
+        if !upstream.contains(',') {
             // 单个上游：直接转发 / Single upstream: direct forward
             let start = std::time::Instant::now();
             let res = match transport {
@@ -1829,6 +1827,7 @@ impl Engine {
         }
 
         // 多个上游：并发请求取最快结果 / Multiple upstreams: concurrent requests, take fastest result
+        let upstreams: Vec<&str> = upstream.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
         tracing::info!(upstreams = ?upstreams, "concurrent upstream requests - spawning tasks");
 
         // 使用 FuturesUnordered 真正并发地等待所有任务
