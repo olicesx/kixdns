@@ -205,7 +205,7 @@
                                     <option disabled value="">选择 Pipeline</option>
                                     <option v-for="p in config.pipelines" :value="p.id">{{ p.id }}</option>
                                 </select>
-                                <button class="btn btn-sm btn-outline-danger ms-auto" @click="removePipelineSelect(idx)">删除</button>
+                                <button class="btn btn-sm btn-outline-danger ms-auto" @click.stop="removePipelineSelect(idx)">删除</button>
                             </div>
                             <div class="ps-3 border-start">
                                 <div class="text-muted small mb-1">匹配条件 (Matchers):</div>
@@ -310,7 +310,7 @@
                 
                 <!-- Dynamic Inputs based on type -->
                 <input v-if="hasField(m.type, 'value')" type="text" class="form-control" v-model="m.value"
-                    :placeholder="m.type === 'geosite' || m.type === 'geosite_not' || m.type === 'response_request_domain_geosite' || m.type === 'response_request_domain_geosite_not' ? 'cn 或 geosite:cn' : 'Value'">
+                    :placeholder="m.type === 'geo_site' || m.type === 'geo_site_not' || m.type === 'response_request_domain_geosite' || m.type === 'response_request_domain_geosite_not' ? 'cn 或 geosite:cn' : 'Value'">
                 <input v-if="hasField(m.type, 'cidr')" type="text" class="form-control" v-model="m.cidr" placeholder="CIDR 或逗号分隔列表 (e.g. 127.0.0.0/8,0.0.0.0/8)">
                 <div v-if="hasField(m.type, 'expect')" class="input-group-text bg-white">
                     <input type="checkbox" class="form-check-input mt-0" v-model="m.expect"> &nbsp;Expect
@@ -384,7 +384,6 @@
                 <template v-if="a.type === 'forward'">
                     <input type="text" class="form-control" v-model="a.upstream" placeholder="Upstream (Optional)">
                     <select class="form-select" style="max-width: 80px;" v-model="a.transport">
-                        <option :value="null">Auto</option>
                         <option value="udp">UDP</option>
                         <option value="tcp">TCP</option>
                     </select>
@@ -407,8 +406,8 @@
             'domain_regex': ['value'],
             'qclass': ['value'],
             'edns_present': ['expect'],
-            'geosite': ['value'],
-            'geosite_not': ['value'],
+            'geo_site': ['value'],
+            'geo_site_not': ['value'],
             'geoip_country': ['country_codes'],
             'geoip_private': ['expect'],
             'qtype': ['value'],
@@ -464,7 +463,7 @@
                     // Keep type, clear others
                     const type = m.type;
                     for (const key in m) { if (key !== 'type' && key !== 'operator') delete m[key]; }
-                    
+
                     // Handle call syntax for GeoSite and GeoIP
                     if (hasField(type, 'value')) {
                         if (type === 'qtype') {
@@ -480,7 +479,7 @@
                         // Support call syntax: "geoip:CN" or "geoip:CN,US,JP"
                         m._callSyntax = false; // Track if using call syntax
                     }
-                    if (hasField(type, 'value') && (type === 'geosite' || type === 'geosite_not' ||
+                    if (hasField(type, 'value') && (type === 'geo_site' || type === 'geo_site_not' ||
                         type === 'response_request_domain_geosite' || type === 'response_request_domain_geosite_not')) {
                         m._callSyntax = false; // Track if using call syntax
                     }
@@ -490,7 +489,7 @@
                 // Watch for call syntax in GeoSite and GeoIP matchers
                 const parseCallSyntaxForMatcher = (m) => {
                     // Handle GeoSite matchers (request and response)
-                    if (m.type === 'geosite' || m.type === 'geosite_not' ||
+                    if (m.type === 'geo_site' || m.type === 'geo_site_not' ||
                         m.type === 'response_request_domain_geosite' || m.type === 'response_request_domain_geosite_not') {
                         if (m.value && m.value.includes(':')) {
                             const parsed = parseCallSyntax(m.value);
@@ -513,7 +512,7 @@
                 };
 
                 // Auto-parse call syntax when value changes
-                watch(() => props.matchers, (matchers) => {
+                Vue.watch(() => props.matchers, (matchers) => {
                     matchers.forEach(m => parseCallSyntaxForMatcher(m));
                 }, { deep: true });
 
@@ -525,7 +524,7 @@
             template: '#action-list-template',
             props: ['actions', 'pipelines', 'currentPipelineId'],
             setup(props) {
-                const pipelineOptions = computed(() => (props.pipelines || []).map(p => p.id));
+                const pipelineOptions = Vue.computed(() => (props.pipelines || []).map(p => p.id));
                 const addAction = () => {
                     props.actions.push({ type: 'log', level: 'info' });
                 };
@@ -539,7 +538,7 @@
                     if (type === 'allow') { /* No fields */ }
                     if (type === 'deny') { /* No fields */ }
                     if (type === 'continue') { /* No fields */ }
-                    if (type === 'forward') { a.upstream = ''; a.transport = null; }
+                    if (type === 'forward') { a.upstream = ''; a.transport = 'udp'; }
                 };
                 return { addAction, resetActionFields, pipelineOptions };
             }
@@ -614,8 +613,8 @@
                     'any': 'Any',
                     'qclass': 'QClass',
                     'edns_present': 'EDNS Present',
-                    'geosite': 'GeoSite',
-                    'geosite_not': 'GeoSite Not',
+                    'geo_site': 'GeoSite',
+                    'geo_site_not': 'GeoSite Not',
                     'geoip_country': 'GeoIP Country',
                     'geoip_private': 'GeoIP Private',
                     'qtype': 'QType'
@@ -627,8 +626,8 @@
                     'client_ip': 'Client IP',
                     'qclass': 'QClass',
                     'edns_present': 'EDNS Present',
-                    'geosite': 'GeoSite',
-                    'geosite_not': 'GeoSite Not',
+                    'geo_site': 'GeoSite',
+                    'geo_site_not': 'GeoSite Not',
                     'geoip_country': 'GeoIP Country',
                     'geoip_private': 'GeoIP Private',
                     'qtype': 'QType'
@@ -651,6 +650,10 @@
 
                 const toCleanJsonString = (cfgObj) => JSON.stringify(cfgObj, (key, value) => {
                     if (key && key.startsWith('_')) return undefined;
+                    // 过滤掉空的 geosite_data_paths 数组
+                    if (key === 'geosite_data_paths' && Array.isArray(value) && value.length === 0) {
+                        return undefined;
+                    }
                     return value;
                 }, 2);
 
@@ -659,15 +662,33 @@
                     if (!manualJsonEdit.value) {
                         rawJson.value = toCleanJsonString(newVal);
                     }
-                    // Sync geosite_data_paths to geositePaths array
+                    // Sync geosite_data_paths to geositePaths array (单向同步，避免循环)
                     if (Array.isArray(newVal.settings.geosite_data_paths)) {
-                        geositePaths.value = [...newVal.settings.geosite_data_paths];
+                        // 只有当真正不同时才更新，避免触发 watch
+                        const currentPaths = geositePaths.value.join(',');
+                        const newPaths = newVal.settings.geosite_data_paths.join(',');
+                        if (currentPaths !== newPaths) {
+                            // 使用 nextTick 避免同步触发其他 watch
+                            nextTick(() => {
+                                geositePaths.value = [...newVal.settings.geosite_data_paths];
+                            });
+                        }
                     }
                 }, { deep: true });
 
-                // Sync geositePaths -> config.settings.geosite_data_paths
+                // Sync geositePaths -> config.settings.geosite_data_paths (单向同步，避免循环)
                 watch(geositePaths, (newPaths) => {
-                    config.value.settings.geosite_data_paths = [...newPaths];
+                    // 过滤掉空字符串，只保留有效的路径
+                    const filteredPaths = newPaths.filter(p => p && p.trim());
+                    // 只有当真正不同时才更新，避免触发 watch
+                    const currentConfigPaths = (config.value.settings.geosite_data_paths || []).join(',');
+                    const newConfigPaths = filteredPaths.join(',');
+                    if (currentConfigPaths !== newConfigPaths) {
+                        // 使用 nextTick 避免同步触发其他 watch
+                        nextTick(() => {
+                            config.value.settings.geosite_data_paths = filteredPaths;
+                        });
+                    }
                 }, { deep: true });
 
                 watch(() => config.value.pipelines, (pipes) => {
@@ -722,7 +743,9 @@
                 };
 
                 const downloadJson = () => {
-                    const blob = new Blob([rawJson.value], { type: 'application/json' });
+                    // 确保使用最新的配置生成 JSON
+                    const latestJson = toCleanJsonString(config.value);
+                    const blob = new Blob([latestJson], { type: 'application/json' });
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement('a');
                     a.href = url;

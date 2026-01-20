@@ -203,16 +203,16 @@ impl Drop for PermitGuard {
 }
 
 /// Extract GeoSite tags used in configuration / 提取配置中使用的 GeoSite tags
-/// 
+///
 /// This function scans the configuration to find all GeoSite tags that are actually
 /// used in matchers, so we can load only those tags from the data file.
 /// 这个函数扫描配置以查找所有在匹配器中实际使用的GeoSite标签，
 /// 这样我们就可以只从数据文件中加载这些标签。
 fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<String> {
     use std::collections::HashSet;
-    
+
     let mut tags_set = HashSet::new();
-    
+
     // Scan pipeline_select rules / 扫描 pipeline_select 规则
     for rule in &cfg.pipeline_select {
         for matcher in &rule.matchers {
@@ -224,10 +224,11 @@ fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<String> 
             }
         }
     }
-    
+
     // Scan all pipeline rules / 扫描所有 pipeline 规则
     for pipeline in &cfg.pipelines {
         for rule in &pipeline.rules {
+            // Scan request matchers / 扫描请求匹配器
             for matcher in &rule.matchers {
                 if let crate::matcher::RuntimeMatcher::GeoSite { tag } = &matcher.matcher {
                     tags_set.insert(tag.clone());
@@ -236,14 +237,24 @@ fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<String> 
                     tags_set.insert(tag.clone());
                 }
             }
+
+            // Scan response matchers / 扫描响应匹配器
+            for matcher in &rule.response_matchers {
+                if let crate::matcher::RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value } = &matcher.matcher {
+                    tags_set.insert(value.clone());
+                }
+                if let crate::matcher::RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { value } = &matcher.matcher {
+                    tags_set.insert(value.clone());
+                }
+            }
         }
     }
-    
+
     tags_set.into_iter().collect()
 }
 
 /// Check if configuration uses GeoIP matchers / 检查配置是否使用 GeoIP 匹配器
-/// 
+///
 /// This function scans the configuration to determine if any GeoIP matchers are used,
 /// so we can implement lazy loading for the MMDB file.
 /// 这个函数扫描配置以确定是否使用了GeoIP匹配器，
@@ -252,6 +263,7 @@ fn uses_geoip_matchers(cfg: &RuntimePipelineConfig) -> bool {
     // Scan all pipeline rules / 扫描所有 pipeline 规则
     for pipeline in &cfg.pipelines {
         for rule in &pipeline.rules {
+            // Check request matchers / 检查请求匹配器
             for matcher in &rule.matchers {
                 if matches!(
                     matcher.matcher,
@@ -261,9 +273,20 @@ fn uses_geoip_matchers(cfg: &RuntimePipelineConfig) -> bool {
                     return true;
                 }
             }
+
+            // Check response matchers / 检查响应匹配器
+            for matcher in &rule.response_matchers {
+                if matches!(
+                    matcher.matcher,
+                    crate::matcher::RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { .. } |
+                    crate::matcher::RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { .. }
+                ) {
+                    return true;
+                }
+            }
         }
     }
-    
+
     false
 }
 
@@ -1587,6 +1610,50 @@ impl Engine {
             );
 
             if req_match {
+                // 检查是否有多个 forward action / Check for multiple forward actions
+                let forward_actions: Vec<_> = rule.actions.iter()
+                    .filter_map(|a| match a {
+                        Action::Forward { upstream, transport } => Some((upstream, transport)),
+                        _ => None,
+                    })
+                    .collect();
+
+                if forward_actions.len() > 1 {
+                    // 多个 forward action：收集所有 upstream 到单个 Forward decision / Multiple forward actions: collect all upstreams into single Forward decision
+                    let mut all_upstreams = String::new();
+                    for (idx, (upstream, _)) in forward_actions.iter().enumerate() {
+                        if idx > 0 {
+                            all_upstreams.push(',');
+                        }
+                        if let Some(u) = upstream {
+                            all_upstreams.push_str(u);
+                        }
+                    }
+
+                    info!(
+                        event = "multiple_forward_actions",
+                        count = forward_actions.len(),
+                        merged_upstreams = %all_upstreams,
+                        "merged multiple forward actions into single concurrent forward"
+                    );
+
+                    let d = Decision::Forward {
+                        upstream: Arc::from(all_upstreams.as_str()),
+                        response_matchers: rule.response_matchers.clone(),
+                        response_matcher_operator: rule.response_matcher_operator,
+                        response_actions_on_match: rule.response_actions_on_match.clone(),
+                        response_actions_on_miss: rule.response_actions_on_miss.clone(),
+                        rule_name: rule.name.clone(),
+                        transport: forward_actions[0].1.unwrap_or(Transport::Udp), // 使用第一个的 transport / Use first action's transport
+                        continue_on_match: false,
+                        continue_on_miss: false,
+                        allow_reuse: false,
+                    };
+                    self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
+                    return d;
+                }
+
+                // 单个 forward 或其他 action：按原逻辑处理 / Single forward or other actions: use original logic
                 for action in &rule.actions {
                     match action {
                         Action::StaticResponse { rcode } => {
