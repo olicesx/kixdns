@@ -5,6 +5,7 @@ use kixdns::config::PipelineConfig;
 use kixdns::geosite::GeoSiteManager;
 use kixdns::matcher::RuntimePipelineConfig;
 use serde_json::json;
+use std::sync::{Arc, Mutex};
 
 #[test]
 fn test_pipeline_selector_geosite_matcher() {
@@ -40,7 +41,7 @@ fn test_pipeline_selector_geosite_matcher() {
 
     // 创建 GeoSiteManager 并添加测试数据
     // Create GeoSiteManager and add test data
-    let mut geosite_manager = GeoSiteManager::new(100, 60);
+    let mut geosite_manager_inner = GeoSiteManager::new(100, 60);
     
     // 合并所有 GeoSite 数据到一个 JSON 中
     // Merge all GeoSite data into one JSON
@@ -66,17 +67,20 @@ fn test_pipeline_selector_geosite_matcher() {
         ]
     }
     "#;
-    geosite_manager.load_from_v2ray_string(v2ray_all_data).expect("load all data");
+    geosite_manager_inner.load_from_v2ray_string(v2ray_all_data).expect("load all data");
     
-    println!("Tags after load: {:?}", geosite_manager.tags());
-    println!("Has cn tag: {}", geosite_manager.has_tag("cn"));
-    println!("Has google tag: {}", geosite_manager.has_tag("google"));
+    println!("Tags after load: {:?}", geosite_manager_inner.tags());
+    println!("Has cn tag: {}", geosite_manager_inner.has_tag("cn"));
+    println!("Has google tag: {}", geosite_manager_inner.has_tag("google"));
+    
+    // 包装在 Arc<Mutex<>> 中 / Wrap in Arc<Mutex<>>
+    let geosite_manager = Arc::new(Mutex::new(geosite_manager_inner));
 
     // 测试 CN 域名应该选择 p2
     // Test CN domains should select p2
     println!("Testing baidu.com...");
-    println!("GeoSiteManager has cn tag: {}", geosite_manager.has_tag("cn"));
-    println!("baidu.com matches cn: {}", geosite_manager.matches("cn", "baidu.com"));
+    println!("GeoSiteManager has cn tag: {}", geosite_manager.lock().unwrap().has_tag("cn"));
+    println!("baidu.com matches cn: {}", geosite_manager.lock().unwrap().matches("cn", "baidu.com"));
     
     let (opt, id) = kixdns::engine::select_pipeline(
         &runtime,
@@ -148,7 +152,7 @@ fn test_pipeline_selector_geosite_not_matcher() {
     let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
     let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime");
 
-    let mut geosite_manager = GeoSiteManager::new(100, 60);
+    let mut geosite_manager_inner = GeoSiteManager::new(100, 60);
     
     let v2ray_cn_data = r#"
     {
@@ -163,7 +167,10 @@ fn test_pipeline_selector_geosite_not_matcher() {
         ]
     }
     "#;
-    geosite_manager.load_from_v2ray_string(v2ray_cn_data).expect("load CN data");
+    geosite_manager_inner.load_from_v2ray_string(v2ray_cn_data).expect("load CN data");
+
+    // 包装在 Arc<Mutex<>> 中 / Wrap in Arc<Mutex<>>
+    let geosite_manager = Arc::new(Mutex::new(geosite_manager_inner));
 
     // 非 CN 域名应该选择 p2
     // Non-CN domains should select p2
@@ -223,7 +230,7 @@ fn test_pipeline_selector_geosite_with_or_operator() {
     let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
     let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime");
 
-    let mut geosite_manager = GeoSiteManager::new(100, 60);
+    let mut geosite_manager_inner = GeoSiteManager::new(100, 60);
     
     let v2ray_data = r#"
     {
@@ -239,7 +246,10 @@ fn test_pipeline_selector_geosite_with_or_operator() {
         ]
     }
     "#;
-    geosite_manager.load_from_v2ray_string(v2ray_data).expect("load data");
+    geosite_manager_inner.load_from_v2ray_string(v2ray_data).expect("load data");
+
+    // 包装在 Arc<Mutex<>> 中 / Wrap in Arc<Mutex<>>
+    let geosite_manager = Arc::new(Mutex::new(geosite_manager_inner));
 
     // CN 域名应该匹配
     // CN domain should match

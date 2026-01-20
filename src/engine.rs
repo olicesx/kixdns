@@ -97,9 +97,9 @@ pub struct Engine {
     cache_refresh_threshold_percent: u8,
     cache_refresh_min_ttl: u32,
     // GeoIP manager for geographic IP-based routing / GeoIP 管理器用于基于地理位置的 IP 路由
-    pub geoip_manager: Arc<GeoIpManager>,
+    pub geoip_manager: Arc<std::sync::Mutex<crate::geoip::GeoIpManager>>,
     // GeoSite manager for domain category-based routing / GeoSite 管理器用于域名分类路由
-    // 使用 Mutex 以支持热重载时的线程安全更新 / Use Mutex for thread-safe updates during hot reload
+    // 使用 DashMap 实现无锁并发访问，但保留 Mutex 用于热重载 / Uses DashMap for lock-free concurrent access, keeps Mutex for hot reload
     pub geosite_manager: Arc<std::sync::Mutex<crate::geosite::GeoSiteManager>>,
 }
 
@@ -183,6 +183,71 @@ impl Drop for PermitGuard {
     }
 }
 
+/// Extract GeoSite tags used in configuration / 提取配置中使用的 GeoSite tags
+/// 
+/// This function scans the configuration to find all GeoSite tags that are actually
+/// used in matchers, so we can load only those tags from the data file.
+/// 这个函数扫描配置以查找所有在匹配器中实际使用的GeoSite标签，
+/// 这样我们就可以只从数据文件中加载这些标签。
+fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<String> {
+    use std::collections::HashSet;
+    
+    let mut tags_set = HashSet::new();
+    
+    // Scan pipeline_select rules / 扫描 pipeline_select 规则
+    for rule in &cfg.pipeline_select {
+        for matcher in &rule.matchers {
+            if let crate::matcher::RuntimePipelineSelectorMatcher::GeoSite { tag } = &matcher.matcher {
+                tags_set.insert(tag.clone());
+            }
+            if let crate::matcher::RuntimePipelineSelectorMatcher::GeoSiteNot { tag } = &matcher.matcher {
+                tags_set.insert(tag.clone());
+            }
+        }
+    }
+    
+    // Scan all pipeline rules / 扫描所有 pipeline 规则
+    for pipeline in &cfg.pipelines {
+        for rule in &pipeline.rules {
+            for matcher in &rule.matchers {
+                if let crate::matcher::RuntimeMatcher::GeoSite { tag } = &matcher.matcher {
+                    tags_set.insert(tag.clone());
+                }
+                if let crate::matcher::RuntimeMatcher::GeoSiteNot { tag } = &matcher.matcher {
+                    tags_set.insert(tag.clone());
+                }
+            }
+        }
+    }
+    
+    tags_set.into_iter().collect()
+}
+
+/// Check if configuration uses GeoIP matchers / 检查配置是否使用 GeoIP 匹配器
+/// 
+/// This function scans the configuration to determine if any GeoIP matchers are used,
+/// so we can implement lazy loading for the MMDB file.
+/// 这个函数扫描配置以确定是否使用了GeoIP匹配器，
+/// 这样我们可以对MMDB文件实现延迟加载。
+fn uses_geoip_matchers(cfg: &RuntimePipelineConfig) -> bool {
+    // Scan all pipeline rules / 扫描所有 pipeline 规则
+    for pipeline in &cfg.pipelines {
+        for rule in &pipeline.rules {
+            for matcher in &rule.matchers {
+                if matches!(
+                    matcher.matcher,
+                    crate::matcher::RuntimeMatcher::GeoipCountry { .. } |
+                    crate::matcher::RuntimeMatcher::GeoipPrivate { .. }
+                ) {
+                    return true;
+                }
+            }
+        }
+    }
+    
+    false
+}
+
 impl Engine {
     pub fn new(cfg: RuntimePipelineConfig, listener_label: String) -> Self {
         // moka 缓存：容量由配置控制（默认 10000 条），最大生存时间由 cache_max_ttl 控制
@@ -211,12 +276,19 @@ impl Engine {
         let cache_refresh_min_ttl = cfg.settings.cache_refresh_min_ttl;
         
         // Extract GeoIP settings before moving cfg / 在 move cfg 之前提取 GeoIP 设置
-        let geoip_db_path = cfg.settings.geoip_db_path.clone();
-        let geoip_cache_capacity = cfg.settings.geoip_cache_capacity;
-        let geoip_cache_ttl = cfg.settings.geoip_cache_ttl;
-        
+        let geoip_db_path = if uses_geoip_matchers(&cfg) {
+            cfg.settings.geoip_db_path.clone()
+        } else {
+            None
+        };
+        let geoip_dat_path = cfg.settings.geoip_dat_path.clone();
+
         // Extract GeoSite settings before moving cfg / 在 move cfg 之前提取 GeoSite 设置
         let geosite_data_paths = cfg.settings.geosite_data_paths.clone();
+        
+        // Extract GeoSite tags used in configuration before moving cfg
+        // 在 move cfg 之前提取配置中使用的 GeoSite tags
+        let used_geosite_tags = extract_geosite_tags_from_config(&cfg);
         
         let compiled = compile_pipelines(&cfg);
         
@@ -226,24 +298,53 @@ impl Engine {
         }));
 
         // Initialize GeoIpManager / 初始化 GeoIpManager
-        let geoip_manager = match GeoIpManager::new(
-            geoip_db_path,
-            geoip_cache_capacity,
-            geoip_cache_ttl,
-        ) {
-            Ok(manager) => Arc::new(manager),
+        let mut geoip_manager = match GeoIpManager::new(geoip_db_path) {
+            Ok(manager) => manager,
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to initialize GeoIpManager, running without GeoIP support");
                 // Create a dummy manager that always returns empty results
-                Arc::new(GeoIpManager::new(None, 1, 1).unwrap())
+                GeoIpManager::new(None).unwrap()
             }
         };
+        
+        // Load GeoIP data from .dat file if configured / 如果配置了 .dat 文件，则加载 GeoIP 数据
+        let mut geoip_dat_path_for_watcher = None;
+        if let Some(ref path_str) = geoip_dat_path {
+            let path = std::path::PathBuf::from(path_str);
+            if path.exists() {
+                // 检测文件格式 / Detect file format
+                let is_dat = path.extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("dat"))
+                    .unwrap_or(false);
+                
+                let load_result = if is_dat {
+                    geoip_manager.load_from_dat_file(&path)
+                } else {
+                    geoip_manager.load_from_v2ray_file(&path)
+                };
+                
+                match load_result {
+                    Ok(count) => {
+                        info!(path = %path.display(), loaded_count = count, "loaded GeoIP data from file");
+                        geoip_dat_path_for_watcher = Some(path);
+                    }
+                    Err(e) => {
+                        warn!(path = %path.display(), error = %e, "failed to load GeoIP data, skipping");
+                    }
+                }
+            } else {
+                warn!(path = %path.display(), "GeoIP data file not found, skipping");
+            }
+        }
+        
+        let geoip_manager = Arc::new(std::sync::Mutex::new(geoip_manager));
 
         // Initialize GeoSiteManager / 初始化 GeoSiteManager
         // GeoSiteManager starts empty and is populated via add_entry() calls
-        // Default capacity: 10000 entries, TTL: 3600 seconds
+        // Cache will be automatically rebuilt after loading data
         let geosite_manager = Arc::new(std::sync::Mutex::new(
-            crate::geosite::GeoSiteManager::new(10000, 3600)
+            crate::geosite::GeoSiteManager::new(),
         ));
         
         // Load GeoSite data from configured files / 从配置的文件加载 GeoSite 数据
@@ -252,10 +353,34 @@ impl Engine {
             let path = PathBuf::from(path_str);
             if path.exists() {
                 // Load data from file / 从文件加载数据
-                let mut manager_guard = geosite_manager.lock().unwrap();
-                match manager_guard.load_from_v2ray_file(&path) {
+                // GeoSiteManager 现在使用 DashMap，支持并发访问，无需 Mutex
+                // GeoSiteManager now uses DashMap for concurrent access, no Mutex needed
+                
+                // 检测文件格式 / Detect file format
+                let is_dat = path.extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("dat"))
+                    .unwrap_or(false);
+                
+                let load_result = if is_dat {
+                    // 使用按需加载 / Use selective loading
+                    let mut manager = geosite_manager.lock().unwrap();
+                    if used_geosite_tags.is_empty() {
+                        manager.load_from_dat_file(&path)
+                    } else {
+                        manager.load_from_dat_file_selective(&path, &used_geosite_tags)
+                    }
+                } else {
+                    // JSON 格式：全量加载 / JSON format: load all
+                    let mut manager = geosite_manager.lock().unwrap();
+                    manager.load_from_v2ray_file(&path)
+                };
+                
+                match load_result {
                     Ok(count) => {
-                        info!(path = %path.display(), loaded_count = count, "loaded GeoSite data from file");
+                        info!(path = %path.display(), loaded_count = count, 
+                             used_tags = used_geosite_tags.len(),
+                             "loaded GeoSite data from file");
                         geosite_paths_for_watcher.push(path);
                     }
                     Err(e) => {
@@ -272,8 +397,15 @@ impl Engine {
             crate::geosite::spawn_geosite_watcher(
                 geosite_paths_for_watcher,
                 Arc::clone(&geosite_manager),
+                used_geosite_tags,
             );
         }
+
+        // Start GeoIP watcher for hot-reload / 启动 GeoIP watcher 用于热重载
+        crate::geoip::spawn_geoip_watcher(
+            geoip_dat_path_for_watcher,
+            Arc::clone(&geoip_manager),
+        );
 
         let flow_control_state = Arc::new(FlowControlState {
             max_permits: AtomicUsize::new(flow_control_max_permits),
@@ -485,7 +617,8 @@ impl Engine {
         let cfg = &state.pipeline;
         let qclass = DNSClass::from(q.qclass);
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
-        let geosite_mgr = self.geosite_manager.lock().unwrap();
+        // GeoSiteManager 现在使用 DashMap，无需 Mutex 锁
+        // GeoSiteManager now uses DashMap, no Mutex lock needed
         let (pipeline_opt, pipeline_id) = select_pipeline(
             cfg,
             q.qname.as_ref(),
@@ -494,7 +627,8 @@ impl Engine {
             q.edns_present,
             qtype,
             &self.listener_label,
-            Some(&*geosite_mgr),
+            Some(&self.geosite_manager),
+            Some(&self.geoip_manager),
         );
         
         // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
@@ -680,7 +814,8 @@ impl Engine {
         // 限制 geosite_mgr 的作用域，确保在 await 之前释放锁
         // Scope geosite_mgr to ensure lock is released before await
         let (pipeline_opt, pipeline_id) = {
-            let geosite_mgr = self.geosite_manager.lock().unwrap();
+            // GeoSiteManager 现在使用 DashMap，无需 Mutex 锁
+            // GeoSiteManager now uses DashMap, no Mutex lock needed
             select_pipeline(
                 cfg,
                 qname_ref,
@@ -689,7 +824,8 @@ impl Engine {
                 edns_present,
                 qtype,
                 &self.listener_label,
-                Some(&*geosite_mgr),
+                Some(&self.geosite_manager),
+                Some(&self.geoip_manager),
             )
         }; // geosite_mgr 在这里释放 / geosite_mgr released here
 
@@ -1412,8 +1548,11 @@ impl Engine {
                 &rule.matchers,
                 |m| m.operator,
                 |m| {
-                    let geosite_mgr = self.geosite_manager.lock().unwrap();
-                    matcher_matches(&m.matcher, qname, qclass, client_ip, edns_present, qtype, Some(&self.geoip_manager), Some(&*geosite_mgr))
+                    // GeoSiteManager 现在使用 DashMap，无需 Mutex 锁
+                    // GeoSiteManager now uses DashMap, no Mutex lock needed
+                    // GeoIpManager 现在使用 Mutex，需要获取锁
+                    // GeoIpManager now uses Mutex, need to acquire lock
+                    matcher_matches(&m.matcher, qname, qclass, client_ip, edns_present, qtype, Some(&self.geoip_manager), Some(&self.geosite_manager))
                 },
             );
 
@@ -2357,13 +2496,21 @@ pub fn select_pipeline<'a>(
     edns_present: bool,
     qtype: hickory_proto::rr::RecordType,
     listener_label: &str,
-    geosite_manager: Option<&crate::geosite::GeoSiteManager>,
+    geosite_manager: Option<&Arc<std::sync::Mutex<crate::geosite::GeoSiteManager>>>,
+    geoip_manager: Option<&Arc<std::sync::Mutex<crate::geoip::GeoIpManager>>>,
 ) -> (Option<&'a RuntimePipeline>, Arc<str>) {
     for rule in &cfg.pipeline_select {
         let matched = eval_match_chain(
             &rule.matchers,
             |m| m.operator,
-            |m| m.matcher.matches_with_qtype(listener_label, client_ip, qname, qclass, edns_present, qtype, geosite_manager),
+            |m| {
+                // 获取 GeoSiteManager 和 GeoIpManager 的引用 / Get GeoSiteManager and GeoIpManager references
+                let geosite_mgr_ref = geosite_manager.map(|m| m.lock().unwrap());
+                let geosite_mgr_ref_deref = geosite_mgr_ref.as_deref();
+                let geoip_mgr_ref = geoip_manager.map(|m| m.lock().unwrap());
+                let geoip_mgr_ref_deref = geoip_mgr_ref.as_deref();
+                m.matcher.matches_with_qtype(listener_label, client_ip, qname, qclass, edns_present, qtype, geoip_mgr_ref_deref, geosite_mgr_ref_deref)
+            },
         );
         if matched {
             if let Some(p) = cfg.pipelines.iter().find(|p| p.id.as_ref() == rule.pipeline) {
@@ -2790,10 +2937,16 @@ fn matcher_matches(
     client_ip: IpAddr,
     edns_present: bool,
     qtype: hickory_proto::rr::RecordType,
-    geoip_manager: Option<&crate::geoip::GeoIpManager>,
-    geosite_manager: Option<&crate::geosite::GeoSiteManager>,
+    geoip_manager: Option<&Arc<std::sync::Mutex<crate::geoip::GeoIpManager>>>,
+    geosite_manager: Option<&Arc<std::sync::Mutex<crate::geosite::GeoSiteManager>>>,
 ) -> bool {
-    matcher.matches_with_qtype(qname, qclass, client_ip, edns_present, qtype, geoip_manager, geosite_manager)
+    // 获取 GeoSiteManager 的引用 / Get GeoSiteManager reference
+    let geosite_mgr_ref = geosite_manager.map(|m| m.lock().unwrap());
+    let geosite_mgr_deref = geosite_mgr_ref.as_deref();
+    // 获取 GeoIpManager 的引用 / Get GeoIpManager reference
+    let geoip_mgr_ref = geoip_manager.map(|m| m.lock().unwrap());
+    let geoip_mgr_deref = geoip_mgr_ref.as_deref();
+    matcher.matches_with_qtype(qname, qclass, client_ip, edns_present, qtype, geoip_mgr_deref, geosite_mgr_deref)
 }
 
 fn log_match(level: Option<&str>, rule_name: &str, qname: &str, client_ip: IpAddr) {
@@ -2991,6 +3144,7 @@ mod tests {
             hickory_proto::rr::RecordType::A,
             "edge",
             None,
+            None,
         );
         
         // Assert: Verify correct pipeline was selected
@@ -3031,6 +3185,7 @@ mod tests {
             false,
             hickory_proto::rr::RecordType::A,
             "edge",
+            None,
             None,
         );
         

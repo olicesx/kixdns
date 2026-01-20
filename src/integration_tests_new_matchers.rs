@@ -14,7 +14,7 @@ mod integration_tests {
     #[test]
     fn test_geosite_matcher_integration() {
         // Arrange: Create a GeoSite manager and add test data
-        let mut geosite_mgr = GeoSiteManager::new(1000, 3600);
+        let mut geosite_mgr = GeoSiteManager::new();
         
         // Simulate loading GeoSite data
         // In real scenario, this would be loaded from V2Ray dat file
@@ -84,7 +84,7 @@ mod integration_tests {
     #[test]
     fn test_geoip_matcher_integration() {
         // Arrange: Test with dummy GeoIP manager (no database)
-        let geoip_mgr = GeoIpManager::new(None, 1000, 3600).unwrap();
+        let geoip_mgr = GeoIpManager::new(None).unwrap();
         
         // Act & Assert: Test private IP detection
         let private_ips = vec![
@@ -318,8 +318,8 @@ mod integration_tests {
     #[test]
     fn test_edge_cases_and_error_handling() {
         // Arrange: Create empty GeoSite manager and GeoIP manager
-        let empty_geosite = GeoSiteManager::new(100, 60);
-        let geoip_mgr = GeoIpManager::new(None, 100, 60).unwrap();
+        let empty_geosite = GeoSiteManager::new();
+        let geoip_mgr = GeoIpManager::new(None).unwrap();
         let invalid_ip: IpAddr = "0.0.0.0".parse().unwrap();
         
         // Act & Assert: Test GeoSite with empty database
@@ -355,7 +355,7 @@ mod integration_tests {
     #[test]
     fn test_performance_and_caching() {
         // Arrange: Create GeoSite manager and add test entry
-        let mut geosite_mgr = GeoSiteManager::new(100, 60);
+        let mut geosite_mgr = GeoSiteManager::new();
         
         use crate::geosite::{GeoSiteEntry, DomainMatcher};
         geosite_mgr.add_entry(GeoSiteEntry {
@@ -380,7 +380,7 @@ mod integration_tests {
         println!("First call: {:?}, Second call: {:?}", first_call_duration, second_call_duration);
         
         // Arrange: Create GeoIP manager and test IP
-        let geoip_mgr = GeoIpManager::new(None, 100, 60).unwrap();
+        let geoip_mgr = GeoIpManager::new(None).unwrap();
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
         
         // Act & Assert: First lookup

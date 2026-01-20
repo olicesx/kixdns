@@ -159,6 +159,35 @@
                                 <div class="form-text small">流控参数检查频率</div>
                             </div>
                         </div>
+
+                        <hr>
+                        <h6 class="fw-bold mb-2 text-info">GeoIP 配置 (GeoIP Database)</h6>
+                        <div class="row g-3">
+                            <div class="col-md-12">
+                                <label class="form-label">MMDB 文件路径</label>
+                                <input type="text" class="form-control" v-model="config.settings.geoip_db_path" placeholder="留空则不使用 GeoIP">
+                                <div class="form-text small">MaxMind MMDB 文件路径（如 GeoLite2-Country.mmdb），留空则不加载 GeoIP 功能</div>
+                            </div>
+                            <div class="col-md-12">
+                                <label class="form-label">.dat 文件路径 (V2Ray 格式)</label>
+                                <input type="text" class="form-control" v-model="config.settings.geoip_dat_path" placeholder="留空则不使用 .dat 文件">
+                                <div class="form-text small">V2Ray .dat 或 JSON 格式的 GeoIP 数据文件路径，支持热重载。缓存大小会根据实际加载的条目自动设置。</div>
+                            </div>
+                        </div>
+
+                        <hr>
+                        <h6 class="fw-bold mb-2 text-primary">GeoSite 配置 (GeoSite Data)</h6>
+                        <div class="row g-3">
+                            <div class="col-md-12">
+                                <label class="form-label">数据文件路径（支持多个）</label>
+                                <div class="input-group mb-2" v-for="(path, idx) in geositePaths" :key="idx">
+                                    <input type="text" class="form-control" v-model="geositePaths[idx]" placeholder="geosite.dat 或 v2ray.dat">
+                                    <button class="btn btn-outline-danger" @click="removeGeositePath(idx)">删除</button>
+                                </div>
+                                <button class="btn btn-sm btn-outline-primary" @click="addGeositePath">+ 添加文件</button>
+                                <div class="form-text small">V2Ray GeoSite 数据文件路径（.dat 或 .json 格式），支持多个文件。缓存大小会根据实际加载的条目自动设置。</div>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -280,14 +309,16 @@
                 </select>
                 
                 <!-- Dynamic Inputs based on type -->
-                <input v-if="hasField(m.type, 'value')" type="text" class="form-control" v-model="m.value" placeholder="Value">
+                <input v-if="hasField(m.type, 'value')" type="text" class="form-control" v-model="m.value" 
+                    :placeholder="m.type === 'geosite' || m.type === 'geosite_not' ? 'cn 或 geosite:cn' : 'Value'">
                 <input v-if="hasField(m.type, 'cidr')" type="text" class="form-control" v-model="m.cidr" placeholder="CIDR 或逗号分隔列表 (e.g. 127.0.0.0/8,0.0.0.0/8)">
                 <div v-if="hasField(m.type, 'expect')" class="input-group-text bg-white">
                     <input type="checkbox" class="form-check-input mt-0" v-model="m.expect"> &nbsp;Expect
                 </div>
                 
                 <!-- GeoIP Country Codes -->
-                <input v-if="hasField(m.type, 'country_codes')" type="text" class="form-control" v-model="m.country_codes" placeholder="逗号分隔的国家代码 (e.g. CN,US,JP)">
+                <input v-if="hasField(m.type, 'country_codes')" type="text" class="form-control" v-model="m.country_codes" 
+                    placeholder="CN,US,JP 或 geoip:CN">
                 
                 <!-- QType Dropdown -->
                 <select v-if="hasField(m.type, 'value') && m.type === 'qtype'" class="form-select" v-model="m.value">
@@ -393,6 +424,17 @@
             'any': []
         };
 
+        // Parse call syntax like "geosite:cn" or "geoip:CN"
+        const parseCallSyntax = (value) => {
+            if (!value || typeof value !== 'string') return null;
+            const match = value.match(/^(\w+):(.+)$/);
+            if (match) {
+                const [, type, arg] = match;
+                return { type: type.toLowerCase(), arg: arg.trim() };
+            }
+            return null;
+        };
+
         // Default logical operator for new matchers
         const DEFAULT_MATCH_OPERATOR = 'and';
 
@@ -418,6 +460,8 @@
                     // Keep type, clear others
                     const type = m.type;
                     for (const key in m) { if (key !== 'type' && key !== 'operator') delete m[key]; }
+                    
+                    // Handle call syntax for GeoSite and GeoIP
                     if (hasField(type, 'value')) {
                         if (type === 'qtype') {
                             m.value = 'A'; // Default QType
@@ -427,9 +471,44 @@
                     }
                     if (hasField(type, 'cidr')) m.cidr = '';
                     if (hasField(type, 'expect')) m.expect = true;
-                    if (hasField(type, 'country_codes')) m.country_codes = '';
+                    if (hasField(type, 'country_codes')) {
+                        m.country_codes = '';
+                        // Support call syntax: "geoip:CN" or "geoip:CN,US,JP"
+                        m._callSyntax = false; // Track if using call syntax
+                    }
+                    if (hasField(type, 'value') && (type === 'geosite' || type === 'geosite_not')) {
+                        m._callSyntax = false; // Track if using call syntax
+                    }
                     if (!m.operator) m.operator = DEFAULT_MATCH_OPERATOR;
                 };
+
+                // Watch for call syntax in GeoSite and GeoIP matchers
+                const parseCallSyntaxForMatcher = (m) => {
+                    if (m.type === 'geosite' || m.type === 'geosite_not') {
+                        if (m.value && m.value.includes(':')) {
+                            const parsed = parseCallSyntax(m.value);
+                            if (parsed && parsed.type === 'geosite') {
+                                m.value = parsed.arg;
+                                m._callSyntax = true;
+                            }
+                        }
+                    }
+                    if (m.type === 'geoip_country') {
+                        if (m.country_codes && m.country_codes.includes(':')) {
+                            const parsed = parseCallSyntax(m.country_codes);
+                            if (parsed && parsed.type === 'geoip') {
+                                m.country_codes = parsed.arg;
+                                m._callSyntax = true;
+                            }
+                        }
+                    }
+                };
+
+                // Auto-parse call syntax when value changes
+                watch(() => props.matchers, (matchers) => {
+                    matchers.forEach(m => parseCallSyntaxForMatcher(m));
+                }, { deep: true });
+
                 return { addMatcher, hasField, resetMatcherFields };
             }
         };
@@ -504,10 +583,16 @@
                         cache_background_refresh: false,
                         cache_refresh_threshold_percent: 10,
                         cache_refresh_min_ttl: 5,
+                        geoip_db_path: "",
+                        geoip_dat_path: "",
+                        geosite_data_paths: []
                     },
                     pipeline_select: [],
                     pipelines: []
                 });
+
+                // GeoSite paths array for UI management
+                const geositePaths = ref([]);
 
                 const rawJson = ref('');
                 const manualJsonEdit = ref(false);
@@ -562,6 +647,15 @@
                     if (!manualJsonEdit.value) {
                         rawJson.value = toCleanJsonString(newVal);
                     }
+                    // Sync geosite_data_paths to geositePaths array
+                    if (Array.isArray(newVal.settings.geosite_data_paths)) {
+                        geositePaths.value = [...newVal.settings.geosite_data_paths];
+                    }
+                }, { deep: true });
+
+                // Sync geositePaths -> config.settings.geosite_data_paths
+                watch(geositePaths, (newPaths) => {
+                    config.value.settings.geosite_data_paths = [...newPaths];
                 }, { deep: true });
 
                 watch(() => config.value.pipelines, (pipes) => {
@@ -777,6 +871,14 @@
                     return rule.actions.some(action => action.type === 'forward');
                 };
 
+                // GeoSite path management
+                const addGeositePath = () => {
+                    geositePaths.value.push('');
+                };
+                const removeGeositePath = (idx) => {
+                    geositePaths.value.splice(idx, 1);
+                };
+
                 const activePipelineIndex = ref(0);
                 const togglePipeline = (idx) => {
                     activePipelineIndex.value = activePipelineIndex.value === idx ? -1 : idx;
@@ -906,8 +1008,13 @@
                 // Initialize with default JSON
                 rawJson.value = toCleanJsonString(config.value);
 
+                // Initialize geositePaths from config
+                if (Array.isArray(config.value.settings.geosite_data_paths)) {
+                    geositePaths.value = [...config.value.settings.geosite_data_paths];
+                }
+
                 return {
-                    config, rawJson, manualJsonEdit,
+                    config, rawJson, manualJsonEdit, geositePaths,
                     selectorMatcherTypes, requestMatcherTypes, responseMatcherTypes,
                     loadJson, handleFileUpload, downloadJson,
                     addPipelineSelect, removePipelineSelect,
@@ -915,7 +1022,8 @@
                     addRule, removeRule,
                     ruleHasForwardAction,
                     activePipelineIndex, togglePipeline,
-                    currentTab, mermaidRef, renderFlowchart
+                    currentTab, mermaidRef, renderFlowchart,
+                    addGeositePath, removeGeositePath
                 };
             }
         }).mount('#app');

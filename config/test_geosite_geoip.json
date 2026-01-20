@@ -1,0 +1,99 @@
+{
+  "version": "1.0",
+  "settings": {
+    "min_ttl": 30,
+    "bind_udp": "0.0.0.0:5353",
+    "bind_tcp": "0.0.0.0:5353",
+    "default_upstream": "1.1.1.1:53",
+    "upstream_timeout_ms": 2000,
+    "geoip_dat_path": "data/geoip.dat",
+    "geosite_data_paths": ["data/geosite.dat"]
+  },
+  "pipeline_select": [
+    {
+      "pipeline": "china_direct",
+      "matchers": [
+        { "type": "geo_site", "value": "cn" }
+      ]
+    },
+    {
+      "pipeline": "google_direct",
+      "matchers": [
+        { "type": "geo_site", "value": "google" }
+      ]
+    },
+    {
+      "pipeline": "github_direct",
+      "matchers": [
+        { "type": "geo_site", "value": "github" }
+      ]
+    },
+    {
+      "pipeline": "default_forward",
+      "matchers": [
+        { "type": "any" }
+      ]
+    }
+  ],
+  "pipelines": [
+    {
+      "id": "china_direct",
+      "rules": [
+        {
+          "name": "log_china_domain",
+          "matchers": [
+            { "type": "geo_site", "value": "cn" }
+          ],
+          "actions": [
+            { "type": "log", "level": "info", "message": "Chinese domain detected" },
+            { "type": "forward", "upstream": "223.5.5.5:53", "transport": "udp" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "google_direct",
+      "rules": [
+        {
+          "name": "log_google_domain",
+          "matchers": [
+            { "type": "geo_site", "value": "google" }
+          ],
+          "actions": [
+            { "type": "log", "level": "info", "message": "Google domain detected" },
+            { "type": "forward", "upstream": "8.8.8.8:53", "transport": "udp" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "github_direct",
+      "rules": [
+        {
+          "name": "log_github_domain",
+          "matchers": [
+            { "type": "geo_site", "value": "github" }
+          ],
+          "actions": [
+            { "type": "log", "level": "info", "message": "GitHub domain detected" },
+            { "type": "forward", "upstream": "1.1.1.1:53", "transport": "udp" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "default_forward",
+      "rules": [
+        {
+          "name": "default_forward_rule",
+          "matchers": [
+            { "type": "any" }
+          ],
+          "actions": [
+            { "type": "forward", "upstream": "1.1.1.1:53", "transport": "udp" }
+          ]
+        }
+      ]
+    }
+  ]
+}

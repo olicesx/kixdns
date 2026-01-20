@@ -82,14 +82,13 @@ pub struct GlobalSettings {
     /// GeoIP 数据库文件路径（MMDB 格式） / GeoIP database file path (MMDB format)
     #[serde(default)]
     pub geoip_db_path: Option<String>,
-    /// GeoIP 查询结果缓存容量（默认 10000） / GeoIP query result cache capacity (default 10000)
-    #[serde(default = "default_geoip_cache_capacity")]
-    pub geoip_cache_capacity: u64,
-    /// GeoIP 查询结果缓存 TTL（秒，默认 3600） / GeoIP query result cache TTL (seconds, default 3600)
-    #[serde(default = "default_geoip_cache_ttl")]
-    pub geoip_cache_ttl: u64,    /// GeoSite 数据文件路径列表（V2Ray 格式，支持多个文件） / GeoSite data file paths (V2Ray format, supports multiple files)
+    /// GeoIP 数据文件路径（V2Ray .dat 格式） / GeoIP data file path (V2Ray .dat format)
     #[serde(default)]
-    pub geosite_data_paths: Vec<String>,}
+    pub geoip_dat_path: Option<String>,
+    /// GeoSite 数据文件路径列表（V2Ray 格式，支持多个文件） / GeoSite data file paths (V2Ray format, supports multiple files)
+    #[serde(default)]
+    pub geosite_data_paths: Vec<String>,
+}
 
 impl Default for GlobalSettings {
     fn default() -> Self {
@@ -114,8 +113,7 @@ impl Default for GlobalSettings {
             cache_refresh_threshold_percent: default_cache_refresh_threshold_percent(),
             cache_refresh_min_ttl: default_cache_refresh_min_ttl(),
             geoip_db_path: None,
-            geoip_cache_capacity: default_geoip_cache_capacity(),
-            geoip_cache_ttl: default_geoip_cache_ttl(),
+            geoip_dat_path: None,
             geosite_data_paths: Vec::new(),
         }
     }
@@ -230,6 +228,14 @@ pub enum PipelineSelectorMatcher {
     /// GeoSite 否定匹配（匹配不在该分类的域名）。 / GeoSite negation matching (match domains NOT in category)
     GeoSiteNot {
         value: String,
+    },
+    /// 匹配客户端IP的GeoIP国家代码（大小写不敏感）。 / Match client IP GeoIP country code (case insensitive)
+    GeoipCountry {
+        country_codes: Vec<String>,
+    },
+    /// 匹配客户端IP是否为私有IP（内网）。 / Match whether client IP is private (internal network)
+    GeoipPrivate {
+        expect: bool,
     },
     /// 请求 QTYPE（如 A/AAAA/CNAME/TXT/MX 等）。 / Request QTYPE (e.g., A/AAAA/CNAME/TXT/MX, etc.)
     Qtype { value: String },
@@ -588,14 +594,6 @@ fn default_cache_refresh_threshold_percent() -> u8 {
 
 fn default_cache_refresh_min_ttl() -> u32 {
     5
-}
-
-fn default_geoip_cache_capacity() -> u64 {
-    10000
-}
-
-fn default_geoip_cache_ttl() -> u64 {
-    3600
 }
 
 /// 反序列化 upstream 字段，支持字符串、逗号分隔字符串或数组格式

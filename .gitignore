@@ -9,5 +9,24 @@ diff_review.txt
 .github/copilot-instructions.md
 /docs
 *.md
-*.json
-.gitignore
+# Data files
+/data/
+/meta-rules-dat/
+# Log files
+*.log
+# Test output and temporary files
+*_output.log
+*_stdout.log
+*_stderr.log
+test_output.log
+*.exe
+*.pdb
+# Python test scripts
+check_*.py
+test_*.py
+# Desktop temp files
+"C\Users\*\Desktop\*.txt"
+nul
+# Allow config JSON files
+!config/*.json
+!tests/config/*.json

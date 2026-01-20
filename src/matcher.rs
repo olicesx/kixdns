@@ -82,6 +82,8 @@ pub enum RuntimePipelineSelectorMatcher {
     EdnsPresent { expect: bool },
     GeoSite { tag: String },
     GeoSiteNot { tag: String },
+    GeoipCountry { country_codes: Vec<String> },
+    GeoipPrivate { expect: bool },
     Qtype { value: RecordType },
 }
 
@@ -511,6 +513,12 @@ impl RuntimePipelineSelectorMatcher {
                     tag: value,
                 }
             }
+            config::PipelineSelectorMatcher::GeoipCountry { country_codes } => {
+                RuntimePipelineSelectorMatcher::GeoipCountry { country_codes }
+            }
+            config::PipelineSelectorMatcher::GeoipPrivate { expect } => {
+                RuntimePipelineSelectorMatcher::GeoipPrivate { expect }
+            }
             config::PipelineSelectorMatcher::Qtype { value } => {
                 RuntimePipelineSelectorMatcher::Qtype {
                     value: parse_dns_type(&value)?,
@@ -527,36 +535,10 @@ impl RuntimePipelineSelectorMatcher {
         qname: &str,
         qclass: DNSClass,
         edns_present: bool,
+        geoip_manager: Option<&crate::geoip::GeoIpManager>,
         geosite_manager: Option<&crate::geosite::GeoSiteManager>,
     ) -> bool {
-        match self {
-            RuntimePipelineSelectorMatcher::ListenerLabel { value } => {
-                value.eq_ignore_ascii_case(listener_label)
-            }
-            RuntimePipelineSelectorMatcher::ClientIp { net } => net.contains(&client_ip),
-            RuntimePipelineSelectorMatcher::DomainSuffix { value } => qname.ends_with(value),
-            RuntimePipelineSelectorMatcher::DomainRegex { regex } => regex.is_match(qname),
-            RuntimePipelineSelectorMatcher::Any => true,
-            RuntimePipelineSelectorMatcher::Qclass { value } => value == &qclass,
-            RuntimePipelineSelectorMatcher::EdnsPresent { expect } => *expect == edns_present,
-            RuntimePipelineSelectorMatcher::GeoSite { tag } => {
-                // GeoSite matching with GeoSiteManager
-                if let Some(manager) = geosite_manager {
-                    manager.matches(tag, qname)
-                } else {
-                    false
-                }
-            }
-            RuntimePipelineSelectorMatcher::GeoSiteNot { tag } => {
-                // GeoSite negation matching with GeoSiteManager
-                if let Some(manager) = geosite_manager {
-                    !manager.matches(tag, qname)
-                } else {
-                    false
-                }
-            }
-            RuntimePipelineSelectorMatcher::Qtype { .. } => false, // Qtype matching requires qtype parameter
-        }
+        self.matches_with_qtype(listener_label, client_ip, qname, qclass, edns_present, hickory_proto::rr::RecordType::A, geoip_manager, geosite_manager)
     }
 
     #[inline]
@@ -568,6 +550,7 @@ impl RuntimePipelineSelectorMatcher {
         qclass: DNSClass,
         edns_present: bool,
         qtype: RecordType,
+        geoip_manager: Option<&crate::geoip::GeoIpManager>,
         geosite_manager: Option<&crate::geosite::GeoSiteManager>,
     ) -> bool {
         match self {
@@ -594,6 +577,30 @@ impl RuntimePipelineSelectorMatcher {
                     !manager.matches(tag, qname)
                 } else {
                     false
+                }
+            }
+            RuntimePipelineSelectorMatcher::GeoipCountry { country_codes } => {
+                // GeoIP matching with GeoIpManager
+                if let Some(manager) = geoip_manager {
+                    let result = manager.lookup(client_ip);
+                    if let Some(cc) = result.country_code {
+                        country_codes.iter()
+                            .any(|c| c.eq_ignore_ascii_case(&cc))
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            RuntimePipelineSelectorMatcher::GeoipPrivate { expect } => {
+                // GeoIP private IP matching with GeoIpManager
+                if let Some(manager) = geoip_manager {
+                    let result = manager.lookup(client_ip);
+                    result.is_private == *expect
+                } else {
+                    // Fallback to basic private IP check
+                    crate::geoip::is_private_ip(client_ip) == *expect
                 }
             }
             RuntimePipelineSelectorMatcher::Qtype { value } => *value == qtype,
@@ -1143,7 +1150,7 @@ mod tests {
             RuntimePipelineSelectorMatcher::ListenerLabel {
                 value: "edge-internal".into()
             }
-            .matches(listener_label, client_ip, qname, DNSClass::IN, false, None),
+            .matches(listener_label, client_ip, qname, DNSClass::IN, false, None, None),
             "ListenerLabel matcher should match when listener labels are equal"
         );
 
@@ -1152,7 +1159,7 @@ mod tests {
             RuntimePipelineSelectorMatcher::ClientIp {
                 net: "10.1.2.0/24".parse().unwrap()
             }
-            .matches(listener_label, client_ip, qname, DNSClass::IN, false, None),
+            .matches(listener_label, client_ip, qname, DNSClass::IN, false, None, None),
             "ClientIp matcher should match when client IP is in CIDR range"
         );
 
@@ -1161,7 +1168,7 @@ mod tests {
             RuntimePipelineSelectorMatcher::DomainSuffix {
                 value: "example.com".into()
             }
-            .matches(listener_label, client_ip, qname, DNSClass::IN, false, None),
+            .matches(listener_label, client_ip, qname, DNSClass::IN, false, None, None),
             "DomainSuffix matcher should match domain suffix"
         );
     }
