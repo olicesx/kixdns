@@ -15,7 +15,7 @@ use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
 use rustc_hash::FxHasher;
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 
 /// 域名匹配器类型 / Domain matcher type
 #[derive(Debug, Clone)]
@@ -624,53 +624,161 @@ impl GeoSiteManager {
     /// # 错误 / Errors
     /// 如果文件不存在或格式错误，返回错误 / Returns error if file doesn't exist or format is invalid
     pub fn load_from_dat_file_selective<P: AsRef<Path>>(
-        &mut self, 
-        path: P, 
+        &mut self,
+        path: P,
         tags: &[String]
     ) -> anyhow::Result<usize> {
         if tags.is_empty() {
             return Ok(0);
         }
-        
-        // 创建 tag 查找集合 / Create tag lookup set
-        let tags_set: std::collections::HashSet<&str> = 
-            tags.iter().map(|s| s.as_str()).collect();
-        
-        // 先加载所有数据 / Load all data first
-        let total_loaded = self.load_from_dat_file(path.as_ref())?;
-        
-        // 删除不需要的 tags / Remove unwanted tags
-        let mut tags_to_remove = Vec::new();
-        for tag in self.database.iter() {
-            let tag_key = tag.key().as_str();
-            tracing::debug!(target = "geosite", tag = %tag_key, 
-                         requested = ?tags_set,
-                         "checking if tag should be kept");
-            
-            // 大小写不敏感比较 / Case-insensitive comparison
-            let should_keep = tags_set.iter().any(|requested_tag| {
-                requested_tag.eq_ignore_ascii_case(tag_key)
-            });
-            
-            if !should_keep {
-                tracing::debug!(target = "geosite", tag = %tag_key, "removing unwanted tag");
-                tags_to_remove.push(tag.key().clone());
+
+        // 创建 tag 查找集合（小写）/ Create tag lookup set (lowercase)
+        let tags_set: std::collections::HashSet<String> =
+            tags.iter().map(|s| s.to_lowercase()).collect();
+
+        info!(target = "geosite", requested_tags = ?tags,
+             "loading GeoSite data selectively from .dat file");
+
+        // 读取文件内容 / Read file content
+        let content = fs::read(path.as_ref())
+            .with_context(|| format!("read .dat file: {}", path.as_ref().display()))?;
+
+        let mut pos = 0;
+        let mut loaded_count = 0;
+
+        while pos < content.len() {
+            // 读取外层字段标签 / Read outer field tag
+            if pos >= content.len() {
+                break;
+            }
+
+            let field_tag = content[pos];
+            pos += 1;
+
+            // 解析 varint 长度 / Parse varint length
+            let entry_len = parse_varint(&content, &mut pos)?;
+
+            // 检查是否有足够的数据 / Check if we have enough data
+            if pos + entry_len > content.len() {
+                break;
+            }
+
+            let entry_end = pos + entry_len;
+
+            // field_tag = 0x0A 表示 GeoSite 条目
+            if field_tag == 0x0A {
+                let mut tag = String::new();
+                let mut tag_found = false;
+
+                // 先解析 tag，判断是否需要加载 / Parse tag first to check if we need to load it
+                let temp_pos = pos;
+                while pos < entry_end {
+                    let inner_tag = content[pos];
+                    pos += 1;
+
+                    let inner_len = parse_varint(&content, &mut pos)?;
+
+                    if pos + inner_len > entry_end {
+                        break;
+                    }
+
+                    // 0x0A: tag/country_code (string, field 1)
+                    if inner_tag == 0x0A {
+                        if let Ok(tag_str) = std::str::from_utf8(&content[pos..pos + inner_len]) {
+                            tag = tag_str.to_string();
+                            let tag_lower = tag.to_lowercase();
+
+                            // 检查是否在需要的列表中 / Check if in requested list
+                            tag_found = tags_set.contains(&tag_lower);
+
+                            if tag_found {
+                                debug!(target = "geosite", tag = %tag_str,
+                                      "loading requested tag");
+                            } else {
+                                debug!(target = "geosite", tag = %tag_str,
+                                      "skipping unwanted tag");
+                            }
+                        }
+                        pos += inner_len;
+                        break; // tag 字段后直接跳过，不再继续解析 / Skip after tag field
+                    }
+
+                    // 跳过非 tag 字段 / Skip non-tag fields
+                    pos += inner_len;
+                }
+
+                // 如果 tag 在需要列表中，重新解析整个条目 / If tag is requested, re-parse entire entry
+                if tag_found {
+                    // 重置位置到条目开始 / Reset position to entry start
+                    pos = temp_pos;
+                    let mut matchers: Vec<DomainMatcher> = Vec::new();
+
+                    while pos < entry_end {
+                        let inner_tag = content[pos];
+                        pos += 1;
+
+                        let inner_len = parse_varint(&content, &mut pos)?;
+
+                        if pos + inner_len > entry_end {
+                            break;
+                        }
+
+                        match inner_tag {
+                            // 0x0A: tag (string, field 1)
+                            0x0A => {
+                                if let Ok(tag_str) = std::str::from_utf8(&content[pos..pos + inner_len]) {
+                                    tag = tag_str.to_string();
+                                }
+                                pos += inner_len;
+                            }
+                            // 0x12: domain (repeated Domain message, field 2)
+                            0x12 => {
+                                let domains_data = &content[pos..pos + inner_len];
+                                match self.parse_v2ray_domains(domains_data) {
+                                    Ok(parsed_matchers) => {
+                                        let count = parsed_matchers.len();
+                                        matchers.extend(parsed_matchers);
+                                        debug!(target = "geosite", tag = %tag,
+                                             count = count,
+                                             "parsed domains from V2Ray protobuf format");
+                                    }
+                                    Err(err) => {
+                                        warn!(target = "geosite", tag = %tag, error = %err,
+                                             "failed to parse V2Ray domains, skipping tag");
+                                    }
+                                }
+                                pos += inner_len;
+                            }
+                            _ => {
+                                // 跳过未知字段 / Skip unknown field
+                                pos += inner_len;
+                            }
+                        }
+                    }
+
+                    // 添加到 database / Add to database
+                    if !tag.is_empty() && !matchers.is_empty() {
+                        info!(target = "geosite", tag = %tag,
+                              domain_count = matchers.len(),
+                              "loaded GeoSite tag with domains");
+                        let tag_lower = tag.to_lowercase();
+                        self.database.insert(tag_lower, matchers);
+                        loaded_count += 1;
+                    }
+                } else {
+                    // tag 不在需要列表中，跳过此条目 / Tag not in requested list, skip this entry
+                    pos = entry_end;
+                }
             } else {
-                tracing::info!(target = "geosite", tag = %tag_key, "keeping requested tag");
+                // 跳过非 GeoSite 条目 / Skip non-GeoSite entries
+                pos = entry_end;
             }
         }
-        
-        for tag in tags_to_remove {
-            self.database.remove(&tag);
-        }
-        
-        // 计算实际加载的 tags 数量 / Calculate actually loaded tags count
-        let loaded_count = self.database.len();
-        
-        info!(target = "geosite", total_loaded = total_loaded, 
-             selective_count = loaded_count, requested = tags.len(),
-             "loaded GeoSite data selectively from .dat file");
-        
+
+        info!(target = "geosite", loaded_count = loaded_count,
+             requested_count = tags.len(),
+             "selectively loaded GeoSite data from .dat file");
+
         Ok(loaded_count)
     }
     

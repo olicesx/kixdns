@@ -395,11 +395,12 @@
 
                 <!-- Forward -->
                 <template v-if="a.type === 'forward'">
-                    <input type="text" class="form-control" v-model="a.upstream" placeholder="Upstream (Optional)">
+                    <input type="text" class="form-control" v-model="a.upstream" placeholder="8.8.8.8:53 或 tcp://8.8.4.4:53,udp://8.8.4.4:53">
                     <select class="form-select" style="max-width: 80px;" v-model="a.transport">
                         <option value="udp">UDP</option>
                         <option value="tcp">TCP</option>
                     </select>
+                    <div class="form-text small" style="font-size: 11px;">支持协议前缀 (tcp://, udp://) 和逗号分隔的多个上游</div>
                 </template>
 
                 <button class="btn btn-outline-danger" @click="actions.splice(idx, 1)">×</button>

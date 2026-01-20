@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU16, AtomicUsize, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use futures::{stream::{FuturesUnordered, StreamExt}};
 use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
@@ -318,7 +319,8 @@ impl Engine {
         let cache_refresh_min_ttl = cfg.settings.cache_refresh_min_ttl;
         
         // Extract GeoIP settings before moving cfg / 在 move cfg 之前提取 GeoIP 设置
-        let geoip_db_path = if uses_geoip_matchers(&cfg) {
+        let uses_geoip = uses_geoip_matchers(&cfg);
+        let geoip_db_path = if uses_geoip {
             cfg.settings.geoip_db_path.clone()
         } else {
             None
@@ -348,7 +350,7 @@ impl Engine {
                 GeoIpManager::new(None).unwrap()
             }
         };
-        
+
         // Load GeoIP data from .dat file if configured / 如果配置了 .dat 文件，则加载 GeoIP 数据
         let mut geoip_dat_path_for_watcher = None;
         if let Some(ref path_str) = geoip_dat_path {
@@ -359,17 +361,30 @@ impl Engine {
                     .and_then(|s| s.to_str())
                     .map(|s| s.eq_ignore_ascii_case("dat"))
                     .unwrap_or(false);
-                
+
                 let load_result = if is_dat {
-                    geoip_manager.load_from_dat_file(&path)
+                    if uses_geoip {
+                        geoip_manager.load_from_dat_file(&path)
+                    } else {
+                        info!("No GeoIP matchers used in config, skipping GeoIP .dat data loading");
+                        Ok(0)
+                    }
                 } else {
-                    geoip_manager.load_from_v2ray_file(&path)
+                    // JSON 格式：检查是否需要加载 / JSON format: check if loading is needed
+                    if uses_geoip {
+                        geoip_manager.load_from_v2ray_file(&path)
+                    } else {
+                        info!("No GeoIP matchers used in config, skipping GeoIP JSON data loading");
+                        Ok(0)
+                    }
                 };
-                
+
                 match load_result {
                     Ok(count) => {
-                        info!(path = %path.display(), loaded_count = count, "loaded GeoIP data from file");
-                        geoip_dat_path_for_watcher = Some(path);
+                        if count > 0 {
+                            info!(path = %path.display(), loaded_count = count, "loaded GeoIP data from file");
+                            geoip_dat_path_for_watcher = Some(path);
+                        }
                     }
                     Err(e) => {
                         warn!(path = %path.display(), error = %e, "failed to load GeoIP data, skipping");
@@ -379,7 +394,7 @@ impl Engine {
                 warn!(path = %path.display(), "GeoIP data file not found, skipping");
             }
         }
-        
+
         let geoip_manager = Arc::new(std::sync::Mutex::new(geoip_manager));
 
         // Initialize GeoSiteManager / 初始化 GeoSiteManager
@@ -408,7 +423,9 @@ impl Engine {
                     // 使用按需加载 / Use selective loading
                     let mut manager = geosite_manager.lock().unwrap();
                     if used_geosite_tags.is_empty() {
-                        manager.load_from_dat_file(&path)
+                        // 没有使用 GeoSite 标签，跳过加载 / No GeoSite tags used, skip loading
+                        info!("No GeoSite tags used in config, skipping GeoSite data loading");
+                        Ok(0)
                     } else {
                         manager.load_from_dat_file_selective(&path, &used_geosite_tags)
                     }
@@ -1810,55 +1827,78 @@ impl Engine {
             }
             return res;
         }
-        
+
         // 多个上游：并发请求取最快结果 / Multiple upstreams: concurrent requests, take fastest result
-        tracing::debug!(upstreams = ?upstreams, "concurrent upstream requests");
-        
-        // 使用 futures::future::select_all 等待第一个成功响应
-        // Use futures::future::select_all to wait for first successful response
-        let mut tasks = Vec::with_capacity(upstreams.len());
+        tracing::info!(upstreams = ?upstreams, "concurrent upstream requests - spawning tasks");
+
+        // 使用 FuturesUnordered 真正并发地等待所有任务
+        // Use FuturesUnordered to truly wait for all tasks concurrently
+        let mut tasks = FuturesUnordered::new();
+        let spawn_time = std::time::Instant::now();
+
         for &up in &upstreams {
             let engine = self.clone();
             let packet = packet.to_vec();
             let up = up.to_string();
+            let default_transport = transport;
             tasks.push(tokio::spawn(async move {
+                let task_start = std::time::Instant::now();
+                let elapsed_since_spawn = task_start.duration_since(spawn_time);
+
+                // 解析每个 upstream 的协议前缀 / Parse protocol prefix for each upstream
+                let (parsed_transport, parsed_addr) = if let Some(pos) = up.find("://") {
+                    let proto = &up[..pos];
+                    let addr = &up[pos + 3..];
+                    let t = match proto {
+                        "tcp" => Transport::Tcp,
+                        "udp" => Transport::Udp,
+                        _ => default_transport, // 未知协议，使用默认 / Unknown protocol, use default
+                    };
+                    (t, addr.to_string())
+                } else {
+                    (default_transport, up.clone())
+                };
+
+                tracing::info!(
+                    upstream = %up,
+                    transport = ?parsed_transport,
+                    addr = %parsed_addr,
+                    spawn_delay_ms = elapsed_since_spawn.as_millis(),
+                    "concurrent task started"
+                );
+
                 let start = std::time::Instant::now();
-                let res = match transport {
-                    Transport::Udp => engine.forward_udp_smart(&packet, &up, timeout_dur).await,
-                    Transport::Tcp => engine.tcp_mux.send(&packet, &up, timeout_dur).await,
+                let res = match parsed_transport {
+                    Transport::Udp => engine.forward_udp_smart(&packet, &parsed_addr, timeout_dur).await,
+                    Transport::Tcp => engine.tcp_mux.send(&packet, &parsed_addr, timeout_dur).await,
                 };
                 let dur = start.elapsed();
                 (up, res, dur)
             }));
         }
-        
+
         // 等待第一个成功响应 / Wait for first successful response
-        let mut results = Vec::new();
-        for task in tasks {
-            match task.await {
+        while let Some(result) = tasks.next().await {
+            match result {
                 Ok((up, res, dur)) => {
                     if res.is_ok() {
-                        // 第一个成功响应，取消其他任务 / First successful response, cancel other tasks
+                        // 第一个成功响应 / First successful response
                         tracing::debug!(upstream=%up, upstream_ns = dur.as_nanos() as u64, "upstream call succeeded (first)");
+                        self.metrics_last_upstream_latency_ns.store(dur.as_nanos() as u64, Ordering::Relaxed);
                         return res;
                     } else {
                         // 记录失败，继续等待其他上游 / Record failure, continue waiting for other upstreams
-                        results.push((up, res, dur));
+                        tracing::warn!(upstream=%up, error=%res.as_ref().unwrap_err(), elapsed_ns = dur.as_nanos() as u64, "upstream call failed, waiting for others");
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "upstream task join error");
+                    tracing::warn!(error = %e, "upstream task join error, waiting for others");
                 }
             }
         }
-        
-        // 所有上游都失败，返回第一个错误 / All upstreams failed, return first error
-        if let Some((up, Err(e), dur)) = results.into_iter().next() {
-            tracing::warn!(upstream=%up, error=%e, elapsed_ns = dur.as_nanos() as u64, "all upstreams failed");
-            Err(e)
-        } else {
-            anyhow::bail!("no upstream results")
-        }
+
+        // 所有上游都失败 / All upstreams failed
+        anyhow::bail!("all upstreams failed")
     }
 
     /// UDP forwarder with hedged retry and TCP fallback for better tail latency.

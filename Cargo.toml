@@ -26,8 +26,8 @@ rustc-hash = "2.1.1"
 smallvec = "1.13"
 maxminddb = "0.24"
 maxminddb-writer = "0.1"
-[dev-dependencies]
 futures = "0.3"
+[dev-dependencies]
 criterion = "0.5"
 
 [[bench]]
