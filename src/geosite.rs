@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Context;
-use dashmap::DashMap;
+use rustc_hash::FxHashMap;
 use moka::sync::Cache as MokaCache;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
@@ -81,12 +81,12 @@ impl GeoSiteEntry {
 }
 
 /// GeoSite 数据库管理器 / GeoSite database manager
-/// 使用 DashMap 实现无锁并发访问 / Uses DashMap for lock-free concurrent access
+/// 使用 FxHashMap 实现高性能查找（由外层 RwLock 保护线程安全）/ Uses FxHashMap for high-performance lookup (thread-safety protected by outer RwLock)
 pub struct GeoSiteManager {
-    // Tag -> Domain matchers (使用 DashMap 实现并发访问 / Uses DashMap for concurrent access)
-    database: DashMap<String, Vec<DomainMatcher>>,
-    // Suffix index for O(1) lookup (使用 DashMap 实现并发访问 / Uses DashMap for concurrent access)
-    suffix_index: DashMap<String, Vec<String>>,
+    // Tag -> Domain matchers
+    database: FxHashMap<String, Vec<DomainMatcher>>,
+    // Suffix index for O(1) lookup
+    suffix_index: FxHashMap<String, Vec<String>>,
     // Query cache: hash(tag, domain) -> bool (零分配优化 / zero-allocation optimization)
     cache: MokaCache<u64, bool>,
 }
@@ -96,8 +96,8 @@ impl GeoSiteManager {
     pub fn new() -> Self {
         // 初始时创建一个小缓存，加载数据后会根据实际条数重建
         Self {
-            database: DashMap::new(),
-            suffix_index: DashMap::new(),
+            database: FxHashMap::default(),
+            suffix_index: FxHashMap::default(),
             cache: MokaCache::builder()
                 .max_capacity(1000)
                 .build(),
@@ -109,7 +109,7 @@ impl GeoSiteManager {
         // 根据实际加载的域名数量设置缓存大小
         // 统计所有标签的域名总数
         let total_domains: usize = self.database.iter()
-            .map(|entry| entry.value().len())
+            .map(|(_, matchers)| matchers.len())
             .sum();
 
         // 缓存大小为域名总数的 2 倍，最小 10000，最大 1000000
@@ -178,9 +178,9 @@ impl GeoSiteManager {
     fn matches_impl(&self, tag: &str, domain: &str) -> bool {
         // 不区分大小写：将 tag 转换为小写再查找 / Case insensitive: convert tag to lowercase before lookup
         let tag_lower = tag.to_ascii_lowercase();
-        
+
         if let Some(matchers) = self.database.get(&tag_lower) {
-            for matcher in matchers.value() {
+            for matcher in matchers {
                 if self.matcher_matches(matcher, domain) {
                     return true;
                 }
@@ -242,17 +242,17 @@ impl GeoSiteManager {
 
     /// 获取已加载的标签列表 / Get list of loaded tags
     pub fn tags(&self) -> Vec<String> {
-        self.database.iter().map(|entry| entry.key().clone()).collect()
+        self.database.iter().map(|(tag, _)| tag.clone()).collect()
     }
 
     /// 检查标签是否已加载 / Check if tag is loaded
     pub fn has_tag(&self, tag: &str) -> bool {
         self.database.contains_key(tag)
     }
-    
+
     /// 获取标签的所有域名匹配器（仅用于调试）/ Get all domain matchers for a tag (debug only)
     pub fn get_tag_matchers(&self, tag: &str) -> Option<Vec<DomainMatcher>> {
-        self.database.get(tag).map(|matchers| matchers.value().clone())
+        self.database.get(tag).map(|matchers| matchers.clone())
     }
 }
 

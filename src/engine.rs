@@ -214,17 +214,16 @@ impl Drop for PermitGuard {
 fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<String> {
     use std::collections::HashSet;
 
-    // 使用 HashSet<Arc<str>> 避免中间分配 / Use HashSet<Arc<str>> to avoid intermediate allocations
-    let mut tags_set: HashSet<Arc<str>> = HashSet::new();
+    let mut tags_set: HashSet<String> = HashSet::new();
 
     // Scan pipeline_select rules / 扫描 pipeline_select 规则
     for rule in &cfg.pipeline_select {
         for matcher in &rule.matchers {
             if let crate::matcher::RuntimePipelineSelectorMatcher::GeoSite { tag } = &matcher.matcher {
-                tags_set.insert(Arc::clone(tag));  // Arc::clone 避免分配 / Arc::clone avoids allocation
+                tags_set.insert(tag.clone());
             }
             if let crate::matcher::RuntimePipelineSelectorMatcher::GeoSiteNot { tag } = &matcher.matcher {
-                tags_set.insert(Arc::clone(tag));  // Arc::clone 避免分配 / Arc::clone avoids allocation
+                tags_set.insert(tag.clone());
             }
         }
     }
@@ -235,27 +234,26 @@ fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<String> 
             // Scan request matchers / 扫描请求匹配器
             for matcher in &rule.matchers {
                 if let crate::matcher::RuntimeMatcher::GeoSite { tag } = &matcher.matcher {
-                    tags_set.insert(Arc::clone(tag));  // Arc::clone 避免分配 / Arc::clone avoids allocation
+                    tags_set.insert(tag.clone());
                 }
                 if let crate::matcher::RuntimeMatcher::GeoSiteNot { tag } = &matcher.matcher {
-                    tags_set.insert(Arc::clone(tag));  // Arc::clone 避免分配 / Arc::clone avoids allocation
+                    tags_set.insert(tag.clone());
                 }
             }
 
             // Scan response matchers / 扫描响应匹配器
             for matcher in &rule.response_matchers {
                 if let crate::matcher::RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value } = &matcher.matcher {
-                    tags_set.insert(Arc::from(value.as_str()));  // 将 String 转为 Arc<str> / Convert String to Arc<str>
+                    tags_set.insert(value.clone());
                 }
                 if let crate::matcher::RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { value } = &matcher.matcher {
-                    tags_set.insert(Arc::from(value.as_str()));  // 将 String 转为 Arc<str> / Convert String to Arc<str>
+                    tags_set.insert(value.clone());
                 }
             }
         }
     }
 
-    // 转换回 Vec<String> 用于向后兼容 / Convert back to Vec<String> for backward compatibility
-    tags_set.into_iter().map(|s| s.to_string()).collect()
+    tags_set.into_iter().collect()
 }
 
 /// Check if configuration uses GeoIP matchers / 检查配置是否使用 GeoIP 匹配器
@@ -414,8 +412,8 @@ impl Engine {
             let path = PathBuf::from(path_str);
             if path.exists() {
                 // Load data from file / 从文件加载数据
-                // GeoSiteManager 现在使用 DashMap，支持并发访问，无需 Mutex
-                // GeoSiteManager now uses DashMap for concurrent access, no Mutex needed
+                // GeoSiteManager 使用 FxHashMap 实现高性能查找，由外层 RwLock 保护线程安全
+                // GeoSiteManager uses FxHashMap for high-performance lookup, thread-safety protected by outer RwLock
                 
                 // 检测文件格式 / Detect file format
                 let is_dat = path.extension()
@@ -707,8 +705,8 @@ impl Engine {
         let cfg = &state.pipeline;
         let qclass = DNSClass::from(q.qclass);
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
-        // GeoSiteManager 现在使用 DashMap，无需 Mutex 锁
-        // GeoSiteManager now uses DashMap, no Mutex lock needed
+        // GeoSiteManager 使用 FxHashMap + RwLock 保护，无需额外锁
+        // GeoSiteManager uses FxHashMap protected by RwLock, no additional locks needed
         let (pipeline_opt, pipeline_id) = select_pipeline(
             cfg,
             q.qname.as_ref(),

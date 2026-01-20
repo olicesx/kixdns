@@ -40,10 +40,10 @@ pub struct CompiledMatcherWithOp {
 pub enum CompiledMatcher {
     #[allow(dead_code)]
     DomainExact {
-        domain: Arc<str>,  // 零拷贝优化 / Zero-copy optimization
+        domain: String,
     },
     DomainSuffix {
-        suffix: Arc<str>,  // 零拷贝优化 / Zero-copy optimization
+        suffix: String,
     },
     ClientIp {
         net: IpNet,
@@ -71,8 +71,8 @@ pub enum PrecomputedAction {
 
 #[derive(Debug, Clone, Default)]
 pub struct RuleIndex {
-    pub domain_exact: FxHashMap<Arc<str>, Vec<usize>>,
-    pub domain_suffix: FxHashMap<Arc<str>, Vec<usize>>,
+    pub domain_exact: FxHashMap<String, Vec<usize>>,
+    pub domain_suffix: FxHashMap<String, Vec<usize>>,
     pub query_type: FxHashMap<RecordType, Vec<usize>>,
     pub always_check: Vec<usize>,
 }
@@ -99,7 +99,7 @@ impl RuleIndex {
             match &m.matcher {
                 CompiledMatcher::DomainExact { domain } if !domain.is_empty() => {
                     self.domain_exact
-                        .entry(Arc::clone(domain))  // Arc::clone 而不是 domain.clone()
+                        .entry(domain.clone())
                         .or_default()
                         .push(rule_idx);
                     indexed = true;
@@ -107,7 +107,7 @@ impl RuleIndex {
                 }
                 CompiledMatcher::DomainSuffix { suffix } if !suffix.is_empty() => {
                     self.domain_suffix
-                        .entry(Arc::clone(suffix))  // Arc::clone 而不是 suffix.clone()
+                        .entry(suffix.clone())
                         .or_default()
                         .push(rule_idx);
                     indexed = true;
@@ -207,13 +207,13 @@ fn compile_rule(rule: &RuntimeRule, rule_idx: usize) -> CompiledRule {
 fn compile_matcher(m: &RuntimeMatcher) -> CompiledMatcher {
     match m {
         RuntimeMatcher::Any => CompiledMatcher::DomainSuffix {
-            suffix: Arc::from(""),  // 使用 Arc::from 而不是 String::new() / Use Arc::from instead of String::new()
+            suffix: String::new(),
         },
         RuntimeMatcher::DomainExact { value } => CompiledMatcher::DomainExact {
-            domain: Arc::clone(value),  // Arc::clone 而不是 value.clone() / Arc::clone instead of value.clone()
+            domain: value.clone(),
         },
         RuntimeMatcher::DomainSuffix { value } => CompiledMatcher::DomainSuffix {
-            suffix: Arc::clone(value),  // Arc::clone 而不是 value.clone() / Arc::clone instead of value.clone()
+            suffix: value.clone(),
         },
         RuntimeMatcher::ClientIp { net } => CompiledMatcher::ClientIp { net: net.clone() },
         RuntimeMatcher::DomainRegex { regex } => CompiledMatcher::Regex {
@@ -305,12 +305,12 @@ fn compiled_matcher_matches(
     edns_present: bool,
 ) -> bool {
     match matcher {
-        CompiledMatcher::DomainExact { domain } => qname.eq_ignore_ascii_case(domain.as_ref()),  // 使用 as_ref() 获取 &str / Use as_ref() to get &str
+        CompiledMatcher::DomainExact { domain } => qname.eq_ignore_ascii_case(domain),
         CompiledMatcher::DomainSuffix { suffix } => {
             if suffix.is_empty() {
                 true
             } else {
-                qname.ends_with(suffix.as_ref())  // 使用 as_ref() 进行字符串匹配 / Use as_ref() for string matching
+                qname.ends_with(suffix)
             }
         }
         CompiledMatcher::ClientIp { net } => net.contains(&client_ip),
@@ -319,8 +319,8 @@ fn compiled_matcher_matches(
         CompiledMatcher::Regex { regex } => regex.is_match(qname),
         CompiledMatcher::Complex { matcher } => match matcher {
             RuntimeMatcher::Any => true,
-            RuntimeMatcher::DomainExact { value } => qname.eq_ignore_ascii_case(value.as_ref()),  // 使用 as_ref()
-            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value.as_ref()),  // 使用 as_ref()
+            RuntimeMatcher::DomainExact { value } => qname.eq_ignore_ascii_case(value),
+            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value),
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes: _ } => {

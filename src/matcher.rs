@@ -35,13 +35,13 @@ mod matcher_helpers {
     pub fn match_geoip_country(
         manager: &crate::geoip::GeoIpManager,
         ip: IpAddr,
-        country_codes: &[Arc<str>],  // 改为 Arc<str> 零拷贝 / Changed to Arc<str> for zero-copy
+        country_codes: &[String],
     ) -> bool {
         let result = manager.lookup(ip);
         result.country_code.as_ref()
             .map(|country| {
                 country_codes.iter()
-                    .any(|code| code.eq_ignore_ascii_case(country.as_ref()))  // 使用 as_ref() / Use as_ref()
+                    .any(|code| code.eq_ignore_ascii_case(country.as_ref()))
             })
             .unwrap_or(false)
     }
@@ -143,11 +143,9 @@ pub struct RuntimePipeline {
     pub uses_client_ip: bool,
     // Indices for O(1) lookup
     // 完全域名匹配索引（最高优先级）/ Exact domain match index (highest priority)
-    // 使用 Arc<str> 零拷贝优化 / Use Arc<str> for zero-copy optimization
-    pub domain_exact_index: FxHashMap<Arc<str>, Vec<usize>>,
+    pub domain_exact_index: FxHashMap<String, Vec<usize>>,
     // Maps domain suffix -> list of rule indices that MUST be checked
-    // 使用 Arc<str> 零拷贝优化 / Use Arc<str> for zero-copy optimization
-    pub domain_suffix_index: FxHashMap<Arc<str>, Vec<usize>>,
+    pub domain_suffix_index: FxHashMap<String, Vec<usize>>,
     // Maps query type -> list of rule indices (高频过滤条件 / High-frequency filter)
     pub query_type_index: FxHashMap<RecordType, Vec<usize>>,
     // Rules that are NOT indexed by domain (must always be checked)
@@ -178,16 +176,16 @@ pub struct RuntimePipelineSelectRule {
 #[derive(Debug, Clone)]
 pub enum RuntimeMatcher {
     Any,
-    DomainExact { value: Arc<str> },  // 完全域名匹配 / Exact domain match (零拷贝优化 / Zero-copy)
-    DomainSuffix { value: Arc<str> },  // 零拷贝优化 / Zero-copy optimization
+    DomainExact { value: String },
+    DomainSuffix { value: String },
     ClientIp { net: IpNet },
     DomainRegex { regex: Regex },
-    GeoipCountry { country_codes: Vec<Arc<str>> },  // 零拷贝优化 / Zero-copy optimization
+    GeoipCountry { country_codes: Vec<String> },
     GeoipPrivate { expect: bool },
     Qclass { value: DNSClass },
     EdnsPresent { expect: bool },
-    GeoSite { tag: Arc<str> },  // 零拷贝优化 / Zero-copy optimization
-    GeoSiteNot { tag: Arc<str> },  // 零拷贝优化 / Zero-copy optimization
+    GeoSite { tag: String },
+    GeoSiteNot { tag: String },
     Qtype { value: RecordType },
 }
 
@@ -199,16 +197,16 @@ pub struct RuntimeMatcherWithOp {
 
 #[derive(Debug, Clone)]
 pub enum RuntimePipelineSelectorMatcher {
-    ListenerLabel { value: Arc<str> },  // 零拷贝优化 / Zero-copy optimization
+    ListenerLabel { value: String },
     ClientIp { net: IpNet },
-    DomainSuffix { value: Arc<str> },  // 零拷贝优化 / Zero-copy optimization
+    DomainSuffix { value: String },
     DomainRegex { regex: Regex },
     Any,
     Qclass { value: DNSClass },
     EdnsPresent { expect: bool },
-    GeoSite { tag: Arc<str> },  // 零拷贝优化 / Zero-copy optimization
-    GeoSiteNot { tag: Arc<str> },  // 零拷贝优化 / Zero-copy optimization
-    GeoipCountry { country_codes: Vec<Arc<str>> },  // 零拷贝优化 / Zero-copy optimization
+    GeoSite { tag: String },
+    GeoSiteNot { tag: String },
+    GeoipCountry { country_codes: Vec<String> },
     GeoipPrivate { expect: bool },
     Qtype { value: RecordType },
 }
@@ -251,7 +249,7 @@ pub enum RuntimeResponseMatcher {
     },
     /// 匹配响应中 IP 的 GeoIP 国家代码 / Match GeoIP country code of IPs in response
     ResponseAnswerIpGeoipCountry {
-        country_codes: Vec<Arc<str>>,
+        country_codes: Vec<String>,
     },
     /// 匹配响应中 IP 是否为私有 IP / Match whether IPs in response are private
     ResponseAnswerIpGeoipPrivate {
@@ -347,8 +345,8 @@ impl RuntimePipelineConfig {
 
             // Build Indices - 优化：索引所有可索引的匹配器，而不只是第一个
             // Build Indices - Optimized: index all indexable matchers, not just the first one
-            let mut domain_suffix_index: FxHashMap<Arc<str>, Vec<usize>> = FxHashMap::default();
-            let mut domain_exact_index: FxHashMap<Arc<str>, Vec<usize>> = FxHashMap::default();
+            let mut domain_suffix_index: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+            let mut domain_exact_index: FxHashMap<String, Vec<usize>> = FxHashMap::default();
             let mut query_type_index: FxHashMap<RecordType, Vec<usize>> = FxHashMap::default();
             let mut always_check_rules = Vec::new();
 
@@ -362,18 +360,15 @@ impl RuntimePipelineConfig {
                     for m in &rule.matchers {
                         match &m.matcher {
                             RuntimeMatcher::DomainExact { value } => {
-                                // 零拷贝：完全匹配，最高优先级 / Zero-copy: exact match, highest priority
                                 domain_exact_index
-                                    .entry(Arc::clone(value))
+                                    .entry(value.clone())
                                     .or_default()
                                     .push(idx);
                                 indexed = true;
                             }
                             RuntimeMatcher::DomainSuffix { value } => {
-                                // 零拷贝：直接使用 Arc::clone 而不是 String::clone
-                                // Zero-copy: use Arc::clone instead of String::clone
                                 domain_suffix_index
-                                    .entry(Arc::clone(value))
+                                    .entry(value.clone())
                                     .or_default()
                                     .push(idx);
                                 indexed = true;
@@ -507,14 +502,14 @@ impl RuntimeMatcher {
         Ok(match m {
             config::Matcher::Any => RuntimeMatcher::Any,
             config::Matcher::DomainSuffix { value } => RuntimeMatcher::DomainSuffix {
-                value: Arc::from(value.to_ascii_lowercase()),  // 零拷贝优化 / Zero-copy
+                value: value.to_ascii_lowercase(),
             },
             config::Matcher::ClientIp { cidr } => RuntimeMatcher::ClientIp { net: cidr.parse()? },
             config::Matcher::DomainRegex { value } => RuntimeMatcher::DomainRegex {
                 regex: Regex::new(&value)?,
             },
             config::Matcher::GeoipCountry { country_codes } => RuntimeMatcher::GeoipCountry {
-                country_codes: country_codes.into_iter().map(|s| Arc::from(s)).collect(),  // 零拷贝优化 / Zero-copy
+                country_codes,
             },
             config::Matcher::GeoipPrivate { expect } => RuntimeMatcher::GeoipPrivate {
                 expect,
@@ -524,10 +519,10 @@ impl RuntimeMatcher {
             },
             config::Matcher::EdnsPresent { expect } => RuntimeMatcher::EdnsPresent { expect },
             config::Matcher::GeoSite { value } => RuntimeMatcher::GeoSite {
-                tag: Arc::from(value),  // 零拷贝优化 / Zero-copy
+                tag: value,
             },
             config::Matcher::GeoSiteNot { value } => RuntimeMatcher::GeoSiteNot {
-                tag: Arc::from(value),  // 零拷贝优化 / Zero-copy
+                tag: value,
             },
             config::Matcher::Qtype { value } => RuntimeMatcher::Qtype {
                 value: parse_dns_type(&value)?,
@@ -560,9 +555,9 @@ impl RuntimeMatcher {
             RuntimeMatcher::Any => true,
             RuntimeMatcher::DomainExact { value } => {
                 // 完全匹配，大小写不敏感 / Exact match, case insensitive
-                qname.eq_ignore_ascii_case(value.as_ref())
+                qname.eq_ignore_ascii_case(value)
             }
-            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value.as_ref()),  // 使用 as_ref()
+            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value),
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes } => {
@@ -614,9 +609,9 @@ impl RuntimeMatcher {
             RuntimeMatcher::Any => true,
             RuntimeMatcher::DomainExact { value } => {
                 // 完全匹配，大小写不敏感 / Exact match, case insensitive
-                qname.eq_ignore_ascii_case(value.as_ref())
+                qname.eq_ignore_ascii_case(value)
             }
-            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value.as_ref()),  // 使用 as_ref()
+            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value),
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes } => {
@@ -659,7 +654,7 @@ impl RuntimePipelineSelectorMatcher {
         Ok(match m {
             config::PipelineSelectorMatcher::ListenerLabel { value } => {
                 RuntimePipelineSelectorMatcher::ListenerLabel {
-                    value: Arc::from(value),  // 零拷贝优化 / Zero-copy
+                    value,
                 }
             }
             config::PipelineSelectorMatcher::ClientIp { cidr } => {
@@ -667,7 +662,7 @@ impl RuntimePipelineSelectorMatcher {
             }
             config::PipelineSelectorMatcher::DomainSuffix { value } => {
                 RuntimePipelineSelectorMatcher::DomainSuffix {
-                    value: Arc::from(value.to_ascii_lowercase()),  // 零拷贝优化 / Zero-copy
+                    value: value.to_ascii_lowercase(),
                 }
             }
             config::PipelineSelectorMatcher::DomainRegex { value } => {
@@ -686,17 +681,17 @@ impl RuntimePipelineSelectorMatcher {
             }
             config::PipelineSelectorMatcher::GeoSite { value } => {
                 RuntimePipelineSelectorMatcher::GeoSite {
-                    tag: Arc::from(value),  // 零拷贝优化 / Zero-copy
+                    tag: value,
                 }
             }
             config::PipelineSelectorMatcher::GeoSiteNot { value } => {
                 RuntimePipelineSelectorMatcher::GeoSiteNot {
-                    tag: Arc::from(value),  // 零拷贝优化 / Zero-copy
+                    tag: value,
                 }
             }
             config::PipelineSelectorMatcher::GeoipCountry { country_codes } => {
                 RuntimePipelineSelectorMatcher::GeoipCountry {
-                    country_codes: country_codes.into_iter().map(|s| Arc::from(s)).collect(),  // 零拷贝优化 / Zero-copy
+                    country_codes,
                 }
             }
             config::PipelineSelectorMatcher::GeoipPrivate { expect } => {
@@ -741,7 +736,7 @@ impl RuntimePipelineSelectorMatcher {
                 value.eq_ignore_ascii_case(listener_label)
             }
             RuntimePipelineSelectorMatcher::ClientIp { net } => net.contains(&client_ip),
-            RuntimePipelineSelectorMatcher::DomainSuffix { value } => qname.ends_with(value.as_ref()),  // 使用 as_ref()
+            RuntimePipelineSelectorMatcher::DomainSuffix { value } => qname.ends_with(value),
             RuntimePipelineSelectorMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimePipelineSelectorMatcher::Any => true,
             RuntimePipelineSelectorMatcher::Qclass { value } => value == &qclass,
@@ -919,7 +914,7 @@ impl RuntimeResponseMatcher {
             }
             config::ResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } => {
                 RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry {
-                    country_codes: country_codes.into_iter().map(|s| Arc::from(s)).collect(),
+                    country_codes,
                 }
             }
             config::ResponseMatcher::ResponseAnswerIpGeoipPrivate { expect } => {
@@ -1059,12 +1054,12 @@ mod tests {
         // Act & Assert: Test case-insensitive matching with private IPs
         // GeoIpManager without MMDB will return None for country_code
         assert!(
-            !matcher_helpers::match_geoip_country(&manager, "192.168.1.1".parse().unwrap(), &[Arc::from("cn")]),
+            !matcher_helpers::match_geoip_country(&manager, "192.168.1.1".parse().unwrap(), &["cn".to_string()]),
             "Should return false for IP without country data"
         );
 
         assert!(
-            !matcher_helpers::match_geoip_country(&manager, "10.0.0.1".parse().unwrap(), &[Arc::from("CN"), Arc::from("US")]),
+            !matcher_helpers::match_geoip_country(&manager, "10.0.0.1".parse().unwrap(), &["CN".to_string(), "US".to_string()]),
             "Should return false when multiple country codes provided but no data"
         );
     }
@@ -1076,7 +1071,7 @@ mod tests {
 
         // Act & Assert: Test IP with no country data
         assert!(
-            !matcher_helpers::match_geoip_country(&manager, "192.168.1.1".parse().unwrap(), &[Arc::from("CN")]),
+            !matcher_helpers::match_geoip_country(&manager, "192.168.1.1".parse().unwrap(), &["CN".to_string()]),
             "Should return false for IP without country data"
         );
     }
