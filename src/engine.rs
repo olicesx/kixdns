@@ -37,14 +37,33 @@ use crate::matcher::{
 use crate::proto_utils::parse_quick;
 use crate::geoip::GeoIpManager;
 
-// Metrics use simple atomic increments with Relaxed ordering.
-// On x86-64, Relaxed fetch_add compiles to a single `lock add` instruction,
-// which is faster than thread_local + RefCell + time checks.
+// ============================================================================
+// Engine Helper Functions / 引擎辅助函数
+// ============================================================================
 
-// Thread-local object pool removed as it was ineffective (buffers never returned)
-// relying on jemalloc/system allocator is cleaner than a broken custom pool.
+/// 引擎辅助函数模块 - 提供可复用的引擎逻辑
+/// Engine helper functions module - provides reusable engine logic
+pub mod engine_helpers {
+    use super::*;
 
-/// Fast-path response for UDP workers.
+    /// 构建错误响应（ServFail）
+    /// Build error response (ServFail)
+    #[inline]
+    pub fn build_servfail_response(req: &Message) -> anyhow::Result<Bytes> {
+        build_response(req, ResponseCode::ServFail, Vec::new())
+    }
+
+    /// 构建拒绝响应（Refused）
+    /// Build refused response (Refused)
+    #[inline]
+    pub fn build_refused_response(req: &Message) -> anyhow::Result<Bytes> {
+        build_response(req, ResponseCode::Refused, Vec::new())
+    }
+}
+
+// ============================================================================
+// Fast-path Response / 快速路径响应
+// ============================================================================
 ///
 /// - `Direct`: already has correct TXID and can be sent as-is.
 /// - `CacheHit`: carries cached bytes (with an old TXID) and the request TXID to patch.
@@ -1011,6 +1030,7 @@ impl Engine {
                 allow_reuse,
             } => {
                 let mut cleanup_guard = None;
+
                 let resp = if allow_reuse {
                     if let Some(ctx) = reused_response.take() {
                         Ok(ctx.raw)
@@ -1128,16 +1148,26 @@ impl Engine {
 
                         let effective_ttl = Duration::from_secs(ttl_secs.max(min_ttl.as_secs()));
 
-                        let (resp_match_ok, msg) = if let Some(m) = msg_opt {
-                            let matched = eval_match_chain(
-                                &response_matchers,
-                                |m| m.operator,
-                                |matcher_op| matcher_op.matcher.matches(&upstream, &qname, qtype, qclass, &m),
-                            );
-                            (matched, m)
-                        } else {
-                            (false, Message::new()) // Dummy message, won't be used as actions are empty
-                        };
+                        let (resp_match_ok, msg) = {
+                            // Get manager references for GeoIP/GeoSite matching in response matchers
+                            // 获取 manager 引用以用于响应匹配器中的 GeoIP/GeoSite 匹配
+                            // 使用作用域确保锁在使用后立即释放 / Use scope to ensure locks are released immediately after use
+                            let geoip_manager = self.geoip_manager.try_lock().ok();
+                            let geosite_manager = self.geosite_manager.try_lock().ok();
+                            let geoip_manager_ref = geoip_manager.as_deref();
+                            let geosite_manager_ref = geosite_manager.as_deref();
+
+                            if let Some(m) = msg_opt {
+                                let matched = eval_match_chain(
+                                    &response_matchers,
+                                    |m| m.operator,
+                                    |matcher_op| matcher_op.matcher.matches(&upstream, &qname, qtype, qclass, &m, geoip_manager_ref, geosite_manager_ref),
+                                );
+                                (matched, m)
+                            } else {
+                                (false, Message::new()) // Dummy message, won't be used as actions are empty
+                            }
+                        }; // guards are dropped here / 锁在此处释放
 
                         let empty_actions = Vec::new();
                         let actions_to_run = if !response_actions_on_match.is_empty()
@@ -1332,7 +1362,7 @@ impl Engine {
                                     } else {
                                         warn!("pipeline missing while continuing: {}", current_pipeline_id);
                                         let req = Message::from_bytes(packet).context("parse request")?;
-                                        let resp_bytes = build_response(&req, ResponseCode::ServFail, Vec::new())?;
+                                        let resp_bytes = engine_helpers::build_servfail_response(&req)?;
                                         if let Some(g) = cleanup_guard.as_mut() {
                                             g.defuse();
                                         }
@@ -1453,7 +1483,7 @@ impl Engine {
                                         } else {
                                             warn!("pipeline missing while continuing: {}", current_pipeline_id);
                                             let req = Message::from_bytes(packet).context("parse request")?;
-                                            let resp_bytes = build_response(&req, ResponseCode::ServFail, Vec::new())?;
+                                            let resp_bytes = engine_helpers::build_servfail_response(&req)?;
                                             if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
                                             self.notify_inflight_waiters(dedupe_hash, &resp_bytes).await;
                                             return Ok(resp_bytes);
@@ -2000,7 +2030,7 @@ impl Engine {
                 }
                 Action::JumpToPipeline { pipeline } => {
                     if remaining_jumps == 0 {
-                        let bytes = build_response(req, ResponseCode::ServFail, Vec::new())?;
+                        let bytes = engine_helpers::build_servfail_response(req)?;
                         return Ok(ResponseActionResult::Static {
                             bytes,
                             rcode: ResponseCode::ServFail,
@@ -2014,14 +2044,21 @@ impl Engine {
                 }
                 Action::Allow => {
                     if let Some(ctx) = ctx_opt {
+                        // Get manager references for GeoIP/GeoSite matching
+                        // 获取 manager 引用以用于 GeoIP/GeoSite 匹配
+                        let geoip_manager = self.geoip_manager.try_lock().ok();
+                        let geosite_manager = self.geosite_manager.try_lock().ok();
+                        let geoip_manager_ref = geoip_manager.as_deref();
+                        let geosite_manager_ref = geosite_manager.as_deref();
+
                         let resp_match = eval_match_chain(
                             response_matchers,
                             |m| m.operator,
-                            |m| m.matcher.matches(&ctx.upstream, qname, qtype, qclass, &ctx.msg),
+                            |m| m.matcher.matches(&ctx.upstream, qname, qtype, qclass, &ctx.msg, geoip_manager_ref, geosite_manager_ref),
                         );
                         return Ok(ResponseActionResult::Upstream { ctx, resp_match });
                     }
-                    let bytes = build_response(req, ResponseCode::ServFail, Vec::new())?;
+                    let bytes = engine_helpers::build_servfail_response(req)?;
                     return Ok(ResponseActionResult::Static {
                         bytes,
                         rcode: ResponseCode::ServFail,
@@ -2029,7 +2066,7 @@ impl Engine {
                     });
                 }
                 Action::Deny => {
-                    let bytes = build_response(req, ResponseCode::Refused, Vec::new())?;
+                    let bytes = engine_helpers::build_refused_response(req)?;
                     return Ok(ResponseActionResult::Static {
                         bytes,
                         rcode: ResponseCode::Refused,
@@ -2054,7 +2091,7 @@ impl Engine {
                             rule = %rule_name,
                             "response actions exceeded forward limit"
                         );
-                        let bytes = build_response(req, ResponseCode::ServFail, Vec::new())?;
+                        let bytes = engine_helpers::build_servfail_response(req)?;
                         return Ok(ResponseActionResult::Static {
                             bytes,
                             rcode: ResponseCode::ServFail,
@@ -2086,7 +2123,7 @@ impl Engine {
                                 error = %err,
                                 "response action forward failed"
                             );
-                            let bytes = build_response(req, ResponseCode::ServFail, Vec::new())?;
+                            let bytes = engine_helpers::build_servfail_response(req)?;
                             return Ok(ResponseActionResult::Static {
                                 bytes,
                                 rcode: ResponseCode::ServFail,
@@ -2106,10 +2143,17 @@ impl Engine {
         }
 
         if let Some(ctx) = ctx_opt {
+            // Get manager references for GeoIP/GeoSite matching
+            // 获取 manager 引用以用于 GeoIP/GeoSite 匹配
+            let geoip_manager = self.geoip_manager.try_lock().ok();
+            let geosite_manager = self.geosite_manager.try_lock().ok();
+            let geoip_manager_ref = geoip_manager.as_deref();
+            let geosite_manager_ref = geosite_manager.as_deref();
+
             let resp_match = eval_match_chain(
                 response_matchers,
                 |m| m.operator,
-                |m| m.matcher.matches(&ctx.upstream, qname, qtype, qclass, &ctx.msg),
+                |m| m.matcher.matches(&ctx.upstream, qname, qtype, qclass, &ctx.msg, geoip_manager_ref, geosite_manager_ref),
             );
             return Ok(ResponseActionResult::Upstream { ctx, resp_match });
         }
@@ -2170,14 +2214,14 @@ impl Engine {
 
         loop {
             if remaining_jumps == 0 {
-                let resp_bytes = build_response(req, ResponseCode::ServFail, Vec::new())?;
+                let resp_bytes = engine_helpers::build_servfail_response(req)?;
                 for g in &mut cleanup_guards { g.defuse(); }
                 for h in &inflight_hashes { self.notify_inflight_waiters(*h, &resp_bytes).await; }
                 return Ok(resp_bytes);
             }
 
             let Some(pipeline) = state.pipeline.pipelines.iter().find(|p| p.id == pipeline_id) else {
-                let resp_bytes = build_response(req, ResponseCode::ServFail, Vec::new())?;
+                let resp_bytes = engine_helpers::build_servfail_response(req)?;
                 for g in &mut cleanup_guards { g.defuse(); }
                 for h in &inflight_hashes { self.notify_inflight_waiters(*h, &resp_bytes).await; }
                 return Ok(resp_bytes);
@@ -2205,7 +2249,7 @@ impl Engine {
             loop {
                 if let Decision::Jump { pipeline } = decision {
                     if local_jumps == 0 {
-                        let resp_bytes = build_response(req, ResponseCode::ServFail, Vec::new())?;
+                        let resp_bytes = engine_helpers::build_servfail_response(req)?;
                         for g in &mut cleanup_guards { g.defuse(); }
                         for h in &inflight_hashes { self.notify_inflight_waiters(*h, &resp_bytes).await; }
                         return Ok(resp_bytes);
@@ -2226,7 +2270,7 @@ impl Engine {
                         );
                         continue;
                     } else {
-                        let resp_bytes = build_response(req, ResponseCode::ServFail, Vec::new())?;
+                        let resp_bytes = engine_helpers::build_servfail_response(req)?;
                         for g in &mut cleanup_guards { g.defuse(); }
                         for h in &inflight_hashes { self.notify_inflight_waiters(*h, &resp_bytes).await; }
                         return Ok(resp_bytes);
@@ -2364,11 +2408,21 @@ impl Engine {
                             let ttl_secs = extract_ttl(&msg);
                             let effective_ttl = Duration::from_secs(ttl_secs.max(min_ttl.as_secs()));
 
-                            let resp_match_ok = eval_match_chain(
-                                &response_matchers,
-                                |m| m.operator,
-                                |m| m.matcher.matches(&upstream, qname, qtype, qclass, &msg),
-                            );
+                            // Get manager references for GeoIP/GeoSite matching in response matchers
+                            // 获取 manager 引用以用于响应匹配器中的 GeoIP/GeoSite 匹配
+                            // 使用作用域确保锁在使用后立即释放 / Use scope to ensure locks are released immediately after use
+                            let resp_match_ok = {
+                                let geoip_manager = self.geoip_manager.try_lock().ok();
+                                let geosite_manager = self.geosite_manager.try_lock().ok();
+                                let geoip_manager_ref = geoip_manager.as_deref();
+                                let geosite_manager_ref = geosite_manager.as_deref();
+
+                                eval_match_chain(
+                                    &response_matchers,
+                                    |m| m.operator,
+                                    |m| m.matcher.matches(&upstream, qname, qtype, qclass, &msg, geoip_manager_ref, geosite_manager_ref),
+                                )
+                            }; // guards are dropped here / 锁在此处释放
 
                             let actions_to_run = if !response_actions_on_match.is_empty()
                                 || !response_actions_on_miss.is_empty()
@@ -2466,7 +2520,7 @@ impl Engine {
                             }
                         }
                         Err(_err) => {
-                            let resp_bytes = build_response(req, ResponseCode::ServFail, Vec::new())?;
+                            let resp_bytes = engine_helpers::build_servfail_response(req)?;
                             for g in &mut cleanup_guards { g.defuse(); }
                             for h in &inflight_hashes { self.notify_inflight_waiters(*h, &resp_bytes).await; }
                             return Ok(resp_bytes);
@@ -2479,7 +2533,7 @@ impl Engine {
                         remaining_jumps -= 1;
                         continue;
                     } else {
-                        let resp_bytes = build_response(req, ResponseCode::ServFail, Vec::new())?;
+                        let resp_bytes = engine_helpers::build_servfail_response(req)?;
                         return Ok(resp_bytes);
                     }
                 }
@@ -3031,6 +3085,88 @@ mod tests {
     use super::*;
     use crate::config::{GlobalSettings, MatchOperator};
     use hickory_proto::rr::RecordType;
+    use hickory_proto::op::{Message, OpCode, Query};
+
+    // ========================================================================
+    // Engine Helper Functions Unit Tests / 引擎辅助函数单元测试
+    // ========================================================================
+
+    #[test]
+    fn test_engine_helpers_build_servfail_response() {
+        // Arrange: Create test request
+        let mut req = Message::new();
+        req.set_id(12345);
+        req.set_op_code(OpCode::Query);
+        req.set_recursion_desired(true);
+        let query = Query::query(Name::from_str("example.com").unwrap(), RecordType::A);
+        req.add_query(query);
+
+        // Act: Build ServFail response
+        let result = engine_helpers::build_servfail_response(&req);
+
+        // Assert: Verify response
+        assert!(result.is_ok(), "Should successfully build ServFail response");
+        let bytes = result.unwrap();
+        assert!(!bytes.is_empty(), "Response should not be empty");
+
+        // Verify it's a valid DNS message
+        let msg = Message::from_bytes(&bytes).unwrap();
+        assert_eq!(msg.id(), 12345, "TXID should be preserved");
+        assert_eq!(msg.response_code(), ResponseCode::ServFail, "Should be ServFail");
+        assert_eq!(msg.op_code(), OpCode::Query, "Should be Query opcode");
+        assert!(msg.recursion_desired(), "RD flag should be preserved");
+        assert_eq!(msg.queries().len(), 1, "Should have one query");
+    }
+
+    #[test]
+    fn test_engine_helpers_build_refused_response() {
+        // Arrange: Create test request
+        let mut req = Message::new();
+        req.set_id(54321);
+        req.set_op_code(OpCode::Query);
+        let query = Query::query(Name::from_str("example.com").unwrap(), RecordType::A);
+        req.add_query(query);
+
+        // Act: Build Refused response
+        let result = engine_helpers::build_refused_response(&req);
+
+        // Assert: Verify response
+        assert!(result.is_ok(), "Should successfully build Refused response");
+        let bytes = result.unwrap();
+        assert!(!bytes.is_empty(), "Response should not be empty");
+
+        // Verify it's a valid DNS message
+        let msg = Message::from_bytes(&bytes).unwrap();
+        assert_eq!(msg.id(), 54321, "TXID should be preserved");
+        assert_eq!(msg.response_code(), ResponseCode::Refused, "Should be Refused");
+        assert_eq!(msg.queries().len(), 1, "Should have one query");
+    }
+
+    #[test]
+    fn test_engine_helpers_build_servfail_vs_refused_different() {
+        // Arrange: Create test request
+        let mut req = Message::new();
+        req.set_id(11111);
+        let query = Query::query(Name::from_str("test.com").unwrap(), RecordType::A);
+        req.add_query(query);
+
+        // Act: Build both response types
+        let servfail = engine_helpers::build_servfail_response(&req).unwrap();
+        let refused = engine_helpers::build_refused_response(&req).unwrap();
+
+        // Assert: Should produce different responses
+        assert_ne!(servfail, refused, "ServFail and Refused should be different");
+
+        // Verify different response codes
+        let sf_msg = Message::from_bytes(&servfail).unwrap();
+        let ref_msg = Message::from_bytes(&refused).unwrap();
+        assert_eq!(sf_msg.response_code(), ResponseCode::ServFail);
+        assert_eq!(ref_msg.response_code(), ResponseCode::Refused);
+    }
+
+    // ========================================================================
+    // Original Engine Tests / 原有引擎测试
+    // ========================================================================
     use std::net::Ipv4Addr;
     use crate::matcher::RuntimeResponseMatcher;
     use futures::future::join_all;

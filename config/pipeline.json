@@ -5,7 +5,9 @@
     "bind_udp": "0.0.0.0:5353",
     "bind_tcp": "0.0.0.0:5353",
     "default_upstream": "1.1.1.1:53",
-    "upstream_timeout_ms": 2000
+    "upstream_timeout_ms": 2000,
+    "geoip_dat_path": "data/geoip.dat",
+    "geosite_data_paths": ["data/geosite.dat"]
   },
   "pipeline_select": [
     {
