@@ -173,6 +173,19 @@
                                 <input type="text" class="form-control" v-model="config.settings.geoip_dat_path" placeholder="留空则不使用 .dat 文件">
                                 <div class="form-text small">V2Ray .dat 或 JSON 格式的 GeoIP 数据文件路径，支持热重载。缓存大小会根据实际加载的条目自动设置。</div>
                             </div>
+                            <div class="col-md-4">
+                                <label class="form-label">自动转换 .dat 为 MMDB</label>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" v-model="config.settings.geoip_auto_convert">
+                                    <label class="form-check-label">启用自动转换</label>
+                                </div>
+                                <div class="form-text small">当 MMDB 不存在但 .dat 文件存在时，自动转换并缓存 MMDB</div>
+                            </div>
+                            <div class="col-md-8">
+                                <label class="form-label">转换时过滤国家代码</label>
+                                <input type="text" class="form-control" v-model="geoipFilterCountriesString" placeholder="CN,US,JP 或留空表示全部">
+                                <div class="form-text small">只转换指定国家的数据，逗号分隔（如 CN,US,JP），留空则转换全部国家</div>
+                            </div>
                         </div>
 
                         <hr>
@@ -592,6 +605,8 @@
                         cache_refresh_min_ttl: 5,
                         geoip_db_path: "",
                         geoip_dat_path: "",
+                        geoip_auto_convert: false,
+                        geoip_filter_countries: [],
                         geosite_data_paths: []
                     },
                     pipeline_select: [],
@@ -600,6 +615,9 @@
 
                 // GeoSite paths array for UI management
                 const geositePaths = ref([]);
+
+                // GeoIP filter countries string for UI management
+                const geoipFilterCountriesString = ref('');
 
                 const rawJson = ref('');
                 const manualJsonEdit = ref(false);
@@ -687,6 +705,31 @@
                         // 使用 nextTick 避免同步触发其他 watch
                         nextTick(() => {
                             config.value.settings.geosite_data_paths = filteredPaths;
+                        });
+                    }
+                }, { deep: true });
+
+                // Sync geoipFilterCountriesString -> config.settings.geoip_filter_countries (单向同步)
+                watch(geoipFilterCountriesString, (newStr) => {
+                    // 解析逗号分隔的字符串为数组
+                    const countries = newStr
+                        .split(',')
+                        .map(s => s.trim())
+                        .filter(s => s);
+                    // 只有当真正不同时才更新
+                    const currentCountries = (config.value.settings.geoip_filter_countries || []).join(',');
+                    const newCountries = countries.join(',');
+                    if (currentCountries !== newCountries) {
+                        config.value.settings.geoip_filter_countries = countries;
+                    }
+                });
+
+                // Sync config.settings.geoip_filter_countries -> geoipFilterCountriesString (单向同步)
+                watch(() => config.value.settings.geoip_filter_countries, (newCountries) => {
+                    const newStr = (newCountries || []).join(',');
+                    if (geoipFilterCountriesString.value !== newStr) {
+                        nextTick(() => {
+                            geoipFilterCountriesString.value = newStr;
                         });
                     }
                 }, { deep: true });
@@ -1048,8 +1091,13 @@
                     geositePaths.value = [...config.value.settings.geosite_data_paths];
                 }
 
+                // Initialize geoipFilterCountriesString from config
+                if (Array.isArray(config.value.settings.geoip_filter_countries)) {
+                    geoipFilterCountriesString.value = config.value.settings.geoip_filter_countries.join(',');
+                }
+
                 return {
-                    config, rawJson, manualJsonEdit, geositePaths,
+                    config, rawJson, manualJsonEdit, geositePaths, geoipFilterCountriesString,
                     selectorMatcherTypes, requestMatcherTypes, responseMatcherTypes,
                     loadJson, handleFileUpload, downloadJson,
                     addPipelineSelect, removePipelineSelect,

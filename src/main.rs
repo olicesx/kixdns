@@ -3,6 +3,7 @@ mod cache;
 mod config;
 mod engine;
 mod geoip;
+mod geoip_converter;
 mod geosite;
 mod matcher;
 mod proto_utils;
@@ -13,10 +14,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tracing::{error, info};
+use tracing::{error, info, debug};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::load_config;
@@ -26,114 +27,284 @@ use crate::matcher::RuntimePipelineConfig;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "KixDNS async DNS with hot-reload pipelines", long_about = None)]
 struct Args {
-    /// 配置文件路径（JSON） / Config file path (JSON)
-    #[arg(short = 'c', long = "config", default_value = "config/pipeline.json")]
-    config: PathBuf,
-    /// 监听实例标签，用于 pipeline 选择（可选）。 / Listener instance label for pipeline selection (optional)
-    #[arg(long = "listener-label", default_value = "default")]
-    listener_label: String,
-    /// 启用调试日志 / Enable debug logging
-    #[arg(long = "debug", default_value_t = false)]
-    debug: bool,
-    /// UDP worker 数量（默认 CPU 核心数） / Number of UDP workers (defaults to CPU core count)
-    #[arg(long = "udp-workers", default_value_t = 0)]
-    udp_workers: usize,
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Run DNS server / 运行 DNS 服务器
+    Run {
+        /// 配置文件路径（JSON） / Config file path (JSON)
+        #[arg(short = 'c', long = "config", default_value = "config/pipeline.json")]
+        config: PathBuf,
+        /// 监听实例标签，用于 pipeline 选择（可选）。 / Listener instance label for pipeline selection (optional)
+        #[arg(long = "listener-label", default_value = "default")]
+        listener_label: String,
+        /// 启用调试日志 / Enable debug logging
+        #[arg(long = "debug", default_value_t = false)]
+        debug: bool,
+        /// UDP worker 数量（默认 CPU 核心数） / Number of UDP workers (defaults to CPU core count)
+        #[arg(long = "udp-workers", default_value_t = 0)]
+        udp_workers_count: usize,
+    },
+    /// Convert GeoIP .dat to MMDB format / 转换 GeoIP .dat 为 MMDB 格式
+    ConvertGeoIp {
+        /// 输入 .dat 文件路径 / Input .dat file path
+        #[arg(short = 'i', long = "input")]
+        input: PathBuf,
+        /// 输出 MMDB 文件路径 / Output MMDB file path
+        #[arg(short = 'o', long = "output")]
+        output: PathBuf,
+        /// 过滤国家代码（逗号分隔，如 CN,US,JP）/ Filter country codes (comma-separated, e.g., CN,US,JP)
+        #[arg(short = 'f', long = "filter")]
+        filter: Option<String>,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    init_tracing(args.debug);
 
-    let cfg = load_config(&args.config).context("load initial config")?;
-    let cfg = RuntimePipelineConfig::from_config(cfg).context("compile matchers")?;
-    let bind_addr: SocketAddr = cfg.settings.bind_udp.parse().context("parse bind addr")?;
-    let bind_tcp: SocketAddr = cfg
-        .settings
-        .bind_tcp
-        .parse()
-        .context("parse tcp bind addr")?;
+    match args.command {
+        Some(Commands::ConvertGeoIp { input, output, filter }) => {
+            // Convert GeoIP .dat to MMDB
+            let filter_countries: Option<Vec<String>> = filter
+                .map(|f| f.split(',').map(|s| s.trim().to_uppercase()).collect());
 
-    let engine = Engine::new(cfg, args.listener_label.clone());
+            let filter_slice = filter_countries.as_deref();
 
-    watcher::spawn(args.config.clone(), engine.clone());
+            match crate::geoip::GeoIpManager::convert_dat_to_mmdb(&input, &output, filter_slice) {
+                Ok(stats) => {
+                    println!("Conversion completed successfully:\n{}", stats);
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("Conversion failed: {}", e);
+                    Err(e)
+                }
+            }
+        }
+        Some(Commands::Run { config, listener_label, debug, udp_workers_count }) => {
+            // Run DNS server
+            init_tracing(debug);
 
-    // UDP worker 数量：默认为 CPU 核心数，最少 1 个 / UDP worker count: defaults to CPU core count, minimum 1
-    let udp_workers = if args.udp_workers > 0 {
-        args.udp_workers
-    } else {
-        num_cpus::get()
-    };
+            let cfg = load_config(&config).context("load initial config")?;
+            let cfg = RuntimePipelineConfig::from_config(cfg).context("compile matchers")?;
+            let bind_addr: SocketAddr = cfg.settings.bind_udp.parse().context("parse bind addr")?;
+            let bind_tcp: SocketAddr = cfg
+                .settings
+                .bind_tcp
+                .parse()
+                .context("parse tcp bind addr")?;
 
-    info!(bind_udp = %bind_addr, bind_tcp = %bind_tcp, udp_workers = udp_workers, "dns server started");
+            let engine = Engine::new(cfg, listener_label.clone());
 
-    let mut udp_handles = Vec::with_capacity(udp_workers);
+            watcher::spawn(config.clone(), engine.clone());
 
-    #[cfg(unix)]
-    {
-        // On Unix create individual sockets with SO_REUSEPORT so kernel distributes packets / 在 Unix 上创建带有 SO_REUSEPORT 的独立套接字，以便内核分发数据包
-        for worker_id in 0..udp_workers {
-            let engine = engine.clone();
-            let std_socket = create_reuseport_udp_socket(bind_addr)
-                .with_context(|| format!("create udp socket for worker {}", worker_id))?;
-            let socket = UdpSocket::from_std(std_socket)?;
-            let handle = tokio::spawn(async move {
-                if let Err(err) = run_udp_worker(worker_id, Arc::new(socket), engine).await {
-                    error!(worker_id, error = %err, "udp worker exited");
+            // UDP worker 数量：默认为 CPU 核心数，最少 1 个 / UDP worker count: defaults to CPU core count, minimum 1
+            let udp_workers_final = if udp_workers_count > 0 {
+                udp_workers_count
+            } else {
+                num_cpus::get()
+            };
+
+            info!(bind_udp = %bind_addr, bind_tcp = %bind_tcp, udp_workers_count = udp_workers_final, "dns server started");
+
+            let mut udp_handles = Vec::with_capacity(udp_workers_final);
+
+            #[cfg(unix)]
+            {
+                // On Unix create individual sockets with SO_REUSEPORT so kernel distributes packets / 在 Unix 上创建带有 SO_REUSEPORT 的独立套接字，以便内核分发数据包
+                for worker_id in 0..udp_workers_final {
+                    let engine = engine.clone();
+                    let std_socket = create_reuseport_udp_socket(bind_addr)
+                        .with_context(|| format!("create udp socket for worker {}", worker_id))?;
+                    let socket = UdpSocket::from_std(std_socket)?;
+                    let handle = tokio::spawn(async move {
+                        if let Err(err) = run_udp_worker(worker_id, Arc::new(socket), engine).await {
+                            error!(worker_id, error = %err, "udp worker exited");
+                        }
+                    });
+                    udp_handles.push(handle);
+                }
+            }
+
+            #[cfg(not(unix))]
+            {
+                // Non-Unix: create a single shared socket and spawn workers that share it / 非 Unix：创建单个共享套接字并生成共享它的工作线程
+                // Use socket2 to set buffer sizes / 使用 socket2 设置缓冲区大小
+                use socket2::{Domain, Protocol, Socket, Type};
+                let domain = if bind_addr.is_ipv4() {
+                    Domain::IPV4
+                } else {
+                    Domain::IPV6
+                };
+                let socket =
+                    Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create socket")?;
+
+                // Set buffer sizes to prevent packet loss under load
+                // Try 4MB first, then fall back to 1MB if it fails
+                let desired_size = 4 * 1024 * 1024;
+                let fallback_size = 1024 * 1024;
+
+                if let Err(e) = socket.set_recv_buffer_size(desired_size) {
+                    debug!("failed to set udp recv buffer to {} bytes: {}, trying {}", desired_size, e, fallback_size);
+                    let _ = socket.set_recv_buffer_size(fallback_size);
+                }
+                if let Err(e) = socket.set_send_buffer_size(desired_size) {
+                    debug!("failed to set udp send buffer to {} bytes: {}, trying {}", desired_size, e, fallback_size);
+                    let _ = socket.set_send_buffer_size(fallback_size);
+                }
+
+                socket.set_nonblocking(true).context("set nonblocking")?;
+                socket.bind(&bind_addr.into()).context("bind socket")?;
+
+                let udp_socket = Arc::new(UdpSocket::from_std(socket.into()).context("from_std")?);
+                for worker_id in 0..udp_workers_final {
+                    let engine = engine.clone();
+                    let socket = Arc::clone(&udp_socket);
+                    let handle = tokio::spawn(async move {
+                        if let Err(err) = run_udp_worker(worker_id, socket, engine).await {
+                            error!(worker_id, error = %err, "udp worker exited");
+                        }
+                    });
+                    udp_handles.push(handle);
+                }
+            }
+
+            // TCP listener / TCP 监听器
+            let tcp_listener = TcpListener::bind(bind_tcp)
+                .await
+                .context("bind tcp listener")?;
+            let tcp_engine = engine.clone();
+            let tcp_handle = tokio::spawn(async move {
+                if let Err(err) = run_tcp(tcp_listener, tcp_engine).await {
+                    error!(error = %err, "tcp server exited");
                 }
             });
-            udp_handles.push(handle);
+
+            // 等待所有任务 / Wait for all tasks
+            let _ = tcp_handle.await;
+            for h in udp_handles {
+                let _ = h.await;
+            }
+
+            Ok(())
         }
-    }
+        None => {
+            // No subcommand provided - run DNS server with defaults
+            let config = PathBuf::from("config/pipeline.json");
+            let listener_label = "default".to_string();
+            let debug = false;
+            let udp_workers_count = 0;
 
-    #[cfg(not(unix))]
-    {
-        // Non-Unix: create a single shared socket and spawn workers that share it / 非 Unix：创建单个共享套接字并生成共享它的工作线程
-        // Use socket2 to set buffer sizes / 使用 socket2 设置缓冲区大小
-        use socket2::{Domain, Protocol, Socket, Type};
-        let domain = if bind_addr.is_ipv4() {
-            Domain::IPV4
-        } else {
-            Domain::IPV6
-        };
-        let socket =
-            Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create socket")?;
-        let _ = socket.set_recv_buffer_size(4 * 1024 * 1024);
-        let _ = socket.set_send_buffer_size(4 * 1024 * 1024);
-        socket.set_nonblocking(true).context("set nonblocking")?;
-        socket.bind(&bind_addr.into()).context("bind socket")?;
+            init_tracing(debug);
 
-        let udp_socket = Arc::new(UdpSocket::from_std(socket.into()).context("from_std")?);
-        for worker_id in 0..udp_workers {
-            let engine = engine.clone();
-            let socket = Arc::clone(&udp_socket);
-            let handle = tokio::spawn(async move {
-                if let Err(err) = run_udp_worker(worker_id, socket, engine).await {
-                    error!(worker_id, error = %err, "udp worker exited");
+            let cfg = load_config(&config).context("load initial config")?;
+            let cfg = RuntimePipelineConfig::from_config(cfg).context("compile matchers")?;
+            let bind_addr: SocketAddr = cfg.settings.bind_udp.parse().context("parse bind addr")?;
+            let bind_tcp: SocketAddr = cfg
+                .settings
+                .bind_tcp
+                .parse()
+                .context("parse tcp bind addr")?;
+
+            let engine = Engine::new(cfg, listener_label.clone());
+
+            watcher::spawn(config.clone(), engine.clone());
+
+            // UDP worker 数量：默认为 CPU 核心数，最少 1 个 / UDP worker count: defaults to CPU core count, minimum 1
+            let udp_workers_final = if udp_workers_count > 0 {
+                udp_workers_count
+            } else {
+                num_cpus::get()
+            };
+
+            info!(bind_udp = %bind_addr, bind_tcp = %bind_tcp, udp_workers_count = udp_workers_final, "dns server started");
+
+            let mut udp_handles = Vec::with_capacity(udp_workers_final);
+
+            #[cfg(unix)]
+            {
+                // On Unix create individual sockets with SO_REUSEPORT so kernel distributes packets / 在 Unix 上创建带有 SO_REUSEPORT 的独立套接字，以便内核分发数据包
+                for worker_id in 0..udp_workers_final {
+                    let engine = engine.clone();
+                    let std_socket = create_reuseport_udp_socket(bind_addr)
+                        .with_context(|| format!("create udp socket for worker {}", worker_id))?;
+                    let socket = UdpSocket::from_std(std_socket)?;
+                    let handle = tokio::spawn(async move {
+                        if let Err(err) = run_udp_worker(worker_id, Arc::new(socket), engine).await {
+                            error!(worker_id, error = %err, "udp worker exited");
+                        }
+                    });
+                    udp_handles.push(handle);
+                }
+            }
+
+            #[cfg(not(unix))]
+            {
+                // Non-Unix: create a single shared socket and spawn workers that share it / 非 Unix：创建单个共享套接字并生成共享它的工作线程
+                // Use socket2 to set buffer sizes / 使用 socket2 设置缓冲区大小
+                use socket2::{Domain, Protocol, Socket, Type};
+                let domain = if bind_addr.is_ipv4() {
+                    Domain::IPV4
+                } else {
+                    Domain::IPV6
+                };
+                let socket =
+                    Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create socket")?;
+
+                // Set buffer sizes to prevent packet loss under load
+                // Try 4MB first, then fall back to 1MB if it fails
+                let desired_size = 4 * 1024 * 1024;
+                let fallback_size = 1024 * 1024;
+
+                if let Err(e) = socket.set_recv_buffer_size(desired_size) {
+                    debug!("failed to set udp recv buffer to {} bytes: {}, trying {}", desired_size, e, fallback_size);
+                    let _ = socket.set_recv_buffer_size(fallback_size);
+                }
+                if let Err(e) = socket.set_send_buffer_size(desired_size) {
+                    debug!("failed to set udp send buffer to {} bytes: {}, trying {}", desired_size, e, fallback_size);
+                    let _ = socket.set_send_buffer_size(fallback_size);
+                }
+
+                socket.set_nonblocking(true).context("set nonblocking")?;
+                socket.bind(&bind_addr.into()).context("bind socket")?;
+
+                let udp_socket = Arc::new(UdpSocket::from_std(socket.into()).context("from_std")?);
+                for worker_id in 0..udp_workers_final {
+                    let engine = engine.clone();
+                    let socket = Arc::clone(&udp_socket);
+                    let handle = tokio::spawn(async move {
+                        if let Err(err) = run_udp_worker(worker_id, socket, engine).await {
+                            error!(worker_id, error = %err, "udp worker exited");
+                        }
+                    });
+                    udp_handles.push(handle);
+                }
+            }
+
+            // TCP listener / TCP 监听器
+            let tcp_listener = TcpListener::bind(bind_tcp)
+                .await
+                .context("bind tcp listener")?;
+            let tcp_engine = engine.clone();
+            let tcp_handle = tokio::spawn(async move {
+                if let Err(err) = run_tcp(tcp_listener, tcp_engine).await {
+                    error!(error = %err, "tcp server exited");
                 }
             });
-            udp_handles.push(handle);
+
+            // 等待所有任务 / Wait for all tasks
+            let _ = tcp_handle.await;
+            for h in udp_handles {
+                let _ = h.await;
+            }
+
+            Ok(())
         }
     }
-
-    // TCP listener / TCP 监听器
-    let tcp_listener = TcpListener::bind(bind_tcp)
-        .await
-        .context("bind tcp listener")?;
-    let tcp_engine = engine.clone();
-    let tcp_handle = tokio::spawn(async move {
-        if let Err(err) = run_tcp(tcp_listener, tcp_engine).await {
-            error!(error = %err, "tcp server exited");
-        }
-    });
-
-    // 等待所有任务 / Wait for all tasks
-    let _ = tcp_handle.await;
-    for h in udp_handles {
-        let _ = h.await;
-    }
-
-    Ok(())
 }
 
 fn init_tracing(debug: bool) {
@@ -183,8 +354,21 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
         let err = std::io::Error::last_os_error();
         tracing::warn!("SO_REUSEPORT failed: {}, falling back to shared socket", err);
     }
-    let _ = socket.set_recv_buffer_size(4 * 1024 * 1024);
-    let _ = socket.set_send_buffer_size(4 * 1024 * 1024);
+
+    // Set buffer sizes to prevent packet loss under load
+    // Try 4MB first, then fall back to 1MB if it fails
+    let desired_size = 4 * 1024 * 1024;
+    let fallback_size = 1024 * 1024;
+
+    if let Err(e) = socket.set_recv_buffer_size(desired_size) {
+        debug!("failed to set udp recv buffer to {} bytes: {}, trying {}", desired_size, e, fallback_size);
+        let _ = socket.set_recv_buffer_size(fallback_size);
+    }
+    if let Err(e) = socket.set_send_buffer_size(desired_size) {
+        debug!("failed to set udp send buffer to {} bytes: {}, trying {}", desired_size, e, fallback_size);
+        let _ = socket.set_send_buffer_size(fallback_size);
+    }
+
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     Ok(socket.into())

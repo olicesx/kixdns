@@ -7,6 +7,10 @@ use moka::sync::Cache as MokaCache;
 use notify::Watcher;
 use serde::Deserialize;
 
+// Re-export from geoip_converter module
+// Note: geoip_converter is a sibling module at the crate root level
+pub use crate::geoip_converter::{ConversionConfig, ConversionStats, convert_dat_to_mmdb};
+
 /// MaxMind GeoLite2-Country 数据库结构 / MaxMind GeoLite2-Country database structure
 #[derive(Deserialize)]
 struct MaxMindCountryRecord {
@@ -80,15 +84,39 @@ impl GeoIpManager {
     /// 创建新的 GeoIP 管理器 / Create new GeoIP manager
     ///
     /// # 参数 / Parameters
-    /// - `db_path`: MMDB 文件路径（可选） / MMDB file path (optional)
+    /// - `db_path`: MMDB 文件路径（可选）/ MMDB file path (optional)
+    ///
+    /// 此方法会立即加载 MMDB 文件（如果配置了路径），不再使用懒加载。
+    /// This method loads the MMDB file immediately (if path is configured), no longer using lazy loading.
     pub fn new(db_path: Option<String>) -> anyhow::Result<Self> {
         // 初始时创建一个小缓存，加载数据后会根据实际条数重建
         let cache = MokaCache::builder()
             .max_capacity(1000)
             .build();
 
+        // 立即加载 MMDB 文件（如果配置了）/ Load MMDB file immediately (if configured)
+        let reader = if let Some(ref path) = db_path {
+            if std::path::Path::new(path).exists() {
+                match maxminddb::Reader::open_readfile(path) {
+                    Ok(r) => {
+                        tracing::info!(geoip_db = %path, "GeoIP database loaded successfully");
+                        Some(r)
+                    }
+                    Err(e) => {
+                        tracing::warn!(geoip_db = %path, error = %e, "Failed to open GeoIP database");
+                        None
+                    }
+                }
+            } else {
+                tracing::warn!(geoip_db = %path, "GeoIP database file not found");
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
-            reader: Arc::new(None),
+            reader: Arc::new(reader),
             db_path,
             ip_ranges: Vec::new(),
             cache,
@@ -113,55 +141,6 @@ impl GeoIpManager {
             .build();
     }
 
-    /// 确保 MMDB 已加载（延迟加载）/ Ensure MMDB is loaded (lazy loading)
-    ///
-    /// 此方法在第一次查询时自动调用，确保 MMDB 文件只在需要时才加载。
-    /// This method is automatically called on first query, ensuring MMDB is loaded only when needed.
-    fn ensure_loaded(&self) -> anyhow::Result<()> {
-        // 如果已经加载，直接返回 / If already loaded, return directly
-        if self.reader.is_some() {
-            return Ok(());
-        }
-
-        // 如果没有配置路径，返回成功（不使用MMDB）/ If no path configured, return success (don't use MMDB)
-        let db_path = match &self.db_path {
-            Some(path) => path.clone(),
-            None => return Ok(()),
-        };
-
-        // 检查文件是否存在 / Check if file exists
-        if !std::path::Path::new(&db_path).exists() {
-            tracing::warn!(geoip_db = %db_path, "GeoIP database file not found");
-            return Ok(());
-        }
-
-        // 打开 MMDB 文件 / Open MMDB file
-        match maxminddb::Reader::open_readfile(&db_path) {
-            Ok(reader) => {
-                tracing::info!(
-                    geoip_db = %db_path,
-                    "GeoIP database loaded successfully (lazy loading)"
-                );
-                // 使用 Arc::make_mut 更新 reader（需要内部可变性）
-                // 这里我们使用 unsafe 来绕过 Arc 的不可变性限制
-                // 实际上这是安全的，因为我们只是从 None -> Some
-                let reader_ptr = Arc::as_ptr(&self.reader) as *mut Option<maxminddb::Reader<Vec<u8>>>;
-                unsafe {
-                    *reader_ptr = Some(reader);
-                }
-                Ok(())
-            }
-            Err(e) => {
-                tracing::warn!(
-                    geoip_db = %db_path,
-                    error = %e,
-                    "Failed to open GeoIP database"
-                );
-                Err(e.into())
-            }
-        }
-    }
-
     /// 查询 IP 的 GeoIP 信息 / Lookup GeoIP information for an IP address
     ///
     /// # 参数 / Parameters
@@ -175,9 +154,6 @@ impl GeoIpManager {
         if let Some(result) = self.cache.get(&ip) {
             return result.clone();
         }
-
-        // 确保 MMDB 已加载（延迟加载）/ Ensure MMDB is loaded (lazy loading)
-        let _ = self.ensure_loaded();
 
         // 查询 MMDB 或 IP 范围 / Query MMDB or IP ranges
         let result = if let Some(reader) = self.reader.as_ref() {
@@ -248,13 +224,38 @@ impl GeoIpManager {
             }
         };
 
-        // 检查 IP 范围 / Check IP ranges
-        for range in &self.ip_ranges {
-            if range.contains(ip_u32) {
-                return GeoIpResult {
-                    country_code: Some(range.country_code.clone()),
-                    is_private: crate::geoip::is_private_ip(ip),
-                };
+        // 使用二分查找 / Use binary search
+        match self.ip_ranges.binary_search_by_key(&ip_u32, |range| range.start) {
+            Ok(idx) => {
+                // 完全匹配起始 IP / Exact match on start IP
+                let range = &self.ip_ranges[idx];
+                if ip_u32 <= range.end {
+                    return GeoIpResult {
+                        country_code: Some(range.country_code.clone()),
+                        is_private: crate::geoip::is_private_ip(ip),
+                    };
+                }
+            }
+            Err(idx) => {
+                // 检查相邻的范围 / Check adjacent ranges
+                if idx > 0 {
+                    let range = &self.ip_ranges[idx - 1];
+                    if ip_u32 >= range.start && ip_u32 <= range.end {
+                        return GeoIpResult {
+                            country_code: Some(range.country_code.clone()),
+                            is_private: crate::geoip::is_private_ip(ip),
+                        };
+                    }
+                }
+                if idx < self.ip_ranges.len() {
+                    let range = &self.ip_ranges[idx];
+                    if ip_u32 >= range.start && ip_u32 <= range.end {
+                        return GeoIpResult {
+                            country_code: Some(range.country_code.clone()),
+                            is_private: crate::geoip::is_private_ip(ip),
+                        };
+                    }
+                }
             }
         }
 
@@ -472,9 +473,10 @@ impl GeoIpManager {
 
         tracing::info!("loaded {} GeoIP entries from .dat file", count);
 
-        // 调试:打印前 3 个 IP 范围
+        // 排序 IP 范围以支持二分查找 / Sort IP ranges to support binary search
         if !self.ip_ranges.is_empty() {
-            tracing::debug!("First 3 IP ranges:");
+            self.ip_ranges.sort_by_key(|r| r.start);
+            tracing::debug!("First 3 IP ranges (after sorting):");
             for (i, range) in self.ip_ranges.iter().take(3).enumerate() {
                 tracing::debug!("  {}: 0x{:08x} - 0x{:08x} -> {}",
                     i, range.start, range.end, range.country_code);
@@ -491,9 +493,9 @@ impl GeoIpManager {
     pub fn load_from_v2ray_file(&mut self, path: &Path) -> anyhow::Result<usize> {
         let data = std::fs::read_to_string(path)?;
         let list: V2RayGeoIPList = serde_json::from_str(&data)?;
-        
+
         self.ip_ranges.clear();
-        
+
         for geoip in list.entries {
             for ip_str in &geoip.ips {
                 if let Ok(net) = ip_str.parse::<ipnet::IpNet>() {
@@ -501,7 +503,7 @@ impl GeoIpManager {
                         let start = u32::from(v4net.network());
                         let prefix_len = v4net.prefix_len() as u32;
                         let end = start + (1u32 << (32 - prefix_len)) - 1;
-                        
+
                         self.ip_ranges.push(IpRange {
                             start,
                             end,
@@ -512,10 +514,79 @@ impl GeoIpManager {
             }
         }
 
+        // 排序 IP 范围以支持二分查找 / Sort IP ranges to support binary search
+        self.ip_ranges.sort_by_key(|r| r.start);
+
         // 根据实际加载的条数重建缓存
         self.rebuild_cache();
 
         Ok(self.ip_ranges.len())
+    }
+
+    /// 转换 .dat 为 MMDB 格式
+    /// Convert .dat to MMDB format
+    ///
+    /// # 参数 / Parameters
+    /// - `dat_path`: V2Ray .dat 文件路径 / V2Ray .dat file path
+    /// - `mmdb_path`: 输出 MMDB 文件路径 / Output MMDB file path
+    /// - `filter_countries`: 可选的国家代码过滤列表 / Optional country code filter list
+    pub fn convert_dat_to_mmdb(
+        dat_path: &Path,
+        mmdb_path: &Path,
+        filter_countries: Option<&[String]>,
+    ) -> anyhow::Result<ConversionStats> {
+        convert_dat_to_mmdb(dat_path, mmdb_path, filter_countries)
+    }
+
+    /// 自动转换并加载
+    /// Auto-convert and load
+    ///
+    /// 如果 MMDB 文件不存在但 .dat 文件存在，自动转换并加载
+    /// If MMDB file doesn't exist but .dat file exists, auto-convert and load
+    ///
+    /// # 参数 / Parameters
+    /// - `dat_path`: V2Ray .dat 文件路径 / V2Ray .dat file path
+    /// - `mmdb_path`: 输出 MMDB 文件路径 / Output MMDB file path
+    pub fn auto_convert_and_load(
+        dat_path: &Path,
+        mmdb_path: &Path,
+    ) -> anyhow::Result<Self> {
+        // Check if MMDB already exists
+        if mmdb_path.exists() {
+            tracing::info!(
+                mmdb = %mmdb_path.display(),
+                "MMDB file already exists, loading directly"
+            );
+            return Self::new(Some(mmdb_path.to_string_lossy().to_string()));
+        }
+
+        // Check if .dat file exists
+        if !dat_path.exists() {
+            anyhow::bail!(
+                "Neither MMDB nor .dat file exists: mmdb={}, dat={}",
+                mmdb_path.display(),
+                dat_path.display()
+            );
+        }
+
+        tracing::info!(
+            dat = %dat_path.display(),
+            mmdb = %mmdb_path.display(),
+            "MMDB not found, converting from .dat file"
+        );
+
+        // Perform conversion
+        let stats = Self::convert_dat_to_mmdb(dat_path, mmdb_path, None)?;
+
+        tracing::info!(
+            "Conversion successful: {} countries, {} IPv4 ranges, {} IPv6 ranges",
+            stats.countries_count,
+            stats.ipv4_ranges_count,
+            stats.ipv6_ranges_count
+        );
+
+        // Load the converted MMDB
+        Self::new(Some(mmdb_path.to_string_lossy().to_string()))
     }
 }
 

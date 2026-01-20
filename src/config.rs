@@ -85,6 +85,12 @@ pub struct GlobalSettings {
     /// GeoIP 数据文件路径（V2Ray .dat 格式） / GeoIP data file path (V2Ray .dat format)
     #[serde(default)]
     pub geoip_dat_path: Option<String>,
+    /// 是否自动转换 .dat 为 MMDB（默认 false）/ Auto-convert .dat to MMDB (default false)
+    #[serde(default)]
+    pub geoip_auto_convert: bool,
+    /// GeoIP 转换时过滤的国家代码列表 / Country codes to filter during GeoIP conversion
+    #[serde(default)]
+    pub geoip_filter_countries: Vec<String>,
     /// GeoSite 数据文件路径列表（V2Ray 格式，支持多个文件） / GeoSite data file paths (V2Ray format, supports multiple files)
     #[serde(default)]
     pub geosite_data_paths: Vec<String>,
@@ -114,6 +120,8 @@ impl Default for GlobalSettings {
             cache_refresh_min_ttl: default_cache_refresh_min_ttl(),
             geoip_db_path: None,
             geoip_dat_path: None,
+            geoip_auto_convert: false,
+            geoip_filter_countries: Vec::new(),
             geosite_data_paths: Vec::new(),
         }
     }
@@ -331,7 +339,7 @@ pub enum Action {
     Continue,
 }
 
-#[derive(Debug, Clone, Deserialize, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
     Udp,

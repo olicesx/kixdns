@@ -3,6 +3,7 @@ pub mod cache;
 pub mod config;
 pub mod engine;
 pub mod geoip;
+pub mod geoip_converter;
 pub mod geosite;
 pub mod integration_tests_new_matchers;
 pub mod matcher;

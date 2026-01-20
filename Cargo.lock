@@ -724,6 +724,7 @@ dependencies = [
  "ipnet",
  "libc",
  "maxminddb",
+ "maxminddb-writer",
  "moka",
  "notify",
  "num_cpus",
@@ -821,6 +822,16 @@ dependencies = [
  "log",
  "memchr",
  "serde",
+]
+
+[[package]]
+name = "maxminddb-writer"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0500ad4b78e96cc74e8365355a6b595159d54f03a69696a5242bcd9bcaa4f8a"
+dependencies = [
+ "serde",
+ "thiserror",
 ]
 
 [[package]]
