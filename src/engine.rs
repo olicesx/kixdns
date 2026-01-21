@@ -2937,8 +2937,13 @@ impl Engine {
                     match resp {
                         Ok((raw, actual_upstream)) => {
                             let msg = Message::from_bytes(&raw).context("parse upstream response")?;
-                            let ttl_secs = extract_ttl(&msg);
-                            let effective_ttl = Duration::from_secs(ttl_secs.max(min_ttl.as_secs()));
+                            // Extract TTL for cache entry (use min for RFC 1035 compliance)
+                            // 提取 TTL 用于缓存条目 (使用最小值符合 RFC 1035)
+                            let ttl_secs_cache = extract_ttl(&msg);
+                            // Extract TTL for refresh timing (use max to avoid premature refresh)
+                            // 提取 TTL 用于刷新时机 (使用最大值避免过早刷新)
+                            let ttl_secs_refresh = extract_ttl_for_refresh(&msg);
+                            let effective_ttl = Duration::from_secs(ttl_secs_cache.max(min_ttl.as_secs()));
 
                             // Get manager references for GeoIP/GeoSite matching in response matchers
                             // 获取 manager 引用以用于响应匹配器中的 GeoIP/GeoSite 匹配
@@ -2979,7 +2984,7 @@ impl Engine {
                                         pipeline_id: pipeline_id.clone(),
                                         qtype: u16::from(qtype),
                                         inserted_at: Instant::now(),
-                                        original_ttl: ttl_secs as u32,
+                                        original_ttl: ttl_secs_refresh as u32,  // Use max TTL for refresh timing
                                     };
                                     self.cache.insert(dedupe_hash, entry);
                                 }
@@ -3015,9 +3020,14 @@ impl Engine {
 
                             match action_result {
                                 ResponseActionResult::Upstream { ctx, resp_match } => {
-                                    let ttl_secs = extract_ttl(&ctx.msg);
+                                    // Extract TTL for cache entry (use min for RFC 1035 compliance)
+                                    // 提取 TTL 用于缓存条目 (使用最小值符合 RFC 1035)
+                                    let ttl_secs_cache = extract_ttl(&ctx.msg);
+                                    // Extract TTL for refresh timing (use max to avoid premature refresh)
+                                    // 提取 TTL 用于刷新时机 (使用最大值避免过早刷新)
+                                    let ttl_secs_refresh = extract_ttl_for_refresh(&ctx.msg);
                                     let effective_ttl =
-                                        Duration::from_secs(ttl_secs.max(min_ttl.as_secs()));
+                                        Duration::from_secs(ttl_secs_cache.max(min_ttl.as_secs()));
                                     if resp_match && effective_ttl > Duration::from_secs(0) {
                                         let entry = CacheEntry {
                                             bytes: ctx.raw.clone(),
@@ -3028,7 +3038,7 @@ impl Engine {
                                             pipeline_id: pipeline_id.clone(),
                                             qtype: u16::from(qtype),
                                             inserted_at: Instant::now(),
-                                            original_ttl: ttl_secs as u32,
+                                            original_ttl: ttl_secs_refresh as u32,  // Use max TTL for refresh timing
                                         };
                                         self.cache.insert(dedupe_hash, entry);
                                     }
