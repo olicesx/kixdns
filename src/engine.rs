@@ -2309,7 +2309,7 @@ impl Engine {
                         // 使用其他请求的结果更新缓存
                         // Use other request's result to update cache
                         if let Ok(msg) = Message::from_bytes(&bytes) {
-                            let ttl = engine.extract_ttl_from_msg(&msg);
+                            let ttl = engine.extract_ttl_from_msg(&msg, false);  // Use min TTL for cache
                             if ttl > 0 {
                                 let entry = crate::cache::CacheEntry {
                                     bytes: bytes.clone(),
@@ -2385,7 +2385,8 @@ impl Engine {
                         // 验证响应并更新缓存
                         // Verify response and update cache
                         if let Ok(msg) = Message::from_bytes(&resp) {
-                            let ttl = engine.extract_ttl_from_msg(&msg);
+                            // Use min TTL for logging (backward compatibility)
+                            let ttl = extract_ttl(&msg);
                             tracing::info!(
                                 event = "cache_background_refresh_got_response",
                                 qname = %qname,
@@ -2396,7 +2397,10 @@ impl Engine {
                                 cache_hash = cache_hash,
                                 "background refresh got response from upstream"
                             );
-                            if ttl > 0 {
+                            // Use max TTL for refresh timing to avoid premature refresh
+                            // 使用最大 TTL 用于刷新时机以避免过早刷新
+                            let ttl_for_refresh = extract_ttl_for_refresh(&msg);
+                            if ttl_for_refresh > 0 {
                                 let entry = crate::cache::CacheEntry {
                                     bytes: resp.clone(),
                                     rcode: msg.response_code(),
@@ -2406,7 +2410,7 @@ impl Engine {
                                     pipeline_id: pipeline_id.clone(),
                                     qtype: u16::from(qtype),
                                     inserted_at: Instant::now(),
-                                    original_ttl: ttl as u32,
+                                    original_ttl: ttl_for_refresh as u32,  // Use max TTL for refresh timing
                                 };
 
                                 // 强制覆盖：先移除旧条目，再插入新条目
@@ -2481,12 +2485,33 @@ impl Engine {
     
     /// 从Message中提取TTL（辅助函数）
     /// Extract TTL from Message (helper function)
-    fn extract_ttl_from_msg(&self, msg: &Message) -> u64 {
-        msg.answers()
-            .iter()
-            .map(|r| r.ttl() as u64)
-            .min()
-            .unwrap_or(0)
+    /// Extract TTL from DNS response message
+    /// 从 DNS 响应消息中提取 TTL
+    /// 
+    /// # Arguments
+    /// * `msg` - DNS response message
+    /// * `for_refresh` - If true, use max TTL for refresh timing; if false, use min TTL for cache entry
+    /// 
+    /// # Returns
+    /// * TTL value in seconds
+    /// 
+    /// # Rationale
+    /// - Cache entries should use min TTL (RFC 1035 §5.2)
+    /// - Background refresh timing should use max TTL to avoid premature refresh
+    /// 
+    /// # 理由
+    /// - 缓存条目应使用最小 TTL (RFC 1035 §5.2)
+    /// - 后台刷新时机应使用最大 TTL 以避免过早刷新
+    fn extract_ttl_from_msg(&self, msg: &Message, for_refresh: bool) -> u64 {
+        if for_refresh {
+            // Use max TTL for refresh timing to avoid premature refresh
+            // 使用最大 TTL 用于刷新时机以避免过早刷新
+            extract_ttl_for_refresh(msg)
+        } else {
+            // Use min TTL for cache entry (RFC 1035 compliant)
+            // 使用最小 TTL 用于缓存条目 (符合 RFC 1035)
+            extract_ttl(msg)
+        }
     }
 
     async fn apply_response_actions(
@@ -4483,12 +4508,35 @@ fn build_response(
     Ok(Bytes::from(out))
 }
 
-fn extract_ttl(msg: &Message) -> u64 {
-    // Directly iterate without collecting to Vec
+pub fn extract_ttl(msg: &Message) -> u64 {
+    // Extract minimum TTL for cache entry (RFC 1035 §5.2)
+    // 提取最小 TTL 用于缓存条目 (RFC 1035 §5.2)
+    // When multiple records have different TTLs, use the minimum
+    // 当多个记录有不同的 TTL 时,使用最小值
     msg.answers()
         .iter()
         .map(|r| r.ttl() as u64)
         .min()
+        .unwrap_or(0)
+}
+
+/// Extract maximum TTL from DNS response for background refresh timing
+/// 从 DNS 响应中提取最大 TTL 用于后台刷新时机
+/// 
+/// Rationale:
+/// - When multiple A/AAAA records have different TTLs, using min() causes premature refresh
+/// - Using max() ensures cache stays valid until ALL records expire
+/// - This aligns with the goal of reducing upstream queries
+/// 
+/// 理由:
+/// - 当多个 A/AAAA 记录有不同的 TTL 时,使用 min() 会导致过早刷新
+/// - 使用 max() 确保缓存保持有效直到所有记录过期
+/// - 这与减少上游查询的目标一致
+pub fn extract_ttl_for_refresh(msg: &Message) -> u64 {
+    msg.answers()
+        .iter()
+        .map(|r| r.ttl() as u64)
+        .max()
         .unwrap_or(0)
 }
 
