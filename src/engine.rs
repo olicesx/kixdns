@@ -80,6 +80,41 @@ pub enum FastPathResponse {
     },
 }
 
+// ============================================================================
+// Refreshing Guard / 刷新守卫
+// ============================================================================
+
+/// RAII guard for automatic cleanup of refreshing entries
+/// refreshing 条目的 RAII 守卫，自动清理
+///
+/// Ensures that entries in the `refreshing` DashMap are removed when the guard drops,
+/// preventing memory leaks even if the background refresh task panics or is cancelled.
+/// 确保 refreshing DashMap 中的条目在 guard 丢弃时被删除，
+/// 即使后台刷新任务 panic 或被取消也能防止内存泄漏。
+struct RefreshingGuard {
+    refreshing: Arc<DashMap<u64, Instant, FxBuildHasher>>,
+    hash: u64,
+}
+
+impl RefreshingGuard {
+    /// Create a new guard and insert the hash into the refreshing map
+    /// 创建新守卫并将哈希插入 refreshing map
+    #[inline]
+    fn new(refreshing: Arc<DashMap<u64, Instant, FxBuildHasher>>, hash: u64) -> Self {
+        refreshing.insert(hash, Instant::now());
+        Self { refreshing, hash }
+    }
+}
+
+impl Drop for RefreshingGuard {
+    /// Remove the hash from the refreshing map when the guard drops
+    /// 当守卫丢弃时，从 refreshing map 中移除哈希
+    #[inline]
+    fn drop(&mut self) {
+        self.refreshing.remove(&self.hash);
+    }
+}
+
 pub struct EngineInner {
     pub pipeline: RuntimePipelineConfig,
     pub compiled_pipelines: Vec<CompiledPipeline>,
@@ -108,6 +143,9 @@ pub struct Engine {
     // Optimization: SmallVec<[_; 8]> avoids heap allocation for typical Singleflight scenarios (<=8 waiters)
     // 使用 FxBuildHasher 提供更快的哈希计算 / Use FxBuildHasher for faster hashing
     pub inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>,
+    // Background refresh tracking: cache_hash -> refresh_start_time / 后台刷新跟踪：缓存哈希 -> 刷新开始时间
+    // Prevents duplicate refresh triggers for the same cache entry / 防止同一缓存条目的重复刷新触发
+    pub refreshing: Arc<DashMap<u64, Instant, FxBuildHasher>>,
     // Semaphore to limit concurrent handle_packet async tasks / 用于限制并发 handle_packet 异步任务数量
     pub permit_manager: Arc<PermitManager>,
     // Latest upstream latency for adaptive flow control / 用于自适应流控的最新上游延迟
@@ -304,7 +342,7 @@ impl Engine {
         // 规则缓存：1万条，默认长 TTL（通过条目内部 expires_at 手动管理）
         let rule_cache = Cache::builder()
             .max_capacity(10_000)
-            .time_to_live(Duration::from_secs(3600))
+            .time_to_live(Duration::from_secs(60))
             .build();
 
         // Extract flow control settings before moving cfg / 在 move cfg 之前提取流控设置
@@ -506,6 +544,10 @@ impl Engine {
                     dashmap_shards,
                 ))
             },
+            refreshing: Arc::new(DashMap::with_capacity_and_hasher(
+                64,
+                FxBuildHasher::default(),
+            )),
             permit_manager,
             flow_control_state,
             // Cache background refresh settings / 缓存后台刷新设置
@@ -741,11 +783,42 @@ impl Engine {
                         && hit.upstream.is_some()
                         && hit.original_ttl >= self.cache_refresh_min_ttl
                     {
+                        // Calculate remaining TTL and refresh threshold
+                        // 计算剩余 TTL 和刷新阈值
                         let remaining_ttl = hit.original_ttl.saturating_sub(elapsed_secs);
                         let threshold = (hit.original_ttl as u64 * self.cache_refresh_threshold_percent as u64) / 100;
-                        if remaining_ttl as u64 <= threshold && remaining_ttl >= self.cache_refresh_min_ttl as u32 {
-                            // 触发后台刷新，避免无限循环：使用标志位防止重复刷新
-                            // Trigger background refresh, prevent infinite loop: use flag to prevent duplicate refresh
+
+                        // 检查是否已经在刷新中
+                        // Check if already refreshing
+                        let is_refreshing = self.refreshing.contains_key(&cache_hash);
+
+                        tracing::info!(
+                            original_ttl = hit.original_ttl,
+                            elapsed_secs = elapsed_secs,
+                            remaining_ttl = remaining_ttl,
+                            threshold_percent = self.cache_refresh_threshold_percent,
+                            threshold_value = threshold,
+                            min_ttl = self.cache_refresh_min_ttl,
+                            is_refreshing = is_refreshing,
+                            should_trigger = !is_refreshing && remaining_ttl as u64 <= threshold && remaining_ttl >= self.cache_refresh_min_ttl as u32,
+                            upstream = ?hit.upstream,
+                            qname = %q.qname.as_ref(),
+                            "cache background refresh check"
+                        );
+
+                        if !is_refreshing && remaining_ttl as u64 <= threshold && remaining_ttl >= self.cache_refresh_min_ttl as u32 {
+                            // 标记为正在刷新，防止重复触发
+                            // Mark as refreshing to prevent duplicate triggers
+                            self.refreshing.insert(cache_hash, Instant::now());
+
+                            // 触发后台刷新（异步，不阻塞当前请求）
+                            // Trigger background refresh (async, don't block current request)
+                            tracing::debug!(
+                                qname = %q.qname.as_ref(),
+                                original_ttl = hit.original_ttl,
+                                remaining_ttl = remaining_ttl,
+                                "triggering background cache refresh"
+                            );
                             self.spawn_background_refresh(
                                 cache_hash,
                                 &pipeline_id,
@@ -756,7 +829,11 @@ impl Engine {
                             );
                         }
                     }
-                    
+
+                    // 直接返回当前缓存，不等待刷新完成
+                    // Return current cache immediately, don't wait for refresh to complete
+                    // 下次查询时会自动使用刷新后的新缓存（如果已完成）
+                    // Next query will automatically use refreshed new cache (if completed)
                     self.incr_fastpath_hits();
                     return Ok(Some(FastPathResponse::CacheHit {
                         cached: hit.bytes.clone(),
@@ -801,7 +878,13 @@ impl Engine {
             let include_ip_in_hash = p.uses_client_ip || self.cache_background_refresh;
             let rule_hash = calculate_rule_hash(&pipeline_id, q.qname.as_ref(), peer.ip(), include_ip_in_hash);
             if let Some(entry) = self.rule_cache.get(&rule_hash) {
-                if entry.matches(&pipeline_id, q.qname.as_ref(), peer.ip(), include_ip_in_hash) {
+                // Check if entry is valid before using
+                // 在使用前检查条目是否有效
+                if !entry.is_valid() {
+                    // Remove expired entry
+                    // 删除过期条目
+                    self.rule_cache.remove(&rule_hash);
+                } else if entry.matches(&pipeline_id, q.qname.as_ref(), peer.ip(), include_ip_in_hash) {
                     if let Decision::Static { rcode, answers } = entry.decision.as_ref() {
                         let resp = build_fast_static_response(
                             q.tx_id,
@@ -847,7 +930,11 @@ impl Engine {
                     None // Permanent
                 }
             }
-            _ => None, // Jump, Allow, Deny are permanent
+            _ => {
+                // Jump, Allow, Deny: 120秒 TTL（之前是永久）
+                // Jump, Allow, Deny: 120 second TTL (previously permanent)
+                Some(Duration::from_secs(120))
+            }
         };
 
         // If TTL is 0, do not cache / 如果 TTL 为 0，则不缓存
@@ -1119,7 +1206,7 @@ impl Engine {
 
                 let resp = if allow_reuse {
                     if let Some(ctx) = reused_response.take() {
-                        Ok(ctx.raw)
+                        Ok((ctx.raw, ctx.upstream.to_string()))
                     } else {
                         if !dedupe_registered {
                             use dashmap::mapref::entry::Entry;
@@ -1201,7 +1288,7 @@ impl Engine {
                 };
 
                 match resp {
-                    Ok(raw) => {
+                    Ok((raw, actual_upstream)) => {
                         // Optimization: Use quick response parse if no complex matching is needed
                         // Also handles TC (Truncated) flag check for RFC 1035 compliance
                         let (rcode, ttl_secs, msg_opt, truncated) = if response_matchers.is_empty() && response_actions_on_match.is_empty() && response_actions_on_miss.is_empty() {
@@ -1225,7 +1312,7 @@ impl Engine {
                         if truncated && transport == Some(Transport::Udp) {
                             tracing::debug!(event = "tc_flag_retry", upstream = %upstream, "response truncated, retrying with tcp");
                             drop(cleanup_guard);
-                            let tcp_resp = self.forward_upstream(packet, &upstream, upstream_timeout, Some(Transport::Tcp), pre_split_upstreams.as_ref()).await?;
+                            let (tcp_resp, _) = self.forward_upstream(packet, &upstream, upstream_timeout, Some(Transport::Tcp), pre_split_upstreams.as_ref()).await?;
                             if let Some(_g) = self.inflight.get(&dedupe_hash) {
                                 self.notify_inflight_waiters(dedupe_hash, &tcp_resp).await;
                             }
@@ -1275,8 +1362,8 @@ impl Engine {
                                     dedupe_hash,
                                     raw.clone(),
                                     rcode,
-                                    upstream.clone(),
-                                    Some(upstream.clone()),
+                                    Arc::from(actual_upstream.as_str()),
+                                    Some(Arc::from(actual_upstream.as_str())),
                                     &qname,
                                     pipeline_id.clone(),
                                     qtype,
@@ -1288,7 +1375,7 @@ impl Engine {
                             let latency = start.elapsed();
                             info!(
                                 event = "dns_response",
-                                upstream = %upstream,
+                                upstream = %actual_upstream,
                                 qname = %qname,
                                 qtype = ?qtype,
                                 rcode = ?rcode,
@@ -1313,7 +1400,7 @@ impl Engine {
                         let ctx = ResponseContext {
                             raw: raw.clone(),
                             msg,
-                            upstream: upstream.clone(),  // upstream is already Arc<str>
+                            upstream: Arc::from(actual_upstream.as_str()),  // Use actual responding upstream
                             transport: transport.unwrap_or(Transport::Udp),
                         };
                         let action_result = self
@@ -1618,7 +1705,11 @@ impl Engine {
         
         if allow_rule_cache_lookup {
             if let Some(entry) = self.rule_cache.get(&rule_hash) {
-                if entry.matches(&pipeline.id, qname, client_ip, pipeline.uses_client_ip) {
+                // Check validity and clean up if expired
+                // 检查有效性，如果过期则清理
+                if !entry.is_valid() {
+                    self.rule_cache.remove(&rule_hash);
+                } else if entry.matches(&pipeline.id, qname, client_ip, pipeline.uses_client_ip) {
                     return (*entry.decision).clone();
                 }
             }
@@ -1918,7 +2009,7 @@ impl Engine {
         timeout_dur: Duration,
         transport: Option<Transport>,
         pre_split_upstreams: Option<&std::sync::Arc<Vec<String>>>,
-    ) -> anyhow::Result<Bytes> {
+    ) -> anyhow::Result<(Bytes, String)> {
         // 如果 transport 为 None，使用默认 UDP
         let transport = transport.unwrap_or(Transport::Udp);
         // 使用预分割数据或动态分割 / Use pre-split data or dynamic splitting
@@ -1944,7 +2035,7 @@ impl Engine {
                 self.metrics_last_upstream_latency_ns.store(dur_ns, Ordering::Relaxed);
                 tracing::warn!(upstream=%upstream, error=%e, elapsed_ns = dur_ns, "upstream call failed");
             }
-            return res;
+            return res.map(|b| (b, upstream.to_string()));
         } else {
             // 回退：动态分割 / Fallback: dynamic splitting
             upstream.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
@@ -2046,7 +2137,7 @@ impl Engine {
                                 // tasks will be dropped on return, triggering abort for all incomplete JoinHandles
                             }
 
-                            return res;
+                            return res.map(|b| (b, up));
                         }
                         // 否则继续等待其他 upstream / Otherwise continue waiting for other upstreams
                     } else {
@@ -2194,6 +2285,14 @@ impl Engine {
                 }
             }
 
+            // ========== NEW: Add RefreshingGuard ==========
+            // ✅ 使用 RAII guard 确保 refreshing 条目被清理
+            // Use RAII guard to ensure refreshing entry is cleaned up
+            let _refresh_guard = RefreshingGuard::new(
+                engine.refreshing.clone(),
+                cache_hash
+            );
+
             // 如果需要执行查询，设置 cleanup guard
             // If need to execute query, set cleanup guard
             let _cleanup_guard = if should_proceed {
@@ -2223,7 +2322,12 @@ impl Engine {
                                     inserted_at: Instant::now(),
                                     original_ttl: ttl as u32,
                                 };
+
+                                // 强制覆盖：先移除旧条目，再插入新条目
+                                // Force overwrite: remove old entry first, then insert new entry
+                                engine.cache.remove(&cache_hash);
                                 engine.cache.insert(cache_hash, entry);
+
                                 tracing::debug!(
                                     event = "cache_background_refresh_reused",
                                     qname = %qname,
@@ -2277,24 +2381,46 @@ impl Engine {
                 // 发送上游查询
                 // Send upstream query
                 match engine.forward_upstream(&req_bytes, &upstream_to_use, upstream_timeout, Some(Transport::Udp), None).await {
-                    Ok(resp) => {
+                    Ok((resp, actual_upstream)) => {
                         // 验证响应并更新缓存
                         // Verify response and update cache
                         if let Ok(msg) = Message::from_bytes(&resp) {
                             let ttl = engine.extract_ttl_from_msg(&msg);
+                            tracing::info!(
+                                event = "cache_background_refresh_got_response",
+                                qname = %qname,
+                                qtype = ?qtype,
+                                ttl = ttl,
+                                answers_count = msg.answers().len(),
+                                upstream = %actual_upstream,
+                                cache_hash = cache_hash,
+                                "background refresh got response from upstream"
+                            );
                             if ttl > 0 {
                                 let entry = crate::cache::CacheEntry {
                                     bytes: resp.clone(),
                                     rcode: msg.response_code(),
                                     source: Arc::from("background_refresh"),
-                                    upstream: Some(Arc::from(upstream_to_use.as_str())),
+                                    upstream: Some(Arc::from(actual_upstream.as_str())),
                                     qname: Arc::from(qname.as_str()),
                                     pipeline_id: pipeline_id.clone(),
                                     qtype: u16::from(qtype),
                                     inserted_at: Instant::now(),
                                     original_ttl: ttl as u32,
                                 };
+
+                                // 强制覆盖：先移除旧条目，再插入新条目
+                                // Force overwrite: remove old entry first, then insert new entry
+                                engine.cache.remove(&cache_hash);
                                 engine.cache.insert(cache_hash, entry);
+
+                                tracing::info!(
+                                    event = "cache_background_refresh_updated",
+                                    qname = %qname,
+                                    qtype = ?qtype,
+                                    original_ttl = ttl,
+                                    "cache updated successfully"
+                                );
 
                                 // 通知所有等待者
                                 // Notify all waiters
@@ -2305,8 +2431,16 @@ impl Engine {
                                     qname = %qname,
                                     qtype = ?qtype,
                                     ttl = ttl,
-                                    upstream = %upstream_to_use,
+                                    upstream = %actual_upstream,
                                     "background cache refresh completed"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    event = "cache_background_refresh_zero_ttl",
+                                    qname = %qname,
+                                    qtype = ?qtype,
+                                    ttl = ttl,
+                                    "upstream returned zero TTL, not updating cache"
                                 );
                             }
                         }
@@ -2324,6 +2458,11 @@ impl Engine {
                     }
                 }
             }.await;
+
+            // Note: RefreshingGuard automatically removes the entry from refreshing map on drop
+            // 注意：RefreshingGuard 在 drop 时会自动从 refreshing map 中移除条目
+            // No need for manual cleanup here
+            // 无需在此手动清理
 
             if let Err(e) = result {
                 tracing::error!("background refresh error: {}", e);
@@ -2463,11 +2602,11 @@ impl Engine {
                             .unwrap_or_else(|| Arc::from(upstream_default))
                     });
                     let use_transport = transport.unwrap_or(Transport::Udp);
-                    let raw = match self
+                    let (raw, actual_upstream) = match self
                         .forward_upstream(packet, &upstream_addr, upstream_timeout, Some(use_transport), pre_split_upstreams.as_ref())
                         .await
                     {
-                        Ok(bytes) => bytes,
+                        Ok(result) => result,
                         Err(err) => {
                             warn!(
                                 event = "dns_response",
@@ -2492,7 +2631,7 @@ impl Engine {
                     ctx_opt = Some(ResponseContext {
                         raw,
                         msg,
-                        upstream: upstream_addr,  // upstream_addr is already Arc<str>
+                        upstream: Arc::from(actual_upstream.as_str()),  // Use actual responding upstream
                         transport: use_transport,
                     });
                 }
@@ -2672,7 +2811,7 @@ impl Engine {
                 } => {
                     let resp = if allow_reuse {
                         if let Some(ctx) = reused_response.take() {
-                            Ok(ctx.raw)
+                            Ok((ctx.raw, ctx.upstream.to_string()))
                         } else {
                             {
                                 use dashmap::mapref::entry::Entry;
@@ -2762,7 +2901,7 @@ impl Engine {
                     };
 
                     match resp {
-                        Ok(raw) => {
+                        Ok((raw, actual_upstream)) => {
                             let msg = Message::from_bytes(&raw).context("parse upstream response")?;
                             let ttl_secs = extract_ttl(&msg);
                             let effective_ttl = Duration::from_secs(ttl_secs.max(min_ttl.as_secs()));
@@ -2800,8 +2939,8 @@ impl Engine {
                                     let entry = CacheEntry {
                                         bytes: raw.clone(),
                                         rcode: msg.response_code(),
-                                        source: upstream.clone(),
-                                        upstream: Some(upstream.clone()),
+                                        source: Arc::from(actual_upstream.as_str()),
+                                        upstream: Some(Arc::from(actual_upstream.as_str())),
                                         qname: Arc::from(qname),
                                         pipeline_id: pipeline_id.clone(),
                                         qtype: u16::from(qtype),
@@ -2818,7 +2957,7 @@ impl Engine {
                             let ctx = ResponseContext {
                                 raw,
                                 msg,
-                                upstream: upstream.clone(),  // upstream is already Arc<str>
+                                upstream: Arc::from(actual_upstream.as_str()),  // Use actual responding upstream
                                 transport: transport.unwrap_or(Transport::Udp),
                             };
                             let action_result = self
@@ -4445,6 +4584,17 @@ impl RuleCacheEntry {
 
         self.pipeline_id.as_ref() == pipeline_id
             && self.qname_hash == fast_hash_str(qname)
+    }
+
+    /// Check if entry is still valid (not expired)
+    /// 检查条目是否仍然有效（未过期）
+    #[inline]
+    fn is_valid(&self) -> bool {
+        if let Some(expires) = self.expires_at {
+            Instant::now() <= expires
+        } else {
+            true  // No expiration = permanent
+        }
     }
 }
 

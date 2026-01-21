@@ -118,15 +118,10 @@
                                 </div>
                                 <div class="form-text small">当TTL即将过期时异步刷新缓存条目</div>
                             </div>
-                            <div class="col-md-4">
+                            <div class="col-md-6">
                                 <label class="form-label">刷新阈值 (%)</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.cache_refresh_threshold_percent" placeholder="10" min="1" max="90">
                                 <div class="form-text small">当剩余TTL低于此百分比时触发刷新（1-90，默认10）</div>
-                            </div>
-                            <div class="col-md-4">
-                                <label class="form-label">最小TTL (秒)</label>
-                                <input type="number" class="form-control" v-model.number="config.settings.cache_refresh_min_ttl" placeholder="5" min="1">
-                                <div class="form-text small">防止TTL过短导致无限循环刷新（默认5秒）</div>
                             </div>
                         </div>
 

@@ -7,7 +7,10 @@
     "default_upstream": "1.1.1.1:53",
     "upstream_timeout_ms": 2000,
     "geoip_dat_path": "data/geoip.dat",
-    "geosite_data_paths": ["data/geosite.dat"]
+    "geosite_data_paths": ["data/geosite.dat"],
+    "cache_background_refresh": true,
+    "cache_refresh_threshold_percent": 15,
+    "cache_refresh_min_ttl": 6
   },
   "pipeline_select": [
     {
