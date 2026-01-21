@@ -1043,6 +1043,57 @@ impl Engine {
                         resp_bytes[1] = id_bytes[1];
                     }
                     let resp_bytes = resp_bytes.freeze();
+                    
+                    // ========== NEW: Trigger background refresh before returning cached response ==========
+                    // ✅ 在返回缓存响应之前,异步触发后台刷新
+                    // This ensures the client gets an immediate response while the cache is updated in background
+                    // 这确保客户端立即获得响应,同时缓存更新在后台进行
+                    let remaining_ttl = hit.original_ttl.saturating_sub(elapsed);
+                    if cfg.settings.cache_background_refresh
+                        && hit.source.as_ref() == "upstream"
+                        && hit.upstream.is_some()
+                        && hit.original_ttl >= cfg.settings.cache_refresh_min_ttl
+                    {
+                        let threshold = (hit.original_ttl as u64 * cfg.settings.cache_refresh_threshold_percent as u64) / 100;
+                        if remaining_ttl as u64 <= threshold {
+                            // Trigger background refresh asynchronously
+                            // 异步触发后台刷新
+                            tracing::debug!(
+                                event = "cache_background_refresh_trigger",
+                                qname = %qname_ref,
+                                qtype = ?qtype,
+                                remaining_ttl = remaining_ttl,
+                                threshold = threshold,
+                                original_ttl = hit.original_ttl,
+                                "triggering background cache refresh"
+                            );
+                            
+                            // Clone necessary data for async task
+                            // 克隆异步任务所需的数据
+                            let engine_clone = self.clone();
+                            let cache_hash = dedupe_hash;
+                            let upstream = hit.upstream.clone();
+                            let qname_async = qname_ref.to_string();
+                            let qtype_async = qtype;
+                            let qclass_async = qclass;
+                            let pipeline_id_async = pipeline_id.clone();
+                            
+                            // Spawn background refresh task (non-blocking)
+                            // 生成后台刷新任务 (非阻塞)
+                            tokio::spawn(async move {
+                                engine_clone.spawn_background_refresh(
+                                    cache_hash,
+                                    &pipeline_id_async,
+                                    &qname_async,
+                                    qtype_async,
+                                    qclass_async,
+                                    upstream.as_deref(),
+                                );
+                            });
+                        }
+                    }
+                    // ========== END: Background refresh trigger ==========
+                    
                     debug!(
                         event = "dns_response",
                         upstream = %hit.source,
