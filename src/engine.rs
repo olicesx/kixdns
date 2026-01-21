@@ -2435,12 +2435,21 @@ impl Engine {
                                     "background cache refresh completed"
                                 );
                             } else {
+                                // TTL = 0 表示上游明确要求不缓存此响应
+                                // TTL = 0 means upstream explicitly requests not to cache this response
+                                // 根据 RFC 1035, TTL=0 的记录不应被缓存
+                                // Per RFC 1035, records with TTL=0 should not be cached
+                                // 因此需要移除旧缓存条目,防止返回过期数据
+                                // Therefore, remove old cache entry to prevent returning stale data
+                                engine.cache.remove(&cache_hash);
+
                                 tracing::warn!(
                                     event = "cache_background_refresh_zero_ttl",
                                     qname = %qname,
                                     qtype = ?qtype,
                                     ttl = ttl,
-                                    "upstream returned zero TTL, not updating cache"
+                                    cache_hash = cache_hash,
+                                    "upstream returned zero TTL, removed old cache entry per RFC 1035"
                                 );
                             }
                         }
