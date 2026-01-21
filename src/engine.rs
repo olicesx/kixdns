@@ -2035,7 +2035,14 @@ impl Engine {
                 self.metrics_last_upstream_latency_ns.store(dur_ns, Ordering::Relaxed);
                 tracing::warn!(upstream=%upstream, error=%e, elapsed_ns = dur_ns, "upstream call failed");
             }
-            return res.map(|b| (b, upstream.to_string()));
+            // Store upstream with protocol prefix for seamless background refresh
+            return res.map(|b| {
+                let upstream_with_proto = match transport {
+                    Transport::Tcp => format!("tcp:{}", upstream),
+                    Transport::Udp => format!("udp:{}", upstream),
+                };
+                (b, upstream_with_proto)
+            });
         } else {
             // 回退：动态分割 / Fallback: dynamic splitting
             upstream.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
@@ -2137,6 +2144,7 @@ impl Engine {
                                 // tasks will be dropped on return, triggering abort for all incomplete JoinHandles
                             }
 
+                            // up already contains protocol prefix from concurrent task (e.g., "tcp:8.8.4.4:53")
                             return res.map(|b| (b, up));
                         }
                         // 否则继续等待其他 upstream / Otherwise continue waiting for other upstreams
@@ -2378,9 +2386,29 @@ impl Engine {
                 req_bytes.extend_from_slice(&u16::from(qtype).to_be_bytes());
                 req_bytes.extend_from_slice(&u16::from(qclass).to_be_bytes());
 
+                // Parse protocol from upstream field (format: "protocol:ip:port" or "ip:port")
+                // 从 upstream 字段解析协议 (格式: "protocol:ip:port" 或 "ip:port")
+                let (refresh_transport, refresh_addr) = if let Some(pos) = upstream_to_use.find(':') {
+                    let possible_proto = &upstream_to_use[..pos];
+                    let addr = &upstream_to_use[pos + 1..];
+                    match possible_proto {
+                        "tcp" => (Some(Transport::Tcp), addr),
+                        "udp" => (Some(Transport::Udp), addr),
+                        _ => {
+                            // No protocol prefix, assume UDP (backward compatibility)
+                            // 没有协议前缀,假设为 UDP (向后兼容)
+                            (Some(Transport::Udp), upstream_to_use.as_ref())
+                        }
+                    }
+                } else {
+                    // No colon found, invalid format, use as-is with UDP
+                    // 没有找到冒号,格式无效,按原样使用 UDP
+                    (Some(Transport::Udp), upstream_to_use.as_ref())
+                };
+
                 // 发送上游查询
                 // Send upstream query
-                match engine.forward_upstream(&req_bytes, &upstream_to_use, upstream_timeout, Some(Transport::Udp), None).await {
+                match engine.forward_upstream(&req_bytes, refresh_addr, upstream_timeout, refresh_transport, None).await {
                     Ok((resp, actual_upstream)) => {
                         // 验证响应并更新缓存
                         // Verify response and update cache
