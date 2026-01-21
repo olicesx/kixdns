@@ -2492,9 +2492,13 @@ impl Engine {
                                     original_ttl: ttl_for_refresh as u32,  // Use max TTL for refresh timing
                                 };
 
-                                // 强制覆盖：先移除旧条目，再插入新条目
-                                // Force overwrite: remove old entry first, then insert new entry
-                                engine.cache.remove(&cache_hash);
+                                // ========== NEW: Directly overwrite cache to prevent cache penetration ==========
+                                // ✅ 直接覆盖缓存条目,防止缓存击穿
+                                // Directly overwrite cache entry to prevent cache penetration
+                                // 允许短暂脏读:在后台刷新完成前,其他查询可能读到旧缓存
+                                // Allow brief dirty reads: other queries may read old cache before refresh completes
+                                // moka cache 会自动覆盖已存在的 key,无需先删除
+                                // moka cache automatically overwrites existing keys, no need to remove first
                                 engine.cache.insert(cache_hash, entry);
 
                                 tracing::info!(
