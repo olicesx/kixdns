@@ -2007,6 +2007,20 @@ impl Engine {
                         // 第一个成功响应 / First successful response
                         tracing::debug!(upstream=%up, upstream_ns = dur.as_nanos() as u64, "upstream call succeeded (first)");
                         self.metrics_last_upstream_latency_ns.store(dur.as_nanos() as u64, Ordering::Relaxed);
+
+                        // 显式取消其他正在进行的任务
+                        // Explicitly cancel other ongoing tasks
+                        let remaining = tasks.len();
+                        if remaining > 0 {
+                            tracing::debug!(
+                                remaining_tasks = remaining,
+                                winning_upstream = %up,
+                                "cancelling remaining upstream tasks (first response received)"
+                            );
+                            // tasks 会在 return 时被 drop，触发所有未完成 JoinHandle 的 abort
+                            // tasks will be dropped on return, triggering abort for all incomplete JoinHandles
+                        }
+
                         return res;
                     } else {
                         // 记录失败，继续等待其他上游 / Record failure, continue waiting for other upstreams
