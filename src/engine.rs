@@ -800,13 +800,13 @@ impl Engine {
                             threshold_value = threshold,
                             min_ttl = self.cache_refresh_min_ttl,
                             is_refreshing = is_refreshing,
-                            should_trigger = !is_refreshing && remaining_ttl as u64 <= threshold && remaining_ttl >= self.cache_refresh_min_ttl as u32,
+                            should_trigger = !is_refreshing && remaining_ttl as u64 <= threshold,
                             upstream = ?hit.upstream,
                             qname = %q.qname.as_ref(),
                             "cache background refresh check"
                         );
 
-                        if !is_refreshing && remaining_ttl as u64 <= threshold && remaining_ttl >= self.cache_refresh_min_ttl as u32 {
+                        if !is_refreshing && remaining_ttl as u64 <= threshold {
                             // 标记为正在刷新，防止重复触发
                             // Mark as refreshing to prevent duplicate triggers
                             self.refreshing.insert(cache_hash, Instant::now());
