@@ -397,8 +397,12 @@ pub fn load_config(path: &Path) -> Result<PipelineConfig> {
     }
 
     // 轻量校验：CIDR提前解析，便于后续快速匹配。 / Lightweight validation: parse CIDR in advance for subsequent fast matching
+    // 预分割 upstream 字符串以提高性能 / Pre-split upstream strings for better performance
     for pipeline in &mut cfg.pipelines {
         for rule in &mut pipeline.rules {
+            for action in &mut rule.actions {
+                action.pre_split_upstreams();
+            }
             for matcher in &rule.matchers {
                 if let Matcher::ClientIp { cidr } = &matcher.matcher {
                     let _parsed: IpNet = cidr.parse()?;

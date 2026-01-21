@@ -642,6 +642,7 @@ impl Engine {
         bytes: Bytes,
         rcode: ResponseCode,
         source: Arc<str>,
+        upstream: Option<Arc<str>>,
         qname: &str,
         pipeline_id: Arc<str>,
         qtype: hickory_proto::rr::RecordType,
@@ -651,6 +652,7 @@ impl Engine {
             bytes,
             rcode,
             source,
+            upstream,
             qname: Arc::from(qname),  // 一次 Arc::from，避免多次
             pipeline_id,
             qtype: u16::from(qtype),
@@ -733,13 +735,25 @@ impl Engine {
                 } else {
                     // 缓存后台刷新：当TTL < 阈值百分比时，触发异步刷新
                     // Cache background refresh: trigger async refresh when TTL < threshold percentage
-                    if self.cache_background_refresh && hit.original_ttl >= self.cache_refresh_min_ttl {
+                    // 只有来自 upstream 的缓存条目才进行预取刷新
+                    // Only refresh cache entries that came from an upstream server
+                    if self.cache_background_refresh
+                        && hit.upstream.is_some()
+                        && hit.original_ttl >= self.cache_refresh_min_ttl
+                    {
                         let remaining_ttl = hit.original_ttl.saturating_sub(elapsed_secs);
                         let threshold = (hit.original_ttl as u64 * self.cache_refresh_threshold_percent as u64) / 100;
                         if remaining_ttl as u64 <= threshold && remaining_ttl >= self.cache_refresh_min_ttl as u32 {
                             // 触发后台刷新，避免无限循环：使用标志位防止重复刷新
                             // Trigger background refresh, prevent infinite loop: use flag to prevent duplicate refresh
-                            self.spawn_background_refresh(cache_hash, &pipeline_id, q.qname.as_ref(), qtype, qclass);
+                            self.spawn_background_refresh(
+                                cache_hash,
+                                &pipeline_id,
+                                q.qname.as_ref(),
+                                qtype,
+                                qclass,
+                                hit.upstream.as_deref(),
+                            );
                         }
                     }
                     
@@ -1064,6 +1078,7 @@ impl Engine {
                         bytes: resp_bytes.clone(),
                         rcode,
                         source: Arc::from("static"),
+                        upstream: None,  // Static responses have no upstream
                         qname: Arc::from(qname.as_str()),
                         pipeline_id: current_pipeline_id.clone(),
                         qtype: u16::from(qtype),
@@ -1261,6 +1276,7 @@ impl Engine {
                                     raw.clone(),
                                     rcode,
                                     upstream.clone(),
+                                    Some(upstream.clone()),
                                     &qname,
                                     pipeline_id.clone(),
                                     qtype,
@@ -1331,6 +1347,7 @@ impl Engine {
                                         ctx.raw.clone(),
                                         ctx.msg.response_code(),
                                         ctx.upstream.clone(),
+                                        Some(ctx.upstream.clone()),
                                         &qname,
                                         pipeline_id.clone(),
                                         qtype,
@@ -1368,6 +1385,7 @@ impl Engine {
                                         bytes.clone(),
                                         rcode,
                                         Arc::from(source),
+                                        None,  // Static responses have no upstream
                                         &qname,
                                         current_pipeline_id.clone(),
                                         qtype,
@@ -1506,6 +1524,7 @@ impl Engine {
                                                 ctx.raw.clone(),
                                                 ctx.msg.response_code(),
                                                 ctx.upstream.clone(),
+                                                Some(ctx.upstream.clone()),
                                                 &qname,
                                                 pipeline_id.clone(),
                                                 qtype,
@@ -1890,7 +1909,7 @@ impl Engine {
         };
 
         // 多个上游：并发请求取最快结果 / Multiple upstreams: concurrent requests, take fastest result
-        tracing::info!(upstreams = ?upstreams, "concurrent upstream requests - spawning tasks");
+        tracing::info!(upstream_count = upstreams.len(), upstreams = ?upstreams, "concurrent upstream requests - spawning tasks");
 
         // 使用 FuturesUnordered 真正并发地等待所有任务
         // Use FuturesUnordered to truly wait for all tasks concurrently
@@ -2018,11 +2037,11 @@ impl Engine {
 
     /// 缓存后台刷新：当TTL即将过期时，异步刷新缓存条目
     /// Cache background refresh: asynchronously refresh cache entry when TTL is about to expire
-    /// 
+    ///
     /// 防止无限循环的保护措施：
     /// Protection against infinite loops:
     /// 1. 检查 original_ttl >= cache_refresh_min_ttl（默认5秒）
-    /// 2. 使用 DashMap 的 entry API 确保同一时间只有一个刷新任务
+    /// 2. 使用与正常请求相同的 Singleflight 机制（inflight map）
     /// 3. 刷新失败不会删除现有缓存条目
     fn spawn_background_refresh(
         &self,
@@ -2031,43 +2050,126 @@ impl Engine {
         qname: &str,
         qtype: hickory_proto::rr::RecordType,
         qclass: DNSClass,
+        upstream: Option<&str>,
     ) {
         use dashmap::mapref::entry::Entry;
-        
-        // 使用 u64 高位标记刷新键，避免与正常 inflight 键冲突
-        // Use high bit to mark refresh keys, avoiding conflicts with normal inflight keys
-        // 正常 inflight 键: 0x0000_0000_0000_0000 到 0x7fff_ffff_ffff_ffff
-        // 刷新键: 0x8000_0000_0000_0000 到 0xffff_ffff_ffff_ffff
-        let refresh_key = cache_hash | 0x8000_0000_0000_0000;
-        
-        // 尝试插入刷新标志，如果已存在则说明已有刷新任务在进行
-        // Try to insert refresh flag, if exists means refresh task already in progress
-        let should_spawn = match self.inflight.entry(refresh_key) {
-            Entry::Vacant(_) => {
-                // 成功插入，可以执行刷新
-                true
+
+        // 使用正常的 dedupe_hash，与用户请求共享 Singleflight 机制
+        // Use normal dedupe_hash to share Singleflight mechanism with user requests
+        let dedupe_hash = Self::calculate_cache_hash_for_dedupe(pipeline_id, qname, qtype, qclass);
+
+        // 尝试注册到 inflight map，与正常请求使用相同的去重机制
+        // Try to register to inflight map, using same deduplication as normal requests
+        let (should_proceed, wait_rx) = match self.inflight.entry(dedupe_hash) {
+            Entry::Vacant(entry) => {
+                // 没有其他请求在进行，由后台刷新执行查询
+                // No other request in progress, background refresh will execute query
+                entry.insert(SmallVec::new());
+                (true, None)
             }
-            Entry::Occupied(_) => {
-                // 已有刷新任务，跳过
-                false
+            Entry::Occupied(mut entry) => {
+                // 已有请求在进行（用户请求或其他后台刷新），等待结果
+                // Another request in progress (user request or other background refresh), wait for result
+                let (tx, rx) = oneshot::channel();
+                entry.get_mut().push(tx);
+                (false, Some(rx))
             }
         };
-        
-        if !should_spawn {
-            return;
-        }
-        
-        // 克隆必要的数据到 'static 生命周期
-        // Clone necessary data to 'static lifetime
+
         let engine = self.clone();
         let pipeline_id: Arc<str> = Arc::from(pipeline_id);
         let qname = qname.to_string();
-        let upstream_default = self.state.load().pipeline.settings.default_upstream.clone();
+        // 使用原始 upstream，如果没有则使用 default upstream
+        // Use original upstream, fallback to default if not available
+        let upstream_to_use = upstream
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| self.state.load().pipeline.settings.default_upstream.clone());
         let upstream_timeout = self.state.load().pipeline.upstream_timeout();
-        
+
         tokio::spawn(async move {
-            // 执行后台刷新
-            // Perform background refresh
+            struct InflightCleanupGuard {
+                inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>,
+                hash: u64,
+                active: bool,
+            }
+
+            impl InflightCleanupGuard {
+                fn new(inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>, hash: u64) -> Self {
+                    Self { inflight, hash, active: true }
+                }
+
+                fn defuse(&mut self) {
+                    self.active = false;
+                }
+            }
+
+            impl Drop for InflightCleanupGuard {
+                fn drop(&mut self) {
+                    if self.active {
+                        self.inflight.remove(&self.hash);
+                    }
+                }
+            }
+
+            // 如果需要执行查询，设置 cleanup guard
+            // If need to execute query, set cleanup guard
+            let _cleanup_guard = if should_proceed {
+                Some(InflightCleanupGuard::new(engine.inflight.clone(), dedupe_hash))
+            } else {
+                None
+            };
+
+            // 如果是在等待其他请求的结果
+            // If waiting for other request's result
+            if let Some(rx) = wait_rx {
+                match rx.await {
+                    Ok(Ok(bytes)) => {
+                        // 使用其他请求的结果更新缓存
+                        // Use other request's result to update cache
+                        if let Ok(msg) = Message::from_bytes(&bytes) {
+                            let ttl = engine.extract_ttl_from_msg(&msg);
+                            if ttl > 0 {
+                                let entry = crate::cache::CacheEntry {
+                                    bytes: bytes.clone(),
+                                    rcode: msg.response_code(),
+                                    source: Arc::from("background_refresh"),
+                                    upstream: Some(Arc::from(upstream_to_use.as_str())),
+                                    qname: Arc::from(qname.as_str()),
+                                    pipeline_id: pipeline_id.clone(),
+                                    qtype: u16::from(qtype),
+                                    inserted_at: Instant::now(),
+                                    original_ttl: ttl as u32,
+                                };
+                                engine.cache.insert(cache_hash, entry);
+                                tracing::debug!(
+                                    event = "cache_background_refresh_reused",
+                                    qname = %qname,
+                                    qtype = ?qtype,
+                                    ttl = ttl,
+                                    "background cache refresh reused inflight result"
+                                );
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            event = "cache_background_refresh_inflight_failed",
+                            qname = %qname,
+                            qtype = ?qtype,
+                            error = %e,
+                            "background cache refresh: inflight request failed"
+                        );
+                    }
+                    Err(_) => {
+                        // sender dropped, 执行自己的查询
+                        // sender dropped, execute own query
+                    }
+                }
+                return;
+            }
+
+            // 执行后台刷新查询
+            // Perform background refresh query
             let result = async {
                 // 构造DNS查询请求
                 // Construct DNS query request
@@ -2075,7 +2177,7 @@ impl Engine {
                 // TXID (临时值，会被上游重写)
                 req_bytes.extend_from_slice(&0u16.to_be_bytes());
                 // Flags: 标准查询
-                req_bytes.extend_from_slice(&0x0100u16.to_be_bytes()); 
+                req_bytes.extend_from_slice(&0x0100u16.to_be_bytes());
                 // QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
                 req_bytes.extend_from_slice(&1u16.to_be_bytes());
                 // QNAME
@@ -2088,10 +2190,10 @@ impl Engine {
                 // QTYPE, QCLASS
                 req_bytes.extend_from_slice(&u16::from(qtype).to_be_bytes());
                 req_bytes.extend_from_slice(&u16::from(qclass).to_be_bytes());
-                
+
                 // 发送上游查询
                 // Send upstream query
-                match engine.forward_upstream(&req_bytes, &upstream_default, upstream_timeout, Transport::Udp, None).await {
+                match engine.forward_upstream(&req_bytes, &upstream_to_use, upstream_timeout, Transport::Udp, None).await {
                     Ok(resp) => {
                         // 验证响应并更新缓存
                         // Verify response and update cache
@@ -2102,6 +2204,7 @@ impl Engine {
                                     bytes: resp.clone(),
                                     rcode: msg.response_code(),
                                     source: Arc::from("background_refresh"),
+                                    upstream: Some(Arc::from(upstream_to_use.as_str())),
                                     qname: Arc::from(qname.as_str()),
                                     pipeline_id: pipeline_id.clone(),
                                     qtype: u16::from(qtype),
@@ -2109,11 +2212,17 @@ impl Engine {
                                     original_ttl: ttl as u32,
                                 };
                                 engine.cache.insert(cache_hash, entry);
+
+                                // 通知所有等待者
+                                // Notify all waiters
+                                engine.notify_inflight_waiters(dedupe_hash, &resp).await;
+
                                 tracing::debug!(
                                     event = "cache_background_refresh_success",
                                     qname = %qname,
                                     qtype = ?qtype,
                                     ttl = ttl,
+                                    upstream = %upstream_to_use,
                                     "background cache refresh completed"
                                 );
                             }
@@ -2132,11 +2241,7 @@ impl Engine {
                     }
                 }
             }.await;
-            
-            // 无论成功失败，都移除刷新标志
-            // Whether success or failure, remove refresh flag
-            engine.inflight.remove(&refresh_key);
-            
+
             if let Err(e) = result {
                 tracing::error!("background refresh error: {}", e);
             }
@@ -2457,6 +2562,7 @@ impl Engine {
                         bytes: resp_bytes.clone(),
                         rcode,
                         source: Arc::from("static"),
+                        upstream: None,  // Static responses have no upstream
                         qname: Arc::from(qname),
                         pipeline_id: pipeline_id.clone(),
                         qtype: u16::from(qtype),
@@ -2612,6 +2718,7 @@ impl Engine {
                                         bytes: raw.clone(),
                                         rcode: msg.response_code(),
                                         source: upstream.clone(),
+                                        upstream: Some(upstream.clone()),
                                         qname: Arc::from(qname),
                                         pipeline_id: pipeline_id.clone(),
                                         qtype: u16::from(qtype),
@@ -2660,6 +2767,7 @@ impl Engine {
                                             bytes: ctx.raw.clone(),
                                             rcode: ctx.msg.response_code(),
                                             source: ctx.upstream.clone(),
+                                            upstream: Some(ctx.upstream.clone()),
                                             qname: Arc::from(qname),
                                             pipeline_id: pipeline_id.clone(),
                                             qtype: u16::from(qtype),
@@ -3845,6 +3953,7 @@ mod tests {
             bytes: Bytes::from_static(b"old_resp"),
             rcode: ResponseCode::NoError,
             source: Arc::from("old_source"),
+            upstream: None,
             qname: Arc::from(qname),
             pipeline_id: pipeline_id.clone(),
             qtype: u16::from(qtype),

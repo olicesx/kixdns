@@ -10,6 +10,8 @@ pub struct CacheEntry {
     pub bytes: Bytes,
     pub rcode: ResponseCode,
     pub source: Arc<str>,
+    /// Upstream that provided this response / 提供此响应的上游服务器
+    pub upstream: Option<Arc<str>>,
     // Store validation fields to handle hash collisions / 存储验证字段以处理哈希冲突
     pub qname: Arc<str>,
     pub pipeline_id: Arc<str>,

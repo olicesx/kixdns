@@ -1,0 +1,133 @@
+{
+  "version": "1.0",
+  "settings": {
+    "min_ttl": 30,
+    "bind_udp": "0.0.0.0:5353",
+    "bind_tcp": "0.0.0.0:5353",
+    "default_upstream": "223.5.5.5:53",
+    "upstream_timeout_ms": 500,
+    "cache_capacity": 10000,
+    "geoip_dat_path": "data/geoip.dat",
+    "geosite_data_paths": ["data/geosite.dat"]
+  },
+  "pipeline_select": [
+    {
+      "pipeline": "internal_pipe",
+      "matchers": [ { "type": "listener_label", "value": "edge-internal" } ]
+    },
+    {
+      "pipeline": "internal_pipe",
+      "matchers": [ { "type": "client_ip", "cidr": "10.0.0.0/8" } ]
+    },
+    {
+      "pipeline": "large_tcp",
+      "matchers": [ { "type": "domain_suffix", "value": ".large.example" } ]
+    },
+    {
+      "pipeline": "regex_qclass_pipe",
+      "matchers": [
+        { "type": "domain_regex", "value": "(?i)\\bvideo\\.(example|test)\\." },
+        { "type": "qclass", "value": "IN" }
+      ]
+    },
+    {
+      "pipeline": "main_inbound",
+      "matchers": [ { "type": "domain_suffix", "value": ".internal" } ]
+    }
+  ],
+  "pipelines": [
+    {
+      "id": "internal_pipe",
+      "rules": [
+        {
+          "name": "internal_tcp_forward",
+          "matchers": [ { "type": "any" } ],
+          "actions": [
+            { "type": "log", "level": "info" },
+            { "type": "forward", "upstream": "10.0.0.53:53", "transport": "tcp" }
+          ],
+          "response_matchers": [
+            { "type": "upstream_equals", "value": "10.0.0.53:53" },
+            { "type": "response_rcode", "value": "NOERROR" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "large_tcp",
+      "rules": [
+        {
+          "name": "large_tcp_forward",
+          "matchers": [ { "type": "any" } ],
+          "actions": [
+            { "type": "log", "level": "info" },
+            { "type": "forward", "upstream": "114.114.114.114:53", "transport": "tcp" }
+          ],
+          "response_matchers": [
+            { "type": "response_rcode", "value": "NOERROR" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "regex_qclass_pipe",
+      "rules": [
+        {
+          "name": "regex_edns_forward",
+          "matchers": [
+            { "type": "edns_present", "expect": true }
+          ],
+          "actions": [
+            { "type": "forward", "upstream": "223.5.5.5:53", "transport": "udp" }
+          ],
+          "response_matchers": [
+            { "type": "request_domain_regex", "value": "(?i)\\.video\\." },
+            { "type": "response_qclass", "value": "IN" },
+            { "type": "response_edns_present", "expect": true },
+            { "type": "response_rcode", "value": "NOERROR" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "main_inbound",
+      "rules": [
+        {
+          "name": "block_malware",
+          "matchers": [
+            { "type": "domain_suffix", "value": ".bad.example" }
+          ],
+          "actions": [
+            { "type": "log", "level": "warn" },
+            { "type": "static_response", "rcode": "NXDOMAIN" }
+          ],
+          "response_matchers": []
+        },
+        {
+          "name": "internal_forward",
+          "matchers": [
+            { "type": "domain_suffix", "value": ".internal" },
+            { "type": "client_ip", "cidr": "10.0.0.0/8" }
+          ],
+          "actions": [
+            { "type": "log", "level": "info" },
+            { "type": "forward", "upstream": "10.0.0.53:53" }
+          ],
+          "response_matchers": [
+            { "type": "upstream_equals", "value": "10.0.0.53:53" },
+            { "type": "request_domain_suffix", "value": ".internal" },
+            { "type": "response_rcode", "value": "NOERROR" }
+          ]
+        },
+        {
+          "name": "default_forward",
+          "matchers": [ { "type": "any" } ],
+          "actions": [ { "type": "forward", "upstream": null, "transport": "udp" } ],
+          "response_matchers": [
+            { "type": "response_rcode", "value": "NOERROR" }
+          ]
+        }
+      ]
+    }
+  ]
+}

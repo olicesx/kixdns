@@ -38,7 +38,14 @@ impl DomainMatcher {
                 domain.eq_ignore_ascii_case(pattern)
             }
             DomainMatcher::Suffix(suffix) => {
-                domain.eq_ignore_ascii_case(suffix) || domain.ends_with(suffix)
+                // 移除前导点后再进行匹配，让 .github.com 也能匹配 github.com
+                // Remove leading dot for matching, so .github.com can match github.com
+                let suffix_clean = if suffix.starts_with('.') {
+                    &suffix[1..]
+                } else {
+                    suffix
+                };
+                domain.eq_ignore_ascii_case(suffix_clean) || domain.ends_with(suffix)
             }
             DomainMatcher::Keyword(keyword) => {
                 // 智能检查：先看是否需要转换 / Smart check: see if conversion is needed
@@ -200,10 +207,23 @@ impl GeoSiteManager {
             DomainMatcher::Suffix(s) => {
                 // 后缀匹配，不区分大小写 / Suffix match, case insensitive
                 // s 已经在加载时预小写 / s already lowercased during loading
-                // 先尝试不转换（快速路径） / Try without conversion first (fast path)
+                // 移除前导点后再进行匹配，让 .github.com 也能匹配 github.com
+                // Remove leading dot for matching, so .github.com can match github.com
+                let s_clean = if s.starts_with('.') {
+                    &s[1..]
+                } else {
+                    s
+                };
+
+                // 先尝试完全匹配（快速路径）/ Try exact match first (fast path)
+                if domain.eq_ignore_ascii_case(s_clean) {
+                    return true;
+                }
+                // 再尝试后缀匹配 / Then try suffix match
                 if domain.ends_with(s) {
                     return true;
                 }
+
                 // 兜底：转换后比较 / Fallback: compare after conversion
                 domain.to_ascii_lowercase().ends_with(s)
             }
