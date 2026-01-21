@@ -992,7 +992,7 @@ impl Engine {
                 response_actions_on_match: Vec::new(),
                 response_actions_on_miss: Vec::new(),
                 rule_name: Arc::from("default"),
-                transport: Transport::Udp,
+                transport: Some(Transport::Udp),
                 continue_on_match: false,
                 continue_on_miss: false,
                 allow_reuse: false,
@@ -1222,10 +1222,10 @@ impl Engine {
                         };
 
                         // RFC 1035: If TC bit is set, retry over TCP / 如果 TC 标志设置，使用 TCP 重试
-                        if truncated && transport == Transport::Udp {
+                        if truncated && transport == Some(Transport::Udp) {
                             tracing::debug!(event = "tc_flag_retry", upstream = %upstream, "response truncated, retrying with tcp");
                             drop(cleanup_guard);
-                            let tcp_resp = self.forward_upstream(packet, &upstream, upstream_timeout, Transport::Tcp, pre_split_upstreams.as_ref()).await?;
+                            let tcp_resp = self.forward_upstream(packet, &upstream, upstream_timeout, Some(Transport::Tcp), pre_split_upstreams.as_ref()).await?;
                             if let Some(_g) = self.inflight.get(&dedupe_hash) {
                                 self.notify_inflight_waiters(dedupe_hash, &tcp_resp).await;
                             }
@@ -1314,7 +1314,7 @@ impl Engine {
                             raw: raw.clone(),
                             msg,
                             upstream: upstream.clone(),  // upstream is already Arc<str>
-                            transport,
+                            transport: transport.unwrap_or(Transport::Udp),
                         };
                         let action_result = self
                             .apply_response_actions(
@@ -1698,42 +1698,82 @@ impl Engine {
                     .collect();
 
                 if forward_actions.len() > 1 {
-                    // 多个 forward action：收集所有 upstream 到单个 Forward decision / Multiple forward actions: collect all upstreams into single Forward decision
-                    let mut all_upstreams = String::new();
-                    // 合并所有 pre_split_upstreams / Merge all pre_split_upstreams
-                    let mut merged_pre_split: Vec<String> = Vec::new();
-                    for (idx, (upstream, _, pre_split)) in forward_actions.iter().enumerate() {
-                        if idx > 0 {
-                            all_upstreams.push(',');
-                        }
-                        if let Some(u) = upstream {
-                            all_upstreams.push_str(u);
-                            // 如果有预分割数据，合并它们 / If pre-split data exists, merge them
-                            if let Some(pre) = pre_split {
-                                merged_pre_split.extend(pre.iter().cloned());
-                            } else {
-                                // 否则分割字符串 / Otherwise split string
-                                merged_pre_split.extend(u.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+                    // 多个 forward action：按 transport 类型分别合并，并去重 / Multiple forward actions: merge by transport type with deduplication
+                    use std::collections::HashSet;
+
+                    let mut tcp_upstreams: HashSet<String> = HashSet::new();
+                    let mut udp_upstreams: HashSet<String> = HashSet::new();
+
+                    // 收集并按 transport 分组，同时去重
+                    for (upstream_opt, transport_opt, _pre_split) in forward_actions.iter() {
+                        if let Some(upstream) = upstream_opt {
+                            // 获取这个 action 的 transport
+                            let action_transport = transport_opt.unwrap_or(Transport::Udp);
+
+                            // 分割 upstream 字符串（可能包含逗号）
+                            for addr in upstream.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                                // 跳过已有协议前缀的地址
+                                if addr.contains("://") {
+                                    if addr.starts_with("tcp://") {
+                                        tcp_upstreams.insert(addr.to_string());
+                                    } else if addr.starts_with("udp://") {
+                                        udp_upstreams.insert(addr.to_string());
+                                    }
+                                } else {
+                                    // 添加协议前缀
+                                    match action_transport {
+                                        Transport::Tcp => {
+                                            tcp_upstreams.insert(format!("tcp://{}", addr));
+                                        }
+                                        Transport::Udp => {
+                                            udp_upstreams.insert(format!("udp://{}", addr));
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
 
-                    info!(
-                        event = "multiple_forward_actions",
-                        count = forward_actions.len(),
-                        merged_upstreams = %all_upstreams,
-                        "merged multiple forward actions into single concurrent forward"
-                    );
+                    // 合并所有 upstream（保留协议前缀）
+                    let mut all_upstreams = Vec::new();
+                    all_upstreams.extend(tcp_upstreams.iter().cloned());
+                    all_upstreams.extend(udp_upstreams.iter().cloned());
+
+                    if all_upstreams.is_empty() {
+                        // 所有 upstream 都为空，使用默认
+                        info!(
+                            event = "multiple_forward_actions",
+                            count = forward_actions.len(),
+                            "all forward actions have empty upstream, using default"
+                        );
+                    } else {
+                        info!(
+                            event = "multiple_forward_actions",
+                            count = forward_actions.len(),
+                            tcp_count = tcp_upstreams.len(),
+                            udp_count = udp_upstreams.len(),
+                            total_upstreams = all_upstreams.len(),
+                            tcp_upstreams = ?tcp_upstreams,
+                            udp_upstreams = ?udp_upstreams,
+                            "merged multiple forward actions with transport-specific deduplication"
+                        );
+                    }
+
+                    let merged_str = if all_upstreams.is_empty() {
+                        String::new()
+                    } else {
+                        all_upstreams.join(",")
+                    };
 
                     let d = Decision::Forward {
-                        upstream: Arc::from(all_upstreams.as_str()),
-                        pre_split_upstreams: if merged_pre_split.is_empty() { None } else { Some(std::sync::Arc::new(merged_pre_split)) },
+                        upstream: Arc::from(if merged_str.is_empty() { "" } else { merged_str.as_str() }),
+                        pre_split_upstreams: if all_upstreams.is_empty() { None } else { Some(std::sync::Arc::new(all_upstreams)) },
                         response_matchers: rule.response_matchers.clone(),
                         response_matcher_operator: rule.response_matcher_operator,
                         response_actions_on_match: rule.response_actions_on_match.clone(),
                         response_actions_on_miss: rule.response_actions_on_miss.clone(),
                         rule_name: rule.name.clone(),
-                        transport: forward_actions[0].1.unwrap_or(Transport::Udp), // 使用第一个的 transport / Use first action's transport
+                        transport: None, // 让每个 upstream 自己决定 transport / Let each upstream decide its own transport
                         continue_on_match: false,
                         continue_on_miss: false,
                         allow_reuse: false,
@@ -1793,7 +1833,7 @@ impl Engine {
                                 response_actions_on_match: Vec::new(),
                                 response_actions_on_miss: Vec::new(),
                                 rule_name: rule.name.clone(),
-                                transport: Transport::Udp,
+                                transport: Some(Transport::Udp),
                                 continue_on_match: false,
                                 continue_on_miss: false,
                                 allow_reuse: true,
@@ -1828,7 +1868,7 @@ impl Engine {
                                 response_actions_on_match: rule.response_actions_on_match.clone(),
                                 response_actions_on_miss: rule.response_actions_on_miss.clone(),
                                 rule_name: rule.name.clone(),
-                                transport: transport.unwrap_or(Transport::Udp),
+                                transport: Some(transport.unwrap_or(Transport::Udp)),
                                 continue_on_match,
                                 continue_on_miss,
                                 allow_reuse: false,
@@ -1862,7 +1902,7 @@ impl Engine {
             response_actions_on_match: Vec::new(),
             response_actions_on_miss: Vec::new(),
             rule_name: Arc::from("default"),
-            transport: Transport::Udp,
+            transport: Some(Transport::Udp),
             continue_on_match: false,
             continue_on_miss: false,
             allow_reuse: false,
@@ -1876,9 +1916,11 @@ impl Engine {
         packet: &[u8],
         upstream: &str,
         timeout_dur: Duration,
-        transport: Transport,
+        transport: Option<Transport>,
         pre_split_upstreams: Option<&std::sync::Arc<Vec<String>>>,
     ) -> anyhow::Result<Bytes> {
+        // 如果 transport 为 None，使用默认 UDP
+        let transport = transport.unwrap_or(Transport::Udp);
         // 使用预分割数据或动态分割 / Use pre-split data or dynamic splitting
         let upstreams: Vec<&str> = if let Some(pre_split) = pre_split_upstreams {
             pre_split.iter().map(|s| s.as_str()).collect()
@@ -2193,7 +2235,7 @@ impl Engine {
 
                 // 发送上游查询
                 // Send upstream query
-                match engine.forward_upstream(&req_bytes, &upstream_to_use, upstream_timeout, Transport::Udp, None).await {
+                match engine.forward_upstream(&req_bytes, &upstream_to_use, upstream_timeout, Some(Transport::Udp), None).await {
                     Ok(resp) => {
                         // 验证响应并更新缓存
                         // Verify response and update cache
@@ -2381,7 +2423,7 @@ impl Engine {
                     });
                     let use_transport = transport.unwrap_or(Transport::Udp);
                     let raw = match self
-                        .forward_upstream(packet, &upstream_addr, upstream_timeout, use_transport, pre_split_upstreams.as_ref())
+                        .forward_upstream(packet, &upstream_addr, upstream_timeout, Some(use_transport), pre_split_upstreams.as_ref())
                         .await
                     {
                         Ok(bytes) => bytes,
@@ -2736,7 +2778,7 @@ impl Engine {
                                 raw,
                                 msg,
                                 upstream: upstream.clone(),  // upstream is already Arc<str>
-                                transport,
+                                transport: transport.unwrap_or(Transport::Udp),
                             };
                             let action_result = self
                                 .apply_response_actions(
@@ -4279,7 +4321,7 @@ pub(crate) enum Decision {
         response_actions_on_match: Vec<Action>,
         response_actions_on_miss: Vec<Action>,
         rule_name: Arc<str>,
-        transport: Transport,
+        transport: Option<Transport>, // None 表示每个 upstream 自己决定（通过协议前缀）/ None means each upstream decides itself (via protocol prefix)
         #[allow(dead_code)]
         continue_on_match: bool,
         #[allow(dead_code)]
