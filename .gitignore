@@ -35,5 +35,4 @@ nul
 /test/
 /benches/
 /tests/
-src/integration_tests_new_matchers.rs
 test_parse_response_quick.rs
