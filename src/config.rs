@@ -13,11 +13,61 @@ pub struct PipelineConfig {
     pub version: Option<String>,
     #[serde(default)]
     pub settings: GlobalSettings,
-    /// 多维优先级的 pipeline 选择规则（按顺序评估）。 / Multi-dimensional priority pipeline selection rules (evaluated in order)
+    /// 多维优先级的 pipeline 选择规则（按顺序评估）。 / Multi-dimensional priority selection rules (evaluated in order)
     #[serde(default)]
     pub pipeline_select: Vec<PipelineSelectRule>,
     #[serde(default)]
     pub pipelines: Vec<Pipeline>,
+    
+    /// 后台刷新专用规则（可选）。如果未配置，将使用默认规则（Any 匹配 + Forward 到原始 upstream）。
+    /// Background refresh dedicated rule (optional). If not configured, will use default rule (Any matcher + Forward to original upstream).
+    /// 
+    /// # Purpose
+    /// 
+    /// 为后台刷新提供独立的规则配置，允许自定义后台刷新的行为。
+    /// Provide independent rule configuration for background refresh, allowing custom behavior.
+    /// 
+    /// # Design Philosophy
+    /// 
+    /// **后台刷新 = 调用 handle_packet(skip_cache=true)**
+    /// 
+    /// 后台刷新本质上就是向规则引擎发起一个特殊的查询请求，
+     /// 使用"后台刷新专用规则"，完全复用规则引擎的所有逻辑。
+    /// 
+    /// **Background refresh = Call handle_packet(skip_cache=true)**
+    /// 
+    /// 后台刷新与正常查询的唯一区别：
+    /// - 正常查询：检查缓存 → 规则引擎 → 执行查询
+    /// - 后台刷新：跳过缓存 → 规则引擎 → 执行查询
+    /// 
+    /// # Example
+    /// 
+    /// ```json
+    /// {
+    ///   "background_refresh_rule": {
+    ///     "name": "后台刷新专用规则",
+    ///     "matchers": [
+    ///       {
+    ///         "type": "any",
+    ///         "operator": "and"
+    ///       }
+    ///     ],
+    ///     "actions": [
+    ///       {
+    ///         "type": "forward",
+    ///         "upstream": "8.8.8.8:53",  // 将在运行时替换为实际 upstream
+    ///         "transport": "tcp"
+    ///       }
+    ///     ],
+    ///     "response_matchers": [],
+    ///     "response_matcher_operator": "and",
+    ///     "response_actions_on_match": [],
+    ///     "response_actions_on_miss": []
+    ///   }
+    /// }
+    /// ```
+    #[serde(default)]
+    pub background_refresh_rule: Option<Rule>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

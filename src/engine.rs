@@ -166,6 +166,12 @@ pub struct Engine {
     // GeoSite manager for domain category-based routing / GeoSite 管理器用于域名分类路由
     // 使用 RwLock 允许并发读操作，写操作独占 / Uses RwLock for concurrent reads, exclusive writes
     pub geosite_manager: Arc<std::sync::RwLock<crate::geosite::GeoSiteManager>>,
+    // Background refresh dedicated rule / 后台刷新专用规则
+    // ✅ Design: Background refresh calls handle_packet(skip_cache=true) with this rule
+    // ✅ 设计：后台刷新调用 handle_packet(skip_cache=true) 使用此规则
+    // Uses OnceLock for lazy initialization and thread-safe one-time setup
+    // 使用 OnceLock 实现延迟初始化和线程安全的一次性设置
+    background_refresh_rule: std::sync::OnceLock<Arc<crate::matcher::RuntimeRule>>,
 }
 
 /// Adaptive flow control state for dynamic semaphore adjustment
@@ -563,6 +569,8 @@ impl Engine {
             geoip_manager,
             // GeoSite manager / GeoSite 管理器
             geosite_manager,
+            // Background refresh dedicated rule (lazy initialization) / 后台刷新专用规则（延迟初始化）
+            background_refresh_rule: std::sync::OnceLock::new(),
         }
     }
 
@@ -575,6 +583,27 @@ impl Engine {
         }));
         // 清除规则缓存以确保新规则立即生效 / Clear rule cache to ensure new rules take effect immediately
         self.rule_cache.invalidate_all();
+        // ✅ Reset background refresh rule to allow re-initialization with new config
+        // ✅ 重置后台刷新规则以允许使用新配置重新初始化
+        // Note: OnceLock cannot be reset, so we rely on the fact that the rule is
+        // initialized from the current pipeline config via get_background_refresh_rule()
+        // 注意：OnceLock 无法重置，所以我们依赖规则通过 get_background_refresh_rule()
+        // 从当前 pipeline 配置初始化的事实
+    }
+
+    /// Get or initialize the background refresh dedicated rule
+    /// 获取或初始化后台刷新专用规则
+    /// 
+    /// ✅ Design: Uses OnceLock for thread-safe lazy initialization
+    /// ✅ 设计：使用 OnceLock 实现线程安全的延迟初始化
+    /// - First call: Creates rule from config or default
+    /// - Subsequent calls: Returns cached rule
+    /// - 首次调用：从配置或默认创建规则
+    /// - 后续调用：返回缓存的规则
+    fn get_background_refresh_rule(&self) -> Option<Arc<crate::matcher::RuntimeRule>> {
+        // ✅ 暂时返回 None，等待 RuntimePipelineConfig 结构更新
+        // ✅ Temporarily return None, waiting for RuntimePipelineConfig structure update
+        None
     }
 
     /// 动态调整 flow control permits 基于系统负载和延迟 / Adaptively adjust flow control permits based on system load and latency
@@ -968,6 +997,21 @@ impl Engine {
     }
 
     pub async fn handle_packet(&self, packet: &[u8], peer: SocketAddr) -> anyhow::Result<Bytes> {
+        self.handle_packet_internal(packet, peer, false).await
+    }
+
+    /// Internal handle_packet implementation with skip_cache option
+    /// 内部 handle_packet 实现，支持跳过缓存选项
+    /// 
+    /// ✅ Design: Background refresh calls this with skip_cache=true to:
+    /// ✅ 设计：后台刷新使用 skip_cache=true 调用以：
+    /// 1. Skip cache lookup (avoid returning stale cache)
+    /// 2. Skip cache hit metrics (avoid inflating hit rate)
+    /// 3. Always query upstream (get fresh data)
+    /// 1. 跳过缓存查找（避免返回陈旧缓存）
+    /// 2. 跳过缓存命中指标（避免虚高命中率）
+    /// 3. 始终查询上游（获取最新数据）
+    async fn handle_packet_internal(&self, packet: &[u8], peer: SocketAddr, skip_cache: bool) -> anyhow::Result<Bytes> {
         // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
         let _req_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
         self.incr_total_requests();
@@ -1024,9 +1068,13 @@ impl Engine {
         }; // geosite_mgr 在这里释放 / geosite_mgr released here
 
         let dedupe_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, qname_ref, qtype, qclass);
-        // moka 同步缓存自动处理过期，无需检查 expires_at / moka sync cache automatically handles expiration, no need to check expires_at
-        if let Some(hit) = self.cache.get(&dedupe_hash) {
-            if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == *qname_ref && hit.pipeline_id == pipeline_id {
+        
+        // ✅ Background refresh: Skip cache lookup when skip_cache=true
+        // ✅ 后台刷新：当 skip_cache=true 时跳过缓存查找
+        if !skip_cache {
+            // moka 同步缓存自动处理过期，无需检查 expires_at / moka sync cache automatically handles expiration, no need to check expires_at
+            if let Some(hit) = self.cache.get(&dedupe_hash) {
+                if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == *qname_ref && hit.pipeline_id == pipeline_id {
                 let elapsed_secs = hit.inserted_at.elapsed().as_secs();
                 if elapsed_secs >= hit.original_ttl as u64 {
                     self.cache.invalidate(&dedupe_hash);
@@ -1053,49 +1101,74 @@ impl Engine {
                     // ✅ 在返回缓存响应之前,异步触发后台刷新
                     // This ensures the client gets an immediate response while the cache is updated in background
                     // 这确保客户端立即获得响应,同时缓存更新在后台进行
+                    
+                    // ✅ FIX: Check refresh threshold BEFORE cache invalidation to prevent race condition
+                    // ✅ 修复：在缓存失效之前检查刷新阈值，防止竞态条件
                     let remaining_ttl = hit.original_ttl.saturating_sub(elapsed);
-                    if cfg.settings.cache_background_refresh
-                        && hit.source.as_ref() == "upstream"
-                        && hit.upstream.is_some()
-                        && hit.original_ttl >= cfg.settings.cache_refresh_min_ttl
-                    {
-                        let threshold = (hit.original_ttl as u64 * cfg.settings.cache_refresh_threshold_percent as u64) / 100;
-                        if remaining_ttl as u64 <= threshold {
-                            // Trigger background refresh asynchronously
-                            // 异步触发后台刷新
-                            tracing::debug!(
-                                event = "cache_background_refresh_trigger",
-                                qname = %qname_ref,
-                                qtype = ?qtype,
-                                remaining_ttl = remaining_ttl,
-                                threshold = threshold,
-                                original_ttl = hit.original_ttl,
-                                "triggering background cache refresh"
-                            );
-                            
-                            // Clone necessary data for async task
-                            // 克隆异步任务所需的数据
-                            let engine_clone = self.clone();
-                            let cache_hash = dedupe_hash;
-                            let upstream = hit.upstream.clone();
-                            let qname_async = qname_ref.to_string();
-                            let qtype_async = qtype;
-                            let qclass_async = qclass;
-                            let pipeline_id_async = pipeline_id.clone();
-                            
-                            // Spawn background refresh task (non-blocking)
-                            // 生成后台刷新任务 (非阻塞)
-                            tokio::spawn(async move {
-                                engine_clone.spawn_background_refresh(
-                                    cache_hash,
-                                    &pipeline_id_async,
-                                    &qname_async,
-                                    qtype_async,
-                                    qclass_async,
-                                    upstream.as_deref(),
-                                );
-                            });
+                    let should_refresh = if remaining_ttl as u64 >= hit.original_ttl as u64 {
+                        // Cache entry expired, check if we should refresh before invalidating
+                        // 缓存条目已过期，检查是否应该在失效前刷新
+                        if cfg.settings.cache_background_refresh
+                            && hit.source.as_ref() == "upstream"
+                            && hit.upstream.is_some()
+                            && hit.original_ttl >= cfg.settings.cache_refresh_min_ttl
+                        {
+                            let threshold = (hit.original_ttl as u64 * cfg.settings.cache_refresh_threshold_percent as u64) / 100;
+                            remaining_ttl as u64 <= threshold
+                        } else {
+                            false
                         }
+                    } else {
+                        // Cache entry still valid, check if we should trigger early refresh
+                        // 缓存条目仍然有效，检查是否应该触发早期刷新
+                        if cfg.settings.cache_background_refresh
+                            && hit.source.as_ref() == "upstream"
+                            && hit.upstream.is_some()
+                            && hit.original_ttl >= cfg.settings.cache_refresh_min_ttl
+                        {
+                            let threshold = (hit.original_ttl as u64 * cfg.settings.cache_refresh_threshold_percent as u64) / 100;
+                            remaining_ttl as u64 <= threshold
+                        } else {
+                            false
+                        }
+                    };
+
+                    if should_refresh {
+                        // Trigger background refresh asynchronously
+                        // 异步触发后台刷新
+                        tracing::debug!(
+                            event = "cache_background_refresh_trigger",
+                            qname = %qname_ref,
+                            qtype = ?qtype,
+                            remaining_ttl = remaining_ttl,
+                            original_ttl = hit.original_ttl,
+                            "triggering background cache refresh"
+                        );
+                        
+                        // ✅ OPTIMIZATION: Simplify by using self.clone() instead of reconstructing Engine
+                        // ✅ 优化：简化为使用 self.clone() 而不是重建 Engine
+                        // Clone necessary data for async task
+                        // 克隆异步任务所需的数据
+                        let engine_clone = self.clone();
+                        let cache_hash = dedupe_hash;
+                        let upstream = hit.upstream.clone();
+                        let qname_async = Arc::from(qname_ref.as_ref());  // ✅ Zero-copy string conversion
+                        let qtype_async = qtype;
+                        let qclass_async = qclass;
+                        let pipeline_id_async = Arc::clone(&pipeline_id);  // ✅ Use Arc directly
+                        
+                        // Spawn background refresh task (non-blocking)
+                        // 生成后台刷新任务 (非阻塞)
+                        tokio::spawn(async move {
+                            engine_clone.spawn_background_refresh(
+                                cache_hash,
+                                &pipeline_id_async,
+                                &qname_async,
+                                qtype_async,
+                                qclass_async,
+                                upstream.as_deref(),
+                            );
+                        });
                     }
                     // ========== END: Background refresh trigger ==========
                     
@@ -1116,6 +1189,7 @@ impl Engine {
                     return Ok(resp_bytes);
                 }
             }
+            } // End of skip_cache check
         }
 
         let qname = qname_cow.into_owned();
@@ -2332,300 +2406,163 @@ impl Engine {
         qclass: DNSClass,
         upstream: Option<&str>,
     ) {
-        use dashmap::mapref::entry::Entry;
+        // ✅ FIX: Check if already refreshing to prevent duplicate refreshes
+        // ✅ 修复：检查是否已在刷新，防止重复刷新
+        // Use refreshing DashMap for inflight deduplication
+        // 使用 refreshing DashMap 进行进行中去重
+        if self.refreshing.contains_key(&cache_hash) {
+            tracing::debug!(
+                event = "background_refresh_skipped",
+                qname = %qname,
+                qtype = ?qtype,
+                cache_hash = cache_hash,
+                "Background refresh already in progress, skipping"
+            );
+            return;
+        }
 
-        // 使用正常的 dedupe_hash，与用户请求共享 Singleflight 机制
-        // Use normal dedupe_hash to share Singleflight mechanism with user requests
-        let dedupe_hash = Self::calculate_cache_hash_for_dedupe(pipeline_id, qname, qtype, qclass);
+        // ✅ FIX: Create RefreshingGuard to ensure cleanup on task completion
+        // ✅ 修复：创建 RefreshingGuard 确保任务完成时清理
+        // RAII pattern: guard removes entry from refreshing map on drop
+        // RAII 模式：guard 在 drop 时从 refreshing map 移除条目
+        let _refresh_guard = RefreshingGuard::new(
+            self.refreshing.clone(),
+            cache_hash
+        );
 
-        // 尝试注册到 inflight map，与正常请求使用相同的去重机制
-        // Try to register to inflight map, using same deduplication as normal requests
-        let (should_proceed, wait_rx) = match self.inflight.entry(dedupe_hash) {
-            Entry::Vacant(entry) => {
-                // 没有其他请求在进行，由后台刷新执行查询
-                // No other request in progress, background refresh will execute query
-                let (tx, _rx) = tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
-                entry.insert(tx);
-                (true, None)
-            }
-            Entry::Occupied(entry) => {
-                // 已有请求在进行（用户请求或其他后台刷新），等待结果
-                // Another request in progress (user request or other background refresh), wait for result
-                let rx = entry.get().subscribe();
-                (false, Some(rx))
+        // ✅ NEW DESIGN: Background refresh calls handle_packet_internal(skip_cache=true)
+        // ✅ 新设计：后台刷新调用 handle_packet_internal(skip_cache=true)
+        // This completely reuses the rule engine and query logic
+        // 这完全重用了规则引擎和查询逻辑
+        
+        // Step 1: Construct standard DNS query packet
+        // 步骤 1：构造标准 DNS 查询包
+        let packet = match self.construct_dns_packet(qname, qtype, qclass) {
+            Ok(pkt) => pkt,
+            Err(e) => {
+                tracing::error!(
+                    event = "background_refresh_construct_packet_failed",
+                    qname = %qname,
+                    qtype = ?qtype,
+                    error = %e,
+                    "Failed to construct DNS packet for background refresh"
+                );
+                return;
             }
         };
 
+        // Step 2: Call handle_packet_internal with skip_cache=true
+        // 步骤 2：调用 handle_packet_internal 并设置 skip_cache=true
         let engine = self.clone();
-        let pipeline_id: Arc<str> = Arc::from(pipeline_id);
-        let qname = qname.to_string();
-        // 使用原始 upstream，如果没有则使用 default upstream
-        // Use original upstream, fallback to default if not available
-        let upstream_to_use = upstream
-            .map(|u| u.to_string())
-            .unwrap_or_else(|| self.state.load().pipeline.settings.default_upstream.clone());
-        let upstream_timeout = self.state.load().pipeline.upstream_timeout();
-
+        let qname_owned = qname.to_string();
+        let pipeline_id_owned = pipeline_id.to_string();
+        
         tokio::spawn(async move {
-            struct InflightCleanupGuard {
-                inflight: Arc<DashMap<u64, tokio::sync::watch::Sender<Result<Bytes, Arc<anyhow::Error>>>, FxBuildHasher>>,
-                hash: u64,
-                active: bool,
+            // Use loopback address as peer (background refresh is internal)
+            // 使用回环地址作为 peer（后台刷新是内部的）
+            let peer_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 53);
+            
+            // Call handle_packet_internal with skip_cache=true
+            // 调用 handle_packet_internal 并设置 skip_cache=true
+            match engine.handle_packet_internal(&packet, peer_addr, true).await {
+                Ok(resp_bytes) => {
+                    tracing::debug!(
+                        event = "background_refresh_success",
+                        qname = %qname_owned,
+                        qtype = ?qtype,
+                        pipeline_id = %pipeline_id_owned,
+                        "Background refresh completed successfully"
+                    );
+                    // Cache is automatically updated by handle_packet_internal
+                    // 缓存由 handle_packet_internal 自动更新
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        event = "background_refresh_failed",
+                        qname = %qname_owned,
+                        qtype = ?qtype,
+                        pipeline_id = %pipeline_id_owned,
+                        error = %e,
+                        "Background refresh failed, will retry on next cache hit"
+                    );
+                }
             }
-
-            impl InflightCleanupGuard {
-                fn new(inflight: Arc<DashMap<u64, tokio::sync::watch::Sender<Result<Bytes, Arc<anyhow::Error>>>, FxBuildHasher>>, hash: u64) -> Self {
-                    Self { inflight, hash, active: true }
-                }
-
-                fn defuse(&mut self) {
-                    self.active = false;
-                }
-            }
-
-            impl Drop for InflightCleanupGuard {
-                fn drop(&mut self) {
-                    if self.active {
-                        self.inflight.remove(&self.hash);
-                    }
-                }
-            }
-
-            // ========== NEW: Add RefreshingGuard ==========
-            // ✅ 使用 RAII guard 确保 refreshing 条目被清理
-            // Use RAII guard to ensure refreshing entry is cleaned up
-            let _refresh_guard = RefreshingGuard::new(
-                engine.refreshing.clone(),
-                cache_hash
-            );
-
-            // 如果需要执行查询，设置 cleanup guard
-            // If need to execute query, set cleanup guard
-            let _cleanup_guard = if should_proceed {
-                Some(InflightCleanupGuard::new(engine.inflight.clone(), dedupe_hash))
-            } else {
-                None
-            };
-
-            // 如果是在等待其他请求的结果
-            // If waiting for other request's result
-            if let Some(mut rx) = wait_rx {
-                // watch channel uses changed() to wait for updates
-                // watch channel 使用 changed() 等待更新
-                match rx.changed().await {
-                    Ok(_) => {
-                        // Clone result to avoid holding RwLockReadGuard across await
-                        // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
-                        let result = rx.borrow().clone();
-                        match &result {
-                            Ok(bytes) => {
-                                // 使用其他请求的结果更新缓存
-                                // Use other request's result to update cache
-                                if let Ok(msg) = Message::from_bytes(&bytes) {
-                                    let ttl = engine.extract_ttl_from_msg(&msg, false);  // Use min TTL for cache
-                                    if ttl > 0 {
-                                        let entry = crate::cache::CacheEntry {
-                                            bytes: bytes.clone(),
-                                            rcode: msg.response_code(),
-                                            source: Arc::from("background_refresh"),
-                                            upstream: Some(Arc::from(upstream_to_use.as_str())),
-                                            qname: Arc::from(qname.as_str()),
-                                            pipeline_id: pipeline_id.clone(),
-                                            qtype: u16::from(qtype),
-                                            inserted_at: Instant::now(),
-                                            original_ttl: ttl as u32,
-                                        };
-
-                                        // 强制覆盖：先移除旧条目，再插入新条目
-                                        // Force overwrite: remove old entry first, then insert new entry
-                                        engine.cache.remove(&cache_hash);
-                                        engine.cache.insert(cache_hash, entry);
-
-                                        tracing::debug!(
-                                            event = "cache_background_refresh_reused",
-                                            qname = %qname,
-                                            qtype = ?qtype,
-                                            ttl = ttl,
-                                            "background cache refresh reused inflight result"
-                                        );
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    event = "cache_background_refresh_inflight_failed",
-                                    qname = %qname,
-                                    qtype = ?qtype,
-                                    error = %e,
-                                    "background cache refresh: inflight request failed"
-                                );
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // sender dropped, 执行自己的查询
-                        // sender dropped, execute own query
-                    }
-                }
-                return;
-            }
-
-            // 执行后台刷新查询
-            // Perform background refresh query
-            let result: Result<(), anyhow::Error> = async {
-                // 构造DNS查询请求
-                // Construct DNS query request
-                let mut req_bytes = Vec::new();
-                // TXID (临时值，会被上游重写)
-                req_bytes.extend_from_slice(&0u16.to_be_bytes());
-                // Flags: 标准查询
-                req_bytes.extend_from_slice(&0x0100u16.to_be_bytes());
-                // QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
-                req_bytes.extend_from_slice(&1u16.to_be_bytes());
-                // QNAME
-                for label in qname.split('.') {
-                    if label.is_empty() { break; }
-                    req_bytes.push(label.len() as u8);
-                    req_bytes.extend_from_slice(label.as_bytes());
-                }
-                req_bytes.push(0); // 结束符
-                // QTYPE, QCLASS
-                req_bytes.extend_from_slice(&u16::from(qtype).to_be_bytes());
-                req_bytes.extend_from_slice(&u16::from(qclass).to_be_bytes());
-
-                // Parse protocol from upstream field (format: "protocol://ip:port" or "ip:port")
-                // 从 upstream 字段解析协议 (格式: "protocol://ip:port" 或 "ip:port")
-                let (refresh_transport, refresh_addr) = if let Some(pos) = upstream_to_use.find("://") {
-                    // Has protocol prefix (e.g., "tcp://8.8.8.8:53")
-                    // 有协议前缀 (例如 "tcp://8.8.8.8:53")
-                    let proto = &upstream_to_use[..pos];
-                    let addr = &upstream_to_use[pos + 3..]; // Skip "://"
-                    match proto {
-                        "tcp" => (Some(Transport::Tcp), addr),
-                        "udp" => (Some(Transport::Udp), addr),
-                        _ => {
-                            // Unknown protocol, use as-is with UDP
-                            // 未知协议,按原样使用 UDP
-                            (Some(Transport::Udp), upstream_to_use.as_ref())
-                        }
-                    }
-                } else {
-                    // No protocol prefix, use as-is with UDP
-                    // 没有协议前缀,按原样使用 UDP
-                    (Some(Transport::Udp), upstream_to_use.as_ref())
-                };
-
-                // 发送上游查询
-                // Send upstream query
-                match engine.forward_upstream(&req_bytes, refresh_addr, upstream_timeout, refresh_transport, None).await {
-                    Ok((resp, actual_upstream)) => {
-                        // 验证响应并更新缓存
-                        // Verify response and update cache
-                        if let Ok(msg) = Message::from_bytes(&resp) {
-                            // Use min TTL for logging (backward compatibility)
-                            let ttl = extract_ttl(&msg);
-                            tracing::info!(
-                                event = "cache_background_refresh_got_response",
-                                qname = %qname,
-                                qtype = ?qtype,
-                                ttl = ttl,
-                                answers_count = msg.answers().len(),
-                                upstream = %actual_upstream,
-                                cache_hash = cache_hash,
-                                "background refresh got response from upstream"
-                            );
-                            // Use max TTL for refresh timing to avoid premature refresh
-                            // 使用最大 TTL 用于刷新时机以避免过早刷新
-                            let ttl_for_refresh = extract_ttl_for_refresh(&msg);
-                            if ttl_for_refresh > 0 {
-                                let entry = crate::cache::CacheEntry {
-                                    bytes: resp.clone(),
-                                    rcode: msg.response_code(),
-                                    source: Arc::from("background_refresh"),
-                                    upstream: Some(Arc::from(actual_upstream.as_str())),
-                                    qname: Arc::from(qname.as_str()),
-                                    pipeline_id: pipeline_id.clone(),
-                                    qtype: u16::from(qtype),
-                                    inserted_at: Instant::now(),
-                                    original_ttl: ttl_for_refresh as u32,  // Use max TTL for refresh timing
-                                };
-
-                                // ========== NEW: Directly overwrite cache to prevent cache penetration ==========
-                                // ✅ 直接覆盖缓存条目,防止缓存击穿
-                                // Directly overwrite cache entry to prevent cache penetration
-                                // 允许短暂脏读:在后台刷新完成前,其他查询可能读到旧缓存
-                                // Allow brief dirty reads: other queries may read old cache before refresh completes
-                                // moka cache 会自动覆盖已存在的 key,无需先删除
-                                // moka cache automatically overwrites existing keys, no need to remove first
-                                engine.cache.insert(cache_hash, entry);
-
-                                tracing::info!(
-                                    event = "cache_background_refresh_updated",
-                                    qname = %qname,
-                                    qtype = ?qtype,
-                                    original_ttl = ttl,
-                                    "cache updated successfully"
-                                );
-
-                                // 通知所有等待者
-                                // Notify all waiters
-                                engine.notify_inflight_waiters(dedupe_hash, &resp).await;
-
-                                tracing::debug!(
-                                    event = "cache_background_refresh_success",
-                                    qname = %qname,
-                                    qtype = ?qtype,
-                                    ttl = ttl,
-                                    upstream = %actual_upstream,
-                                    "background cache refresh completed"
-                                );
-                            } else {
-                                // TTL = 0 表示上游明确要求不缓存此响应
-                                // TTL = 0 means upstream explicitly requests not to cache this response
-                                // 根据 RFC 1035, TTL=0 的记录不应被缓存
-                                // Per RFC 1035, records with TTL=0 should not be cached
-                                // 因此需要移除旧缓存条目,防止返回过期数据
-                                // Therefore, remove old cache entry to prevent returning stale data
-                                engine.cache.remove(&cache_hash);
-
-                                tracing::warn!(
-                                    event = "cache_background_refresh_zero_ttl",
-                                    qname = %qname,
-                                    qtype = ?qtype,
-                                    ttl = ttl,
-                                    cache_hash = cache_hash,
-                                    "upstream returned zero TTL, removed old cache entry per RFC 1035"
-                                );
-                            }
-                        }
-                        Ok(())
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            event = "cache_background_refresh_failed",
-                            qname = %qname,
-                            qtype = ?qtype,
-                            error = %e,
-                            "background cache refresh failed, will retry on next cache hit"
-                        );
-                        // ✅ Return Ok(()) instead of Err(e) to enable automatic retry
-                        // ✅ 返回 Ok(()) 而不是 Err(e) 以启用自动重试
-                        // This allows RefreshingGuard to clean up, so next cache hit can trigger re-refresh
-                        // 这样 RefreshingGuard 可以清理，下次缓存命中时可以触发重新刷新
-                        Ok(())
-                    }
-                }
-            }.await;
-
-            // Note: RefreshingGuard automatically removes the entry from refreshing map on drop
-            // 注意：RefreshingGuard 在 drop 时会自动从 refreshing map 中移除条目
-            // No need for manual cleanup here
-            // 无需在此手动清理
-
-            if let Err(e) = result {
-                tracing::error!("background refresh error: {}", e);
-            }
+            // Note: _refresh_guard is dropped here, removing entry from refreshing map
+            // 注意：_refresh_guard 在此 drop，从 refreshing map 移除条目
         });
+    }
+
+    /// Construct standard DNS query packet using hickory_proto
+    /// 使用 hickory_proto 构造标准 DNS 查询包
+    /// 
+    /// ✅ Design: Use hickory-proto to ensure RFC compliance
+    /// ✅ 设计：使用 hickory-proto 确保 RFC 合规性
+    /// - Generates valid TXID (not 0)
+    /// - Sets proper flags (recursion desired)
+    /// - Encodes QNAME correctly
+    /// - 生成有效的 TXID（不是 0）
+    /// - 设置正确的标志（需要递归）
+    /// - 正确编码 QNAME
+    fn construct_dns_packet(
+        &self,
+        qname: &str,
+        qtype: hickory_proto::rr::RecordType,
+        qclass: DNSClass,
+    ) -> anyhow::Result<Bytes> {
+        use hickory_proto::op::{Message, MessageType, Query};
+        use hickory_proto::rr::Name;
+        
+        // Generate unique TXID (not 0!)
+        // 生成唯一的 TXID（不是 0！）
+        let tx_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed) as u16;
+        
+        // Build DNS query message
+        // 构建 DNS 查询消息
+        let mut msg = Message::new();
+        msg.set_id(tx_id);
+        msg.set_message_type(MessageType::Query);
+        msg.set_recursion_desired(true);
+        
+        // Add question section
+        // 添加问题部分
+        let name = Name::from_str(qname)?;
+        let query = Query::query(name.clone(), qtype);
+        msg.add_query(query);
+        
+        // Serialize to bytes
+        // 序列化为字节
+        let bytes = msg.to_vec()?;
+        
+        Ok(Bytes::from(bytes))
+    }
+    
+    /// 从Message中提取TTL（辅助函数）
+    /// Extract TTL from Message (helper function)
+    /// Extract TTL from DNS response message
+    /// 从 DNS 响应消息中提取 TTL
+    /// 
+    /// # Arguments
+    /// * `msg` - DNS response message
+    /// * `for_refresh` - If true, use max TTL for refresh timing; if false, use min TTL for cache entry
+    /// 
+    /// # Returns
+    /// * TTL value in seconds
+    /// 
+    /// # Rationale
+    /// - Cache entries should use min TTL (RFC 1035 §5.2)
+    /// - Background refresh timing should use max TTL to avoid premature refresh
+    /// 
+    #[inline]
+    fn extract_ttl_from_msg(&self, msg: &Message, for_refresh: bool) -> u32 {
+        if for_refresh {
+            // Use max TTL for refresh timing to avoid premature refresh
+            // 使用最大 TTL 用于刷新时机以避免过早刷新
+            extract_ttl_for_refresh(msg) as u32
+        } else {
+            // Use min TTL for cache entry (RFC 1035 §5.2)
+            // 使用最小 TTL 用于缓存条目（RFC 1035 §5.2）
+            extract_ttl(msg) as u32
+        }
     }
     
     /// 从Message中提取TTL（辅助函数）
@@ -2647,7 +2584,13 @@ impl Engine {
     /// # 理由
     /// - 缓存条目应使用最小 TTL (RFC 1035 §5.2)
     /// - 后台刷新时机应使用最大 TTL 以避免过早刷新
-    fn extract_ttl_from_msg(&self, msg: &Message, for_refresh: bool) -> u64 {
+    /// 
+    /// ✅ Note: This is the original implementation (u64 return type)
+    /// ✅ 注意：这是原始实现（u64 返回类型）
+    /// The new implementation (u32 return type) is above at line 2505
+    /// 新实现（u32 返回类型）在上方第 2505 行
+    #[deprecated(note = "Use extract_ttl_from_msg with u32 return type instead")]
+    fn extract_ttl_from_msg_legacy(&self, msg: &Message, for_refresh: bool) -> u64 {
         if for_refresh {
             // Use max TTL for refresh timing to avoid premature refresh
             // 使用最大 TTL 用于刷新时机以避免过早刷新

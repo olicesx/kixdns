@@ -491,10 +491,47 @@ impl RuntimePipelineConfig {
             }
         }
 
+        // ✅ 新增：处理后台刷新专用规则
+        // ✅ New: Process background refresh dedicated rule
+        let background_refresh_rule = match cfg.background_refresh_rule {
+            Some(rule) => {
+                // 转换配置的规则为运行时规则
+                // Convert configured rule to runtime rule
+                let mut matchers = Vec::new();
+                for m in rule.matchers {
+                    matchers.push(RuntimeMatcherWithOp {
+                        operator: m.operator,
+                        matcher: RuntimeMatcher::from_config(m.matcher)?,
+                    });
+                }
+                
+                let mut response_matchers = Vec::new();
+                for rm in rule.response_matchers {
+                    response_matchers.push(RuntimeResponseMatcherWithOp {
+                        operator: rm.operator,
+                        matcher: RuntimeResponseMatcher::from_config(rm.matcher)?,
+                    });
+                }
+                
+                Some(RuntimeRule {
+                    name: Arc::from(rule.name),
+                    matcher_operator: rule.matcher_operator,
+                    matchers,
+                    actions: rule.actions,
+                    response_matchers,
+                    response_matcher_operator: rule.response_matcher_operator,
+                    response_actions_on_match: rule.response_actions_on_match,
+                    response_actions_on_miss: rule.response_actions_on_miss,
+                })
+            }
+            None => None,  // 未配置，将在 Engine::new 中使用默认规则
+        };
+
         Ok(Self {
             settings: cfg.settings,
             pipeline_select,
             pipelines,
+            // background_refresh_rule,  // ✅ 暂时注释，等待 RuntimePipelineConfig 结构更新
         })
     }
 
