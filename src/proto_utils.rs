@@ -1,9 +1,9 @@
-use std::borrow::Cow;
+use std::hash::Hasher;
 
-/// 快速解析结果，尽可能零拷贝 / Quick parse result with zero-copy where possible
+/// 快速解析结果，零拷贝实现 / Quick parse result with zero-copy implementation
 pub struct QuickQuery<'a> {
     pub tx_id: u16,
-    pub qname: Cow<'a, str>,
+    pub qname_bytes: &'a [u8],  // 零拷贝：直接引用已小写化的缓冲区
     pub qtype: u16,
     pub qclass: u16,
     pub edns_present: bool,
@@ -171,16 +171,14 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
         }
     }
 
-    // Return slice of buf as string
+    // Return slice of buf as zero-copy reference
     // RFC 1035-compliant: DNS labels are octet strings, not necessarily valid UTF-8.
-    // We use from_utf8_lossy to avoid rejecting non-UTF-8 labels while maintaining
-    // case-insensitive ASCII comparison behavior. Invalid UTF-8 bytes are replaced
-    // with the Unicode replacement character (U+FFFD).
-    let qname = String::from_utf8_lossy(&buf[..buf_pos]);
-
+    // We use the byte slice directly to avoid allocation while maintaining
+    // case-insensitive ASCII comparison behavior through helper methods.
+    // The buf already contains the lowercased domain name from the parsing loop above.
     Some(QuickQuery {
         tx_id,
-        qname,
+        qname_bytes: &buf[..buf_pos],  // 零拷贝：直接引用已小写化的缓冲区
         qtype,
         qclass,
         edns_present,
@@ -205,6 +203,53 @@ fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
             return Some(pos + 2);
         }
         pos += 1 + len as usize;
+    }
+}
+
+impl QuickQuery<'_> {
+    /// 检查 qname 是否匹配指定的域名（忽略大小写）
+    /// Check if qname matches the specified domain name (case-insensitive)
+    /// 
+    /// # Examples
+    /// ```
+    /// # use kixdns::proto_utils::QuickQuery;
+    /// let query = QuickQuery { qname_bytes: b"google.com", ... };
+    /// assert!(query.qname_matches("google.com"));  // 完全匹配
+    /// assert!(query.qname_matches("GOOGLE.COM"));  // 大写匹配
+    /// assert!(!query.qname_matches("example.com"));  // 不匹配
+    /// ```
+    pub fn qname_matches(&self, pattern: &str) -> bool {
+        self.qname_bytes.eq_ignore_ascii_case(pattern.as_bytes())
+    }
+
+    /// 获取 qname 的字符串表示（用于调试和日志）
+    /// Get string representation of qname (for debugging and logging)
+    /// 
+    /// # Examples
+    /// ```
+    /// # use kixdns::proto_utils::QuickQuery;
+    /// let query = QuickQuery { qname_bytes: b"google.com", ... };
+    /// println!("qname: {}", query.qname_str());  // "google.com"
+    /// ```
+    pub fn qname_str(&self) -> String {
+        String::from_utf8_lossy(self.qname_bytes).into_owned()
+    }
+
+    /// 获取 qname 的哈希值（用于缓存键计算）
+    /// Get hash value of qname (for cache key calculation)
+    /// 
+    /// # Examples
+    /// ```
+    /// # use kixdns::proto_utils::QuickQuery;
+    /// let query = QuickQuery { qname_bytes: b"google.com", ... };
+    /// let hash = query.qname_hash();
+    /// ```
+    pub fn qname_hash(&self) -> u64 {
+        let mut h = rustc_hash::FxHasher::default();
+        for &b in self.qname_bytes {
+            h.write_u8(b);
+        }
+        h.finish()
     }
 }
 

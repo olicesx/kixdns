@@ -704,12 +704,13 @@ impl Engine {
     }
 
     #[inline]
-    pub fn calculate_cache_hash_for_dedupe(pipeline_id: &str, qname: &str, qtype: hickory_proto::rr::RecordType, qclass: hickory_proto::rr::DNSClass) -> u64 {
+    pub fn calculate_cache_hash_for_dedupe(pipeline_id: &str, qname: &[u8], qtype: hickory_proto::rr::RecordType, qclass: hickory_proto::rr::DNSClass) -> u64 {
         let mut h = FxHasher::default();
         pipeline_id.hash(&mut h);
         // Hash qname case-insensitively without allocation / 不分配内存地进行不区分大小写的 qname 哈希
-        for b in qname.as_bytes() {
-            h.write_u8(b.to_ascii_lowercase());
+        // qname is already lowercased from parse_quick() / qname 已经在 parse_quick() 中转为小写
+        for b in qname {
+            h.write_u8(*b);
         }
         // RecordType implements Copy+Debug, hash by its u16 representation / RecordType 实现了 Copy+Debug，使用其 u16 表示进行哈希
         u16::from(qtype).hash(&mut h);
@@ -794,9 +795,11 @@ impl Engine {
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
         // GeoSiteManager 使用 FxHashMap + RwLock 保护，无需额外锁
         // GeoSiteManager uses FxHashMap protected by RwLock, no additional locks needed
+        // Convert qname_bytes to str for select_pipeline / 将 qname_bytes 转换为 str 供 select_pipeline 使用
+        let qname_str = std::str::from_utf8(q.qname_bytes).unwrap_or("");
         let (pipeline_opt, pipeline_id) = select_pipeline(
             cfg,
-            q.qname.as_ref(),
+            qname_str,
             peer.ip(),
             qclass,
             q.edns_present,
@@ -808,11 +811,11 @@ impl Engine {
         
         // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
-        let cache_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, q.qname.as_ref(), qtype, qclass);
+        let cache_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, q.qname_bytes, qtype, qclass);
         
         if let Some(hit) = self.cache.get(&cache_hash) {
             // Verify collision / 验证冲突
-            if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == q.qname.as_ref() && hit.pipeline_id == pipeline_id {
+            if hit.qtype == u16::from(qtype) && q.qname_matches(hit.qname.as_ref()) && hit.pipeline_id == pipeline_id {
                 // Check if expired / 检查是否已过期
                 let elapsed_secs = hit.inserted_at.elapsed().as_secs() as u32;
                 if elapsed_secs >= hit.original_ttl {
@@ -845,7 +848,7 @@ impl Engine {
                             is_refreshing = is_refreshing,
                             should_trigger = !is_refreshing && remaining_ttl as u64 <= threshold,
                             upstream = ?hit.upstream,
-                            qname = %q.qname.as_ref(),
+                            qname = %q.qname_str(),
                             "cache background refresh check"
                         );
 
@@ -854,8 +857,9 @@ impl Engine {
                             // Trigger background refresh (async, don't block current request)
                             // Note: RefreshingGuard inside spawn_background_refresh will handle insertion
                             // 注意：spawn_background_refresh 内部的 RefreshingGuard 将处理插入
+                            let qname_str = q.qname_str();
                             tracing::debug!(
-                                qname = %q.qname.as_ref(),
+                                qname = %qname_str,
                                 original_ttl = hit.original_ttl,
                                 remaining_ttl = remaining_ttl,
                                 "triggering background cache refresh"
@@ -863,7 +867,7 @@ impl Engine {
                             self.spawn_background_refresh(
                                 cache_hash,
                                 &pipeline_id,
-                                q.qname.as_ref(),
+                                &qname_str,
                                 qtype,
                                 qclass,
                                 hit.upstream.as_deref(),
@@ -888,9 +892,10 @@ impl Engine {
         // 2. Compiled rule fast-path for static decisions / 2. 编译规则的静态决策快速路径
         if let Some(compiled) = self.compiled_for(&state, &pipeline_id) {
             let qclass = DNSClass::from(q.qclass);
+            let qname_str = std::str::from_utf8(q.qname_bytes).unwrap_or("");
             if let Some(decision) = fast_static_match(
                 &compiled,
-                q.qname.as_ref(),
+                qname_str,
                 qtype,
                 qclass,
                 peer.ip(),
@@ -899,7 +904,7 @@ impl Engine {
                 if let Decision::Static { rcode, answers } = decision {
                     let resp = build_fast_static_response(
                         q.tx_id,
-                        q.qname.as_ref(),
+                        qname_str,
                         q.qtype,
                         q.qclass,
                         rcode,
@@ -917,7 +922,7 @@ impl Engine {
             // 优化：仅当规则使用client_ip匹配器或配置要求时才包含IP在哈希中
             // Optimization: only include IP in hash when rule uses client_ip matcher or config requires it
             let include_ip_in_hash = p.uses_client_ip || self.cache_background_refresh;
-            let rule_hash = calculate_rule_hash(&pipeline_id, q.qname.as_ref(), peer.ip(), include_ip_in_hash);
+            let rule_hash = calculate_rule_hash(&pipeline_id, qname_str, peer.ip(), include_ip_in_hash);
             if let Some(entry) = self.rule_cache.get(&rule_hash) {
                 // Check if entry is valid before using
                 // 在使用前检查条目是否有效
@@ -925,11 +930,11 @@ impl Engine {
                     // Remove expired entry
                     // 删除过期条目
                     self.rule_cache.remove(&rule_hash);
-                } else if entry.matches(&pipeline_id, q.qname.as_ref(), peer.ip(), include_ip_in_hash) {
+                } else if entry.matches(&pipeline_id, qname_str, peer.ip(), include_ip_in_hash) {
                     if let Decision::Static { rcode, answers } = entry.decision.as_ref() {
                         let resp = build_fast_static_response(
                             q.tx_id,
-                            q.qname.as_ref(),
+                            qname_str,
                             q.qtype,
                             q.qclass,
                             *rcode,
@@ -1039,7 +1044,9 @@ impl Engine {
         // Lazy Parse: Use quick parse first / 延迟解析：首先使用快速解析
         let mut qname_buf = [0u8; 256];
         let (qname_cow, qtype, qclass, tx_id, edns_present) = if let Some(q) = parse_quick(packet, &mut qname_buf) {
-            (q.qname, hickory_proto::rr::RecordType::from(q.qtype), DNSClass::from(q.qclass), q.tx_id, q.edns_present)
+            // Convert qname_bytes to String for consistency / 将 qname_bytes 转换为 String 以保持一致性
+            let qname_str = std::str::from_utf8(q.qname_bytes).unwrap_or("").to_string();
+            (std::borrow::Cow::Owned(qname_str), hickory_proto::rr::RecordType::from(q.qtype), DNSClass::from(q.qclass), q.tx_id, q.edns_present)
         } else {
             // Fallback to full parse if quick parse fails (unlikely for standard queries) / 如果快速解析失败则回退到完整解析（对于标准查询不太可能）
             let req = Message::from_bytes(packet).context("parse request")?;
@@ -1074,7 +1081,9 @@ impl Engine {
             )
         }; // geosite_mgr 在这里释放 / geosite_mgr released here
 
-        let dedupe_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, qname_ref, qtype, qclass);
+        // Convert qname_ref to bytes for hash calculation / 将 qname_ref 转换为 bytes 进行哈希计算
+        let qname_bytes = qname_ref.as_bytes();
+        let dedupe_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, qname_bytes, qtype, qclass);
         
         // ✅ Background refresh: Skip cache lookup when skip_cache=true
         // ✅ 后台刷新：当 skip_cache=true 时跳过缓存查找
@@ -1200,7 +1209,9 @@ impl Engine {
         let qname = qname_cow.into_owned();
         let mut skip_rules: HashSet<Arc<str>> = HashSet::new();
         let mut current_pipeline_id = pipeline_id.clone();
-        let mut dedupe_hash = Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, &qname, qtype, qclass);
+        // Convert qname String to bytes for hash calculation / 将 qname String 转换为 bytes 进行哈希计算
+        let qname_bytes = qname.as_bytes();
+        let mut dedupe_hash = Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, qname_bytes, qtype, qclass);
         let mut dedupe_registered = false;
         let mut reused_response: Option<ResponseContext> = None;
 
@@ -1309,7 +1320,7 @@ impl Engine {
                     }
                     if let Some(p) = cfg.pipelines.iter().find(|p| p.id == *pipeline) {
                         current_pipeline_id = p.id.clone();
-                        dedupe_hash = Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, &qname, qtype, qclass);
+                        dedupe_hash = Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, qname_bytes, qtype, qclass);
                         dedupe_registered = false;
                         skip_rules.clear();
                         decision = self.apply_rules(
@@ -2916,7 +2927,7 @@ impl Engine {
                 return Ok(resp_bytes);
             };
 
-            let dedupe_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, qname, qtype, qclass);
+            let dedupe_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, qname.as_bytes(), qtype, qclass);
             
             let mut decision = self.apply_rules(
                 state,
@@ -4473,7 +4484,7 @@ mod tests {
         let qname = "expire.com";
         let qtype = RecordType::A;
         let qclass = DNSClass::IN;
-        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(&pipeline_id, qname, qtype, qclass);
+        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(&pipeline_id, qname.as_bytes(), qtype, qclass);
 
         // Insert an entry that expired 5 seconds ago
         let entry = CacheEntry {
@@ -4593,13 +4604,13 @@ mod tests {
         // Act: Calculate hashes for same QNAME+QTYPE but different QCLASS
         let hash_in = Engine::calculate_cache_hash_for_dedupe(
             &pipeline_id, 
-            qname, 
+            qname.as_bytes(), 
             qtype, 
             qclass_in
         );
         let hash_ch = Engine::calculate_cache_hash_for_dedupe(
             &pipeline_id, 
-            qname, 
+            qname.as_bytes(), 
             qtype, 
             qclass_ch
         );
@@ -4614,7 +4625,7 @@ mod tests {
         // Act: Calculate hash for same QCLASS to verify consistency
         let hash_in2 = Engine::calculate_cache_hash_for_dedupe(
             &pipeline_id, 
-            qname, 
+            qname.as_bytes(), 
             qtype, 
             qclass_in
         );
@@ -4639,21 +4650,25 @@ mod tests {
         let qclass = DNSClass::IN;
 
         // Act: Calculate hashes for different case variations
+        // Note: In parse_quick(), qname is already lowercased before being passed to this function
+        // So we simulate that behavior by lowercasing the input first
+        // 注意：在 parse_quick() 中，qname 在传递给此函数之前已经转为小写
+        // 所以我们通过先小写输入来模拟这种行为
         let hash1 = Engine::calculate_cache_hash_for_dedupe(
             &pipeline_id, 
-            qname_lower, 
+            qname_lower.to_lowercase().as_bytes(), 
             qtype, 
             qclass
         );
         let hash2 = Engine::calculate_cache_hash_for_dedupe(
             &pipeline_id, 
-            qname_upper, 
+            qname_upper.to_lowercase().as_bytes(), 
             qtype, 
             qclass
         );
         let hash3 = Engine::calculate_cache_hash_for_dedupe(
             &pipeline_id, 
-            qname_mixed, 
+            qname_mixed.to_lowercase().as_bytes(), 
             qtype, 
             qclass
         );
@@ -4684,13 +4699,13 @@ mod tests {
         // Act: Calculate hashes for different QTYPE values
         let hash_a = Engine::calculate_cache_hash_for_dedupe(
             &pipeline_id, 
-            qname, 
+            qname.as_bytes(), 
             qtype_a, 
             qclass
         );
         let hash_aaaa = Engine::calculate_cache_hash_for_dedupe(
             &pipeline_id, 
-            qname, 
+            qname.as_bytes(), 
             qtype_aaaa, 
             qclass
         );
@@ -4716,13 +4731,13 @@ mod tests {
         // Act: Calculate hashes for different QNAME values
         let hash1 = Engine::calculate_cache_hash_for_dedupe(
             &pipeline_id, 
-            qname1, 
+            qname1.as_bytes(), 
             qtype, 
             qclass
         );
         let hash2 = Engine::calculate_cache_hash_for_dedupe(
             &pipeline_id, 
-            qname2, 
+            qname2.as_bytes(), 
             qtype, 
             qclass
         );
