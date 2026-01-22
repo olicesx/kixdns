@@ -1741,6 +1741,7 @@ impl Engine {
                                         edns_present,
                                         min_ttl,
                                         upstream_timeout,
+                                        skip_cache,  // ✅ FIX: Pass skip_cache to response phase
                                     )
                                     .await?;
                                 if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
@@ -1869,6 +1870,7 @@ impl Engine {
                                                 edns_present,
                                                 min_ttl,
                                                 upstream_timeout,
+                                                skip_cache,  // ✅ FIX: Pass skip_cache to response phase
                                             )
                                             .await?;
                                         self.notify_inflight_waiters(dedupe_hash, &resp_bytes).await;
@@ -2861,6 +2863,7 @@ impl Engine {
         edns_present: bool,
         min_ttl: Duration,
         upstream_timeout: Duration,
+        skip_cache: bool,  // ✅ NEW: Pass skip_cache to response phase
     ) -> anyhow::Result<Bytes> {
         let cfg = &state.pipeline;
         struct InflightCleanupGuard {
@@ -2922,7 +2925,7 @@ impl Engine {
                 } else {
                     Some(&skip_rules)
                 },
-                false, // skip_cache
+                skip_cache,  // ✅ FIX: Pass skip_cache to apply_rules
             );
 
             // Resolve nested rule-level jumps first
@@ -2948,7 +2951,7 @@ impl Engine {
                             qclass,
                             edns_present,
                             None,
-                            false, // skip_cache
+                            skip_cache,  // ✅ FIX: Pass skip_cache to apply_rules
                         );
                         continue;
                     } else {
@@ -2999,7 +3002,9 @@ impl Engine {
                         if let Some(ctx) = reused_response.take() {
                             Ok((ctx.raw, ctx.upstream.to_string()))
                         } else {
-                            {
+                            // ✅ FIX: Background refresh must skip inflight check
+                            // ✅ 修复：后台刷新必须跳过 inflight 检查
+                            if !skip_cache {
                                 use dashmap::mapref::entry::Entry;
                                 let rx = match self.inflight.entry(dedupe_hash) {
                                     Entry::Vacant(entry) => {
@@ -3057,7 +3062,9 @@ impl Engine {
                         // If reuse is not allowed (e.g. explicit Forward action), we must clear any reused response
                         // and force a new request.
                         
-                        {
+                        // ✅ FIX: Background refresh must skip inflight check
+                        // ✅ 修复：后台刷新必须跳过 inflight 检查
+                        if !skip_cache {
                             use dashmap::mapref::entry::Entry;
                             let rx = match self.inflight.entry(dedupe_hash) {
                                 Entry::Vacant(entry) => {
