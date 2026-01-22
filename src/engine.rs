@@ -1497,19 +1497,21 @@ impl Engine {
                     Ok((raw, actual_upstream)) => {
                         // Optimization: Use quick response parse if no complex matching is needed
                         // Also handles TC (Truncated) flag check for RFC 1035 compliance
+                        // ✅ CHANGE: Use max_ttl for original_ttl to align with background refresh trigger
+                        // ✅ 修改：使用 max_ttl 作为 original_ttl 以与后台刷新触发对齐
                         let (rcode, ttl_secs, msg_opt, truncated) = if response_matchers.is_empty() && response_actions_on_match.is_empty() && response_actions_on_miss.is_empty() {
                             if let Some(qr) = crate::proto_utils::parse_response_quick(&raw) {
-                                (qr.rcode, qr.min_ttl as u64, None, qr.truncated)
+                                (qr.rcode, qr.max_ttl as u64, None, qr.truncated)
                             } else {
                                 // Fallback: parse full message, extract TC from raw bytes
                                 let msg = Message::from_bytes(&raw).context("parse upstream response")?;
-                                let ttl = extract_ttl(&msg);
+                                let ttl = extract_ttl_for_refresh(&msg);  // Use max TTL for consistency
                                 let tc = raw.len() >= 3 && (raw[2] & 0x02) != 0;
                                 (msg.response_code(), ttl, Some(msg), tc)
                             }
                         } else {
                             let msg = Message::from_bytes(&raw).context("parse upstream response")?;
-                            let ttl = extract_ttl(&msg);
+                            let ttl = extract_ttl_for_refresh(&msg);  // Use max TTL for consistency
                             let tc = raw.len() >= 3 && (raw[2] & 0x02) != 0;
                             (msg.response_code(), ttl, Some(msg), tc)
                         };

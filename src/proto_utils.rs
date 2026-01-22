@@ -208,12 +208,14 @@ fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
     }
 }
 
-/// 快速解析响应包，仅提取 RCODE、TC 标志和最小 TTL / Quick parse response packet, extracting only RCODE, TC flag and minimum TTL
+/// 快速解析响应包，仅提取 RCODE、TC 标志和 TTL 范围 / Quick parse response packet, extracting only RCODE, TC flag and TTL range
 /// 避免全量解析 Message / Avoid full Message parsing
 #[derive(Debug, Clone)]
 pub struct QuickResponse {
     pub rcode: hickory_proto::op::ResponseCode,
     pub min_ttl: u32,
+    /// 最大 TTL，用于后台刷新触发决策 / Maximum TTL, used for background refresh trigger decision
+    pub max_ttl: u32,
     /// TC (Truncated) flag - 响应被截断，应使用 TCP 重试 / Response was truncated, retry with TCP
     #[allow(dead_code)]
     pub truncated: bool,
@@ -240,7 +242,7 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     // For caching, we usually care about Answer section TTLs. / 对于缓存，我们通常关心 Answer 部分的 TTL
 
     if an_count == 0 {
-        return Some(QuickResponse { rcode, min_ttl: 0, truncated });
+        return Some(QuickResponse { rcode, min_ttl: 0, max_ttl: 0, truncated });
     }
 
     let mut pos = 12;
@@ -279,6 +281,7 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     }
 
     let mut min_ttl = u32::MAX;
+    let mut max_ttl = u32::MIN;
 
     // Scan Answers / 扫描应答部分
     for _ in 0..an_count {
@@ -325,6 +328,9 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
         if ttl < min_ttl {
             min_ttl = ttl;
         }
+        if ttl > max_ttl {
+            max_ttl = ttl;
+        }
 
         let rd_len = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
         pos += 10 + rd_len;
@@ -333,8 +339,11 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     if min_ttl == u32::MAX {
         min_ttl = 0;
     }
+    if max_ttl == u32::MIN {
+        max_ttl = 0;
+    }
 
-    Some(QuickResponse { rcode, min_ttl, truncated })
+    Some(QuickResponse { rcode, min_ttl, max_ttl, truncated })
 }
 
 /// 批量修正 DNS 响应包中的 TTL 值 / Batch patch TTL values in a DNS response packet
