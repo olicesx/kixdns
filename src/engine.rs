@@ -1537,12 +1537,24 @@ impl Engine {
                             let geosite_manager_ref = geosite_manager.as_deref();
 
                             if let Some(m) = msg_opt {
-                                let matched = eval_match_chain(
-                                    &response_matchers,
-                                    |m| m.operator,
-                                    |matcher_op| matcher_op.matcher.matches(&upstream, &qname, qtype, qclass, &m, geoip_manager_ref, geosite_manager_ref),
-                                );
-                                (matched, m)
+                                // ✅ FIX: Skip response matchers for background refresh
+                                // ✅ 修复：后台刷新跳过响应匹配器
+                                // Background refresh should only update cache, not execute response actions
+                                // 后台刷新应该只更新缓存，不执行响应操作
+                                if skip_cache {
+                                    // Background refresh: force match to skip response actions
+                                    // 后台刷新：强制匹配以跳过响应操作
+                                    (true, m)
+                                } else {
+                                    // Normal request: evaluate response matchers
+                                    // 正常请求：评估响应匹配器
+                                    let matched = eval_match_chain(
+                                        &response_matchers,
+                                        |m| m.operator,
+                                        |matcher_op| matcher_op.matcher.matches(&upstream, &qname, qtype, qclass, &m, geoip_manager_ref, geosite_manager_ref),
+                                    );
+                                    (matched, m)
+                                }
                             } else {
                                 (false, Message::new()) // Dummy message, won't be used as actions are empty
                             }
