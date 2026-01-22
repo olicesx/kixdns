@@ -1199,7 +1199,7 @@ impl Engine {
         let mut reused_response: Option<ResponseContext> = None;
 
         let mut decision = match pipeline_opt {
-            Some(p) => self.apply_rules(&state, p, peer.ip(), &qname, qtype, qclass, edns_present, None),
+            Some(p) => self.apply_rules(&state, p, peer.ip(), &qname, qtype, qclass, edns_present, None, skip_cache),
             None => {
                 // 使用预分割的默认 upstream 以支持并发查询 / Use pre-split default upstream for concurrent queries
                 let (upstream, pre_split) = if let Some(pre) = &cfg.settings.default_upstream_pre_split {
@@ -1315,6 +1315,7 @@ impl Engine {
                             qclass,
                             edns_present,
                             None,
+                            skip_cache,
                         );
                         continue;
                     } else {
@@ -1386,7 +1387,7 @@ impl Engine {
                     if let Some(ctx) = reused_response.take() {
                         Ok((ctx.raw, ctx.upstream.to_string()))
                     } else {
-                        if !dedupe_registered {
+                        if !dedupe_registered && !skip_cache {
                             use dashmap::mapref::entry::Entry;
                             // ========== NEW: Use tokio::watch for lock-free waiting ==========
                             // ✅ 使用 tokio::watch 实现无锁等待
@@ -1442,7 +1443,7 @@ impl Engine {
                     // If reuse is not allowed (e.g. explicit Forward action), we must clear any reused response
                     // and force a new request.
                     
-                    if !dedupe_registered {
+                    if !dedupe_registered && !skip_cache {
                         use dashmap::mapref::entry::Entry;
                         let rx = match self.inflight.entry(dedupe_hash) {
                             Entry::Vacant(entry) => {
@@ -1780,6 +1781,7 @@ impl Engine {
                                         qclass,
                                         edns_present,
                                         skip_ref,
+                                        skip_cache,
                                     );
                                     continue 'decision_loop;
                                 }
@@ -1900,6 +1902,7 @@ impl Engine {
                                             qclass,
                                             edns_present,
                                             skip_ref,
+                                            skip_cache,
                                         );
                                         continue 'decision_loop;
                                     }
@@ -1923,11 +1926,12 @@ impl Engine {
         qclass: DNSClass,
         edns_present: bool,
         skip_rules: Option<&HashSet<Arc<str>>>,
+        skip_cache: bool,
     ) -> Decision {
         // 1. Check Rule Cache
         // Use hash for lookup to avoid cloning String for key on every lookup
         let rule_hash = calculate_rule_hash(&pipeline.id, qname, client_ip, pipeline.uses_client_ip);
-        let allow_rule_cache_lookup = skip_rules.map_or(true, |set| set.is_empty());
+        let allow_rule_cache_lookup = !skip_cache && skip_rules.map_or(true, |set| set.is_empty());
         
         if allow_rule_cache_lookup {
             if let Some(entry) = self.rule_cache.get(&rule_hash) {
@@ -2918,6 +2922,7 @@ impl Engine {
                 } else {
                     Some(&skip_rules)
                 },
+                false, // skip_cache
             );
 
             // Resolve nested rule-level jumps first
@@ -2943,6 +2948,7 @@ impl Engine {
                             qclass,
                             edns_present,
                             None,
+                            false, // skip_cache
                         );
                         continue;
                     } else {
