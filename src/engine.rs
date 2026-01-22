@@ -4095,6 +4095,7 @@ mod tests {
             hickory_proto::rr::DNSClass::IN,
             false,
             None,
+            false,  // skip_cache
         );
 
         // Assert: Verify StaticResponse returns NXDOMAIN
@@ -4136,6 +4137,7 @@ mod tests {
             hickory_proto::rr::DNSClass::IN,
             false,
             None,
+            false,  // skip_cache
         );
 
         // Assert: Verify Forward action returns correct upstream and matchers
@@ -4173,6 +4175,7 @@ mod tests {
             hickory_proto::rr::DNSClass::IN,
             false,
             None,
+            false,  // skip_cache
         );
 
         // Assert: Verify Allow action forwards to default upstream
@@ -4200,6 +4203,7 @@ mod tests {
             hickory_proto::rr::DNSClass::IN,
             false,
             None,
+            false,  // skip_cache
         );
 
         // Assert: Verify JumpToPipeline returns correct target pipeline
