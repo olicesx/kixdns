@@ -1561,7 +1561,13 @@ impl Engine {
                         }; // guards are dropped here / 锁在此处释放
 
                         let empty_actions = Vec::new();
-                        let actions_to_run = if !response_actions_on_match.is_empty()
+                        // ✅ FIX: Background refresh should skip all response actions
+                        // ✅ 修复：后台刷新应跳过所有响应操作
+                        let actions_to_run = if skip_cache {
+                            // Background refresh: force empty actions to skip response processing
+                            // 后台刷新：强制使用空操作列表，跳过响应处理
+                            &empty_actions
+                        } else if !response_actions_on_match.is_empty()
                             || !response_actions_on_miss.is_empty()
                         {
                             if resp_match_ok {
