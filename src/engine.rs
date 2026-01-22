@@ -532,11 +532,17 @@ impl Engine {
         });
         let permit_manager = Arc::new(PermitManager::new(flow_control_initial_permits));
 
+        // ✅ TCP uses independent permit manager (separate from UDP)
+        // ✅ TCP 使用独立的 permit manager（与 UDP 分离）
+        // TCP permit limit = tcp_pool_size (one permit per connection)
+        // TCP permit 上限 = tcp_pool_size（每个连接一个 permit）
+        let tcp_permit_manager = Arc::new(PermitManager::new(tcp_pool_size));
+
         Self {
             state,
             cache,
             udp_client: Arc::new(UdpClient::new(udp_pool_size)),
-            tcp_mux: Arc::new(TcpMultiplexer::new(tcp_pool_size, Arc::clone(&permit_manager))),
+            tcp_mux: Arc::new(TcpMultiplexer::new(tcp_pool_size, tcp_permit_manager)),
             listener_label: Arc::from(listener_label),
             rule_cache,
             metrics_inflight: Arc::new(AtomicUsize::new(0)),
