@@ -142,7 +142,12 @@ pub struct Engine {
     // 优化：SmallVec<[_; 8]>避免典型Singleflight场景的堆分配（<=8个等待者）
     // Optimization: SmallVec<[_; 8]> avoids heap allocation for typical Singleflight scenarios (<=8 waiters)
     // 使用 FxBuildHasher 提供更快的哈希计算 / Use FxBuildHasher for faster hashing
-    pub inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>,
+    /// In-flight request deduplication map using tokio::watch for lock-free concurrent waiting
+    /// 使用 tokio::watch 实现无锁并发等待的进行中请求去重 map
+    /// Key: dedupe_hash (pipeline_id + qname + qtype + qclass)
+    /// Value: watch sender that will be notified when upstream query completes
+    /// Note: Using Arc<anyhow::Error> to make the type Send + Clone
+    pub inflight: Arc<DashMap<u64, tokio::sync::watch::Sender<Result<Bytes, Arc<anyhow::Error>>>, FxBuildHasher>>,
     // Background refresh tracking: cache_hash -> refresh_start_time / 后台刷新跟踪：缓存哈希 -> 刷新开始时间
     // Prevents duplicate refresh triggers for the same cache entry / 防止同一缓存条目的重复刷新触发
     pub refreshing: Arc<DashMap<u64, Instant, FxBuildHasher>>,
@@ -1122,29 +1127,38 @@ impl Engine {
 
         let mut decision = match pipeline_opt {
             Some(p) => self.apply_rules(&state, p, peer.ip(), &qname, qtype, qclass, edns_present, None),
-            None => Decision::Forward {
-                upstream: Arc::from(cfg.settings.default_upstream.as_str()),
-                pre_split_upstreams: None,
-                response_matchers: Vec::new(),
-                response_matcher_operator: crate::config::MatchOperator::And,
-                response_actions_on_match: Vec::new(),
-                response_actions_on_miss: Vec::new(),
-                rule_name: Arc::from("default"),
-                transport: Some(Transport::Udp),
-                continue_on_match: false,
-                continue_on_miss: false,
-                allow_reuse: false,
+            None => {
+                // 使用预分割的默认 upstream 以支持并发查询 / Use pre-split default upstream for concurrent queries
+                let (upstream, pre_split) = if let Some(pre) = &cfg.settings.default_upstream_pre_split {
+                    (Arc::from(cfg.settings.default_upstream.as_str()), Some(pre.clone()))
+                } else {
+                    (Arc::from(cfg.settings.default_upstream.as_str()), None)
+                };
+                
+                Decision::Forward {
+                    upstream,
+                    pre_split_upstreams: pre_split,
+                    response_matchers: Vec::new(),
+                    response_matcher_operator: crate::config::MatchOperator::And,
+                    response_actions_on_match: Vec::new(),
+                    response_actions_on_miss: Vec::new(),
+                    rule_name: Arc::from("default"),
+                    transport: Some(Transport::Udp),
+                    continue_on_match: false,
+                    continue_on_miss: false,
+                    allow_reuse: false,
+                }
             },
         };
 
         struct InflightCleanupGuard {
-            inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>,
+            inflight: Arc<DashMap<u64, tokio::sync::watch::Sender<Result<Bytes, Arc<anyhow::Error>>>, FxBuildHasher>>,
             hash: u64,
             active: bool,
         }
 
         impl InflightCleanupGuard {
-            fn new(inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>, hash: u64) -> Self {
+            fn new(inflight: Arc<DashMap<u64, tokio::sync::watch::Sender<Result<Bytes, Arc<anyhow::Error>>>, FxBuildHasher>>, hash: u64) -> Self {
                 Self { inflight, hash, active: true }
             }
             
@@ -1261,33 +1275,48 @@ impl Engine {
                     } else {
                         if !dedupe_registered {
                             use dashmap::mapref::entry::Entry;
+                            // ========== NEW: Use tokio::watch for lock-free waiting ==========
+                            // ✅ 使用 tokio::watch 实现无锁等待
                             let rx = match self.inflight.entry(dedupe_hash) {
-                                Entry::Occupied(mut entry) => {
-                                    let (tx, rx) = oneshot::channel();
-                                    entry.get_mut().push(tx);
-                                    Some(rx)
-                                }
                                 Entry::Vacant(entry) => {
-                                    entry.insert(SmallVec::new());
+                                    // No other request in progress, create watch channel
+                                    // 没有其他请求在进行,创建 watch channel
+                                    let (tx, _rx) = tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
+                                    entry.insert(tx);
                                     dedupe_registered = true;
                                     cleanup_guard = Some(InflightCleanupGuard::new(self.inflight.clone(), dedupe_hash));
                                     None
                                 }
+                                Entry::Occupied(entry) => {
+                                    // Another request in progress, subscribe to its result
+                                    // 已有请求在进行,订阅其结果
+                                    let rx = entry.get().subscribe();
+                                    Some(rx)
+                                }
                             };
 
-                            if let Some(rx) = rx {
-                                match rx.await {
-                                    Ok(Ok(bytes)) => {
-                                        // Zero-copy TX ID rewrite using BytesMut
-                                        let mut resp_mut = BytesMut::from(bytes.as_ref());
-                                        if resp_mut.len() >= 2 {
-                                            let id_bytes = tx_id.to_be_bytes();
-                                            resp_mut[0] = id_bytes[0];
-                                            resp_mut[1] = id_bytes[1];
+                            if let Some(mut rx) = rx {
+                                // watch channel uses changed() to wait for updates
+                                // watch channel 使用 changed() 等待更新
+                                match rx.changed().await {
+                                    Ok(_) => {
+                                        // Clone result to avoid holding RwLockReadGuard across await
+                                        // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
+                                        let result = rx.borrow().clone();
+                                        match &result {
+                                            Ok(bytes) => {
+                                                // Zero-copy TX ID rewrite using BytesMut
+                                                let mut resp_mut = BytesMut::from(bytes.as_ref());
+                                                if resp_mut.len() >= 2 {
+                                                    let id_bytes = tx_id.to_be_bytes();
+                                                    resp_mut[0] = id_bytes[0];
+                                                    resp_mut[1] = id_bytes[1];
+                                                }
+                                                return Ok(resp_mut.freeze());
+                                            }
+                                            Err(e) => return Err(anyhow::anyhow!("{}", e)),
                                         }
-                                        return Ok(resp_mut.freeze());
                                     }
-                                    Ok(Err(e)) => return Err(e),
                                     Err(_) => {
                                         // sender dropped, fallthrough to attempt upstream
                                     }
@@ -1303,32 +1332,45 @@ impl Engine {
                     if !dedupe_registered {
                         use dashmap::mapref::entry::Entry;
                         let rx = match self.inflight.entry(dedupe_hash) {
-                            Entry::Occupied(mut entry) => {
-                                let (tx, rx) = oneshot::channel();
-                                entry.get_mut().push(tx);
-                                Some(rx)
-                            }
                             Entry::Vacant(entry) => {
-                                entry.insert(SmallVec::new());
+                                // No other request in progress, create watch channel
+                                // 没有其他请求在进行,创建 watch channel
+                                let (tx, _rx) = tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
+                                entry.insert(tx);
                                 dedupe_registered = true;
                                 cleanup_guard = Some(InflightCleanupGuard::new(self.inflight.clone(), dedupe_hash));
                                 None
                             }
+                            Entry::Occupied(entry) => {
+                                // Another request in progress, subscribe to its result
+                                // 已有请求在进行,订阅其结果
+                                let rx = entry.get().subscribe();
+                                Some(rx)
+                            }
                         };
 
-                        if let Some(rx) = rx {
-                            match rx.await {
-                                Ok(Ok(bytes)) => {
-                                    // Zero-copy TX ID rewrite using BytesMut
-                                    let mut resp_mut = BytesMut::from(bytes.as_ref());
-                                    if resp_mut.len() >= 2 {
-                                        let id_bytes = tx_id.to_be_bytes();
-                                        resp_mut[0] = id_bytes[0];
-                                        resp_mut[1] = id_bytes[1];
+                        if let Some(mut rx) = rx {
+                            // watch channel uses changed() to wait for updates
+                            // watch channel 使用 changed() 等待更新
+                            match rx.changed().await {
+                                Ok(_) => {
+                                    // Clone result to avoid holding RwLockReadGuard across await
+                                    // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
+                                    let result = rx.borrow().clone();
+                                    match &result {
+                                        Ok(bytes) => {
+                                            // Zero-copy TX ID rewrite using BytesMut
+                                            let mut resp_mut = BytesMut::from(bytes.as_ref());
+                                            if resp_mut.len() >= 2 {
+                                                let id_bytes = tx_id.to_be_bytes();
+                                                resp_mut[0] = id_bytes[0];
+                                                resp_mut[1] = id_bytes[1];
+                                            }
+                                            return Ok(resp_mut.freeze());
+                                        }
+                                        Err(e) => return Err(anyhow::anyhow!("{}", e)),
                                     }
-                                    return Ok(resp_mut.freeze());
                                 }
-                                Ok(Err(e)) => return Err(e),
                                 Err(_) => {
                                     // sender dropped, fallthrough to attempt upstream
                                 }
@@ -2262,8 +2304,13 @@ impl Engine {
     }
 
     async fn notify_inflight_waiters(&self, dedupe_hash: u64, bytes: &Bytes) {
-        let waiters = self.inflight.remove(&dedupe_hash).map(|(_, v)| v).unwrap_or_default();
-        for tx in waiters {
+        // ========== NEW: Use tokio::watch for lock-free notification ==========
+        // ✅ 使用 tokio::watch 实现无锁通知
+        // Remove the watch sender from inflight map and send result
+        // 从 inflight map 移除 watch sender 并发送结果
+        if let Some((_, tx)) = self.inflight.remove(&dedupe_hash) {
+            // Send result to all waiters (lock-free)
+            // 向所有等待者发送结果 (无锁)
             let _ = tx.send(Ok(bytes.clone()));
         }
     }
@@ -2297,14 +2344,14 @@ impl Engine {
             Entry::Vacant(entry) => {
                 // 没有其他请求在进行，由后台刷新执行查询
                 // No other request in progress, background refresh will execute query
-                entry.insert(SmallVec::new());
+                let (tx, _rx) = tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
+                entry.insert(tx);
                 (true, None)
             }
-            Entry::Occupied(mut entry) => {
+            Entry::Occupied(entry) => {
                 // 已有请求在进行（用户请求或其他后台刷新），等待结果
                 // Another request in progress (user request or other background refresh), wait for result
-                let (tx, rx) = oneshot::channel();
-                entry.get_mut().push(tx);
+                let rx = entry.get().subscribe();
                 (false, Some(rx))
             }
         };
@@ -2321,13 +2368,13 @@ impl Engine {
 
         tokio::spawn(async move {
             struct InflightCleanupGuard {
-                inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>,
+                inflight: Arc<DashMap<u64, tokio::sync::watch::Sender<Result<Bytes, Arc<anyhow::Error>>>, FxBuildHasher>>,
                 hash: u64,
                 active: bool,
             }
 
             impl InflightCleanupGuard {
-                fn new(inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>, hash: u64) -> Self {
+                fn new(inflight: Arc<DashMap<u64, tokio::sync::watch::Sender<Result<Bytes, Arc<anyhow::Error>>>, FxBuildHasher>>, hash: u64) -> Self {
                     Self { inflight, hash, active: true }
                 }
 
@@ -2362,49 +2409,58 @@ impl Engine {
 
             // 如果是在等待其他请求的结果
             // If waiting for other request's result
-            if let Some(rx) = wait_rx {
-                match rx.await {
-                    Ok(Ok(bytes)) => {
-                        // 使用其他请求的结果更新缓存
-                        // Use other request's result to update cache
-                        if let Ok(msg) = Message::from_bytes(&bytes) {
-                            let ttl = engine.extract_ttl_from_msg(&msg, false);  // Use min TTL for cache
-                            if ttl > 0 {
-                                let entry = crate::cache::CacheEntry {
-                                    bytes: bytes.clone(),
-                                    rcode: msg.response_code(),
-                                    source: Arc::from("background_refresh"),
-                                    upstream: Some(Arc::from(upstream_to_use.as_str())),
-                                    qname: Arc::from(qname.as_str()),
-                                    pipeline_id: pipeline_id.clone(),
-                                    qtype: u16::from(qtype),
-                                    inserted_at: Instant::now(),
-                                    original_ttl: ttl as u32,
-                                };
+            if let Some(mut rx) = wait_rx {
+                // watch channel uses changed() to wait for updates
+                // watch channel 使用 changed() 等待更新
+                match rx.changed().await {
+                    Ok(_) => {
+                        // Clone result to avoid holding RwLockReadGuard across await
+                        // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
+                        let result = rx.borrow().clone();
+                        match &result {
+                            Ok(bytes) => {
+                                // 使用其他请求的结果更新缓存
+                                // Use other request's result to update cache
+                                if let Ok(msg) = Message::from_bytes(&bytes) {
+                                    let ttl = engine.extract_ttl_from_msg(&msg, false);  // Use min TTL for cache
+                                    if ttl > 0 {
+                                        let entry = crate::cache::CacheEntry {
+                                            bytes: bytes.clone(),
+                                            rcode: msg.response_code(),
+                                            source: Arc::from("background_refresh"),
+                                            upstream: Some(Arc::from(upstream_to_use.as_str())),
+                                            qname: Arc::from(qname.as_str()),
+                                            pipeline_id: pipeline_id.clone(),
+                                            qtype: u16::from(qtype),
+                                            inserted_at: Instant::now(),
+                                            original_ttl: ttl as u32,
+                                        };
 
-                                // 强制覆盖：先移除旧条目，再插入新条目
-                                // Force overwrite: remove old entry first, then insert new entry
-                                engine.cache.remove(&cache_hash);
-                                engine.cache.insert(cache_hash, entry);
+                                        // 强制覆盖：先移除旧条目，再插入新条目
+                                        // Force overwrite: remove old entry first, then insert new entry
+                                        engine.cache.remove(&cache_hash);
+                                        engine.cache.insert(cache_hash, entry);
 
-                                tracing::debug!(
-                                    event = "cache_background_refresh_reused",
+                                        tracing::debug!(
+                                            event = "cache_background_refresh_reused",
+                                            qname = %qname,
+                                            qtype = ?qtype,
+                                            ttl = ttl,
+                                            "background cache refresh reused inflight result"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    event = "cache_background_refresh_inflight_failed",
                                     qname = %qname,
                                     qtype = ?qtype,
-                                    ttl = ttl,
-                                    "background cache refresh reused inflight result"
+                                    error = %e,
+                                    "background cache refresh: inflight request failed"
                                 );
                             }
                         }
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(
-                            event = "cache_background_refresh_inflight_failed",
-                            qname = %qname,
-                            qtype = ?qtype,
-                            error = %e,
-                            "background cache refresh: inflight request failed"
-                        );
                     }
                     Err(_) => {
                         // sender dropped, 执行自己的查询
@@ -2416,7 +2472,7 @@ impl Engine {
 
             // 执行后台刷新查询
             // Perform background refresh query
-            let result = async {
+            let result: Result<(), anyhow::Error> = async {
                 // 构造DNS查询请求
                 // Construct DNS query request
                 let mut req_bytes = Vec::new();
@@ -2437,23 +2493,25 @@ impl Engine {
                 req_bytes.extend_from_slice(&u16::from(qtype).to_be_bytes());
                 req_bytes.extend_from_slice(&u16::from(qclass).to_be_bytes());
 
-                // Parse protocol from upstream field (format: "protocol:ip:port" or "ip:port")
-                // 从 upstream 字段解析协议 (格式: "protocol:ip:port" 或 "ip:port")
-                let (refresh_transport, refresh_addr) = if let Some(pos) = upstream_to_use.find(':') {
-                    let possible_proto = &upstream_to_use[..pos];
-                    let addr = &upstream_to_use[pos + 1..];
-                    match possible_proto {
+                // Parse protocol from upstream field (format: "protocol://ip:port" or "ip:port")
+                // 从 upstream 字段解析协议 (格式: "protocol://ip:port" 或 "ip:port")
+                let (refresh_transport, refresh_addr) = if let Some(pos) = upstream_to_use.find("://") {
+                    // Has protocol prefix (e.g., "tcp://8.8.8.8:53")
+                    // 有协议前缀 (例如 "tcp://8.8.8.8:53")
+                    let proto = &upstream_to_use[..pos];
+                    let addr = &upstream_to_use[pos + 3..]; // Skip "://"
+                    match proto {
                         "tcp" => (Some(Transport::Tcp), addr),
                         "udp" => (Some(Transport::Udp), addr),
                         _ => {
-                            // No protocol prefix, assume UDP (backward compatibility)
-                            // 没有协议前缀,假设为 UDP (向后兼容)
+                            // Unknown protocol, use as-is with UDP
+                            // 未知协议,按原样使用 UDP
                             (Some(Transport::Udp), upstream_to_use.as_ref())
                         }
                     }
                 } else {
-                    // No colon found, invalid format, use as-is with UDP
-                    // 没有找到冒号,格式无效,按原样使用 UDP
+                    // No protocol prefix, use as-is with UDP
+                    // 没有协议前缀,按原样使用 UDP
                     (Some(Transport::Udp), upstream_to_use.as_ref())
                 };
 
@@ -2548,9 +2606,13 @@ impl Engine {
                             qname = %qname,
                             qtype = ?qtype,
                             error = %e,
-                            "background cache refresh failed"
+                            "background cache refresh failed, will retry on next cache hit"
                         );
-                        Err(e)
+                        // ✅ Return Ok(()) instead of Err(e) to enable automatic retry
+                        // ✅ 返回 Ok(()) 而不是 Err(e) 以启用自动重试
+                        // This allows RefreshingGuard to clean up, so next cache hit can trigger re-refresh
+                        // 这样 RefreshingGuard 可以清理，下次缓存命中时可以触发重新刷新
+                        Ok(())
                     }
                 }
             }.await;
@@ -2797,13 +2859,13 @@ impl Engine {
     ) -> anyhow::Result<Bytes> {
         let cfg = &state.pipeline;
         struct InflightCleanupGuard {
-            inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>,
+            inflight: Arc<DashMap<u64, tokio::sync::watch::Sender<Result<Bytes, Arc<anyhow::Error>>>, FxBuildHasher>>,
             hash: u64,
             active: bool,
         }
 
         impl InflightCleanupGuard {
-            fn new(inflight: Arc<DashMap<u64, SmallVec<[oneshot::Sender<anyhow::Result<Bytes>>; 8]>, FxBuildHasher>>, hash: u64) -> Self {
+            fn new(inflight: Arc<DashMap<u64, tokio::sync::watch::Sender<Result<Bytes, Arc<anyhow::Error>>>, FxBuildHasher>>, hash: u64) -> Self {
                 Self { inflight, hash, active: true }
             }
             
@@ -2933,36 +2995,49 @@ impl Engine {
                             {
                                 use dashmap::mapref::entry::Entry;
                                 let rx = match self.inflight.entry(dedupe_hash) {
-                                    Entry::Occupied(mut entry) => {
-                                        let (tx, rx) = oneshot::channel();
-                                        entry.get_mut().push(tx);
-                                        Some(rx)
-                                    }
                                     Entry::Vacant(entry) => {
-                                        entry.insert(SmallVec::new());
+                                        // No other request in progress, create watch channel
+                                        // 没有其他请求在进行,创建 watch channel
+                                        let (tx, _rx) = tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
+                                        entry.insert(tx);
                                         cleanup_guards.push(InflightCleanupGuard::new(self.inflight.clone(), dedupe_hash));
                                         inflight_hashes.push(dedupe_hash);
                                         None
                                     }
+                                    Entry::Occupied(entry) => {
+                                        // Another request in progress, subscribe to its result
+                                        // 已有请求在进行,订阅其结果
+                                        let rx = entry.get().subscribe();
+                                        Some(rx)
+                                    }
                                 };
 
-                                if let Some(rx) = rx {
-                                    match rx.await {
-                                        Ok(Ok(bytes)) => {
-                                            // Rewrite Transaction ID for followers using BytesMut
-                                            let mut resp_mut = BytesMut::from(bytes.as_ref());
-                                            if resp_mut.len() >= 2 {
-                                                let id_bytes = req.id().to_be_bytes();
-                                                resp_mut[0] = id_bytes[0];
-                                                resp_mut[1] = id_bytes[1];
-                                            }
-                                            let resp_bytes = resp_mut.freeze();
+                                if let Some(mut rx) = rx {
+                                    // watch channel uses changed() to wait for updates
+                                    // watch channel 使用 changed() 等待更新
+                                    match rx.changed().await {
+                                        Ok(_) => {
+                                            // Clone result to avoid holding RwLockReadGuard across await
+                                            // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
+                                            let result = rx.borrow().clone();
+                                            match &result {
+                                                Ok(bytes) => {
+                                                    // Rewrite Transaction ID for followers using BytesMut
+                                                    let mut resp_mut = BytesMut::from(bytes.as_ref());
+                                                    if resp_mut.len() >= 2 {
+                                                        let id_bytes = req.id().to_be_bytes();
+                                                        resp_mut[0] = id_bytes[0];
+                                                        resp_mut[1] = id_bytes[1];
+                                                    }
+                                                    let resp_bytes = resp_mut.freeze();
 
-                                            for g in &mut cleanup_guards { g.defuse(); }
-                                            for h in &inflight_hashes { self.notify_inflight_waiters(*h, &bytes).await; }
-                                            return Ok(resp_bytes);
+                                                    for g in &mut cleanup_guards { g.defuse(); }
+                                                    for h in &inflight_hashes { self.notify_inflight_waiters(*h, &bytes).await; }
+                                                    return Ok(resp_bytes);
+                                                }
+                                                Err(e) => return Err(anyhow::anyhow!("{}", e)),
+                                            }
                                         }
-                                        Ok(Err(e)) => return Err(e),
                                         Err(_) => {
                                             // sender dropped, fallthrough to attempt upstream
                                         }
@@ -2978,36 +3053,49 @@ impl Engine {
                         {
                             use dashmap::mapref::entry::Entry;
                             let rx = match self.inflight.entry(dedupe_hash) {
-                                Entry::Occupied(mut entry) => {
-                                    let (tx, rx) = oneshot::channel();
-                                    entry.get_mut().push(tx);
-                                    Some(rx)
-                                }
                                 Entry::Vacant(entry) => {
-                                    entry.insert(SmallVec::new());
+                                    // No other request in progress, create watch channel
+                                    // 没有其他请求在进行,创建 watch channel
+                                    let (tx, _rx) = tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
+                                    entry.insert(tx);
                                     cleanup_guards.push(InflightCleanupGuard::new(self.inflight.clone(), dedupe_hash));
                                     inflight_hashes.push(dedupe_hash);
                                     None
                                 }
+                                Entry::Occupied(entry) => {
+                                    // Another request in progress, subscribe to its result
+                                    // 已有请求在进行,订阅其结果
+                                    let rx = entry.get().subscribe();
+                                    Some(rx)
+                                }
                             };
 
-                            if let Some(rx) = rx {
-                                match rx.await {
-                                    Ok(Ok(bytes)) => {
-                                        // Rewrite Transaction ID for followers using BytesMut
-                                        let mut resp_mut = BytesMut::from(bytes.as_ref());
-                                        if resp_mut.len() >= 2 {
-                                            let id_bytes = req.id().to_be_bytes();
-                                            resp_mut[0] = id_bytes[0];
-                                            resp_mut[1] = id_bytes[1];
-                                        }
-                                        let resp_bytes = resp_mut.freeze();
+                            if let Some(mut rx) = rx {
+                                // watch channel uses changed() to wait for updates
+                                // watch channel 使用 changed() 等待更新
+                                match rx.changed().await {
+                                    Ok(_) => {
+                                        // Clone result to avoid holding RwLockReadGuard across await
+                                        // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
+                                        let result = rx.borrow().clone();
+                                        match &result {
+                                            Ok(bytes) => {
+                                                // Rewrite Transaction ID for followers using BytesMut
+                                                let mut resp_mut = BytesMut::from(bytes.as_ref());
+                                                if resp_mut.len() >= 2 {
+                                                    let id_bytes = req.id().to_be_bytes();
+                                                    resp_mut[0] = id_bytes[0];
+                                                    resp_mut[1] = id_bytes[1];
+                                                }
+                                                let resp_bytes = resp_mut.freeze();
 
-                                        for g in &mut cleanup_guards { g.defuse(); }
-                                        for h in &inflight_hashes { self.notify_inflight_waiters(*h, &bytes).await; }
-                                        return Ok(resp_bytes);
+                                                for g in &mut cleanup_guards { g.defuse(); }
+                                                for h in &inflight_hashes { self.notify_inflight_waiters(*h, &bytes).await; }
+                                                return Ok(resp_bytes);
+                                            }
+                                            Err(e) => return Err(anyhow::anyhow!("{}", e)),
+                                        }
                                     }
-                                    Ok(Err(e)) => return Err(e),
                                     Err(_) => {
                                         // sender dropped, fallthrough to attempt upstream
                                     }

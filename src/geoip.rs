@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 // Re-export from geoip_converter module
 // Note: geoip_converter is a sibling module at the crate root level
-pub use crate::geoip_converter::{ConversionConfig, ConversionStats, convert_dat_to_mmdb};
+pub use crate::geoip_converter::{ConversionStats, convert_dat_to_mmdb};
 
 /// MaxMind GeoLite2-Country 数据库结构 / MaxMind GeoLite2-Country database structure
 #[derive(Deserialize)]
@@ -617,6 +617,7 @@ fn parse_varint(data: &[u8], pos: &mut usize) -> anyhow::Result<usize> {
 }
 
 /// 检测 IP 是否为私有地址 / Detect if IP is private address
+#[inline]
 pub fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => {

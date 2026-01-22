@@ -43,6 +43,9 @@ pub struct GlobalSettings {
     /// 默认上游DNS。 / Default upstream DNS
     #[serde(default = "default_upstream")]
     pub default_upstream: String,
+    /// 预分割的默认上游列表（性能优化） / Pre-split default upstream list (performance optimization)
+    #[serde(skip)]
+    pub default_upstream_pre_split: Option<std::sync::Arc<Vec<String>>>,
     /// 上游超时（毫秒）。 / Upstream timeout (milliseconds)
     #[serde(default = "default_upstream_timeout_ms")]
     pub upstream_timeout_ms: u64,
@@ -103,6 +106,7 @@ impl Default for GlobalSettings {
             bind_udp: default_bind_udp(),
             bind_tcp: default_bind_tcp(),
             default_upstream: default_upstream(),
+            default_upstream_pre_split: None,
             upstream_timeout_ms: default_upstream_timeout_ms(),
             response_jump_limit: default_response_jump_limit(),
             udp_pool_size: default_udp_pool_size(),
@@ -359,6 +363,20 @@ impl Action {
     }
 }
 
+impl GlobalSettings {
+    /// 预分割默认 upstream 字符串以优化性能（在配置加载时调用）/ Pre-split default upstream string for performance (call during config loading)
+    pub fn pre_split_default_upstream(&mut self) {
+        let split: Vec<String> = self.default_upstream
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if split.len() > 1 {
+            self.default_upstream_pre_split = Some(std::sync::Arc::new(split));
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
@@ -398,6 +416,9 @@ pub fn load_config(path: &Path) -> Result<PipelineConfig> {
 
     // 轻量校验：CIDR提前解析，便于后续快速匹配。 / Lightweight validation: parse CIDR in advance for subsequent fast matching
     // 预分割 upstream 字符串以提高性能 / Pre-split upstream strings for better performance
+    // 预分割默认 upstream 以支持并发查询 / Pre-split default upstream for concurrent queries
+    cfg.settings.pre_split_default_upstream();
+    
     for pipeline in &mut cfg.pipelines {
         for rule in &mut pipeline.rules {
             for action in &mut rule.actions {

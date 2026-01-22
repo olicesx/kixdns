@@ -38,12 +38,22 @@ mod matcher_helpers {
         country_codes: &[String],
     ) -> bool {
         let result = manager.lookup(ip);
-        result.country_code.as_ref()
-            .map(|country| {
-                country_codes.iter()
-                    .any(|code| code.eq_ignore_ascii_case(country.as_ref()))
-            })
-            .unwrap_or(false)
+        
+        // ✅ 优化：提前返回，避免闭包分配
+        // ✅ Optimization: Early return to avoid closure allocation
+        let country_code = match result.country_code.as_ref() {
+            Some(code) => code,
+            None => return false,
+        };
+        
+        // ✅ 优化：直接迭代，避免 any() 的闭包开销
+        // ✅ Optimization: Direct iteration to avoid closure overhead of any()
+        for code in country_codes {
+            if code.eq_ignore_ascii_case(country_code.as_ref()) {
+                return true;
+            }
+        }
+        false
     }
 
     /// 检查域名是否属于指定的 GeoSite 分类
