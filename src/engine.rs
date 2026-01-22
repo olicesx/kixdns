@@ -25,7 +25,7 @@ use tokio::net::{
     TcpStream, UdpSocket,
     tcp::{OwnedReadHalf, OwnedWriteHalf},
 };
-use tokio::sync::{Mutex, Semaphore, oneshot};
+use tokio::sync::{Mutex, oneshot};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
@@ -536,7 +536,7 @@ impl Engine {
             state,
             cache,
             udp_client: Arc::new(UdpClient::new(udp_pool_size)),
-            tcp_mux: Arc::new(TcpMultiplexer::new(tcp_pool_size)),
+            tcp_mux: Arc::new(TcpMultiplexer::new(tcp_pool_size, Arc::clone(&permit_manager))),
             listener_label: Arc::from(listener_label),
             rule_cache,
             metrics_inflight: Arc::new(AtomicUsize::new(0)),
@@ -3470,6 +3470,9 @@ impl UdpClient {
 struct TcpMultiplexer {
     pools: dashmap::DashMap<Arc<str>, Arc<TcpConnectionPool>, FxBuildHasher>,
     pool_size: usize,
+    /// Shared permit manager for unified TCP/UDP concurrency control
+    /// 共享 permit manager 用于统一的 TCP/UDP 并发控制
+    permit_manager: Arc<PermitManager>,
 }
 
 struct TcpConnectionPool {
@@ -3478,10 +3481,11 @@ struct TcpConnectionPool {
 }
 
 impl TcpMultiplexer {
-    fn new(pool_size: usize) -> Self {
+    fn new(pool_size: usize, permit_manager: Arc<PermitManager>) -> Self {
         Self {
             pools: dashmap::DashMap::with_hasher(FxBuildHasher::default()),
             pool_size,
+            permit_manager,
         }
     }
 
@@ -3499,8 +3503,12 @@ impl TcpMultiplexer {
             .or_insert_with(|| {
                 let mut clients = Vec::with_capacity(self.pool_size);
                 let size = if self.pool_size == 0 { 1 } else { self.pool_size };
+                let permit_mgr = Arc::clone(&self.permit_manager);
                 for _ in 0..size {
-                    clients.push(Arc::new(TcpMuxClient::new(upstream_key.clone())));
+                    clients.push(Arc::new(TcpMuxClient::new(
+                        upstream_key.clone(),
+                        Arc::clone(&permit_mgr),
+                    )));
                 }
                 Arc::new(TcpConnectionPool {
                     clients,
@@ -3508,7 +3516,7 @@ impl TcpMultiplexer {
                 })
             })
             .clone();
-        
+
         let idx = pool.next_idx.fetch_add(1, Ordering::Relaxed) % pool.clients.len();
         pool.clients[idx].send(packet, timeout_dur).await
     }
@@ -3520,7 +3528,12 @@ struct TcpMuxClient {
     conn: Arc<Mutex<Option<OwnedWriteHalf>>>,
     pending: Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
     next_id: AtomicU16,
-    inflight_limit: Arc<Semaphore>,
+    /// Shared permit manager for TCP connection-level control (unified with UDP)
+    /// TCP 连接级别并发控制共享 permit manager（与 UDP 统一）
+    permit_manager: Arc<PermitManager>,
+    /// Connection-level permit (acquired when connection is established, held for connection lifetime)
+    /// 连接级别 permit（连接建立时获取，连接生命周期内持有）
+    conn_permit: Arc<Mutex<Option<PermitGuard>>>,
 }
 
 struct Pending {
@@ -3529,13 +3542,14 @@ struct Pending {
 }
 
 impl TcpMuxClient {
-    fn new(upstream: Arc<str>) -> Self {
+    fn new(upstream: Arc<str>, permit_manager: Arc<PermitManager>) -> Self {
         Self {
             upstream,
             conn: Arc::new(Mutex::new(None)),
             pending: Arc::new(dashmap::DashMap::with_hasher(FxBuildHasher::default())),
             next_id: AtomicU16::new(1),
-            inflight_limit: Arc::new(Semaphore::new(128)),
+            permit_manager,
+            conn_permit: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -3543,6 +3557,7 @@ impl TcpMuxClient {
         let pending = Arc::clone(&self.pending);
         let upstream = self.upstream.clone();
         let conn = Arc::clone(&self.conn);
+        let conn_permit = Arc::clone(&self.conn_permit);  // ✅ Clone conn_permit
         tokio::spawn(async move {
             // Pre-allocate a reusable buffer for TCP reads
             // DNS TCP max is 65535 bytes, but typical responses are much smaller
@@ -3551,7 +3566,7 @@ impl TcpMuxClient {
                 let mut len_buf = [0u8; 2];
                 if let Err(err) = reader.read_exact(&mut len_buf).await {
                     debug!(target = "tcp_mux", upstream = %upstream, error = %err, "tcp read len failed");
-                    Self::fail_all_async(&pending, anyhow::anyhow!("tcp read len failed"), &conn)
+                    Self::fail_all_async(&pending, anyhow::anyhow!("tcp read len failed"), &conn, &conn_permit)
                         .await;
                     break;
                 }
@@ -3563,7 +3578,7 @@ impl TcpMuxClient {
 
                 if let Err(err) = reader.read_exact(&mut reusable_buf[..resp_len]).await {
                     debug!(target = "tcp_mux", upstream = %upstream, error = %err, "tcp read body failed");
-                    Self::fail_all_async(&pending, anyhow::anyhow!("tcp read body failed"), &conn)
+                    Self::fail_all_async(&pending, anyhow::anyhow!("tcp read body failed"), &conn, &conn_permit)
                         .await;
                     break;
                 }
@@ -3589,11 +3604,10 @@ impl TcpMuxClient {
         if packet.len() < 2 {
             anyhow::bail!("dns packet too short for tcp");
         }
-        
-        // 1. Acquire semaphore with timeout
-        let _permit = timeout(timeout_dur, self.inflight_limit.acquire())
-            .await
-            .map_err(|_| anyhow::anyhow!("tcp inflight limit semaphore timeout"))??;
+
+        // 1. Ensure connection exists (acquires connection-level permit if needed)
+        // 确保连接存在（如果需要则获取连接级别 permit）
+        self.ensure_connection().await?;
 
         let elapsed = start.elapsed();
         if elapsed >= timeout_dur {
@@ -3607,25 +3621,20 @@ impl TcpMuxClient {
         let (tx, rx) = oneshot::channel();
         self.pending.insert(new_id, Pending { original_id, tx });
 
-        // 2. Ensure connection and write with remaining timeout (single lock)
+        // 2. Write request with remaining timeout (connection already ensured)
+        // 2. 写入请求（连接已确保）
         let write_res = timeout(remaining, async {
             // Build TCP DNS frame: 2-byte length prefix + payload
             let mut out = BytesMut::with_capacity(2 + new_packet.len());
             out.extend_from_slice(&(new_packet.len() as u16).to_be_bytes());
             out.extend_from_slice(&new_packet);
 
-            // Single lock acquisition - conn Mutex provides both connection management and write serialization
+            // Single lock acquisition - conn Mutex provides write serialization
+            // 单次锁获取 - conn Mutex 提供写入序列化
             let mut guard = self.conn.lock().await;
-            
-            // Ensure connection exists
-            if guard.is_none() {
-                let stream = TcpStream::connect(&*self.upstream).await?;
-                let (read_half, write_half) = stream.into_split();
-                *guard = Some(write_half);
-                // Spawn reader while holding the lock to prevent races
-                self.spawn_reader(read_half).await;
-            }
-            
+
+            // Connection must exist (ensure_connection was called earlier)
+            // 连接必须存在（ensure_connection 已在之前调用）
             let writer = guard.as_mut().context("tcp write half missing")?;
             writer.write_all(&out).await?;
             Ok::<(), anyhow::Error>(())
@@ -3635,12 +3644,12 @@ impl TcpMuxClient {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 self.remove_pending(new_id).await;
-                Self::reset_conn(&self.conn).await;
+                Self::reset_conn(&self.conn, &self.conn_permit).await;
                 return Err(err);
             }
             Err(_) => {
                 self.remove_pending(new_id).await;
-                Self::reset_conn(&self.conn).await;
+                Self::reset_conn(&self.conn, &self.conn_permit).await;
                 anyhow::bail!("tcp write/connect timeout");
             }
         }
@@ -3661,11 +3670,56 @@ impl TcpMuxClient {
             }
             Err(_elapsed) => {
                 self.remove_pending(new_id).await;
-                Self::reset_conn(&self.conn).await;
+                Self::reset_conn(&self.conn, &self.conn_permit).await;
                 anyhow::bail!("tcp response timeout")
             }
         };
         Ok(resp)
+    }
+
+    /// Ensure TCP connection exists, acquiring connection-level permit if needed
+    /// 确保 TCP 连接存在，如果需要则获取连接级别 permit
+    ///
+    /// Connection-level permit semantics:
+    /// - Acquired when connection is established
+    /// - Held for the entire connection lifetime
+    /// - Released when connection is closed/reset
+    /// - Allows unlimited requests on the same connection (TCP multiplexing)
+    ///
+    /// 连接级别 permit 语义：
+    /// - 连接建立时获取
+    /// - 连接生命周期内持有
+    /// - 连接关闭/重置时释放
+    /// - 允许同一连接上无限请求（TCP 多路复用）
+    async fn ensure_connection(&self) -> anyhow::Result<()> {
+        let mut guard = self.conn.lock().await;
+
+        if guard.is_none() {
+            // ✅ Acquire connection-level permit (non-blocking)
+            // ✅ 获取连接级别 permit（非阻塞）
+            let permit = self.permit_manager.try_acquire()
+                .ok_or_else(|| anyhow::anyhow!("tcp connection limit exceeded"))?;
+
+            // ✅ Establish TCP connection
+            // ✅ 建立 TCP 连接
+            let stream = TcpStream::connect(&*self.upstream).await
+                .map_err(|e| anyhow::anyhow!("tcp connect failed: {}", e))?;
+
+            let (read_half, write_half) = stream.into_split();
+
+            *guard = Some(write_half);
+
+            // ✅ Spawn reader while holding the lock to prevent races
+            // ✅ 持有锁时启动 reader 以防止竞争
+            self.spawn_reader(read_half).await;
+
+            // ✅ Store permit in connection (held for connection lifetime)
+            // ✅ 将 permit 保存在连接中（连接生命周期内持有）
+            let mut conn_permit_guard = self.conn_permit.lock().await;
+            *conn_permit_guard = Some(permit);
+        }
+
+        Ok(())
     }
 
     /// Rewrite DNS transaction ID, returning BytesMut for efficient further operations
@@ -3696,6 +3750,7 @@ impl TcpMuxClient {
         pending: &Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
         err: anyhow::Error,
         conn: &Arc<Mutex<Option<OwnedWriteHalf>>>,
+        conn_permit: &Arc<Mutex<Option<PermitGuard>>>,
     ) {
         let err_msg = err.to_string();
         let keys: Vec<u16> = pending.iter().map(|item| *item.key()).collect();
@@ -3704,12 +3759,22 @@ impl TcpMuxClient {
                 let _ = p.tx.send(Err(anyhow::anyhow!(err_msg.clone())));
             }
         }
-        Self::reset_conn(conn).await;
+        Self::reset_conn(conn, conn_permit).await;
     }
 
-    async fn reset_conn(conn: &Arc<Mutex<Option<OwnedWriteHalf>>>) {
+    /// Reset TCP connection and release connection-level permit
+    /// 重置 TCP 连接并释放连接级别 permit
+    async fn reset_conn(
+        conn: &Arc<Mutex<Option<OwnedWriteHalf>>>,
+        conn_permit: &Arc<Mutex<Option<PermitGuard>>>,
+    ) {
         let mut cg = conn.lock().await;
         *cg = None;
+
+        // ✅ Release connection-level permit
+        // ✅ 释放连接级别 permit
+        let mut permit_guard = conn_permit.lock().await;
+        *permit_guard = None;
     }
 }
 
@@ -3934,7 +3999,8 @@ mod tests {
     #[tokio::test]
     async fn tcp_mux_rewrite_id_no_deadlock_under_contention() {
         // Arrange: Prepare a TCP client with many pending IDs to force contention
-        let client = Arc::new(TcpMuxClient::new(Arc::from("127.0.0.1:0")));
+        let permit_manager = Arc::new(PermitManager::new(128)); // Default TCP limit
+        let client = Arc::new(TcpMuxClient::new(Arc::from("127.0.0.1:0"), permit_manager));
         for id in 1u16..200u16 {
             client.pending.insert(
                 id,
