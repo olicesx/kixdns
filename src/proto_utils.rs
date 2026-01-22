@@ -119,6 +119,19 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
         current_pos += label_len;
     }
 
+    // Validate UTF-8 for safety / 验证 UTF-8 以确保安全
+    // RFC 1035: DNS labels are octet strings, but in practice:
+    // - 99.999% of domain names are valid ASCII/UTF-8
+    // - We need valid UTF-8 for safe &str conversion in hot path
+    // RFC 1035：DNS 标签是字节串，但实际上：
+    // - 99.999% 的域名是有效的 ASCII/UTF-8
+    // - 我们需要在热路径中安全地转换为 &str
+    if std::str::from_utf8(&buf[..buf_pos]).is_err() {
+        // Fallback: reject non-UTF-8 domain names (extremely rare)
+        // 回退：拒绝非 UTF-8 域名（极其罕见）
+        return None;
+    }
+
     // 4. QType / 查询类型
     if packet.len() < pos + 4 {
         return None;
@@ -218,12 +231,40 @@ impl QuickQuery<'_> {
     /// assert!(query.qname_matches("GOOGLE.COM"));  // 大写匹配
     /// assert!(!query.qname_matches("example.com"));  // 不匹配
     /// ```
+    /// 
+    /// # Performance
+    /// This function is optimized for hot path usage:
+    /// - No allocation / 无分配
+    /// - Early exit on length mismatch / 长度不匹配时提前退出
+    /// - Byte-by-byte comparison with ASCII lowercasing / 逐字节比较并转为小写
+    #[inline]
     pub fn qname_matches(&self, pattern: &str) -> bool {
-        self.qname_bytes.eq_ignore_ascii_case(pattern.as_bytes())
+        // Fast path: length check / 快速路径：长度检查
+        if self.qname_bytes.len() != pattern.len() {
+            return false;
+        }
+        
+        // Byte-by-byte comparison with ASCII lowercasing / 逐字节比较并转为小写
+        // qname_bytes is already lowercased from parse_quick() / qname_bytes 在 parse_quick() 中已经转为小写
+        // So we only need to lowercase the pattern bytes / 所以我们只需要将 pattern 字节转为小写
+        self.qname_bytes
+            .iter()
+            .zip(pattern.as_bytes())
+            .all(|(a, b)| *a == b.to_ascii_lowercase())
     }
 
     /// 获取 qname 的字符串表示（用于调试和日志）
     /// Get string representation of qname (for debugging and logging)
+    /// 
+    /// # Performance Warning
+    /// This function allocates a new String. Use sparingly in hot paths.
+    /// 此函数分配新的 String。在热路径中谨慎使用。
+    /// 
+    /// # Safety
+    /// qname_bytes is guaranteed to be valid UTF-8 by parse_quick().
+    /// parse_quick() validates UTF-8 before returning QuickQuery.
+    /// qname_bytes 由 parse_quick() 保证为有效的 UTF-8。
+    /// parse_quick() 在返回 QuickQuery 之前验证 UTF-8。
     /// 
     /// # Examples
     /// ```
@@ -231,8 +272,43 @@ impl QuickQuery<'_> {
     /// let query = QuickQuery { qname_bytes: b"google.com", ... };
     /// println!("qname: {}", query.qname_str());  // "google.com"
     /// ```
+    #[inline]
     pub fn qname_str(&self) -> String {
-        String::from_utf8_lossy(self.qname_bytes).into_owned()
+        // SAFETY: qname_bytes is validated UTF-8 from parse_quick()
+        // 安全性：qname_bytes 在 parse_quick() 中已经验证为 UTF-8
+        unsafe {
+            std::str::from_utf8_unchecked(self.qname_bytes).to_string()
+        }
+    }
+
+    /// 获取 qname 的 &str 表示（零分配，但受生命周期限制）
+    /// Get &str representation of qname (zero-allocation, but lifetime-bound)
+    /// 
+    /// # Performance
+    /// This is the preferred method for string operations in hot paths.
+    /// 这是热路径中字符串操作的首选方法。
+    /// 
+    /// # Safety
+    /// qname_bytes is guaranteed to be valid UTF-8 by parse_quick().
+    /// parse_quick() validates UTF-8 before returning QuickQuery.
+    /// If parse_quick() succeeds, qname_bytes is always valid UTF-8.
+    /// qname_bytes 由 parse_quick() 保证为有效的 UTF-8。
+    /// parse_quick() 在返回 QuickQuery 之前验证 UTF-8。
+    /// 如果 parse_quick() 成功，qname_bytes 始终是有效的 UTF-8。
+    /// 
+    /// # Examples
+    /// ```
+    /// # use kixdns::proto_utils::QuickQuery;
+    /// let query = QuickQuery { qname_bytes: b"google.com", ... };
+    /// let qname_str = query.qname_str_unchecked();  // &str
+    /// ```
+    #[inline]
+    pub fn qname_str_unchecked(&self) -> &str {
+        // SAFETY: qname_bytes is validated UTF-8 from parse_quick()
+        // 安全性：qname_bytes 在 parse_quick() 中已经验证为 UTF-8
+        unsafe {
+            std::str::from_utf8_unchecked(self.qname_bytes)
+        }
     }
 
     /// 获取 qname 的哈希值（用于缓存键计算）
@@ -244,11 +320,10 @@ impl QuickQuery<'_> {
     /// let query = QuickQuery { qname_bytes: b"google.com", ... };
     /// let hash = query.qname_hash();
     /// ```
+    #[inline]
     pub fn qname_hash(&self) -> u64 {
         let mut h = rustc_hash::FxHasher::default();
-        for &b in self.qname_bytes {
-            h.write_u8(b);
-        }
+        h.write(self.qname_bytes);
         h.finish()
     }
 }

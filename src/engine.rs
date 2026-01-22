@@ -795,8 +795,9 @@ impl Engine {
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
         // GeoSiteManager 使用 FxHashMap + RwLock 保护，无需额外锁
         // GeoSiteManager uses FxHashMap protected by RwLock, no additional locks needed
-        // Convert qname_bytes to str for select_pipeline / 将 qname_bytes 转换为 str 供 select_pipeline 使用
-        let qname_str = std::str::from_utf8(q.qname_bytes).unwrap_or("");
+        // Use unchecked conversion for performance (qname_bytes is validated UTF-8)
+        // 使用未检查转换以提高性能（qname_bytes 是已验证的 UTF-8）
+        let qname_str = q.qname_str_unchecked();
         let (pipeline_opt, pipeline_id) = select_pipeline(
             cfg,
             qname_str,
@@ -810,7 +811,6 @@ impl Engine {
         );
         
         // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
-        let qtype = hickory_proto::rr::RecordType::from(q.qtype);
         let cache_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, q.qname_bytes, qtype, qclass);
         
         if let Some(hit) = self.cache.get(&cache_hash) {
@@ -848,7 +848,7 @@ impl Engine {
                             is_refreshing = is_refreshing,
                             should_trigger = !is_refreshing && remaining_ttl as u64 <= threshold,
                             upstream = ?hit.upstream,
-                            qname = %q.qname_str(),
+                            qname = %q.qname_str_unchecked(),  // Use unchecked for performance / 使用未检查版本以提高性能
                             "cache background refresh check"
                         );
 
@@ -857,7 +857,7 @@ impl Engine {
                             // Trigger background refresh (async, don't block current request)
                             // Note: RefreshingGuard inside spawn_background_refresh will handle insertion
                             // 注意：spawn_background_refresh 内部的 RefreshingGuard 将处理插入
-                            let qname_str = q.qname_str();
+                            let qname_str = q.qname_str_unchecked();  // Zero-allocation / 零分配
                             tracing::debug!(
                                 qname = %qname_str,
                                 original_ttl = hit.original_ttl,
@@ -867,7 +867,7 @@ impl Engine {
                             self.spawn_background_refresh(
                                 cache_hash,
                                 &pipeline_id,
-                                &qname_str,
+                                qname_str,
                                 qtype,
                                 qclass,
                                 hit.upstream.as_deref(),
@@ -892,7 +892,7 @@ impl Engine {
         // 2. Compiled rule fast-path for static decisions / 2. 编译规则的静态决策快速路径
         if let Some(compiled) = self.compiled_for(&state, &pipeline_id) {
             let qclass = DNSClass::from(q.qclass);
-            let qname_str = std::str::from_utf8(q.qname_bytes).unwrap_or("");
+            let qname_str = q.qname_str_unchecked();  // Zero-allocation / 零分配
             if let Some(decision) = fast_static_match(
                 &compiled,
                 qname_str,
@@ -1044,9 +1044,11 @@ impl Engine {
         // Lazy Parse: Use quick parse first / 延迟解析：首先使用快速解析
         let mut qname_buf = [0u8; 256];
         let (qname_cow, qtype, qclass, tx_id, edns_present) = if let Some(q) = parse_quick(packet, &mut qname_buf) {
-            // Convert qname_bytes to String for consistency / 将 qname_bytes 转换为 String 以保持一致性
-            let qname_str = std::str::from_utf8(q.qname_bytes).unwrap_or("").to_string();
-            (std::borrow::Cow::Owned(qname_str), hickory_proto::rr::RecordType::from(q.qtype), DNSClass::from(q.qclass), q.tx_id, q.edns_present)
+            // Use unchecked conversion to avoid double allocation / 使用未检查转换避免双重分配
+            // SAFETY: qname_bytes is validated UTF-8 from parse_quick()
+            // 安全性：qname_bytes 在 parse_quick() 中已验证为 UTF-8
+            let qname_str = unsafe { std::str::from_utf8_unchecked(q.qname_bytes) };
+            (std::borrow::Cow::Borrowed(qname_str), hickory_proto::rr::RecordType::from(q.qtype), DNSClass::from(q.qclass), q.tx_id, q.edns_present)
         } else {
             // Fallback to full parse if quick parse fails (unlikely for standard queries) / 如果快速解析失败则回退到完整解析（对于标准查询不太可能）
             let req = Message::from_bytes(packet).context("parse request")?;
