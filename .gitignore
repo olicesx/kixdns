@@ -34,5 +34,6 @@ nul
 # Local development and testing files (keep locally, don't commit)
 /test/
 /benches/
+/tests/
 src/integration_tests_new_matchers.rs
 test_parse_response_quick.rs
