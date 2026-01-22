@@ -30,3 +30,9 @@ nul
 # Allow config JSON files
 !config/*.json
 !tests/config/*.json
+
+# Local development and testing files (keep locally, don't commit)
+/test/
+/benches/
+src/integration_tests_new_matchers.rs
+test_parse_response_quick.rs
