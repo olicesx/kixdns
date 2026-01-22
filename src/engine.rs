@@ -1045,8 +1045,10 @@ impl Engine {
         let mut qname_buf = [0u8; 256];
         let (qname_cow, qtype, qclass, tx_id, edns_present) = if let Some(q) = parse_quick(packet, &mut qname_buf) {
             // Use unchecked conversion to avoid double allocation / 使用未检查转换避免双重分配
-            // SAFETY: qname_bytes is validated UTF-8 from parse_quick()
-            // 安全性：qname_bytes 在 parse_quick() 中已验证为 UTF-8
+            // SAFETY: qname_bytes is validated ASCII from parse_quick()
+            // ASCII is always valid UTF-8, so this is safe
+            // 安全性：qname_bytes 在 parse_quick() 中已验证为 ASCII
+            // ASCII 始终是有效的 UTF-8，所以这是安全的
             let qname_str = unsafe { std::str::from_utf8_unchecked(q.qname_bytes) };
             (std::borrow::Cow::Borrowed(qname_str), hickory_proto::rr::RecordType::from(q.qtype), DNSClass::from(q.qclass), q.tx_id, q.edns_present)
         } else {
