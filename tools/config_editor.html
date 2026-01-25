@@ -79,6 +79,11 @@
                                 <input type="number" class="form-control" v-model.number="config.settings.upstream_timeout_ms">
                             </div>
                             <div class="col-md-3">
+                                <label class="form-label">整体请求超时 (ms)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.request_timeout_ms" placeholder="留空自动计算">
+                                <div class="form-text small">包含 hedge + TCP fallback 的总超时，留空则自动计算为 upstream * 2.5</div>
+                            </div>
+                            <div class="col-md-3">
                                 <label class="form-label">响应跳转上限</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.response_jump_limit">
                             </div>
@@ -89,6 +94,21 @@
                             <div class="col-md-3">
                                 <label class="form-label">TCP 连接池大小</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.tcp_pool_size" placeholder="64">
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">TCP 健康检查错误阈值</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.tcp_health_check_error_threshold" placeholder="3">
+                                <div class="form-text small">连续失败多少次后重置连接（0=禁用，默认 3）</div>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">TCP 连接最大存活时间 (秒)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.tcp_connection_max_age_seconds" placeholder="300">
+                                <div class="form-text small">连接超过此时间强制重置（0=禁用，默认 300）</div>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">TCP 连接空闲超时 (秒)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.tcp_connection_idle_timeout_seconds" placeholder="60">
+                                <div class="form-text small">无请求超过此时间重置连接（0=禁用，默认 60）</div>
                             </div>
                                 <div class="col-md-3">
                                     <label class="form-label">缓存容量 (entries)</label>
@@ -584,9 +604,13 @@
                         bind_tcp: "0.0.0.0:5353",
                         default_upstream: "1.1.1.1:53",
                         upstream_timeout_ms: 2000,
+                        request_timeout_ms: null,
                         response_jump_limit: 10,
                         udp_pool_size: 64,
                         tcp_pool_size: 64,
+                        tcp_health_check_error_threshold: 3,
+                        tcp_connection_max_age_seconds: 300,
+                        tcp_connection_idle_timeout_seconds: 60,
                         flow_control_initial_permits: 500,
                         flow_control_min_permits: 100,
                         flow_control_max_permits: 800,
