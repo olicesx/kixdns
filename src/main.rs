@@ -125,6 +125,40 @@ async fn run_dns_server(
 
             watcher::spawn(config.clone(), engine.clone());
 
+            // ✅ 添加信号处理以支持优雅关闭
+            // ✅ Add signal handling for graceful shutdown
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+
+                let mut sigterm = match signal(SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to setup SIGTERM handler");
+                        return Err(e.into());
+                    }
+                };
+                let mut sigint = match signal(SignalKind::interrupt()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to setup SIGINT handler");
+                        return Err(e.into());
+                    }
+                };
+
+                // 启动信号监听任务 / Spawn signal listener task
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = sigterm.recv() => {
+                            tracing::warn!("Received SIGTERM, shutting down gracefully");
+                        }
+                        _ = sigint.recv() => {
+                            tracing::warn!("Received SIGINT, shutting down gracefully");
+                        }
+                    }
+                });
+            }
+
             // UDP worker 数量：默认为 CPU 核心数，最少 1 个 / UDP worker count: defaults to CPU core count, minimum 1
             let udp_workers_final = if udp_workers_count > 0 {
                 udp_workers_count

@@ -495,18 +495,26 @@ impl Engine {
                 
                 let load_result = if is_dat {
                     // 使用按需加载 / Use selective loading
-                    let mut manager = geosite_manager.write().unwrap();
-                    if used_geosite_tags.is_empty() {
+                    if let Some(mut manager) = geosite_manager.write().ok() {
+                        if used_geosite_tags.is_empty() {
                         // 没有使用 GeoSite 标签，跳过加载 / No GeoSite tags used, skip loading
                         info!("No GeoSite tags used in config, skipping GeoSite data loading");
                         Ok(0)
                     } else {
-                        manager.load_from_dat_file_selective(&path, &used_geosite_tags)
+                            manager.load_from_dat_file_selective(&path, &used_geosite_tags)
+                        }
+                    } else {
+                        tracing::error!("GeoSite RwLock is poisoned during .dat config load, skipping GeoSite loading");
+                        Ok(0) // Skip loading but continue with other files
                     }
                 } else {
                     // JSON 格式：全量加载 / JSON format: load all
-                    let mut manager = geosite_manager.write().unwrap();
-                    manager.load_from_v2ray_file(&path)
+                    if let Some(mut manager) = geosite_manager.write().ok() {
+                        manager.load_from_v2ray_file(&path)
+                    } else {
+                        tracing::error!("GeoSite RwLock is poisoned during JSON config load, skipping GeoSite loading");
+                        Ok(0) // Skip loading but continue with other files
+                    }
                 };
                 
                 match load_result {
@@ -3378,10 +3386,34 @@ pub fn select_pipeline<'a>(
             |m| m.operator,
             |m| {
                 // 获取 GeoSiteManager 和 GeoIpManager 的引用 / Get GeoSiteManager and GeoIpManager references
-                let geosite_mgr_ref = geosite_manager.map(|m| m.read().unwrap());
+                let geosite_mgr_ref = match geosite_manager {
+                    Some(manager) => {
+                        match manager.read() {
+                            Ok(guard) => Some(guard),
+                            Err(e) => {
+                                tracing::error!(error = ?e, "GeoSite RwLock is poisoned during request");
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                };
                 let geosite_mgr_ref_deref = geosite_mgr_ref.as_deref();
-                let geoip_mgr_ref = geoip_manager.map(|m| m.read().unwrap());
+
+                let geoip_mgr_ref = match geoip_manager {
+                    Some(manager) => {
+                        match manager.read() {
+                            Ok(guard) => Some(guard),
+                            Err(e) => {
+                                tracing::error!(error = ?e, "GeoIP RwLock is poisoned during request");
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                };
                 let geoip_mgr_ref_deref = geoip_mgr_ref.as_deref();
+
                 m.matcher.matches_with_qtype(listener_label, client_ip, qname, qclass, edns_present, qtype, geoip_mgr_ref_deref, geosite_mgr_ref_deref)
             },
         );
