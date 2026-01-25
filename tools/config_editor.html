@@ -146,24 +146,6 @@
                         </div>
 
                         <hr>
-                        <h6 class="fw-bold mb-2 text-danger">✨ Worker 本地缓存配置 (Worker Local Cache)</h6>
-                        <div class="row g-3">
-                            <div class="col-md-4">
-                                <label class="form-label">启用 Worker 本地缓存</label>
-                                <div class="form-check form-switch">
-                                    <input class="form-check-input" type="checkbox" v-model="config.settings.worker_local_cache_enabled">
-                                    <label class="form-check-label">启用 Worker 本地缓存</label>
-                                </div>
-                                <div class="form-text small">每个 worker 线程独立的缓存，减少锁竞争</div>
-                            </div>
-                            <div class="col-md-4">
-                                <label class="form-label">本地缓存容量</label>
-                                <input type="number" class="form-control" v-model.number="config.settings.worker_local_cache_capacity" placeholder="1000" min="100" max="100000">
-                                <div class="form-text small">每个 worker 本地缓存的最大条目数（默认1000）</div>
-                            </div>
-                        </div>
-
-                        <hr>
                         <h6 class="fw-bold mb-2 text-success">自适应流量控制配置 (Flow Control)</h6>
                         <div class="row g-3">
                             <div class="col-md-6">
@@ -641,8 +623,6 @@
                         cache_background_refresh: false,
                         cache_refresh_threshold_percent: 10,
                         cache_refresh_min_ttl: 5,
-                        worker_local_cache_enabled: false,
-                        worker_local_cache_capacity: 1000,
                         geoip_db_path: "",
                         geoip_dat_path: "",
                         geoip_auto_convert: false,

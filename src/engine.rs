@@ -105,11 +105,6 @@ pub struct EngineInner {
 pub struct Engine {
     state: Arc<ArcSwap<EngineInner>>,
     cache: DnsCache,
-    /// Worker 本地缓存：每个 worker 线程独立的缓存副本，减少锁竞争
-    /// 仅在 worker_local_cache_enabled=true 时使用
-    worker_local_caches: Vec<DnsCache>,
-    /// Worker 本地缓存代际：用于检测配置更新并失效缓存
-    worker_cache_generation: Arc<AtomicU64>,
     udp_client: Arc<UdpClient>,
     tcp_mux: Arc<TcpMultiplexer>,
     listener_label: Arc<str>,
@@ -136,8 +131,8 @@ pub struct Engine {
     pub inflight: Arc<DashMap<u64, tokio::sync::watch::Sender<Result<Bytes, Arc<anyhow::Error>>>, FxBuildHasher>>,
     // Background refresh tracking: bitmap for concurrent refresh deduplication
     // 后台刷新跟踪：用于并发刷新去重的位图
-    // OPTIMIZATION: Use AtomicU64 bitmap instead of DashMap for zero-lock overhead
-    // 优化：使用 AtomicU64 位图代替 DashMap，实现零锁开销
+    // ✅ OPTIMIZATION: Use AtomicU64 bitmap instead of DashMap for zero-lock overhead
+    // ✅ 优化：使用 AtomicU64 位图代替 DashMap，实现零锁开销
     // Each bit represents whether a cache_hash (low 6 bits) is currently being refreshed
     // 每个位表示一个 cache_hash（低 6 位）是否正在刷新
     // Trade-off: Can track up to 64 concurrent refreshes (sufficient for background refresh)
@@ -159,13 +154,11 @@ pub struct Engine {
     // 使用 RwLock 允许并发读操作，写操作独占 / Uses RwLock for concurrent reads, exclusive writes
     pub geosite_manager: Arc<std::sync::RwLock<crate::geosite::GeoSiteManager>>,
     // Background refresh dedicated rule / 后台刷新专用规则
-    // Design: Background refresh calls handle_packet(skip_cache=true) with this rule
-    // 设计：后台刷新调用 handle_packet(skip_cache=true) 使用此规则
+    // ✅ Design: Background refresh calls handle_packet(skip_cache=true) with this rule
+    // ✅ 设计：后台刷新调用 handle_packet(skip_cache=true) 使用此规则
     // Uses OnceLock for lazy initialization and thread-safe one-time setup
     // 使用 OnceLock 实现延迟初始化和线程安全的一次性设置
     background_refresh_rule: std::sync::OnceLock<Arc<crate::matcher::RuntimeRule>>,
-    /// Worker 本地缓存配置 / Worker local cache configuration
-    worker_local_cache_enabled: bool,
 }
 
 /// Adaptive flow control state for dynamic semaphore adjustment
@@ -368,24 +361,12 @@ fn uses_geoip_matchers(cfg: &RuntimePipelineConfig) -> bool {
 }
 
 impl Engine {
-    pub fn new(cfg: RuntimePipelineConfig, listener_label: String, worker_count: usize) -> Self {
+    pub fn new(cfg: RuntimePipelineConfig, listener_label: String) -> Self {
         // moka 缓存：容量由配置控制（默认 10000 条），最大生存时间由 cache_max_ttl 控制
         // moka cache capacity and max TTL are configurable via settings
         let cache_capacity = cfg.settings.cache_capacity;
         let cache_max_ttl = cfg.settings.cache_max_ttl;
         let cache = new_cache(cache_capacity, cache_max_ttl);
-
-        // Worker 本地缓存：根据配置决定是否启用 / Worker local cache: enable based on config
-        let worker_local_cache_enabled = cfg.settings.worker_local_cache_enabled;
-        let worker_local_cache_capacity = cfg.settings.worker_local_cache_capacity;
-        let worker_local_caches = if worker_local_cache_enabled {
-            // 为每个 worker 创建独立的缓存 / Create independent cache for each worker
-            (0..worker_count)
-                .map(|_| new_cache(worker_local_cache_capacity, cache_max_ttl))
-                .collect()
-        } else {
-            Vec::new()
-        };
         // Rule cache: 10k entries, long default TTL (managed manually per-entry)
         // 规则缓存：1万条，默认长 TTL（通过条目内部 expires_at 手动管理）
         let rule_cache = Cache::builder()
@@ -406,7 +387,7 @@ impl Engine {
         let cache_refresh_threshold_percent = cfg.settings.cache_refresh_threshold_percent;
         let cache_refresh_min_ttl = cfg.settings.cache_refresh_min_ttl;
 
-        // Extract TCP health check settings / 提取 TCP 健康检查配置
+        // ✅ Extract TCP health check settings / 提取 TCP 健康检查配置
         let tcp_health_error_threshold = cfg.settings.tcp_health_check_error_threshold;
         let tcp_max_age_secs = cfg.settings.tcp_connection_max_age_seconds;
         let tcp_idle_timeout_secs = cfg.settings.tcp_connection_idle_timeout_seconds;
@@ -576,8 +557,8 @@ impl Engine {
         });
         let permit_manager = Arc::new(PermitManager::new(flow_control_initial_permits));
 
-        // TCP uses independent permit manager (separate from UDP)
-        // TCP 使用独立的 permit manager（与 UDP 分离）
+        // ✅ TCP uses independent permit manager (separate from UDP)
+        // ✅ TCP 使用独立的 permit manager（与 UDP 分离）
         // TCP permit limit = tcp_pool_size (one permit per connection)
         // TCP permit 上限 = tcp_pool_size（每个连接一个 permit）
         let tcp_permit_manager = Arc::new(PermitManager::new(tcp_pool_size));
@@ -585,7 +566,6 @@ impl Engine {
         Self {
             state,
             cache,
-            worker_local_caches,
             udp_client: Arc::new(UdpClient::new(udp_pool_size)),
             tcp_mux: Arc::new(TcpMultiplexer::new(
                 tcp_pool_size,
@@ -631,10 +611,6 @@ impl Engine {
             geosite_manager,
             // Background refresh dedicated rule (lazy initialization) / 后台刷新专用规则（延迟初始化）
             background_refresh_rule: std::sync::OnceLock::new(),
-            // Worker local cache configuration / Worker 本地缓存配置
-            worker_local_cache_enabled,
-            // Worker cache generation for cache invalidation / Worker 缓存代际用于缓存失效
-            worker_cache_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -645,41 +621,28 @@ impl Engine {
             pipeline: new_cfg,
             compiled_pipelines: compiled,
         }));
-        // 清除规则缓存以确保新规则立即生效
+        // 清除规则缓存以确保新规则立即生效 / Clear rule cache to ensure new rules take effect immediately
         self.rule_cache.invalidate_all();
-        // 清空 worker 本地缓存以确保新配置立即生效
-        self.clear_local_caches();
-        // 重置后台刷新规则以允许使用新配置重新初始化
+        // ✅ Reset background refresh rule to allow re-initialization with new config
+        // ✅ 重置后台刷新规则以允许使用新配置重新初始化
         // Note: OnceLock cannot be reset, so we rely on the fact that the rule is
         // initialized from the current pipeline config via get_background_refresh_rule()
         // 注意：OnceLock 无法重置，所以我们依赖规则通过 get_background_refresh_rule()
         // 从当前 pipeline 配置初始化的事实
     }
 
-    /// 清空所有 worker 本地缓存
-    /// 在配置更新时调用，确保新规则立即生效
-    fn clear_local_caches(&self) {
-        if !self.worker_local_caches.is_empty() {
-            for cache in &self.worker_local_caches {
-                cache.invalidate_all();
-            }
-            // 增加代际计数，用于检测缓存失效
-            self.worker_cache_generation.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
     /// Get or initialize the background refresh dedicated rule
     /// 获取或初始化后台刷新专用规则
     /// 
-    /// Design: Uses OnceLock for thread-safe lazy initialization
-    /// 设计：使用 OnceLock 实现线程安全的延迟初始化
+    /// ✅ Design: Uses OnceLock for thread-safe lazy initialization
+    /// ✅ 设计：使用 OnceLock 实现线程安全的延迟初始化
     /// - First call: Creates rule from config or default
     /// - Subsequent calls: Returns cached rule
     /// - 首次调用：从配置或默认创建规则
     /// - 后续调用：返回缓存的规则
     fn get_background_refresh_rule(&self) -> Option<Arc<crate::matcher::RuntimeRule>> {
-        // 暂时返回 None，等待 RuntimePipelineConfig 结构更新
-        // Temporarily return None, waiting for RuntimePipelineConfig structure update
+        // ✅ 暂时返回 None，等待 RuntimePipelineConfig 结构更新
+        // ✅ Temporarily return None, waiting for RuntimePipelineConfig structure update
         None
     }
 
@@ -776,11 +739,11 @@ impl Engine {
         if let Some(timeout) = settings.request_timeout_ms {
             timeout
         } else {
-            // 自动计算：hedge(1/3) + full(1x) + tcp_fallback(1x) + 余量
+            // ✅ 自动计算：hedge(1/3) + full(1x) + tcp_fallback(1x) + 余量
             // - hedge 通常提前返回，不计入最大时间
             // - 实际路径：hedge 尝试 → full 尝试 → tcp fallback
             // - 最大时间：upstream * 2.5（保守估计）
-            // Auto-calculate: hedge(1/3) + full(1x) + tcp_fallback(1x) + margin
+            // ✅ Auto-calculate: hedge(1/3) + full(1x) + tcp_fallback(1x) + margin
             // - hedge usually returns early, not counted in max time
             // - Actual path: hedge attempt → full attempt → tcp fallback
             // - Max time: upstream * 2.5 (conservative estimate)
@@ -788,8 +751,8 @@ impl Engine {
         }
     }
 
-    /// Mark TCP external timeout for a specific upstream
-    /// 标记特定上游的 TCP 外部超时
+    /// ✅ Mark TCP external timeout for a specific upstream
+    /// ✅ 标记特定上游的 TCP 外部超时
     ///
     /// 当 TCP worker 发生外部超时时调用此方法，记录错误并可能触发连接重置
     /// Call this method when TCP worker external timeout occurs, recording errors and possibly triggering connection reset
@@ -832,8 +795,8 @@ impl Engine {
         h.finish()
     }
 
-    /// 辅助函数：创建并插入 DNS 缓存条目
-    /// 消除重复的 CacheEntry 构造代码
+    /// 辅助函数：创建并插入 DNS 缓存条目 / Helper: create and insert DNS cache entry
+    /// 消除重复的 CacheEntry 构造代码 / Eliminate duplicate CacheEntry construction code
     #[inline]
     fn insert_dns_cache_entry(
         &self,
@@ -846,7 +809,6 @@ impl Engine {
         pipeline_id: Arc<str>,
         qtype: hickory_proto::rr::RecordType,
         original_ttl: u32,
-        worker_id: Option<usize>,
     ) {
         let entry = CacheEntry {
             bytes,
@@ -859,64 +821,7 @@ impl Engine {
             inserted_at: Instant::now(),
             original_ttl,
         };
-        let entry_arc = Arc::new(entry);
-        self.insert_to_both_caches(cache_hash, entry_arc, worker_id);
-    }
-
-    /// 辅助函数：从缓存查询，支持本地缓存
-    /// worker_id: UDP workers 使用 Some(worker_id)，TCP 使用 None（不使用本地缓存）
-    #[inline]
-    fn get_from_cache(&self, cache_hash: u64, worker_id: Option<usize>) -> Option<Arc<CacheEntry>> {
-        // Worker 本地缓存：先查询本地缓存，减少锁竞争
-        if self.worker_local_cache_enabled && !self.worker_local_caches.is_empty() {
-            if let Some(wid) = worker_id {
-                let cache_idx = wid % self.worker_local_caches.len();
-
-                // 先查本地缓存
-                if let Some(local_hit) = self.worker_local_caches[cache_idx].get(&cache_hash) {
-                    // 本地缓存命中
-                    tracing::debug!(
-                        cache_idx = cache_idx,
-                        worker_id = wid,
-                        "worker local cache hit"
-                    );
-                    return Some(local_hit);
-                } else {
-                    // 本地缓存未命中，查主缓存
-                    if let Some(main_hit) = self.cache.get(&cache_hash) {
-                        // 主缓存命中，写入本地缓存
-                        tracing::debug!(
-                            cache_idx = cache_idx,
-                            worker_id = wid,
-                            "worker local cache miss, main cache hit, populating local cache"
-                        );
-                        // Arc<CacheEntry> 可以直接克隆，成本低
-                        self.worker_local_caches[cache_idx].insert(cache_hash, main_hit.clone());
-                        return Some(main_hit);
-                    }
-                    return None;
-                }
-            }
-        }
-        // 未启用本地缓存或 TCP（无 worker_id），直接查主缓存
-        self.cache.get(&cache_hash)
-    }
-
-    /// 辅助函数：同时更新主缓存和本地缓存
-    /// worker_id: UDP workers 使用 Some(worker_id)，TCP 使用 None（不使用本地缓存）
-    /// 用于避免代码重复
-    #[inline]
-    fn insert_to_both_caches(&self, cache_hash: u64, entry_arc: Arc<CacheEntry>, worker_id: Option<usize>) {
-        self.cache.insert(cache_hash, entry_arc.clone());
-
-        // Worker 本地缓存：更新当前 worker 的本地缓存
-        // 只有 UDP workers（有明确的 worker_id）才使用本地缓存
-        if self.worker_local_cache_enabled && !self.worker_local_caches.is_empty() {
-            if let Some(wid) = worker_id {
-                let cache_idx = wid % self.worker_local_caches.len();
-                self.worker_local_caches[cache_idx].insert(cache_hash, entry_arc);
-            }
-        }
+        self.cache.insert(cache_hash, Arc::new(entry));
     }
 
     #[allow(dead_code)]
@@ -945,7 +850,6 @@ impl Engine {
         &self,
         packet: &[u8],
         peer: SocketAddr,
-        worker_id: Option<usize>,
     ) -> anyhow::Result<Option<FastPathResponse>> {
         // 快速解析，避免完整 Message 解析和大量分配 / Quick parsing, avoiding full Message parsing and massive allocations
         // 使用栈上缓冲区避免 String 分配 / Use stack buffer to avoid String allocation
@@ -985,10 +889,7 @@ impl Engine {
         // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
         let cache_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, q.qname_bytes, qtype, qclass);
 
-        // Worker 本地缓存：先查询本地缓存，减少锁竞争
-        let cached_entry = self.get_from_cache(cache_hash, worker_id);
-
-        if let Some(hit) = cached_entry {
+        if let Some(hit) = self.cache.get(&cache_hash) {
             // Verify collision / 验证冲突
             if hit.qtype == u16::from(qtype) && q.qname_matches(hit.qname.as_ref()) && hit.pipeline_id == pipeline_id {
                 // Check if expired / 检查是否已过期
@@ -1009,8 +910,8 @@ impl Engine {
                         let remaining_ttl = hit.original_ttl.saturating_sub(elapsed_secs);
                         let threshold = (hit.original_ttl as u64 * self.cache_refresh_threshold_percent as u64) / 100;
 
-                        // OPTIMIZATION: Zero-lock check using bitmap
-                        // 优化：使用位图进行零锁检查
+                        // ✅ OPTIMIZATION: Zero-lock check using bitmap
+                        // ✅ 优化：使用位图进行零锁检查
                         let is_refreshing = is_refreshing(&self.refreshing_bitmap, cache_hash);
 
                         tracing::info!(
@@ -1183,22 +1084,22 @@ impl Engine {
         );
     }
 
-    pub async fn handle_packet(&self, packet: &[u8], peer: SocketAddr, worker_id: Option<usize>) -> anyhow::Result<Bytes> {
-        self.handle_packet_internal(packet, peer, false, worker_id).await
+    pub async fn handle_packet(&self, packet: &[u8], peer: SocketAddr) -> anyhow::Result<Bytes> {
+        self.handle_packet_internal(packet, peer, false).await
     }
 
     /// Internal handle_packet implementation with skip_cache option
     /// 内部 handle_packet 实现，支持跳过缓存选项
-    ///
-    /// Design: Background refresh calls this with skip_cache=true to:
-    /// 设计：后台刷新使用 skip_cache=true 调用以：
+    /// 
+    /// ✅ Design: Background refresh calls this with skip_cache=true to:
+    /// ✅ 设计：后台刷新使用 skip_cache=true 调用以：
     /// 1. Skip cache lookup (avoid returning stale cache)
     /// 2. Skip cache hit metrics (avoid inflating hit rate)
     /// 3. Always query upstream (get fresh data)
     /// 1. 跳过缓存查找（避免返回陈旧缓存）
     /// 2. 跳过缓存命中指标（避免虚高命中率）
     /// 3. 始终查询上游（获取最新数据）
-    async fn handle_packet_internal(&self, packet: &[u8], peer: SocketAddr, skip_cache: bool, worker_id: Option<usize>) -> anyhow::Result<Bytes> {
+    async fn handle_packet_internal(&self, packet: &[u8], peer: SocketAddr, skip_cache: bool) -> anyhow::Result<Bytes> {
         // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
         let _req_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
         self.incr_total_requests();
@@ -1264,8 +1165,8 @@ impl Engine {
         let qname_bytes = qname_ref.as_bytes();
         let dedupe_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, qname_bytes, qtype, qclass);
         
-        // Background refresh: Skip cache lookup when skip_cache=true
-        // 后台刷新：当 skip_cache=true 时跳过缓存查找
+        // ✅ Background refresh: Skip cache lookup when skip_cache=true
+        // ✅ 后台刷新：当 skip_cache=true 时跳过缓存查找
         if !skip_cache {
             // moka 同步缓存自动处理过期，无需检查 expires_at / moka sync cache automatically handles expiration, no need to check expires_at
             if let Some(hit) = self.cache.get(&dedupe_hash) {
@@ -1293,18 +1194,18 @@ impl Engine {
                     let resp_bytes = resp_bytes.freeze();
                     
                     // ========== NEW: Trigger background refresh before returning cached response ==========
-                    // 在返回缓存响应之前,异步触发后台刷新
+                    // ✅ 在返回缓存响应之前,异步触发后台刷新
                     // This ensures the client gets an immediate response while the cache is updated in background
                     // 这确保客户端立即获得响应,同时缓存更新在后台进行
                     
-                    // FIX: Check refresh threshold BEFORE cache invalidation to prevent race condition
-                    // 修复：在缓存失效之前检查刷新阈值，防止竞态条件
+                    // ✅ FIX: Check refresh threshold BEFORE cache invalidation to prevent race condition
+                    // ✅ 修复：在缓存失效之前检查刷新阈值，防止竞态条件
                     let remaining_ttl = hit.original_ttl.saturating_sub(elapsed);
                     let should_refresh = if remaining_ttl as u64 >= hit.original_ttl as u64 {
                         // Cache entry expired, check if we should refresh before invalidating
                         // 缓存条目已过期，检查是否应该在失效前刷新
                         if cfg.settings.cache_background_refresh
-                            && hit.upstream.is_some()  // FIX: Only check upstream field (source is upstream address, not "upstream")
+                            && hit.upstream.is_some()  // ✅ FIX: Only check upstream field (source is upstream address, not "upstream")
                             && hit.original_ttl >= cfg.settings.cache_refresh_min_ttl
                         {
                             let threshold = (hit.original_ttl as u64 * cfg.settings.cache_refresh_threshold_percent as u64) / 100;
@@ -1316,7 +1217,7 @@ impl Engine {
                         // Cache entry still valid, check if we should trigger early refresh
                         // 缓存条目仍然有效，检查是否应该触发早期刷新
                         if cfg.settings.cache_background_refresh
-                            && hit.upstream.is_some()  // FIX: Only check upstream field (source is upstream address, not "upstream")
+                            && hit.upstream.is_some()  // ✅ FIX: Only check upstream field (source is upstream address, not "upstream")
                             && hit.original_ttl >= cfg.settings.cache_refresh_min_ttl
                         {
                             let threshold = (hit.original_ttl as u64 * cfg.settings.cache_refresh_threshold_percent as u64) / 100;
@@ -1338,17 +1239,17 @@ impl Engine {
                             "triggering background cache refresh"
                         );
                         
-                        // OPTIMIZATION: Simplify by using self.clone() instead of reconstructing Engine
-                        // 优化：简化为使用 self.clone() 而不是重建 Engine
+                        // ✅ OPTIMIZATION: Simplify by using self.clone() instead of reconstructing Engine
+                        // ✅ 优化：简化为使用 self.clone() 而不是重建 Engine
                         // Clone necessary data for async task
                         // 克隆异步任务所需的数据
                         let engine_clone = self.clone();
                         let cache_hash = dedupe_hash;
                         let upstream = hit.upstream.clone();
-                        let qname_async = Arc::from(qname_ref.as_ref());  // Zero-copy string conversion
+                        let qname_async = Arc::from(qname_ref.as_ref());  // ✅ Zero-copy string conversion
                         let qtype_async = qtype;
                         let qclass_async = qclass;
-                        let pipeline_id_async = Arc::clone(&pipeline_id);  // Use Arc directly
+                        let pipeline_id_async = Arc::clone(&pipeline_id);  // ✅ Use Arc directly
                         
                         // Spawn background refresh task (non-blocking)
                         // 生成后台刷新任务 (非阻塞)
@@ -1420,8 +1321,8 @@ impl Engine {
             },
         };
 
-        // DESIGN NOTE: InflightCleanupGuard theoretical race condition analysis
-        // 设计说明：InflightCleanupGuard 理论竞态条件分析
+        // ✅ DESIGN NOTE: InflightCleanupGuard theoretical race condition analysis
+        // ✅ 设计说明：InflightCleanupGuard 理论竞态条件分析
         //
         // Theoretical Issue: If defuse() is called concurrently with Drop, there's a race
         // where Drop might execute before defuse() sets active=false, causing unexpected cleanup.
@@ -1547,7 +1448,7 @@ impl Engine {
                         inserted_at: Instant::now(),
                         original_ttl: min_ttl.as_secs() as u32,
                     };
-                    self.insert_to_both_caches(dedupe_hash, Arc::new(entry), worker_id);
+                    self.cache.insert(dedupe_hash, Arc::new(entry));
                 }
                 let latency = start.elapsed();
                 info!(
@@ -1586,7 +1487,7 @@ impl Engine {
                         if !dedupe_registered && !skip_cache {
                             use dashmap::mapref::entry::Entry;
                             // ========== NEW: Use tokio::watch for lock-free waiting ==========
-                            // 使用 tokio::watch 实现无锁等待
+                            // ✅ 使用 tokio::watch 实现无锁等待
                             let rx = match self.inflight.entry(dedupe_hash) {
                                 Entry::Vacant(entry) => {
                                     // No other request in progress, create watch channel
@@ -1694,8 +1595,8 @@ impl Engine {
                     Ok((raw, actual_upstream)) => {
                         // Optimization: Use quick response parse if no complex matching is needed
                         // Also handles TC (Truncated) flag check for RFC 1035 compliance
-                        // CHANGE: Use max_ttl for original_ttl to align with background refresh trigger
-                        // 修改：使用 max_ttl 作为 original_ttl 以与后台刷新触发对齐
+                        // ✅ CHANGE: Use max_ttl for original_ttl to align with background refresh trigger
+                        // ✅ 修改：使用 max_ttl 作为 original_ttl 以与后台刷新触发对齐
                         let (rcode, ttl_secs, msg_opt, truncated) = if response_matchers.is_empty() && response_actions_on_match.is_empty() && response_actions_on_miss.is_empty() {
                             if let Some(qr) = crate::proto_utils::parse_response_quick(&raw) {
                                 (qr.rcode, qr.max_ttl as u64, None, qr.truncated)
@@ -1736,8 +1637,8 @@ impl Engine {
                             let geosite_manager_ref = geosite_manager.as_deref();
 
                             if let Some(m) = msg_opt {
-                                // FIX: Skip response matchers for background refresh
-                                // 修复：后台刷新跳过响应匹配器
+                                // ✅ FIX: Skip response matchers for background refresh
+                                // ✅ 修复：后台刷新跳过响应匹配器
                                 // Background refresh should only update cache, not execute response actions
                                 // 后台刷新应该只更新缓存，不执行响应操作
                                 if skip_cache {
@@ -1760,8 +1661,8 @@ impl Engine {
                         }; // guards are dropped here / 锁在此处释放
 
                         let empty_actions = Vec::new();
-                        // FIX: Background refresh should skip all response actions
-                        // 修复：后台刷新应跳过所有响应操作
+                        // ✅ FIX: Background refresh should skip all response actions
+                        // ✅ 修复：后台刷新应跳过所有响应操作
                         let actions_to_run = if skip_cache {
                             // Background refresh: force empty actions to skip response processing
                             // 后台刷新：强制使用空操作列表，跳过响应处理
@@ -1791,7 +1692,6 @@ impl Engine {
                                     pipeline_id.clone(),
                                     qtype,
                                     ttl_secs as u32,
-                                    worker_id,
                                 );
                             }
                             if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
@@ -1863,7 +1763,6 @@ impl Engine {
                                         pipeline_id.clone(),
                                         qtype,
                                         ttl_secs as u32,
-                                        worker_id,
                                     );
                                 }
                                 if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
@@ -1902,7 +1801,6 @@ impl Engine {
                                         current_pipeline_id.clone(),
                                         qtype,
                                         min_ttl.as_secs() as u32,
-                                        worker_id,
                                     );
                                 }
                                 if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
@@ -1940,8 +1838,7 @@ impl Engine {
                                         edns_present,
                                         min_ttl,
                                         upstream_timeout,
-                                        skip_cache,  // FIX: Pass skip_cache to response phase
-                                        worker_id,  // Worker ID for local cache
+                                        skip_cache,  // ✅ FIX: Pass skip_cache to response phase
                                     )
                                     .await?;
                                 if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
@@ -2045,7 +1942,6 @@ impl Engine {
                                                 pipeline_id.clone(),
                                                 qtype,
                                                 ttl_secs as u32,
-                                                worker_id,
                                             );
                                         }
                                         self.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
@@ -2071,8 +1967,7 @@ impl Engine {
                                                 edns_present,
                                                 min_ttl,
                                                 upstream_timeout,
-                                                skip_cache,  // FIX: Pass skip_cache to response phase
-                                                worker_id,  // Worker ID for local cache
+                                                skip_cache,  // ✅ FIX: Pass skip_cache to response phase
                                             )
                                             .await?;
                                         self.notify_inflight_waiters(dedupe_hash, &resp_bytes).await;
@@ -2647,7 +2542,7 @@ impl Engine {
 
     async fn notify_inflight_waiters(&self, dedupe_hash: u64, bytes: &Bytes) {
         // ========== NEW: Use tokio::watch for lock-free notification ==========
-        // 使用 tokio::watch 实现无锁通知
+        // ✅ 使用 tokio::watch 实现无锁通知
         // Remove the watch sender from inflight map and send result
         // 从 inflight map 移除 watch sender 并发送结果
         if let Some((_, tx)) = self.inflight.remove(&dedupe_hash) {
@@ -2674,10 +2569,10 @@ impl Engine {
         qclass: DNSClass,
         upstream: Option<&str>,
     ) {
-        // FIX: Check if already refreshing to prevent duplicate refreshes
-        // 修复：检查是否已在刷新，防止重复刷新
-        // OPTIMIZATION: Zero-lock check using bitmap
-        // 优化：使用位图进行零锁检查
+        // ✅ FIX: Check if already refreshing to prevent duplicate refreshes
+        // ✅ 修复：检查是否已在刷新，防止重复刷新
+        // ✅ OPTIMIZATION: Zero-lock check using bitmap
+        // ✅ 优化：使用位图进行零锁检查
         if is_refreshing(&self.refreshing_bitmap, cache_hash) {
             tracing::debug!(
                 event = "background_refresh_skipped",
@@ -2689,12 +2584,12 @@ impl Engine {
             return;
         }
 
-        // OPTIMIZATION: Mark as refreshing using bitmap (zero-lock write)
-        // 优化：使用位图标记为正在刷新（零锁写入）
+        // ✅ OPTIMIZATION: Mark as refreshing using bitmap (zero-lock write)
+        // ✅ 优化：使用位图标记为正在刷新（零锁写入）
         mark_refreshing(&self.refreshing_bitmap, cache_hash);
 
-        // NEW DESIGN: Background refresh calls handle_packet_internal(skip_cache=true)
-        // 新设计：后台刷新调用 handle_packet_internal(skip_cache=true)
+        // ✅ NEW DESIGN: Background refresh calls handle_packet_internal(skip_cache=true)
+        // ✅ 新设计：后台刷新调用 handle_packet_internal(skip_cache=true)
         // This completely reuses the rule engine and query logic
         // 这完全重用了规则引擎和查询逻辑
         
@@ -2727,8 +2622,7 @@ impl Engine {
             
             // Call handle_packet_internal with skip_cache=true
             // 调用 handle_packet_internal 并设置 skip_cache=true
-            // 后台刷新没有 worker_id，传递 None
-            let result = engine.handle_packet_internal(&packet, peer_addr, true, None).await;
+            let result = engine.handle_packet_internal(&packet, peer_addr, true).await;
             
             match result {
                 Ok(resp_bytes) => {
@@ -2754,8 +2648,8 @@ impl Engine {
                 }
             }
             
-            // OPTIMIZATION: Clear refreshing mark using bitmap (zero-lock write)
-            // 优化：使用位图清除刷新标记（零锁写入）
+            // ✅ OPTIMIZATION: Clear refreshing mark using bitmap (zero-lock write)
+            // ✅ 优化：使用位图清除刷新标记（零锁写入）
             clear_refreshing(&engine.refreshing_bitmap, cache_hash);
         });
     }
@@ -2763,8 +2657,8 @@ impl Engine {
     /// Construct standard DNS query packet using hickory_proto
     /// 使用 hickory_proto 构造标准 DNS 查询包
     /// 
-    /// Design: Use hickory-proto to ensure RFC compliance
-    /// 设计：使用 hickory-proto 确保 RFC 合规性
+    /// ✅ Design: Use hickory-proto to ensure RFC compliance
+    /// ✅ 设计：使用 hickory-proto 确保 RFC 合规性
     /// - Generates valid TXID (not 0)
     /// - Sets proper flags (recursion desired)
     /// - Encodes QNAME correctly
@@ -2853,8 +2747,8 @@ impl Engine {
     /// - 缓存条目应使用最小 TTL (RFC 1035 §5.2)
     /// - 后台刷新时机应使用最大 TTL 以避免过早刷新
     /// 
-    /// Note: This is the original implementation (u64 return type)
-    /// 注意：这是原始实现（u64 返回类型）
+    /// ✅ Note: This is the original implementation (u64 return type)
+    /// ✅ 注意：这是原始实现（u64 返回类型）
     /// The new implementation (u32 return type) is above at line 2505
     /// 新实现（u32 返回类型）在上方第 2505 行
     #[deprecated(note = "Use extract_ttl_from_msg with u32 return type instead")]
@@ -3067,8 +2961,7 @@ impl Engine {
         edns_present: bool,
         min_ttl: Duration,
         upstream_timeout: Duration,
-        skip_cache: bool,  // NEW: Pass skip_cache to response phase
-        worker_id: Option<usize>,  // Worker ID for local cache
+        skip_cache: bool,  // ✅ NEW: Pass skip_cache to response phase
     ) -> anyhow::Result<Bytes> {
         let cfg = &state.pipeline;
         struct InflightCleanupGuard {
@@ -3130,7 +3023,7 @@ impl Engine {
                 } else {
                     Some(&skip_rules)
                 },
-                skip_cache,  // FIX: Pass skip_cache to apply_rules
+                skip_cache,  // ✅ FIX: Pass skip_cache to apply_rules
             );
 
             // Resolve nested rule-level jumps first
@@ -3156,7 +3049,7 @@ impl Engine {
                             qclass,
                             edns_present,
                             None,
-                            skip_cache,  // FIX: Pass skip_cache to apply_rules
+                            skip_cache,  // ✅ FIX: Pass skip_cache to apply_rules
                         );
                         continue;
                     } else {
@@ -3185,7 +3078,7 @@ impl Engine {
                         inserted_at: Instant::now(),
                         original_ttl: min_ttl.as_secs() as u32,
                     };
-                    self.insert_to_both_caches(dedupe_hash, Arc::new(entry), worker_id);
+                    self.cache.insert(dedupe_hash, Arc::new(entry));
                     for g in &mut cleanup_guards { g.defuse(); }
                     for h in &inflight_hashes { self.notify_inflight_waiters(*h, &resp_bytes).await; }
                     return Ok(resp_bytes);
@@ -3207,8 +3100,8 @@ impl Engine {
                         if let Some(ctx) = reused_response.take() {
                             Ok((ctx.raw, ctx.upstream.to_string()))
                         } else {
-                            // FIX: Background refresh must skip inflight check
-                            // 修复：后台刷新必须跳过 inflight 检查
+                            // ✅ FIX: Background refresh must skip inflight check
+                            // ✅ 修复：后台刷新必须跳过 inflight 检查
                             if !skip_cache {
                                 use dashmap::mapref::entry::Entry;
                                 let rx = match self.inflight.entry(dedupe_hash) {
@@ -3267,8 +3160,8 @@ impl Engine {
                         // If reuse is not allowed (e.g. explicit Forward action), we must clear any reused response
                         // and force a new request.
                         
-                        // FIX: Background refresh must skip inflight check
-                        // 修复：后台刷新必须跳过 inflight 检查
+                        // ✅ FIX: Background refresh must skip inflight check
+                        // ✅ 修复：后台刷新必须跳过 inflight 检查
                         if !skip_cache {
                             use dashmap::mapref::entry::Entry;
                             let rx = match self.inflight.entry(dedupe_hash) {
@@ -3376,7 +3269,7 @@ impl Engine {
                                         inserted_at: Instant::now(),
                                         original_ttl: ttl_secs_refresh as u32,  // Use max TTL for refresh timing
                                     };
-                                    self.insert_to_both_caches(dedupe_hash, Arc::new(entry), worker_id);
+                                    self.cache.insert(dedupe_hash, Arc::new(entry));
                                 }
                                 for g in &mut cleanup_guards { g.defuse(); }
                                 for h in &inflight_hashes { self.notify_inflight_waiters(*h, &raw).await; }
@@ -3430,7 +3323,7 @@ impl Engine {
                                             inserted_at: Instant::now(),
                                             original_ttl: ttl_secs_refresh as u32,  // Use max TTL for refresh timing
                                         };
-                                        self.insert_to_both_caches(dedupe_hash, Arc::new(entry), worker_id);
+                                        self.cache.insert(dedupe_hash, Arc::new(entry));
                                     }
                                     for g in &mut cleanup_guards { g.defuse(); }
                                     for h in &inflight_hashes { self.notify_inflight_waiters(*h, &ctx.raw).await; }
@@ -3680,7 +3573,7 @@ struct TcpMultiplexer {
     /// Shared permit manager for unified TCP/UDP concurrency control
     /// 共享 permit manager 用于统一的 TCP/UDP 并发控制
     permit_manager: Arc<PermitManager>,
-    /// 健康检查配置 / Health check configuration
+    /// ✅ 健康检查配置 / Health check configuration
     health_error_threshold: usize,
     max_age_secs: u64,
     idle_timeout_secs: u64,
@@ -3729,7 +3622,7 @@ impl TcpMultiplexer {
                         upstream_key.clone(),
                         Arc::clone(&permit_mgr),
                     ));
-                    // 设置健康检查配置
+                    // ✅ 设置健康检查配置
                     client.set_health_check_config(
                         self.health_error_threshold,
                         self.max_age_secs,
@@ -3807,19 +3700,19 @@ struct TcpMuxClient {
     /// Connection-level permit (acquired when connection is established, held for connection lifetime)
     /// 连接级别 permit（连接建立时获取，连接生命周期内持有）
     conn_permit: Arc<Mutex<Option<PermitGuard>>>,
-    /// 健康检查：连续错误计数 / Health check: consecutive error count
+    /// ✅ 健康检查：连续错误计数 / Health check: consecutive error count
     consecutive_errors: AtomicUsize,
-    /// 健康检查：错误阈值 / Health check: error threshold (Atomic for thread-safe updates)
+    /// ✅ 健康检查：错误阈值 / Health check: error threshold (Atomic for thread-safe updates)
     health_threshold: AtomicUsize,
-    /// 连接老化：创建时间戳（毫秒）/ Connection aging: creation timestamp (ms)
+    /// ✅ 连接老化：创建时间戳（毫秒）/ Connection aging: creation timestamp (ms)
     conn_create_time: AtomicU64,
-    /// 连接老化：最大存活时间（毫秒）/ Connection aging: max age (ms)
+    /// ✅ 连接老化：最大存活时间（毫秒）/ Connection aging: max age (ms)
     max_age_ms: AtomicU64,
-    /// 空闲超时：最后请求时间（毫秒）/ Idle timeout: last request time (ms)
+    /// ✅ 空闲超时：最后请求时间（毫秒）/ Idle timeout: last request time (ms)
     last_request_time: AtomicU64,
-    /// 空闲超时：空闲超时时间（毫秒）/ Idle timeout: idle timeout (ms)
+    /// ✅ 空闲超时：空闲超时时间（毫秒）/ Idle timeout: idle timeout (ms)
     idle_timeout_ms: AtomicU64,
-    /// 性能优化：上次健康检查时间（毫秒）/ Performance: last health check time (ms)
+    /// ✅ 性能优化：上次健康检查时间（毫秒）/ Performance: last health check time (ms)
     last_health_check_time: AtomicU64,
 }
 
@@ -3837,7 +3730,7 @@ impl TcpMuxClient {
             next_id: AtomicU16::new(1),
             permit_manager,
             conn_permit: Arc::new(Mutex::new(None)),
-            // 初始化健康检查字段（默认值，实际值会在 TcpMultiplexer 中设置）
+            // ✅ 初始化健康检查字段（默认值，实际值会在 TcpMultiplexer 中设置）
             consecutive_errors: AtomicUsize::new(0),
             health_threshold: AtomicUsize::new(3),
             conn_create_time: AtomicU64::new(0),
@@ -3848,7 +3741,7 @@ impl TcpMuxClient {
         }
     }
 
-    /// 设置健康检查参数
+    /// ✅ 设置健康检查参数
     /// Set health check parameters
     fn set_health_check_config(&self, error_threshold: usize, max_age_secs: u64, idle_timeout_secs: u64) {
         self.health_threshold.store(error_threshold, Ordering::Release);
@@ -3860,7 +3753,7 @@ impl TcpMuxClient {
         let pending = Arc::clone(&self.pending);
         let upstream = self.upstream.clone();
         let conn = Arc::clone(&self.conn);
-        let conn_permit = Arc::clone(&self.conn_permit);  // Clone conn_permit
+        let conn_permit = Arc::clone(&self.conn_permit);  // ✅ Clone conn_permit
         tokio::spawn(async move {
             // Pre-allocate a reusable buffer for TCP reads
             // DNS TCP max is 65535 bytes, but typical responses are much smaller
@@ -4011,8 +3904,8 @@ impl TcpMuxClient {
             anyhow::bail!("dns packet too short for tcp");
         }
 
-        // 性能优化：仅在距离上次检查超过 30 秒时才执行健康检查
-        // Performance: Only check connection health if 30 seconds have passed since last check
+        // ✅ 性能优化：仅在距离上次检查超过 30 秒时才执行健康检查
+        // ✅ Performance: Only check connection health if 30 seconds have passed since last check
         const HEALTH_CHECK_INTERVAL_MS: u64 = 30_000;  // 30 秒
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4151,13 +4044,13 @@ impl TcpMuxClient {
         let mut guard = self.conn.lock().await;
 
         if guard.is_none() {
-            // Acquire connection-level permit (non-blocking)
-            // 获取连接级别 permit（非阻塞）
+            // ✅ Acquire connection-level permit (non-blocking)
+            // ✅ 获取连接级别 permit（非阻塞）
             let permit = self.permit_manager.try_acquire()
                 .ok_or_else(|| anyhow::anyhow!("tcp connection limit exceeded"))?;
 
-            // Establish TCP connection
-            // 建立 TCP 连接
+            // ✅ Establish TCP connection
+            // ✅ 建立 TCP 连接
             let stream = TcpStream::connect(&*self.upstream).await
                 .map_err(|e| anyhow::anyhow!("tcp connect failed: {}", e))?;
 
@@ -4165,17 +4058,17 @@ impl TcpMuxClient {
 
             *guard = Some(write_half);
 
-            // Spawn reader while holding the lock to prevent races
-            // 持有锁时启动 reader 以防止竞争
+            // ✅ Spawn reader while holding the lock to prevent races
+            // ✅ 持有锁时启动 reader 以防止竞争
             self.spawn_reader(read_half).await;
 
-            // Store permit in connection (held for connection lifetime)
-            // 将 permit 保存在连接中（连接生命周期内持有）
+            // ✅ Store permit in connection (held for connection lifetime)
+            // ✅ 将 permit 保存在连接中（连接生命周期内持有）
             let mut conn_permit_guard = self.conn_permit.lock().await;
             *conn_permit_guard = Some(permit);
 
-            // 设置连接创建时间
-            // Set connection creation time
+            // ✅ 设置连接创建时间
+            // ✅ Set connection creation time
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -4241,8 +4134,8 @@ impl TcpMuxClient {
         let mut cg = conn.lock().await;
         *cg = None;
 
-        // Release connection-level permit
-        // 释放连接级别 permit
+        // ✅ Release connection-level permit
+        // ✅ 释放连接级别 permit
         let mut permit_guard = conn_permit.lock().await;
         *permit_guard = None;
     }
@@ -4350,9 +4243,6 @@ mod tests {
     use crate::config::{GlobalSettings, MatchOperator};
     use hickory_proto::rr::RecordType;
     use hickory_proto::op::{Message, OpCode, Query};
-
-    // 测试中使用的默认 worker 数量
-    const TEST_WORKER_COUNT: usize = 1;
 
     // ========================================================================
     // Engine Helper Functions Unit Tests / 引擎辅助函数单元测试
@@ -4621,7 +4511,7 @@ mod tests {
         // Act: Parse configuration and create engine
         let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse");
         let runtime = RuntimePipelineConfig::from_config(cfg.clone()).expect("runtime");
-        let engine = Engine::new(runtime.clone(), "lbl".to_string(), TEST_WORKER_COUNT);
+        let engine = Engine::new(runtime.clone(), "lbl".to_string());
         let state = engine.state.load();
 
         // Act: Apply rules - StaticResponse should return Static decision
@@ -4763,7 +4653,7 @@ mod tests {
             pipeline_select: Vec::new(),
             pipelines: Vec::new(),
         };
-        Engine::new(runtime, "lbl".to_string(), TEST_WORKER_COUNT)
+        Engine::new(runtime, "lbl".to_string())
     }
 
     fn build_response_context() -> ResponseContext {
@@ -4954,7 +4844,7 @@ mod tests {
             inserted_at: Instant::now() - Duration::from_secs(10),
             original_ttl: 5, // Expired 5 seconds ago
         };
-        engine.insert_to_both_caches(dedupe_hash, Arc::new(entry), None);
+        engine.cache.insert(dedupe_hash, Arc::new(entry));
 
         // Act: Create DNS query packet and check fast path
         let mut packet = vec![0u8; 12];
