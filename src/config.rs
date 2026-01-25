@@ -97,8 +97,14 @@ pub struct GlobalSettings {
     #[serde(skip)]
     pub default_upstream_pre_split: Option<std::sync::Arc<Vec<String>>>,
     /// 上游超时（毫秒）。 / Upstream timeout (milliseconds)
+    /// 单次上游请求的超时时间
     #[serde(default = "default_upstream_timeout_ms")]
     pub upstream_timeout_ms: u64,
+    /// 整体请求超时（毫秒）。 / Overall request timeout (milliseconds)
+    /// 包含 hedge + TCP fallback 的总超时时间。如果未设置，自动计算为 upstream_timeout_ms * 2.5
+    /// Total timeout including hedge + TCP fallback. If not set, auto-calculated as upstream_timeout_ms * 2.5
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
     /// 响应阶段 Pipeline 跳转上限。 / Response phase pipeline jump limit
     #[serde(default = "default_response_jump_limit")]
     pub response_jump_limit: u32,
@@ -108,6 +114,18 @@ pub struct GlobalSettings {
     /// TCP 上游连接池大小。 / TCP upstream connection pool size
     #[serde(default = "default_tcp_pool_size")]
     pub tcp_pool_size: usize,
+    /// TCP 健康检查错误阈值（连续失败多少次后重置连接） / TCP health check error threshold (reset connection after N consecutive failures)
+    /// 默认 3 次，0 表示禁用健康检查 / Default 3, 0 means disable health check
+    #[serde(default = "default_tcp_health_check_error_threshold")]
+    pub tcp_health_check_error_threshold: usize,
+    /// TCP 连接最大存活时间（秒，超过强制重置） / TCP connection max age (seconds, force reset after this time)
+    /// 0 表示禁用连接老化检查 / 0 means disable connection aging check
+    #[serde(default = "default_tcp_connection_max_age_seconds")]
+    pub tcp_connection_max_age_seconds: u64,
+    /// TCP 连接空闲超时（秒，无请求超过此时间重置） / TCP connection idle timeout (seconds, reset if no requests for this time)
+    /// 0 表示禁用空闲超时检查 / 0 means disable idle timeout check
+    #[serde(default = "default_tcp_connection_idle_timeout_seconds")]
+    pub tcp_connection_idle_timeout_seconds: u64,
     /// 自适应流控初始 permits 数量。 / Initial permits for adaptive flow control
     #[serde(default = "default_flow_control_initial_permits")]
     pub flow_control_initial_permits: usize,
@@ -158,9 +176,13 @@ impl Default for GlobalSettings {
             default_upstream: default_upstream(),
             default_upstream_pre_split: None,
             upstream_timeout_ms: default_upstream_timeout_ms(),
+            request_timeout_ms: None,  // 默认自动计算 / Auto-calculated by default
             response_jump_limit: default_response_jump_limit(),
             udp_pool_size: default_udp_pool_size(),
             tcp_pool_size: default_tcp_pool_size(),
+            tcp_health_check_error_threshold: default_tcp_health_check_error_threshold(),
+            tcp_connection_max_age_seconds: default_tcp_connection_max_age_seconds(),
+            tcp_connection_idle_timeout_seconds: default_tcp_connection_idle_timeout_seconds(),
             flow_control_initial_permits: default_flow_control_initial_permits(),
             flow_control_min_permits: default_flow_control_min_permits(),
             flow_control_max_permits: default_flow_control_max_permits(),
@@ -425,6 +447,39 @@ impl GlobalSettings {
             self.default_upstream_pre_split = Some(std::sync::Arc::new(split));
         }
     }
+
+    /// Validate timeout configuration sanity
+    /// 验证超时配置的合理性
+    pub fn validate_timeouts(&self) -> anyhow::Result<()> {
+        // Validate request_timeout >= upstream_timeout
+        // 验证 request_timeout >= upstream_timeout
+        if let Some(request_timeout) = self.request_timeout_ms {
+            if request_timeout < self.upstream_timeout_ms {
+                anyhow::bail!(
+                    "Configuration error: request_timeout_ms ({request_timeout}) must be >= upstream_timeout_ms ({upstream})\n\
+                     配置错误: request_timeout_ms ({request_timeout}) 必须大于等于 upstream_timeout_ms ({upstream})",
+                    upstream = self.upstream_timeout_ms
+                );
+            }
+
+            // Recommended value check (warning only, doesn't block)
+            // 建议值检查（警告但不阻止）
+            // Recommended value should be at least upstream * 2.5 to allow hedge + TCP fallback to complete
+            // 建议值应至少为 upstream * 2.5，以允许 hedge + TCP fallback 完成
+            let recommended = self.upstream_timeout_ms * 5 / 2;
+            if request_timeout < recommended {
+                tracing::warn!(
+                    upstream_timeout_ms = self.upstream_timeout_ms,
+                    request_timeout_ms = request_timeout,
+                    recommended = recommended,
+                    "request_timeout_ms may be too short, may interrupt hedge and TCP fallback\n\
+                     request_timeout_ms 可能太短，可能会中断 hedge 和 TCP fallback"
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Copy, PartialEq, Eq, Hash)]
@@ -674,6 +729,18 @@ fn default_udp_pool_size() -> usize {
 
 fn default_tcp_pool_size() -> usize {
     64
+}
+
+fn default_tcp_health_check_error_threshold() -> usize {
+    3  // 连续 3 次失败后重置连接 / Reset connection after 3 consecutive failures
+}
+
+fn default_tcp_connection_max_age_seconds() -> u64 {
+    300  // 5 分钟 / 5 minutes
+}
+
+fn default_tcp_connection_idle_timeout_seconds() -> u64 {
+    60  // 1 分钟 / 1 minute
 }
 
 fn default_flow_control_initial_permits() -> usize {

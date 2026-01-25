@@ -12,12 +12,13 @@ mod watcher;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tracing::{error, info, debug};
+use tracing::{error, info, debug, warn};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::load_config;
@@ -354,15 +355,37 @@ async fn run_udp_worker(
                         // Need async processing, try to acquire permit for backpressure
                         let permit_mgr = Arc::clone(&engine.permit_manager);
 
+                        // ✅ 获取整体请求超时（包含 hedge + TCP fallback）
+                        // ✅ Get overall request timeout (including hedge + TCP fallback)
+                        let timeout_ms = engine.get_request_timeout_ms();
+
                         // 非阻塞式尝试获取 permit，避免 async 等待导致的延迟
                         // Non-blocking try_acquire to avoid async waiting in the hot path
                         if let Some(permit) = permit_mgr.try_acquire() {
                             let engine = engine.clone();
                             let socket = Arc::clone(&socket);
                             tokio::spawn(async move {
-                                let _permit = permit; // 任务完成时自动释放
-                                if let Ok(resp) = engine.handle_packet(&packet_bytes, peer).await {
-                                    let _ = socket.send_to(&resp, peer).await;
+                                let _permit = permit; // 任务完成时自动释放 / Auto-release on task completion
+
+                                // ✅ 添加外层超时保护，防止上游抽风时任务卡住
+                                // ✅ Add outer timeout protection to prevent task stuck when upstream is unstable
+                                let timeout_dur = Duration::from_millis(timeout_ms);
+                                match tokio::time::timeout(timeout_dur, engine.handle_packet(&packet_bytes, peer)).await {
+                                    Ok(Ok(resp)) => {
+                                        let _ = socket.send_to(&resp, peer).await;
+                                    }
+                                    Ok(Err(e)) => {
+                                        debug!(error = %e, "handle_packet error");
+                                    }
+                                    Err(_) => {
+                                        // 超时：permit 会被 _permit 的 Drop 自动释放
+                                        // Timeout: permit will be auto-released by _permit's Drop
+                                        warn!(
+                                            timeout_ms,
+                                            upstream_timeout_ms = engine.get_upstream_timeout_ms(),
+                                            "request timeout after hedge and fallback exhausted"
+                                        );
+                                    }
                                 }
                             });
                         }
@@ -405,6 +428,10 @@ async fn handle_tcp_conn(
     const MAX_TCP_FRAME: usize = 64 * 1024;
     let mut len_buf = [0u8; 2];
 
+    // ✅ 获取整体请求超时（包含 hedge + TCP fallback）
+    // ✅ Get overall request timeout (including hedge + TCP fallback)
+    let timeout_ms = engine.get_request_timeout_ms();
+
     // Reusable buffer to avoid per-frame heap allocation / 可复用缓冲区，避免每帧堆分配
     // 使用 BytesMut 以支持零拷贝操作 / Use BytesMut for zero-copy operations
     let mut buf = bytes::BytesMut::with_capacity(MAX_TCP_FRAME);
@@ -429,9 +456,20 @@ async fn handle_tcp_conn(
             return Ok(());
         }
 
-        let resp = match engine.handle_packet(&buf, peer).await {
-            Ok(r) => r,
-            Err(_) => return Ok(()),
+        // ✅ 添加外层超时保护，防止上游抽风时任务卡住
+        // ✅ Add outer timeout protection to prevent task stuck when upstream is unstable
+        let timeout_dur = Duration::from_millis(timeout_ms);
+        let resp = match tokio::time::timeout(timeout_dur, engine.handle_packet(&buf, peer)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => return Ok(()),
+            Err(_) => {
+                warn!(
+                    timeout_ms,
+                    upstream_timeout_ms = engine.get_upstream_timeout_ms(),
+                    "TCP request timeout after hedge and fallback exhausted"
+                );
+                return Ok(()); // 关闭连接 / Close connection
+            }
         };
 
         if resp.len() <= u16::MAX as usize {

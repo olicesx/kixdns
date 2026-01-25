@@ -1,6 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use anyhow::Context;
 use hickory_proto::op::Message;
 use hickory_proto::rr::{DNSClass, RecordType};
 use ipnet::IpNet;
@@ -297,6 +298,11 @@ impl RuntimePipelineConfig {
                 "cache_capacity is very large, may cause high memory usage"
             );
         }
+
+        // ✅ 验证超时配置的合理性
+        // ✅ Validate timeout configuration sanity
+        cfg.settings.validate_timeouts()
+            .context("validate timeout configuration")?;
 
         let mut pipelines = Vec::new();
         for p in cfg.pipelines {

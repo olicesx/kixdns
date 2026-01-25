@@ -39,6 +39,18 @@ use crate::proto_utils::parse_quick;
 use crate::geoip::GeoIpManager;
 
 // ============================================================================
+// Constants / 常量
+// ============================================================================
+
+/// Hedge timeout divisor: first attempt uses 1/N of the budget to reserve time for TCP fallback
+/// Hedge 超时除数：第一次尝试使用 1/N 的时间，为 TCP fallback 预留时间
+const HEDGE_TIMEOUT_DIVISOR: u32 = 3;
+
+/// Default minimum hedge timeout in milliseconds (used when calculated value is too small)
+/// 默认最小 hedge 超时毫秒数（当计算值过小时使用）
+const DEFAULT_HEDGE_TIMEOUT_MS: u64 = 100;
+
+// ============================================================================
 // Engine Helper Functions / 引擎辅助函数
 // ============================================================================
 
@@ -374,7 +386,12 @@ impl Engine {
         let cache_background_refresh = cfg.settings.cache_background_refresh;
         let cache_refresh_threshold_percent = cfg.settings.cache_refresh_threshold_percent;
         let cache_refresh_min_ttl = cfg.settings.cache_refresh_min_ttl;
-        
+
+        // ✅ Extract TCP health check settings / 提取 TCP 健康检查配置
+        let tcp_health_error_threshold = cfg.settings.tcp_health_check_error_threshold;
+        let tcp_max_age_secs = cfg.settings.tcp_connection_max_age_seconds;
+        let tcp_idle_timeout_secs = cfg.settings.tcp_connection_idle_timeout_seconds;
+
         // Extract GeoIP settings before moving cfg / 在 move cfg 之前提取 GeoIP 设置
         let uses_geoip = uses_geoip_matchers(&cfg);
         let geoip_db_path = if uses_geoip {
@@ -542,7 +559,13 @@ impl Engine {
             state,
             cache,
             udp_client: Arc::new(UdpClient::new(udp_pool_size)),
-            tcp_mux: Arc::new(TcpMultiplexer::new(tcp_pool_size, tcp_permit_manager)),
+            tcp_mux: Arc::new(TcpMultiplexer::new(
+                tcp_pool_size,
+                tcp_permit_manager,
+                tcp_health_error_threshold,
+                tcp_max_age_secs,
+                tcp_idle_timeout_secs,
+            )),
             listener_label: Arc::from(listener_label),
             rule_cache,
             metrics_inflight: Arc::new(AtomicUsize::new(0)),
@@ -682,6 +705,51 @@ impl Engine {
                 "increasing permits - system performing well"
             );
         }
+    }
+
+    /// Get the configured upstream timeout in milliseconds
+    /// 获取配置的上游超时时间（毫秒）
+    #[inline]
+    pub fn get_upstream_timeout_ms(&self) -> u64 {
+        self.state.load().pipeline.settings.upstream_timeout_ms
+    }
+
+    /// Get the overall request timeout in milliseconds (including hedge + TCP fallback)
+    /// 获取整体请求超时时间（毫秒），包含 hedge + TCP fallback
+    ///
+    /// 如果用户显式配置了 request_timeout_ms，使用配置值
+    /// 否则自动计算为 upstream_timeout_ms * 2.5
+    /// If request_timeout_ms is explicitly configured, use that value
+    /// Otherwise auto-calculate as upstream_timeout_ms * 2.5
+    #[inline]
+    pub fn get_request_timeout_ms(&self) -> u64 {
+        let state = self.state.load();
+        let settings = &state.pipeline.settings;
+
+        // 如果用户显式配置了 request_timeout，使用配置值
+        // If user explicitly configured request_timeout, use that value
+        if let Some(timeout) = settings.request_timeout_ms {
+            timeout
+        } else {
+            // ✅ 自动计算：hedge(1/3) + full(1x) + tcp_fallback(1x) + 余量
+            // - hedge 通常提前返回，不计入最大时间
+            // - 实际路径：hedge 尝试 → full 尝试 → tcp fallback
+            // - 最大时间：upstream * 2.5（保守估计）
+            // ✅ Auto-calculate: hedge(1/3) + full(1x) + tcp_fallback(1x) + margin
+            // - hedge usually returns early, not counted in max time
+            // - Actual path: hedge attempt → full attempt → tcp fallback
+            // - Max time: upstream * 2.5 (conservative estimate)
+            settings.upstream_timeout_ms * 5 / 2  // * 2.5
+        }
+    }
+
+    /// ✅ Mark TCP external timeout for a specific upstream
+    /// ✅ 标记特定上游的 TCP 外部超时
+    ///
+    /// 当 TCP worker 发生外部超时时调用此方法，记录错误并可能触发连接重置
+    /// Call this method when TCP worker external timeout occurs, recording errors and possibly triggering connection reset
+    pub fn mark_tcp_timeout(&self, upstream: &str) {
+        self.tcp_mux.mark_timeout(upstream);
     }
 
     /// Increment total_requests counter using simple atomic operation
@@ -2423,10 +2491,11 @@ impl Engine {
         upstream: &str,
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
-        // Split timeout: first attempt uses half budget, second uses full budget.
+        // Split timeout: first attempt uses 1/N budget (leaving room for TCP fallback)
+        // 分割超时：第一次尝试使用 1/N 时间（为 TCP fallback 留出空间）
         let hedge_timeout = timeout_dur
-            .checked_div(2)
-            .unwrap_or_else(|| Duration::from_millis(50).max(timeout_dur));
+            .checked_div(HEDGE_TIMEOUT_DIVISOR)
+            .unwrap_or_else(|| Duration::from_millis(DEFAULT_HEDGE_TIMEOUT_MS).max(timeout_dur));
         let attempts = [hedge_timeout, timeout_dur];
 
         for (idx, dur) in attempts.iter().enumerate() {
@@ -3494,6 +3563,10 @@ struct TcpMultiplexer {
     /// Shared permit manager for unified TCP/UDP concurrency control
     /// 共享 permit manager 用于统一的 TCP/UDP 并发控制
     permit_manager: Arc<PermitManager>,
+    /// ✅ 健康检查配置 / Health check configuration
+    health_error_threshold: usize,
+    max_age_secs: u64,
+    idle_timeout_secs: u64,
 }
 
 struct TcpConnectionPool {
@@ -3502,11 +3575,20 @@ struct TcpConnectionPool {
 }
 
 impl TcpMultiplexer {
-    fn new(pool_size: usize, permit_manager: Arc<PermitManager>) -> Self {
+    fn new(
+        pool_size: usize,
+        permit_manager: Arc<PermitManager>,
+        health_error_threshold: usize,
+        max_age_secs: u64,
+        idle_timeout_secs: u64,
+    ) -> Self {
         Self {
             pools: dashmap::DashMap::with_hasher(FxBuildHasher::default()),
             pool_size,
             permit_manager,
+            health_error_threshold,
+            max_age_secs,
+            idle_timeout_secs,
         }
     }
 
@@ -3526,10 +3608,17 @@ impl TcpMultiplexer {
                 let size = if self.pool_size == 0 { 1 } else { self.pool_size };
                 let permit_mgr = Arc::clone(&self.permit_manager);
                 for _ in 0..size {
-                    clients.push(Arc::new(TcpMuxClient::new(
+                    let client = Arc::new(TcpMuxClient::new(
                         upstream_key.clone(),
                         Arc::clone(&permit_mgr),
-                    )));
+                    ));
+                    // ✅ 设置健康检查配置
+                    client.set_health_check_config(
+                        self.health_error_threshold,
+                        self.max_age_secs,
+                        self.idle_timeout_secs,
+                    );
+                    clients.push(client);
                 }
                 Arc::new(TcpConnectionPool {
                     clients,
@@ -3540,6 +3629,52 @@ impl TcpMultiplexer {
 
         let idx = pool.next_idx.fetch_add(1, Ordering::Relaxed) % pool.clients.len();
         pool.clients[idx].send(packet, timeout_dur).await
+    }
+
+    /// Record external timeout, incrementing error counters for all connections of the upstream
+    /// 记录外部超时，增加该上游所有连接的错误计数
+    ///
+    /// # Design / 设计
+    ///
+    /// This method is called from sync context when TCP worker external timeout occurs.
+    /// Since we cannot identify which specific connection had the timeout, we increment
+    /// the error counter for all connections in the pool. The actual connection reset
+    /// will be triggered on the next use via `record_error()` or `check_connection_health()`.
+    ///
+    /// 此方法在 TCP worker 外部超时时从同步上下文调用。
+    /// 由于无法确定是哪个连接超时，我们对池中所有连接增加错误计数。
+    /// 实际的连接重置会在下次使用时通过 `record_error()` 或 `check_connection_health()` 触发。
+    ///
+    /// # Thread Safety / 线程安全
+    ///
+    /// The health threshold is only set once during initialization and never modified
+    /// at runtime, so reading it once per loop iteration is safe.
+    ///
+    /// 健康检查阈值仅在初始化时设置一次，运行时不会修改，因此每次循环读取一次是安全的。
+    pub(crate) fn mark_timeout(&self, upstream: &str) {
+        if let Some(pool) = self.pools.get(upstream) {
+            // Record errors for all connections (since we don't know which specific one timed out)
+            // 对所有连接记录错误（因为我们不知道具体是哪个超时）
+            for client in &pool.clients {
+                // Read threshold once: safe because it's only set during initialization
+                // 读取一次阈值：安全，因为它仅在初始化时设置
+                let threshold = client.health_threshold.load(Ordering::Acquire);
+                let errors = client.consecutive_errors.fetch_add(1, Ordering::Release) + 1;
+
+                if errors >= threshold {
+                    warn!(
+                        upstream = %client.upstream,
+                        consecutive_errors = errors,
+                        threshold = threshold,
+                        "TCP external timeout threshold exceeded, connection will be reset on next use"
+                    );
+                    // Note: Cannot call async reset_conn here. The error count has been recorded,
+                    // and the connection will be reset on the next send() call via record_error().
+                    // 注意：这里无法调用 async reset_conn。错误计数已记录，
+                    // 连接会在下次 send() 调用时通过 record_error() 重置。
+                }
+            }
+        }
     }
 }
 
@@ -3555,6 +3690,18 @@ struct TcpMuxClient {
     /// Connection-level permit (acquired when connection is established, held for connection lifetime)
     /// 连接级别 permit（连接建立时获取，连接生命周期内持有）
     conn_permit: Arc<Mutex<Option<PermitGuard>>>,
+    /// ✅ 健康检查：连续错误计数 / Health check: consecutive error count
+    consecutive_errors: AtomicUsize,
+    /// ✅ 健康检查：错误阈值 / Health check: error threshold (Atomic for thread-safe updates)
+    health_threshold: AtomicUsize,
+    /// ✅ 连接老化：创建时间戳（毫秒）/ Connection aging: creation timestamp (ms)
+    conn_create_time: AtomicU64,
+    /// ✅ 连接老化：最大存活时间（毫秒）/ Connection aging: max age (ms)
+    max_age_ms: AtomicU64,
+    /// ✅ 空闲超时：最后请求时间（毫秒）/ Idle timeout: last request time (ms)
+    last_request_time: AtomicU64,
+    /// ✅ 空闲超时：空闲超时时间（毫秒）/ Idle timeout: idle timeout (ms)
+    idle_timeout_ms: AtomicU64,
 }
 
 struct Pending {
@@ -3571,7 +3718,22 @@ impl TcpMuxClient {
             next_id: AtomicU16::new(1),
             permit_manager,
             conn_permit: Arc::new(Mutex::new(None)),
+            // ✅ 初始化健康检查字段（默认值，实际值会在 TcpMultiplexer 中设置）
+            consecutive_errors: AtomicUsize::new(0),
+            health_threshold: AtomicUsize::new(3),
+            conn_create_time: AtomicU64::new(0),
+            max_age_ms: AtomicU64::new(300_000),  // 5 分钟
+            last_request_time: AtomicU64::new(0),
+            idle_timeout_ms: AtomicU64::new(60_000),  // 1 分钟
         }
+    }
+
+    /// ✅ 设置健康检查参数
+    /// Set health check parameters
+    fn set_health_check_config(&self, error_threshold: usize, max_age_secs: u64, idle_timeout_secs: u64) {
+        self.health_threshold.store(error_threshold, Ordering::Release);
+        self.max_age_ms.store(max_age_secs * 1000, Ordering::Release);
+        self.idle_timeout_ms.store(idle_timeout_secs * 1000, Ordering::Release);
     }
 
     async fn spawn_reader(&self, mut reader: OwnedReadHalf) {
@@ -3620,11 +3782,118 @@ impl TcpMuxClient {
         });
     }
 
+    // ========== Health check methods / 健康检查方法 ==========
+
+    /// Record error and check if connection reset is needed
+    /// 记录错误并检查是否需要重置连接
+    ///
+    /// When the error threshold is exceeded, the connection is reset and the error
+    /// counter is cleared to avoid immediate re-triggering on the next error.
+    ///
+    /// 当错误阈值超过时，连接会被重置，错误计数器会被清零以避免下次错误时立即重新触发。
+    async fn record_error(&self) -> bool {
+        let errors = self.consecutive_errors.fetch_add(1, Ordering::Release) + 1;
+        let threshold = self.health_threshold.load(Ordering::Acquire);
+
+        debug!(
+            upstream = %self.upstream,
+            consecutive_errors = errors,
+            threshold = threshold,
+            "TCP connection error recorded"
+        );
+
+        // Check if threshold exceeded / 检查是否超过阈值
+        if errors >= threshold {
+            warn!(
+                upstream = %self.upstream,
+                consecutive_errors = errors,
+                threshold = threshold,
+                "TCP connection error threshold exceeded, resetting connection"
+            );
+            Self::reset_conn(&self.conn, &self.conn_permit).await;
+            // Clear error counter to avoid immediate re-triggering on next error
+            // 清零错误计数器，避免下次错误时立即重新触发
+            self.consecutive_errors.store(0, Ordering::Release);
+            true  // Connection was reset / 连接已重置
+        } else {
+            false  // Connection was not reset / 连接未重置
+        }
+    }
+
+    /// Record success and clear error counter
+    /// 记录成功并清零错误计数
+    fn record_success(&self) {
+        self.consecutive_errors.store(0, Ordering::Release);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        self.last_request_time.store(now, Ordering::Release);
+    }
+
+    /// Check if connection needs reset due to aging or idle timeout
+    /// 检查连接是否需要重置（老化或空闲超时）
+    ///
+    /// Returns true if connection was reset, false otherwise.
+    /// 如果连接被重置返回 true，否则返回 false。
+    async fn check_connection_health(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Check connection aging / 检查连接老化
+        let create_time = self.conn_create_time.load(Ordering::Acquire);
+        let max_age = self.max_age_ms.load(Ordering::Acquire);
+        if create_time > 0 && max_age > 0 {
+            let age_ms = now.saturating_sub(create_time);
+            if age_ms > max_age {
+                info!(
+                    upstream = %self.upstream,
+                    age_ms = age_ms,
+                    max_age_ms = max_age,
+                    "TCP connection too old, resetting"
+                );
+                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                // Clear error counter since we're starting fresh
+                // 清零错误计数器，因为我们重新开始
+                self.consecutive_errors.store(0, Ordering::Release);
+                return true;
+            }
+        }
+
+        // Check idle timeout / 检查空闲超时
+        let last_req = self.last_request_time.load(Ordering::Acquire);
+        let idle_timeout = self.idle_timeout_ms.load(Ordering::Acquire);
+        if last_req > 0 && idle_timeout > 0 {
+            let idle_ms = now.saturating_sub(last_req);
+            if idle_ms > idle_timeout {
+                info!(
+                    upstream = %self.upstream,
+                    idle_ms = idle_ms,
+                    idle_timeout_ms = idle_timeout,
+                    "TCP connection idle timeout, resetting"
+                );
+                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                // Clear error counter since we're starting fresh
+                // 清零错误计数器，因为我们重新开始
+                self.consecutive_errors.store(0, Ordering::Release);
+                return true;
+            }
+        }
+
+        false
+    }
+
     async fn send(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes> {
         let start = tokio::time::Instant::now();
         if packet.len() < 2 {
             anyhow::bail!("dns packet too short for tcp");
         }
+
+        // ✅ 检查连接健康状态（老化/空闲）
+        // ✅ Check connection health (aging/idle)
+        self.check_connection_health().await;
 
         // 1. Ensure connection exists (acquires connection-level permit if needed)
         // 确保连接存在（如果需要则获取连接级别 permit）
@@ -3665,34 +3934,71 @@ impl TcpMuxClient {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 self.remove_pending(new_id).await;
-                Self::reset_conn(&self.conn, &self.conn_permit).await;
-                return Err(err);
+                // Record error and check if reset is needed
+                // 记录错误并检查是否需要重置
+                self.record_error().await;
+                return Err(err).context(format!(
+                    "TCP write/connect failed for upstream {upstream}",
+                    upstream = self.upstream
+                ));
             }
             Err(_) => {
                 self.remove_pending(new_id).await;
-                Self::reset_conn(&self.conn, &self.conn_permit).await;
-                anyhow::bail!("tcp write/connect timeout");
+                // Record error and check if reset is needed
+                // 记录错误并检查是否需要重置
+                self.record_error().await;
+                return Err(anyhow::anyhow!(
+                    "TCP write/connect timeout for upstream {upstream} (timeout: {timeout_ms}ms)",
+                    upstream = self.upstream,
+                    timeout_ms = remaining.as_millis()
+                ));
             }
         }
 
         // 3. Wait for response
+        // 3. 等待响应
         let elapsed_after_write = start.elapsed();
         if elapsed_after_write >= timeout_dur {
             self.remove_pending(new_id).await;
-            anyhow::bail!("tcp timeout waiting for response");
+            // Record error and check if reset is needed
+            // 记录错误并检查是否需要重置
+            self.record_error().await;
+            return Err(anyhow::anyhow!(
+                "TCP timeout before waiting for response from upstream {upstream} (elapsed: {elapsed_ms}ms, timeout: {timeout_ms}ms)",
+                upstream = self.upstream,
+                elapsed_ms = elapsed_after_write.as_millis(),
+                timeout_ms = timeout_dur.as_millis()
+            ));
         }
         let final_remaining = timeout_dur - elapsed_after_write;
 
         let resp = match timeout(final_remaining, rx).await {
-            Ok(Ok(r)) => r?,
+            Ok(Ok(r)) => {
+                // Record success and clear error count
+                // 记录成功并清零错误计数
+                self.record_success();
+                r?
+            }
             Ok(Err(_canceled)) => {
                 self.remove_pending(new_id).await;
-                anyhow::bail!("tcp response canceled")
+                // Record error and check if reset is needed
+                // 记录错误并检查是否需要重置
+                self.record_error().await;
+                return Err(anyhow::anyhow!(
+                    "TCP response canceled for upstream {upstream}",
+                    upstream = self.upstream
+                ));
             }
             Err(_elapsed) => {
                 self.remove_pending(new_id).await;
-                Self::reset_conn(&self.conn, &self.conn_permit).await;
-                anyhow::bail!("tcp response timeout")
+                // Record error and check if reset is needed
+                // 记录错误并检查是否需要重置
+                self.record_error().await;
+                return Err(anyhow::anyhow!(
+                    "TCP response timeout from upstream {upstream} (remaining: {timeout_ms}ms)",
+                    upstream = self.upstream,
+                    timeout_ms = final_remaining.as_millis()
+                ));
             }
         };
         Ok(resp)
@@ -3738,6 +4044,20 @@ impl TcpMuxClient {
             // ✅ 将 permit 保存在连接中（连接生命周期内持有）
             let mut conn_permit_guard = self.conn_permit.lock().await;
             *conn_permit_guard = Some(permit);
+
+            // ✅ 设置连接创建时间
+            // ✅ Set connection creation time
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            self.conn_create_time.store(now, Ordering::Release);
+            self.last_request_time.store(now, Ordering::Release);
+
+            info!(
+                upstream = %self.upstream,
+                "TCP connection established"
+            );
         }
 
         Ok(())
