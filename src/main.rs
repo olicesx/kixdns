@@ -121,12 +121,20 @@ async fn run_dns_server(
                 .parse()
                 .context("parse tcp bind addr")?;
 
-            let engine = Engine::new(cfg, listener_label.clone());
+            // Engine 创建在 worker 数量确定之后 / Engine is created after worker count is determined
+            // UDP worker 数量：默认为 CPU 核心数，最少 1 个 / UDP worker count: defaults to CPU core count, minimum 1
+            let udp_workers_final = if udp_workers_count > 0 {
+                udp_workers_count
+            } else {
+                num_cpus::get()
+            };
+
+            let engine = Engine::new(cfg, listener_label.clone(), udp_workers_final);
 
             watcher::spawn(config.clone(), engine.clone());
 
-            // ✅ 添加信号处理以支持优雅关闭
-            // ✅ Add signal handling for graceful shutdown
+            // 添加信号处理以支持优雅关闭
+            // Add signal handling for graceful shutdown
             #[cfg(unix)]
             {
                 use tokio::signal::unix::{signal, SignalKind};
@@ -158,13 +166,6 @@ async fn run_dns_server(
                     }
                 });
             }
-
-            // UDP worker 数量：默认为 CPU 核心数，最少 1 个 / UDP worker count: defaults to CPU core count, minimum 1
-            let udp_workers_final = if udp_workers_count > 0 {
-                udp_workers_count
-            } else {
-                num_cpus::get()
-            };
 
             info!(bind_udp = %bind_addr, bind_tcp = %bind_tcp, udp_workers_count = udp_workers_final, "dns server started");
 
@@ -356,7 +357,7 @@ async fn run_udp_worker(
                 }
 
                 // 快速路径：尝试同步处理（缓存命中等场景） / Fast path: try synchronous handling (cache hit scenarios, etc.)
-                match engine.handle_packet_fast(&packet_bytes, peer) {
+                match engine.handle_packet_fast(&packet_bytes, peer, Some(worker_id)) {
                     Ok(Some(resp)) => match resp {
                         FastPathResponse::Direct(bytes) => {
                             // 已包含正确 TXID，可直接发送 / Already contains correct TXID
@@ -389,8 +390,8 @@ async fn run_udp_worker(
                         // Need async processing, try to acquire permit for backpressure
                         let permit_mgr = Arc::clone(&engine.permit_manager);
 
-                        // ✅ 获取整体请求超时（包含 hedge + TCP fallback）
-                        // ✅ Get overall request timeout (including hedge + TCP fallback)
+                        // 获取整体请求超时（包含 hedge + TCP fallback）
+                        // Get overall request timeout (including hedge + TCP fallback)
                         let timeout_ms = engine.get_request_timeout_ms();
 
                         // 非阻塞式尝试获取 permit，避免 async 等待导致的延迟
@@ -401,10 +402,10 @@ async fn run_udp_worker(
                             tokio::spawn(async move {
                                 let _permit = permit; // 任务完成时自动释放 / Auto-release on task completion
 
-                                // ✅ 添加外层超时保护，防止上游抽风时任务卡住
-                                // ✅ Add outer timeout protection to prevent task stuck when upstream is unstable
+                                // 添加外层超时保护，防止上游抽风时任务卡住
+                                // Add outer timeout protection to prevent task stuck when upstream is unstable
                                 let timeout_dur = Duration::from_millis(timeout_ms);
-                                match tokio::time::timeout(timeout_dur, engine.handle_packet(&packet_bytes, peer)).await {
+                                match tokio::time::timeout(timeout_dur, engine.handle_packet(&packet_bytes, peer, Some(worker_id))).await {
                                     Ok(Ok(resp)) => {
                                         let _ = socket.send_to(&resp, peer).await;
                                     }
@@ -462,8 +463,8 @@ async fn handle_tcp_conn(
     const MAX_TCP_FRAME: usize = 64 * 1024;
     let mut len_buf = [0u8; 2];
 
-    // ✅ 获取整体请求超时（包含 hedge + TCP fallback）
-    // ✅ Get overall request timeout (including hedge + TCP fallback)
+    // 获取整体请求超时（包含 hedge + TCP fallback）
+    // Get overall request timeout (including hedge + TCP fallback)
     let timeout_ms = engine.get_request_timeout_ms();
 
     // Reusable buffer to avoid per-frame heap allocation / 可复用缓冲区，避免每帧堆分配
@@ -490,10 +491,10 @@ async fn handle_tcp_conn(
             return Ok(());
         }
 
-        // ✅ 添加外层超时保护，防止上游抽风时任务卡住
-        // ✅ Add outer timeout protection to prevent task stuck when upstream is unstable
+        // 添加外层超时保护，防止上游抽风时任务卡住
+        // Add outer timeout protection to prevent task stuck when upstream is unstable
         let timeout_dur = Duration::from_millis(timeout_ms);
-        let resp = match tokio::time::timeout(timeout_dur, engine.handle_packet(&buf, peer)).await {
+        let resp = match tokio::time::timeout(timeout_dur, engine.handle_packet(&buf, peer, None)).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => return Ok(()),
             Err(_) => {

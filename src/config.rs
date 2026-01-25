@@ -150,6 +150,23 @@ pub struct GlobalSettings {
     /// 缓存后台刷新最小TTL（秒，默认5）。防止TTL过短导致无限循环刷新 / Cache background refresh minimum TTL (seconds, default 5). Prevent infinite refresh loop for very short TTLs
     #[serde(default = "default_cache_refresh_min_ttl")]
     pub cache_refresh_min_ttl: u32,
+    /// ✅ Worker 本地缓存：启用 worker 线程本地缓存以减少锁竞争（默认 false）
+    /// ✅ Worker local cache: Enable per-thread local cache to reduce lock contention (default false)
+    ///
+    /// 当启用时，每个 worker 线程维护自己的本地缓存副本，避免所有线程访问同一个缓存
+    /// When enabled, each worker thread maintains its own local cache copy, avoiding all threads accessing the same cache
+    ///
+    /// 性能优化：对于高并发 + 少量热点域名的场景，可以显著提升吞吐量
+    /// Performance optimization: Significantly improves throughput for high concurrency + few hot domains
+    ///
+    /// 权衡：内存占用增加（每个 worker 一个缓存副本），缓存命中率可能略降
+    /// Trade-off: Increased memory usage (one cache per worker), cache hit rate may slightly decrease
+    #[serde(default = "default_worker_local_cache_enabled")]
+    pub worker_local_cache_enabled: bool,
+    /// Worker 本地缓存容量（默认 1000 条）- 每个本地缓存的条目数
+    /// Worker local cache capacity (default 1000 entries) - entries per local cache
+    #[serde(default = "default_worker_local_cache_capacity")]
+    pub worker_local_cache_capacity: u64,
     /// GeoIP 数据库文件路径（MMDB 格式） / GeoIP database file path (MMDB format)
     #[serde(default)]
     pub geoip_db_path: Option<String>,
@@ -194,6 +211,8 @@ impl Default for GlobalSettings {
             cache_background_refresh: default_cache_background_refresh(),
             cache_refresh_threshold_percent: default_cache_refresh_threshold_percent(),
             cache_refresh_min_ttl: default_cache_refresh_min_ttl(),
+            worker_local_cache_enabled: default_worker_local_cache_enabled(),
+            worker_local_cache_capacity: default_worker_local_cache_capacity(),
             geoip_db_path: None,
             geoip_dat_path: None,
             geoip_auto_convert: false,
@@ -773,6 +792,18 @@ fn default_cache_refresh_threshold_percent() -> u8 {
 
 fn default_cache_refresh_min_ttl() -> u32 {
     5
+}
+
+/// ✅ Worker 本地缓存：默认禁用（false）
+/// ✅ Worker local cache: Disabled by default (false)
+fn default_worker_local_cache_enabled() -> bool {
+    false
+}
+
+/// ✅ Worker 本地缓存容量：默认 1000 条（每个 worker）
+/// ✅ Worker local cache capacity: Default 1000 entries per worker
+fn default_worker_local_cache_capacity() -> u64 {
+    1000
 }
 
 /// 反序列化 upstream 字段，支持字符串、逗号分隔字符串或数组格式
