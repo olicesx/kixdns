@@ -821,7 +821,7 @@ impl Engine {
             inserted_at: Instant::now(),
             original_ttl,
         };
-        self.cache.insert(cache_hash, entry);
+        self.cache.insert(cache_hash, Arc::new(entry));
     }
 
     #[allow(dead_code)]
@@ -888,7 +888,7 @@ impl Engine {
         
         // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
         let cache_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, q.qname_bytes, qtype, qclass);
-        
+
         if let Some(hit) = self.cache.get(&cache_hash) {
             // Verify collision / 验证冲突
             if hit.qtype == u16::from(qtype) && q.qname_matches(hit.qname.as_ref()) && hit.pipeline_id == pipeline_id {
@@ -1448,7 +1448,7 @@ impl Engine {
                         inserted_at: Instant::now(),
                         original_ttl: min_ttl.as_secs() as u32,
                     };
-                    self.cache.insert(dedupe_hash, entry);
+                    self.cache.insert(dedupe_hash, Arc::new(entry));
                 }
                 let latency = start.elapsed();
                 info!(
@@ -3078,7 +3078,7 @@ impl Engine {
                         inserted_at: Instant::now(),
                         original_ttl: min_ttl.as_secs() as u32,
                     };
-                    self.cache.insert(dedupe_hash, entry);
+                    self.cache.insert(dedupe_hash, Arc::new(entry));
                     for g in &mut cleanup_guards { g.defuse(); }
                     for h in &inflight_hashes { self.notify_inflight_waiters(*h, &resp_bytes).await; }
                     return Ok(resp_bytes);
@@ -3269,7 +3269,7 @@ impl Engine {
                                         inserted_at: Instant::now(),
                                         original_ttl: ttl_secs_refresh as u32,  // Use max TTL for refresh timing
                                     };
-                                    self.cache.insert(dedupe_hash, entry);
+                                    self.cache.insert(dedupe_hash, Arc::new(entry));
                                 }
                                 for g in &mut cleanup_guards { g.defuse(); }
                                 for h in &inflight_hashes { self.notify_inflight_waiters(*h, &raw).await; }
@@ -3323,7 +3323,7 @@ impl Engine {
                                             inserted_at: Instant::now(),
                                             original_ttl: ttl_secs_refresh as u32,  // Use max TTL for refresh timing
                                         };
-                                        self.cache.insert(dedupe_hash, entry);
+                                        self.cache.insert(dedupe_hash, Arc::new(entry));
                                     }
                                     for g in &mut cleanup_guards { g.defuse(); }
                                     for h in &inflight_hashes { self.notify_inflight_waiters(*h, &ctx.raw).await; }
@@ -3386,32 +3386,10 @@ pub fn select_pipeline<'a>(
             |m| m.operator,
             |m| {
                 // 获取 GeoSiteManager 和 GeoIpManager 的引用 / Get GeoSiteManager and GeoIpManager references
-                let geosite_mgr_ref = match geosite_manager {
-                    Some(manager) => {
-                        match manager.read() {
-                            Ok(guard) => Some(guard),
-                            Err(e) => {
-                                tracing::error!(error = ?e, "GeoSite RwLock is poisoned during request");
-                                None
-                            }
-                        }
-                    }
-                    None => None,
-                };
+                // 简化 RwLock 读取路径以提高性能 / Simplified RwLock read path for better performance
+                let geosite_mgr_ref = geosite_manager.and_then(|m| m.read().ok());
                 let geosite_mgr_ref_deref = geosite_mgr_ref.as_deref();
-
-                let geoip_mgr_ref = match geoip_manager {
-                    Some(manager) => {
-                        match manager.read() {
-                            Ok(guard) => Some(guard),
-                            Err(e) => {
-                                tracing::error!(error = ?e, "GeoIP RwLock is poisoned during request");
-                                None
-                            }
-                        }
-                    }
-                    None => None,
-                };
+                let geoip_mgr_ref = geoip_manager.and_then(|m| m.read().ok());
                 let geoip_mgr_ref_deref = geoip_mgr_ref.as_deref();
 
                 m.matcher.matches_with_qtype(listener_label, client_ip, qname, qclass, edns_present, qtype, geoip_mgr_ref_deref, geosite_mgr_ref_deref)
@@ -3734,6 +3712,8 @@ struct TcpMuxClient {
     last_request_time: AtomicU64,
     /// ✅ 空闲超时：空闲超时时间（毫秒）/ Idle timeout: idle timeout (ms)
     idle_timeout_ms: AtomicU64,
+    /// ✅ 性能优化：上次健康检查时间（毫秒）/ Performance: last health check time (ms)
+    last_health_check_time: AtomicU64,
 }
 
 struct Pending {
@@ -3757,6 +3737,7 @@ impl TcpMuxClient {
             max_age_ms: AtomicU64::new(300_000),  // 5 分钟
             last_request_time: AtomicU64::new(0),
             idle_timeout_ms: AtomicU64::new(60_000),  // 1 分钟
+            last_health_check_time: AtomicU64::new(0),
         }
     }
 
@@ -3923,9 +3904,18 @@ impl TcpMuxClient {
             anyhow::bail!("dns packet too short for tcp");
         }
 
-        // ✅ 检查连接健康状态（老化/空闲）
-        // ✅ Check connection health (aging/idle)
-        self.check_connection_health().await;
+        // ✅ 性能优化：仅在距离上次检查超过 30 秒时才执行健康检查
+        // ✅ Performance: Only check connection health if 30 seconds have passed since last check
+        const HEALTH_CHECK_INTERVAL_MS: u64 = 30_000;  // 30 秒
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let last_check = self.last_health_check_time.load(Ordering::Relaxed);
+        if last_check == 0 || now.saturating_sub(last_check) >= HEALTH_CHECK_INTERVAL_MS {
+            self.check_connection_health().await;
+            self.last_health_check_time.store(now, Ordering::Relaxed);
+        }
 
         // 1. Ensure connection exists (acquires connection-level permit if needed)
         // 确保连接存在（如果需要则获取连接级别 permit）
@@ -4854,7 +4844,7 @@ mod tests {
             inserted_at: Instant::now() - Duration::from_secs(10),
             original_ttl: 5, // Expired 5 seconds ago
         };
-        engine.cache.insert(dedupe_hash, entry);
+        engine.cache.insert(dedupe_hash, Arc::new(entry));
 
         // Act: Create DNS query packet and check fast path
         let mut packet = vec![0u8; 12];

@@ -20,6 +20,7 @@ bytes = "1"
 regex = "1"
 num_cpus = "1.16"
 moka = { version = "0.12.12", features = ["sync"] }
+quick_cache = { version = "0.6", features = ["sync"] }
 socket2 = "0.5"
 libc = "0.2"
 rustc-hash = "2.1.1"
