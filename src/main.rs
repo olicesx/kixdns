@@ -148,18 +148,29 @@ async fn run_dns_server(
                 // 为每个地址族创建独立的 socket 和 workers，避免 sockaddr 大小断言失败
                 // Create separate sockets and workers for each address family to avoid sockaddr size assertion failures
 
-                // 检查是否需要 IPv4 socket / Check if IPv4 socket is needed
-                let needs_ipv4 = bind_addr.is_ipv4() || bind_addr.is_unspecified();
-                // 检查是否需要 IPv6 socket / Check if IPv6 socket is needed
-                let needs_ipv6 = bind_addr.is_ipv6() || bind_addr.is_unspecified();
+                // 根据配置地址决定创建哪种 socket / Determine which socket type to create based on config
+                // IPv6 unspecified address (::) 需要同时创建 IPv4 和 IPv6 socket
+                // IPv6 other addresses 只创建 IPv6 socket
+                // IPv4 addresses 只创建 IPv4 socket
+                let needs_ipv4 = bind_addr.is_ipv4() ||
+                    (bind_addr.is_ipv6() && bind_addr.ip().is_unspecified());
+                let needs_ipv6 = bind_addr.is_ipv6();
 
                 if needs_ipv4 {
-                    let workers_per_family = udp_workers_final.div_ceil(2);
+                    let workers_per_family = if needs_ipv6 {
+                        udp_workers_final.div_ceil(2)
+                    } else {
+                        udp_workers_final
+                    };
                     spawn_ipv4_udp_workers(bind_addr, workers_per_family, engine.clone(), &mut udp_handles)?;
                 }
 
                 if needs_ipv6 {
-                    let workers_per_family = udp_workers_final.div_ceil(2);
+                    let workers_per_family = if needs_ipv4 {
+                        udp_workers_final.div_ceil(2)
+                    } else {
+                        udp_workers_final
+                    };
                     spawn_ipv6_udp_workers(bind_addr, workers_per_family, engine.clone(), &mut udp_handles)?;
                 }
             }
