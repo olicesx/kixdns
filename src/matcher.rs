@@ -5,10 +5,37 @@ use anyhow::Context;
 use hickory_proto::op::Message;
 use hickory_proto::rr::{DNSClass, RecordType};
 use ipnet::IpNet;
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use rustc_hash::FxHashMap;
 
 use crate::config::{self, Action, MatchOperator, PipelineConfig};
+
+// ============================================================================
+// TXT Match Mode / TXT 匹配模式
+// ============================================================================
+
+/// TXT 匹配模式 / TXT match mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxtMatchMode {
+    /// 精确匹配 / Exact match
+    Exact,
+    /// 前缀匹配 / Prefix match
+    Prefix,
+    /// 正则匹配 / Regex match
+    Regex,
+}
+
+impl TxtMatchMode {
+    /// 从字符串解析匹配模式 / Parse match mode from string
+    pub fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s.to_lowercase().as_str() {
+            "exact" => Ok(TxtMatchMode::Exact),
+            "prefix" => Ok(TxtMatchMode::Prefix),
+            "regex" => Ok(TxtMatchMode::Regex),
+            _ => anyhow::bail!("invalid TXT match mode: {}, must be one of: exact, prefix, regex", s),
+        }
+    }
+}
 
 // ============================================================================
 // Matcher Helper Functions / 匹配器辅助函数
@@ -273,6 +300,12 @@ pub enum RuntimeResponseMatcher {
     /// 匹配响应中的请求域名是否不属于指定 GeoSite 分类 / Match if request domain in response does NOT belong to specified GeoSite category
     ResponseRequestDomainGeoSiteNot {
         value: String,
+    },
+    /// 匹配响应中的 TXT 记录内容 / Match TXT record content in response
+    ResponseTxtContent {
+        mode: TxtMatchMode,
+        value: String,
+        regex: Option<Regex>,
     },
 }
 
@@ -979,6 +1012,33 @@ impl RuntimeResponseMatcher {
             config::ResponseMatcher::ResponseRequestDomainGeoSiteNot { value } => {
                 RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { value }
             }
+            config::ResponseMatcher::ResponseTxtContent { mode, value } => {
+                let mode = TxtMatchMode::from_str(&mode)?;
+                let regex = match mode {
+                    TxtMatchMode::Regex => {
+                        // ReDoS保护: 限制正则表达式大小 / ReDoS protection: limit regex size
+                        const MAX_REGEX_LEN: usize = 1000;
+                        if value.len() > MAX_REGEX_LEN {
+                            anyhow::bail!(
+                                "regex pattern too long: {} bytes (max {})",
+                                value.len(),
+                                MAX_REGEX_LEN
+                            );
+                        }
+                        // 使用regex crate的大小限制来防止复杂度攻击
+                        // Use regex crate size limit to prevent complexity attacks
+                        Some(
+                            RegexBuilder::new(&value)
+                                .size_limit(1000) // 限制正则引擎状态空间 / limit regex engine state space
+                                .dfa_size_limit(1000) // 限制DFA状态数 / limit DFA states
+                                .build()
+                                .map_err(|e| anyhow::anyhow!("invalid regex: {}", e))?
+                        )
+                    }
+                    _ => None,
+                };
+                RuntimeResponseMatcher::ResponseTxtContent { mode, value, regex }
+            }
         })
     }
 
@@ -1077,6 +1137,35 @@ impl RuntimeResponseMatcher {
                 geosite_manager.map_or(false, |mgr| {
                     !matcher_helpers::match_geosite(mgr, qname, value)
                 })
+            }
+            RuntimeResponseMatcher::ResponseTxtContent { mode, value, regex } => {
+                // 从响应中提取 TXT 记录 / Extract TXT records from response
+                use hickory_proto::rr::{RData, rdata::TXT};
+                let txt_data = msg.answers().iter()
+                    .filter_map(|r| {
+                        if let Some(RData::TXT(txt)) = r.data() {
+                            Some(txt)
+                        } else {
+                            None
+                        }
+                    })
+                    .flat_map(|txt| txt.iter().flat_map(|s| s.as_ref()))
+                    .copied()
+                    .collect::<Vec<u8>>();
+
+                let txt_str = String::from_utf8_lossy(&txt_data);
+
+                match mode {
+                    TxtMatchMode::Exact => &txt_str == value,
+                    TxtMatchMode::Prefix => txt_str.starts_with(value),
+                    TxtMatchMode::Regex => {
+                        if let Some(re) = regex {
+                            re.is_match(&txt_str)
+                        } else {
+                            false
+                        }
+                    }
+                }
             }
         }
     }

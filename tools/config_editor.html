@@ -345,9 +345,16 @@
                 </div>
                 
                 <!-- GeoIP Country Codes -->
-                <input v-if="hasField(m.type, 'country_codes')" type="text" class="form-control" v-model="m.country_codes" 
+                <input v-if="hasField(m.type, 'country_codes')" type="text" class="form-control" v-model="m.country_codes"
                     placeholder="CN,US,JP 或 geoip:CN">
-                
+
+                <!-- TXT Content Mode -->
+                <select v-if="hasField(m.type, 'mode') && m.type === 'response_txt_content'" class="form-select" v-model="m.mode">
+                    <option value="exact">Exact (精确匹配)</option>
+                    <option value="prefix">Prefix (前缀匹配)</option>
+                    <option value="regex">Regex (正则匹配)</option>
+                </select>
+
                 <!-- QType Dropdown -->
                 <select v-if="hasField(m.type, 'value') && m.type === 'qtype'" class="form-select" v-model="m.value">
                     <option value="A">A</option>
@@ -371,10 +378,12 @@
     <script type="text/x-template" id="action-list-template">
         <div>
             <div v-for="(a, idx) in actions" :key="idx" class="input-group input-group-sm mb-1">
-                <select class="form-select" style="max-width: 140px;" v-model="a.type" @change="resetActionFields(a)">
+                <select class="form-select" style="max-width: 160px;" v-model="a.type" @change="resetActionFields(a)">
                     <option value="log">Log</option>
                     <option value="static_response">Static Response</option>
                     <option value="static_ip_response">Static IP</option>
+                    <option value="static_txt_response">Static TXT</option>
+                    <option value="replace_txt_response">Replace TXT</option>
                     <option value="jump_to_pipeline">Jump to Pipeline</option>
                     <option value="allow">Allow (Pass)</option>
                     <option value="deny">Deny (Drop)</option>
@@ -418,6 +427,24 @@
                     <div class="form-text small" style="font-size: 11px;">支持协议前缀 (tcp://, udp://) 和逗号分隔的多个上游</div>
                 </template>
 
+                <!-- Static TXT -->
+                <template v-if="a.type === 'static_txt_response'">
+                    <input type="text" class="form-control" v-model="a._textSingle" placeholder="单个字符串或逗号分隔多个"
+                        @input="updateTxtText(a)">
+                    <button class="btn btn-outline-secondary" type="button" @click="a._showArray = !a._showArray">数组/TTL</button>
+                    <div v-if="a._showArray" class="input-group-text bg-white">
+                        TTL: <input type="number" class="form-control form-control-sm" style="max-width: 70px;" v-model.number="a.ttl" placeholder="300" min="1">
+                    </div>
+                    <div class="form-text small" style="font-size: 11px;">逗号分隔多段，或点击"数组/TTL"配置TTL</div>
+                </template>
+
+                <!-- Replace TXT -->
+                <template v-if="a.type === 'replace_txt_response'">
+                    <input type="text" class="form-control" v-model="a._textSingle" placeholder="替换为的TXT内容"
+                        @input="updateTxtText(a)">
+                    <div class="form-text small" style="font-size: 11px;">逗号分隔多段，或直接编辑JSON使用[]数组格式</div>
+                </template>
+
                 <button class="btn btn-outline-danger" @click="actions.splice(idx, 1)">×</button>
             </div>
             <button class="btn btn-sm btn-link text-decoration-none p-0" @click="addAction">+ 添加动作</button>
@@ -453,6 +480,7 @@
             'response_answer_ip_geoip_private': ['expect'],
             'response_request_domain_geosite': ['value'],
             'response_request_domain_geosite_not': ['value'],
+            'response_txt_content': ['mode', 'value'],
             'any': []
         };
 
@@ -563,13 +591,47 @@
                     if (type === 'log') a.level = 'info';
                     if (type === 'static_response') a.rcode = 'NXDOMAIN';
                     if (type === 'static_ip_response') a.ip = '127.0.0.1';
+                    if (type === 'static_txt_response') {
+                        a.text = ['v=spf1 ~all'];
+                        a._textSingle = 'v=spf1 ~all';
+                        a.ttl = 300;
+                        a._showArray = false;
+                    }
+                    if (type === 'replace_txt_response') {
+                        a.text = ['replaced'];
+                        a._textSingle = 'replaced';
+                        a._showArray = false;
+                    }
                     if (type === 'jump_to_pipeline') a.pipeline = '';
                     if (type === 'allow') { /* No fields */ }
                     if (type === 'deny') { /* No fields */ }
                     if (type === 'continue') { /* No fields */ }
                     if (type === 'forward') { a.upstream = ''; a.transport = 'udp'; }
                 };
-                return { addAction, resetActionFields, pipelineOptions };
+
+                const updateTxtText = (a) => {
+                    // 从单字符串输入更新到数组
+                    if (a._textSingle !== undefined) {
+                        a.text = a._textSingle.split(',').map(s => s.trim()).filter(s => s);
+                    }
+                };
+
+                Vue.watch(() => {
+                    // 监听所有actions，确保text字段正确同步
+                    (config.value.pipelines || []).forEach(pipe => {
+                        (pipe.rules || []).forEach(rule => {
+                            [rule.actions, rule.response_actions_on_match, rule.response_actions_on_miss].forEach(actions => {
+                                (actions || []).forEach(a => {
+                                    if ((a.type === 'static_txt_response' || a.type === 'replace_txt_response') && a._textSingle === undefined && Array.isArray(a.text)) {
+                                        a._textSingle = a.text.join(', ');
+                                    }
+                                });
+                            });
+                        });
+                    });
+                }, { deep: true });
+
+                return { addAction, resetActionFields, pipelineOptions, updateTxtText };
             }
         };
 
@@ -683,7 +745,8 @@
                     'response_answer_ip_geoip_country': 'Answer IP GeoIP Country',
                     'response_answer_ip_geoip_private': 'Answer IP GeoIP Private',
                     'response_request_domain_geosite': 'Req Domain GeoSite',
-                    'response_request_domain_geosite_not': 'Req Domain GeoSite Not'
+                    'response_request_domain_geosite_not': 'Req Domain GeoSite Not',
+                    'response_txt_content': 'TXT Content'
                 };
 
                 const toCleanJsonString = (cfgObj) => JSON.stringify(cfgObj, (key, value) => {

@@ -387,6 +387,13 @@ pub enum ResponseMatcher {
     ResponseRequestDomainGeoSite { value: String },
     /// 匹配响应中的请求域名是否不属于指定 GeoSite 分类 / Match if request domain in response does NOT belong to specified GeoSite category
     ResponseRequestDomainGeoSiteNot { value: String },
+    /// 匹配响应中 TXT 记录的内容 / Match TXT record content in response
+    ResponseTxtContent {
+        /// 匹配模式: exact(精确), prefix(前缀), regex(正则) / Match mode: exact, prefix, or regex
+        mode: String,
+        /// 要匹配的文本 / Text to match
+        value: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -398,6 +405,15 @@ pub enum Action {
     StaticResponse { rcode: String },
     /// 返回固定 IP (A/AAAA)。 / Return static IP (A/AAAA)
     StaticIpResponse { ip: String },
+    /// 返回固定 TXT 记录。支持单个字符串或字符串数组。 / Return static TXT record. Supports single string or string array.
+    StaticTxtResponse {
+        /// TXT 记录内容 / TXT record content
+        #[serde(deserialize_with = "deserialize_txt_text")]
+        text: Vec<String>,
+        /// TTL (可选，默认 300) / TTL (optional, default 300)
+        #[serde(default)]
+        ttl: Option<u32>,
+    },
     /// 跳转到指定 Pipeline 继续处理。 / Jump to specified Pipeline to continue processing
     JumpToPipeline { pipeline: String },
     /// 终止匹配。请求阶段使用默认上游，响应阶段使用当前响应。 / Terminate matching. Request phase uses default upstream, response phase uses current response
@@ -416,6 +432,12 @@ pub enum Action {
     },
     /// 继续匹配后续规则。响应阶段会复用当前响应结果。 / Continue matching subsequent rules. Response phase will reuse current response result
     Continue,
+    /// 修改响应中的 TXT 记录 / Modify TXT records in response
+    ReplaceTxtResponse {
+        /// 新的 TXT 内容 / New TXT content
+        #[serde(deserialize_with = "deserialize_txt_text")]
+        text: Vec<String>,
+    },
 }
 
 /// Action 辅助函数 / Action helper functions
@@ -782,16 +804,16 @@ where
     D: serde::Deserializer<'de>,
 {
     use serde::Deserialize;
-    
+
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum UpstreamInput {
         String(String),
         Array(Vec<String>),
     }
-    
+
     let input = Option::<UpstreamInput>::deserialize(deserializer)?;
-    
+
     match input {
         None => Ok(None),
         Some(UpstreamInput::String(s)) => Ok(Some(s)),
@@ -802,5 +824,27 @@ where
                 Ok(Some(arr.join(",")))
             }
         }
+    }
+}
+
+/// 反序列化TXT文本字段，支持单个字符串或字符串数组 / Deserialize TXT text field, supports single string or string array
+fn deserialize_txt_text<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum TxtTextInput {
+        String(String),
+        Array(Vec<String>),
+    }
+
+    let input = TxtTextInput::deserialize(deserializer)?;
+
+    match input {
+        TxtTextInput::String(s) => Ok(vec![s]),
+        TxtTextInput::Array(arr) => Ok(arr),
     }
 }

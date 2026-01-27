@@ -16,7 +16,7 @@ use rustc_hash::{FxHasher, FxBuildHasher};
 use smallvec::SmallVec;
 use socket2::{Domain, Protocol, Socket, Type};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::rdata::{A, AAAA};
+use hickory_proto::rr::rdata::{A, AAAA, TXT};
 use hickory_proto::rr::{DNSClass, Name, RData, Record};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable, BinEncoder};
 use moka::sync::Cache;
@@ -2293,6 +2293,29 @@ impl Engine {
                             // This is a trade-off. Layer 3 usually implies sampling logs or skipping them for cached hot paths.
                             // We will accept that cached hits won't log again.
                         }
+                        Action::StaticTxtResponse { text, ttl } => {
+                            if let Ok(name) = std::str::FromStr::from_str(qname) {
+                                let ttl = ttl.unwrap_or(300);
+                                let txt = TXT::new(text.to_vec());
+                                let record = Record::from_rdata(name, ttl, RData::TXT(txt));
+                                let d = Decision::Static {
+                                    rcode: ResponseCode::NoError,
+                                    answers: vec![record],
+                                };
+                                self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
+                                return d;
+                            }
+                            let d = Decision::Static {
+                                rcode: ResponseCode::ServFail,
+                                answers: Vec::new(),
+                            };
+                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
+                            return d;
+                        }
+                        Action::ReplaceTxtResponse { .. } => {
+                            // ReplaceTxtResponse在请求阶段没有意义，跳过 / ReplaceTxtResponse has no meaning in request phase, skip
+                            continue 'rules;
+                        }
                         Action::Continue => {
                             continue 'rules;
                         }
@@ -2794,6 +2817,16 @@ impl Engine {
                         source: "response_action",
                     });
                 }
+                Action::StaticTxtResponse { text, ttl } => {
+                    let ttl = ttl.unwrap_or(300);
+                    let (rcode, answers) = make_static_txt_answer(qname, &text, ttl);
+                    let bytes = build_response(req, rcode, answers)?;
+                    return Ok(ResponseActionResult::Static {
+                        bytes,
+                        rcode,
+                        source: "response_action",
+                    });
+                }
                 Action::JumpToPipeline { pipeline } => {
                     if remaining_jumps == 0 {
                         let bytes = engine_helpers::build_servfail_response(req)?;
@@ -2841,6 +2874,34 @@ impl Engine {
                 }
                 Action::Continue => {
                     return Ok(ResponseActionResult::Continue { ctx: ctx_opt });
+                }
+                Action::ReplaceTxtResponse { text } => {
+                    if let Some(ctx) = ctx_opt {
+                        let name = ctx.msg.queries().first()
+                            .map(|q| q.name().clone())
+                            .ok_or_else(|| anyhow::anyhow!("No query name"))?;
+
+                        // 创建新的 TXT 记录 / Create new TXT record
+                        let txt = TXT::new(text.to_vec());
+                        let record = Record::from_rdata(name, 300, RData::TXT(txt));
+
+                        // 替换答案中的 TXT 记录 / Replace TXT records in answers
+                        let new_answers = vec![record];
+                        let rcode = ctx.msg.response_code();
+
+                        let bytes = build_response(req, rcode, new_answers)?;
+                        return Ok(ResponseActionResult::Static {
+                            bytes,
+                            rcode,
+                            source: "replace_txt",
+                        });
+                    }
+                    let bytes = engine_helpers::build_servfail_response(req)?;
+                    return Ok(ResponseActionResult::Static {
+                        bytes,
+                        rcode: ResponseCode::ServFail,
+                        source: "response_action",
+                    });
                 }
                 Action::Forward {
                     upstream,
@@ -4235,6 +4296,52 @@ pub(crate) fn make_static_ip_answer(qname: &str, ip: &str) -> (ResponseCode, Vec
             let record = Record::from_rdata(name, 300, rdata);
             return (ResponseCode::NoError, vec![record]);
         }
+    }
+    (ResponseCode::ServFail, Vec::new())
+}
+
+/// 创建静态TXT记录响应 / Create static TXT record response
+///
+/// RFC 1035 TXT记录规范:
+/// - 单个TXT段最大255字节
+/// - 总大小不超过65535字节
+pub(crate) fn make_static_txt_answer(
+    qname: &str,
+    text: &[String],
+    ttl: u32,
+) -> (ResponseCode, Vec<Record>) {
+    // 验证TXT记录大小 / Validate TXT record size
+    const MAX_SEGMENT_SIZE: usize = 255;
+    const MAX_TOTAL_SIZE: usize = 65535;
+
+    let mut total_size = 0usize;
+    for txt_part in text {
+        // 检查单个段大小 / Check individual segment size
+        if txt_part.len() > MAX_SEGMENT_SIZE {
+            warn!(
+                qname = %qname,
+                size = txt_part.len(),
+                max = MAX_SEGMENT_SIZE,
+                "TXT record segment exceeds 255 bytes"
+            );
+            return (ResponseCode::ServFail, Vec::new());
+        }
+        total_size = total_size.saturating_add(txt_part.len());
+        if total_size > MAX_TOTAL_SIZE {
+            warn!(
+                qname = %qname,
+                size = total_size,
+                max = MAX_TOTAL_SIZE,
+                "TXT record total size exceeds 65535 bytes"
+            );
+            return (ResponseCode::ServFail, Vec::new());
+        }
+    }
+
+    if let Ok(name) = Name::from_str(qname) {
+        let txt = TXT::new(text.to_vec());
+        let record = Record::from_rdata(name, ttl, RData::TXT(txt));
+        return (ResponseCode::NoError, vec![record]);
     }
     (ResponseCode::ServFail, Vec::new())
 }

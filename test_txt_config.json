@@ -1,0 +1,127 @@
+{
+  "version": "1.0",
+  "settings": {
+    "min_ttl": 0,
+    "bind_udp": "0.0.0.0:5353",
+    "bind_tcp": "0.0.0.0:5353",
+    "cache_capacity": 10000,
+    "cache_max_ttl": 86400,
+    "default_upstream": "8.8.8.8:53",
+    "upstream_timeout": 2000
+  },
+  "pipelines": [
+    {
+      "name": "txt_test_pipeline",
+      "rules": [
+        {
+          "name": "static_txt_single",
+          "matchers": [
+            {
+              "type": "qtype",
+              "value": "TXT",
+              "operator": "and"
+            },
+            {
+              "type": "domain_suffix",
+              "value": "txt1.test.local",
+              "operator": "and"
+            }
+          ],
+          "actions": [
+            {
+              "type": "static_txt_response",
+              "text": "v=spf1 include:_spf.example.com ~all",
+              "ttl": 3600
+            }
+          ]
+        },
+        {
+          "name": "static_txt_array",
+          "matchers": [
+            {
+              "type": "qtype",
+              "value": "TXT",
+              "operator": "and"
+            },
+            {
+              "type": "domain_suffix",
+              "value": "txt2.test.local",
+              "operator": "and"
+            }
+          ],
+          "actions": [
+            {
+              "type": "static_txt_response",
+              "text": [
+                "part1",
+                "part2",
+                "part3"
+              ],
+              "ttl": 300
+            }
+          ]
+        },
+        {
+          "name": "match_txt_prefix",
+          "matchers": [
+            {
+              "type": "qtype",
+              "value": "TXT",
+              "operator": "and"
+            },
+            {
+              "type": "domain_suffix",
+              "value": "txt3.test.local",
+              "operator": "and"
+            }
+          ],
+          "actions": [
+            {
+              "type": "forward",
+              "upstream": "8.8.8.8:53"
+            }
+          ],
+          "response_matchers": [
+            {
+              "type": "response_txt_content",
+              "mode": "prefix",
+              "value": "v=spf1",
+              "operator": "and"
+            }
+          ],
+          "response_matcher_operator": "and",
+          "response_actions_on_match": [
+            {
+              "type": "log",
+              "level": "info"
+            }
+          ]
+        },
+        {
+          "name": "replace_txt",
+          "matchers": [
+            {
+              "type": "qtype",
+              "value": "TXT",
+              "operator": "and"
+            },
+            {
+              "type": "domain_suffix",
+              "value": "txt4.test.local",
+              "operator": "and"
+            }
+          ],
+          "actions": [
+            {
+              "type": "replace_txt_response",
+              "text": [
+                "replaced",
+                "content"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
