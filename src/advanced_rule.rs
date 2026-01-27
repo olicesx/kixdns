@@ -278,6 +278,8 @@ pub(crate) fn fast_static_match(
         if !matched {
             continue;
         }
+        // 找到第一个匹配的规则
+        // 如果它可预计算，使用快速路径；否则放弃快速路径以保持规则顺序
         if let Some(pre) = &rule.precomputed {
             match pre {
                 PrecomputedAction::Static { rcode } => {
@@ -291,6 +293,12 @@ pub(crate) fn fast_static_match(
                     return Some(Decision::Static { rcode, answers });
                 }
             }
+        } else {
+            // 第一个匹配的规则不可预计算（如 Forward、Jump 等）
+            // 放弃快速路径，让规则走正常路径以保持配置顺序
+            // 这确保了像 "domain_regex → forward" 这样的规则不会被
+            // 后面的 "domain_suffix → static_ip" 规则跳过
+            return None;
         }
     }
     None

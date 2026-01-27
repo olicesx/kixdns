@@ -5100,6 +5100,90 @@ mod tests {
             "Different QNAME should produce different cache hashes"
         );
     }
+
+    /// 测试 fast_static_match 不会跳过不可预计算的规则
+    ///
+    /// 这是一个回归测试，用于验证以下场景：
+    /// - 规则1：domain_regex("^_acme") → forward（不可预计算）
+    /// - 规则2：domain_suffix("mydomain.com") → static_ip（可预计算）
+    /// - 查询：_acme-challenge.mydomain.com
+    ///
+    /// 预期行为：第一条规则应该生效（forward），而不是第二条规则（static_ip）
+    ///
+    /// 修复前：fast_static_match 会跳过不可预计算的规则，直接返回可预计算的规则结果
+    /// 修复后：fast_static_match 在遇到第一个匹配但不可预计算的规则时放弃快速路径
+    #[test]
+    fn test_fast_static_match_preserves_rule_order() {
+        use crate::advanced_rule::{compile_pipelines, fast_static_match};
+
+        // Arrange: 构建一个配置，模拟用户的问题场景
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [
+                {
+                    "id": "test",
+                    "rules": [
+                        {
+                            "name": "acme-forward",
+                            "matchers": [{ "type": "domain_regex", "value": "^_acme" }],
+                            "actions": [{ "type": "forward", "upstream": "223.5.5.5:53" }]
+                        },
+                        {
+                            "name": "mydomain-static",
+                            "matchers": [{ "type": "domain_suffix", "value": "mydomain.com" }],
+                            "actions": [{ "type": "static_ip_response", "ip": "192.168.16.42" }]
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
+        let compiled = compile_pipelines(&runtime);
+
+        // Act: 调用 fast_static_match 查询 _acme-challenge.mydomain.com
+        let result = fast_static_match(
+            &compiled[0],
+            "_acme-challenge.mydomain.com",
+            hickory_proto::rr::RecordType::TXT,
+            hickory_proto::rr::DNSClass::IN,
+            "127.0.0.1".parse().unwrap(),
+            false,
+        );
+
+        // Assert: fast_static_match 应该返回 None
+        // 原因：第一条规则（domain_regex("^_acme")）匹配但不可预计算，
+        // 所以 fast_static_match 应该放弃快速路径，让规则走正常路径
+        assert!(
+            result.is_none(),
+            "fast_static_match 应该返回 None，因为第一个匹配的规则不可预计算"
+        );
+
+        // 验证：如果查询一个只匹配第二条规则的域名，应该返回静态 IP
+        let result2 = fast_static_match(
+            &compiled[0],
+            "other.mydomain.com",
+            hickory_proto::rr::RecordType::A,
+            hickory_proto::rr::DNSClass::IN,
+            "127.0.0.1".parse().unwrap(),
+            false,
+        );
+
+        assert!(
+            result2.is_some(),
+            "fast_static_match 应该返回 Some，因为第一个匹配的规则可预计算"
+        );
+
+        // 验证返回的是静态 IP 决策
+        match result2.unwrap() {
+            Decision::Static { rcode, answers } => {
+                assert_eq!(rcode, ResponseCode::NoError);
+                assert!(!answers.is_empty(), "应该有静态 IP 答案");
+            }
+            _ => panic!("应该返回 Static 决策"),
+        }
+    }
 }
 
 fn parse_rcode(rcode: &str) -> Option<ResponseCode> {
