@@ -125,40 +125,6 @@ async fn run_dns_server(
 
             watcher::spawn(config.clone(), engine.clone());
 
-            // ✅ 添加信号处理以支持优雅关闭
-            // ✅ Add signal handling for graceful shutdown
-            #[cfg(unix)]
-            {
-                use tokio::signal::unix::{signal, SignalKind};
-
-                let mut sigterm = match signal(SignalKind::terminate()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to setup SIGTERM handler");
-                        return Err(e.into());
-                    }
-                };
-                let mut sigint = match signal(SignalKind::interrupt()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to setup SIGINT handler");
-                        return Err(e.into());
-                    }
-                };
-
-                // 启动信号监听任务 / Spawn signal listener task
-                tokio::spawn(async move {
-                    tokio::select! {
-                        _ = sigterm.recv() => {
-                            tracing::warn!("Received SIGTERM, shutting down gracefully");
-                        }
-                        _ = sigint.recv() => {
-                            tracing::warn!("Received SIGINT, shutting down gracefully");
-                        }
-                    }
-                });
-            }
-
             // UDP worker 数量：默认为 CPU 核心数，最少 1 个 / UDP worker count: defaults to CPU core count, minimum 1
             let udp_workers_final = if udp_workers_count > 0 {
                 udp_workers_count
@@ -172,18 +138,29 @@ async fn run_dns_server(
 
             #[cfg(unix)]
             {
-                // On Unix create individual sockets with SO_REUSEPORT so kernel distributes packets / 在 Unix 上创建带有 SO_REUSEPORT 的独立套接字，以便内核分发数据包
-                for worker_id in 0..udp_workers_final {
-                    let engine = engine.clone();
-                    let std_socket = create_reuseport_udp_socket(bind_addr)
-                        .with_context(|| format!("create udp socket for worker {}", worker_id))?;
-                    let socket = UdpSocket::from_std(std_socket)?;
-                    let handle = tokio::spawn(async move {
-                        if let Err(err) = run_udp_worker(worker_id, Arc::new(socket), engine).await {
-                            error!(worker_id, error = %err, "udp worker exited");
-                        }
-                    });
-                    udp_handles.push(handle);
+                // ✅ OpenBSD 兼容性方案：双 socket（IPv4 + IPv6）+ 零拷贝 recv_buf_from
+                // ✅ OpenBSD compatibility: dual sockets (IPv4 + IPv6) + zero-copy recv_buf_from
+                // 为每个地址族创建独立的 socket 和 workers，避免 sockaddr 大小断言失败
+                // Create separate sockets and workers for each address family to avoid sockaddr size assertion failures
+
+                // ✅ OpenBSD 兼容性方案：双 socket（IPv4 + IPv6）+ 零拷贝 recv_buf_from
+                // ✅ OpenBSD compatibility: dual sockets (IPv4 + IPv6) + zero-copy recv_buf_from
+                // 为每个地址族创建独立的 socket 和 workers，避免 sockaddr 大小断言失败
+                // Create separate sockets and workers for each address family to avoid sockaddr size assertion failures
+
+                // 检查是否需要 IPv4 socket / Check if IPv4 socket is needed
+                let needs_ipv4 = bind_addr.is_ipv4() || bind_addr.is_unspecified();
+                // 检查是否需要 IPv6 socket / Check if IPv6 socket is needed
+                let needs_ipv6 = bind_addr.is_ipv6() || bind_addr.is_unspecified();
+
+                if needs_ipv4 {
+                    let workers_per_family = udp_workers_final.div_ceil(2);
+                    spawn_ipv4_udp_workers(bind_addr, workers_per_family, engine.clone(), &mut udp_handles)?;
+                }
+
+                if needs_ipv6 {
+                    let workers_per_family = udp_workers_final.div_ceil(2);
+                    spawn_ipv6_udp_workers(bind_addr, workers_per_family, engine.clone(), &mut udp_handles)?;
                 }
             }
 
@@ -266,6 +243,76 @@ fn init_tracing(debug: bool) {
         .init();
 }
 
+// 为 IPv4 地址创建并启动 UDP workers / Create and spawn UDP workers for IPv4 address
+#[cfg(unix)]
+fn spawn_ipv4_udp_workers(
+    bind_addr: SocketAddr,
+    worker_count: usize,
+    engine: Engine,
+    udp_handles: &mut Vec<tokio::task::JoinHandle<()>>,
+) -> anyhow::Result<()> {
+    let ipv4_addr: SocketAddr = if bind_addr.is_ipv4() {
+        bind_addr
+    } else {
+        // 预编译的常量地址，避免 unwrap / Precompiled constant address, avoid unwrap
+        "0.0.0.0:5353"
+            .parse()
+            .expect("Hardcoded default IPv4 address should always be valid")
+    };
+
+    info!(bind_addr = %ipv4_addr, workers = worker_count, "Starting IPv4 UDP workers");
+
+    for worker_id in 0..worker_count {
+        let engine = engine.clone();
+        let std_socket = create_reuseport_udp_socket(ipv4_addr)
+            .with_context(|| format!("create ipv4 udp socket for worker {}", worker_id))?;
+        let socket = UdpSocket::from_std(std_socket)?;
+        let handle = tokio::spawn(async move {
+            if let Err(err) = run_udp_worker(worker_id, Arc::new(socket), engine).await {
+                error!(worker_id, error = %err, "IPv4 udp worker exited");
+            }
+        });
+        udp_handles.push(handle);
+    }
+
+    Ok(())
+}
+
+// 为 IPv6 地址创建并启动 UDP workers / Create and spawn UDP workers for IPv6 address
+#[cfg(unix)]
+fn spawn_ipv6_udp_workers(
+    bind_addr: SocketAddr,
+    worker_count: usize,
+    engine: Engine,
+    udp_handles: &mut Vec<tokio::task::JoinHandle<()>>,
+) -> anyhow::Result<()> {
+    let ipv6_addr: SocketAddr = if bind_addr.is_ipv6() {
+        bind_addr
+    } else {
+        // 预编译的常量地址，避免 unwrap / Precompiled constant address, avoid unwrap
+        "[::]:5353"
+            .parse()
+            .expect("Hardcoded default IPv6 address should always be valid")
+    };
+
+    info!(bind_addr = %ipv6_addr, workers = worker_count, "Starting IPv6 UDP workers");
+
+    for worker_id in 0..worker_count {
+        let engine = engine.clone();
+        let std_socket = create_reuseport_udp_socket(ipv6_addr)
+            .with_context(|| format!("create ipv6 udp socket for worker {}", worker_id))?;
+        let socket = UdpSocket::from_std(std_socket)?;
+        let handle = tokio::spawn(async move {
+            if let Err(err) = run_udp_worker(worker_id, Arc::new(socket), engine).await {
+                error!(worker_id, error = %err, "IPv6 udp worker exited");
+            }
+        });
+        udp_handles.push(handle);
+    }
+
+    Ok(())
+}
+
 // 在 Unix 上创建带 SO_REUSEPORT 的 UDP socket；非 Unix 使用标准绑定 / Create UDP socket with SO_REUSEPORT on Unix; use standard binding on non-Unix
 #[cfg(unix)]
 fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::UdpSocket> {
@@ -278,6 +325,33 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
     };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
+
+    // ✅ OpenBSD/FreeBSD 安全措施：为 IPv6 socket 显式设置 IPV6_V6ONLY=1
+    // ✅ OpenBSD/FreeBSD safety: explicitly set IPV6_V6ONLY=1 for IPv6 sockets
+    // 双 socket 方案下，IPv6 socket 只处理 IPv6 流量，确保地址族一致性，避免 sockaddr 大小断言失败
+    // With dual-socket approach, IPv6 socket only handles IPv6 traffic, ensuring address family consistency
+    // 这使得我们可以安全地使用零拷贝的 recv_buf_from
+    // This allows us to safely use zero-copy recv_buf_from
+    if domain == Domain::IPV6 {
+        #[allow(unused_imports)]
+        use libc::{IPV6_V6ONLY, IPPROTO_IPV6, c_int, c_void, setsockopt, socklen_t};
+        let val: c_int = 1;  // 1 = 仅 IPv6 / 1 = IPv6 only
+        let fd = socket.as_raw_fd();
+        let ret = unsafe {
+            setsockopt(
+                fd,
+                IPPROTO_IPV6,
+                IPV6_V6ONLY,
+                &val as *const _ as *const c_void,
+                std::mem::size_of_val(&val) as socklen_t,
+            )
+        };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            tracing::warn!("Failed to set IPV6_V6ONLY=1: {}, this may cause issues on OpenBSD", err);
+        }
+    }
+
     // Try to set SO_REUSEPORT via libc to avoid depending on socket2 method availability / 尝试通过 libc 设置 SO_REUSEPORT，避免依赖 socket2 方法的可用性
     #[allow(unused_imports)]
     use libc::{SO_REUSEPORT, SOL_SOCKET, c_int, c_void, setsockopt, socklen_t};
@@ -342,7 +416,10 @@ async fn run_udp_worker(
             buf.reserve(4096 - buf.len());
         }
 
-        // 使用 tokio 的 recv_buf_from 配合 BytesMut，实现安全且零拷贝的接收 / Use tokio's recv_buf_from with BytesMut for safe and zero-copy reception
+        // ✅ 使用 tokio 的 recv_buf_from 配合 BytesMut，实现零拷贝的高性能接收
+        // ✅ Use tokio's recv_buf_from with BytesMut for zero-copy high-performance reception
+        // 由于使用双 socket 方案（IPv4 + IPv6 分离），不会出现混合地址族的 sockaddr 问题
+        // Since we use dual-socket approach (IPv4 + IPv6 separated), no mixed address family sockaddr issues
         match socket.recv_buf_from(&mut buf).await {
             Ok((_len, peer)) => {
                 // 零拷贝获取 Bytes / Zero-copy obtain Bytes
@@ -369,7 +446,7 @@ async fn run_udp_worker(
                                 send_buf.reserve(cached.len() - send_buf.capacity());
                             }
                             send_buf.extend_from_slice(&cached);
-                            
+
                             // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
                             let elapsed = inserted_at.elapsed().as_secs() as u32;
                             if elapsed > 0 {
@@ -430,14 +507,10 @@ async fn run_udp_worker(
                         // 解析错误，忽略 / Parse error, ignore
                     }
                 }
-
-                // 重置 buffer 供下次使用 (split 后 buf 为空，需要 reserve) / Reset buffer for next use (buf is empty after split, need reserve)
-                // 实际上 split() 拿走了所有权，buf 变为空。 / Actually split() takes ownership, buf becomes empty
-                // 下次循环开头会 reserve。 / Will reserve at the beginning of next loop
             }
-            Err(_) => {
-                // 继续接收，不退出 / Continue receiving, don't exit
-                // 如果出错，buf 长度可能不对，重置 / If error occurs, buf length might be wrong, reset
+            Err(e) => {
+                // 接收错误，清除缓冲区并继续 / Receive error, clear buffer and continue
+                debug!(error = %e, "UDP recv error");
                 buf.clear();
             }
         }
