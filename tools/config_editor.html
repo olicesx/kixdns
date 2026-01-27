@@ -617,7 +617,7 @@
                 };
 
                 // 使用Vue 3的watch监听actions，确保text字段正确同步
-                const stopWatch = Vue.watch(() => config.value.pipelines, (pipelines) => {
+                const stopWatch = Vue.watch(() => props.pipelines, (pipelines) => {
                     (pipelines || []).forEach(pipe => {
                         (pipe.rules || []).forEach(rule => {
                             [rule.actions, rule.response_actions_on_match, rule.response_actions_on_miss].forEach(actions => {
