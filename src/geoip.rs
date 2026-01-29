@@ -861,12 +861,25 @@ fn run_geoip_watcher(
                 while retries > 0 {
                     let load_result = if is_dat {
                         // 加载 .dat 格式 / Load .dat format
-                        let mut manager_guard = manager.write().unwrap();
-                        manager_guard.load_from_dat_file(event_path)
+                        // 安全地获取写锁 / Safely acquire write lock
+                        match manager.write() {
+                            Ok(mut guard) => guard.load_from_dat_file(event_path),
+                            Err(e) => {
+                                tracing::warn!(target = "geoip_watcher", "RwLock was poisoned during .dat reload, recovering");
+                                e.into_inner().load_from_dat_file(event_path)
+                            }
+                        }
                     } else {
                         // 加载 V2Ray JSON 格式 / Load V2Ray JSON format
-                        let mut manager_guard = manager.write().unwrap();
-                        manager_guard.load_from_v2ray_file(event_path)
+                        // 安全地获取写锁 / Safely acquire write lock
+                        match manager.write() {
+                            Ok(mut guard) => guard.load_from_v2ray_file(event_path),
+                            Err(e) => {
+                                let mut guard = e.into_inner();
+                                tracing::warn!(target = "geoip_watcher", "RwLock was poisoned during JSON reload, recovering");
+                                guard.load_from_v2ray_file(event_path)
+                            }
+                        }
                     };
                     
                     match load_result {

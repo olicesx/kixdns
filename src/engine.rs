@@ -4218,11 +4218,13 @@ fn matcher_matches(
     geoip_manager: Option<&Arc<std::sync::RwLock<crate::geoip::GeoIpManager>>>,
     geosite_manager: Option<&Arc<std::sync::RwLock<crate::geosite::GeoSiteManager>>>,
 ) -> bool {
-    // 获取 GeoSiteManager 的引用 / Get GeoSiteManager reference
-    let geosite_mgr_ref = geosite_manager.map(|m| m.read().unwrap());
+    // 安全地获取 GeoSiteManager 的引用，避免 RwLock 被污染时 panic
+    // Safely acquire GeoSiteManager reference to avoid panic if RwLock is poisoned
+    let geosite_mgr_ref = geosite_manager.and_then(|m| m.read().ok());
     let geosite_mgr_deref = geosite_mgr_ref.as_deref();
-    // 获取 GeoIpManager 的引用 / Get GeoIpManager reference
-    let geoip_mgr_ref = geoip_manager.map(|m| m.read().unwrap());
+    // 安全地获取 GeoIpManager 的引用，避免 RwLock 被污染时 panic
+    // Safely acquire GeoIpManager reference to avoid panic if RwLock is poisoned
+    let geoip_mgr_ref = geoip_manager.and_then(|m| m.read().ok());
     let geoip_mgr_deref = geoip_mgr_ref.as_deref();
     matcher.matches_with_qtype(qname, qclass, client_ip, edns_present, qtype, geoip_mgr_deref, geosite_mgr_deref)
 }

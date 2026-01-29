@@ -1165,13 +1165,26 @@ fn run_geosite_watcher(
                 while retries > 0 {
                     let load_result = if is_dat {
                         // 加载 .dat 格式 / Load .dat format
-                        let mut manager_guard = manager.write().unwrap();
-                        if tags.is_empty() {
-                            // 加载所有 tags / Load all tags
-                            manager_guard.load_from_dat_file(path)
-                        } else {
-                            // 按需加载指定的 tags / Load specified tags on-demand
-                            manager_guard.load_from_dat_file_selective(path, &tags)
+                        // 安全地获取写锁，避免 RwLock 被污染时 panic / Safely acquire write lock to avoid panic if RwLock is poisoned
+                        match manager.write() {
+                            Ok(mut guard) => {
+                                if tags.is_empty() {
+                                    // 加载所有 tags / Load all tags
+                                    guard.load_from_dat_file(path)
+                                } else {
+                                    // 按需加载指定的 tags / Load specified tags on-demand
+                                    guard.load_from_dat_file_selective(path, &tags)
+                                }
+                            }
+                            Err(e) => {
+                                let mut guard = e.into_inner();
+                                warn!(target = "geosite_watcher", "RwLock was poisoned, recovering and attempting reload");
+                                if tags.is_empty() {
+                                    guard.load_from_dat_file(path)
+                                } else {
+                                    guard.load_from_dat_file_selective(path, &tags)
+                                }
+                            }
                         }
                     } else {
                         // 加载 JSON 格式 / Load JSON format
@@ -1182,11 +1195,23 @@ fn run_geosite_watcher(
                                     .with_context(|| "parse V2Ray GeoSite JSON format")
                             })
                             .and_then(|v2ray_data| {
-                                let mut manager_guard = manager.write().unwrap();
-                                let entries = manager_guard.convert_v2ray_to_entries(v2ray_data);
-                                let loaded_count = entries.len();
-                                manager_guard.reload(entries);
-                                Ok(loaded_count)
+                                // 安全地获取写锁 / Safely acquire write lock
+                                match manager.write() {
+                                    Ok(mut guard) => {
+                                        let entries = guard.convert_v2ray_to_entries(v2ray_data);
+                                        let loaded_count = entries.len();
+                                        guard.reload(entries);
+                                        Ok(loaded_count)
+                                    }
+                                    Err(e) => {
+                                        let mut guard = e.into_inner();
+                                        warn!(target = "geosite_watcher", "RwLock was poisoned during JSON reload, recovering");
+                                        let entries = guard.convert_v2ray_to_entries(v2ray_data);
+                                        let loaded_count = entries.len();
+                                        guard.reload(entries);
+                                        Ok(loaded_count)
+                                    }
+                                }
                             })
                     };
                     
