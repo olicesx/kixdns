@@ -1308,46 +1308,24 @@ impl Engine {
             },
         };
 
-        // DESIGN NOTE: InflightCleanupGuard theoretical race condition analysis
-        // 设计说明：InflightCleanupGuard 理论竞态条件分析
+        // DESIGN NOTE: InflightCleanupGuard safety analysis
+        // 设计说明：InflightCleanupGuard 安全性分析
         //
-        // Theoretical Issue: If defuse() is called concurrently with Drop, there's a race
-        // where Drop might execute before defuse() sets active=false, causing unexpected cleanup.
+        // Safety Guarantee: No race condition exists
+        // 安全性保证：不存在竞态条件
         //
-        // 理论问题：如果 defuse() 与 Drop 并发调用，存在竞态条件，
-        // Drop 可能在 defuse() 设置 active=false 之前执行，导致意外清理。
+        // The guard is always used as a local stack variable (never shared via Arc/Mutex).
+        // Rust's ownership model guarantees that:
+        // - Mutable borrow via as_mut() (for defuse()) and Drop execution are mutually exclusive
+        // - The compiler prevents concurrent access at compile time
         //
-        // Why This Doesn't Need Fixing (aligned with KixDNS design philosophy):
-        // 为什么不需要修复（符合 KixDNS 设计哲学）：
+        // 该守卫始终作为局部栈变量使用（从不通过 Arc/Mutex 共享）。
+        // Rust 所有权模型保证：
+        // - 通过 as_mut() 的可变借用（用于 defuse()）和 Drop 执行互斥
+        // - 编译器在编译期阻止并发访问
         //
-        // 1. Performance First (性能优先):
-        //    - Adding synchronization (Mutex/Atomic) would add overhead to hot path
-        //    - Current zero-allocation design is optimal for 99.9% happy path
-        //    - 添加同步（Mutex/Atomic）会增加热路径开销
-        //    - 当前零分配设计对 99.9% 快乐路径是最优的
-        //
-        // 2. Practicality Over Theory (实用性胜于理论):
-        //    - Race requires: defuse() call AND task cancellation at exact same moment
-        //    - Probability: <0.001% (requires tokio scheduler timing attack)
-        //    - Impact: Temporary duplicate upstream query (self-healing via cache)
-        //    - 竞态需要：defuse() 调用 AND 任务取消在同一时刻
-        //    - 概率：<0.001%（需要 tokio 调度器时序攻击）
-        //    - 影响：临时重复上游查询（通过缓存自愈）
-        //
-        // 3. Simplicity (简单性):
-        //    - Current RAII pattern is simple and idiomatic Rust
-        //    - Fix would require complex synchronization primitives
-        //    - 当前 RAII 模式简单且符合 Rust 惯用法
-        //    - 修复需要复杂的同步原语
-        //
-        // 4. Safety (安全性):
-        //    - Worst case: Temporary duplicate query (not crash/corruption)
-        //    - No memory safety violation (Rust type system guarantees this)
-        //    - 最坏情况：临时重复查询（不是崩溃/损坏）
-        //    - 无内存安全违规（Rust 类型系统保证这一点）
-        //
-        // Conclusion: Theoretical issue doesn't justify violating Performance/Simplicity principles
-        // 结论：理论问题不值得违反性能/简单性原则
+        // This is a standard Rust RAII pattern that is safe and idiomatic.
+        // 这是标准的 Rust RAII 模式，安全且符合惯用法。
         struct InflightCleanupGuard {
             inflight: Arc<DashMap<u64, tokio::sync::watch::Sender<Result<Bytes, Arc<anyhow::Error>>>, FxBuildHasher>>,
             hash: u64,
