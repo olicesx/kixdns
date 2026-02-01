@@ -188,6 +188,16 @@ async fn run_dns_server(
                 let socket =
                     Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create socket")?;
 
+                // ✅ Windows 上设置 IPV6_V6ONLY=0 以支持双栈，与 Linux 行为一致
+                // ✅ On Windows, set IPV6_V6ONLY=0 for dual-stack support, consistent with Linux behavior
+                if domain == Domain::IPV6 {
+                    if let Err(e) = socket.set_only_v6(false) {
+                        debug!("failed to set IPV6_V6ONLY=0: {}, IPv4 may not work on [::] bind", e);
+                    } else {
+                        info!("UDP IPv6 socket set to dual-stack mode (IPV6_V6ONLY=0)");
+                    }
+                }
+
                 // Set buffer sizes to prevent packet loss under load
                 // Try 4MB first, then fall back to 1MB if it fails
                 let desired_size = 4 * 1024 * 1024;
@@ -267,7 +277,7 @@ fn spawn_ipv4_udp_workers(
     } else {
         // 预编译的常量地址，避免 unwrap / Precompiled constant address, avoid unwrap
         // 使用配置中的端口号而非硬编码 / Use port from config instead of hardcoded
-        SocketAddr::new(std::net::Ipv4Addr::new(0, 0, 0, 0), bind_addr.port())
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), bind_addr.port())
     };
 
     info!(bind_addr = %ipv4_addr, workers = worker_count, "Starting IPv4 UDP workers");
@@ -301,7 +311,7 @@ fn spawn_ipv6_udp_workers(
     } else {
         // 预编译的常量地址，避免 unwrap / Precompiled constant address, avoid unwrap
         // 使用配置中的端口号而非硬编码 / Use port from config instead of hardcoded
-        SocketAddr::new(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), bind_addr.port())
+        SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)), bind_addr.port())
     };
 
     info!(bind_addr = %ipv6_addr, workers = worker_count, "Starting IPv6 UDP workers");
