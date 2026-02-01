@@ -155,6 +155,8 @@ pub struct Engine {
     // 设计：后台刷新调用 handle_packet(skip_cache=true) 使用此规则
     // Uses OnceLock for lazy initialization and thread-safe one-time setup
     // 使用 OnceLock 实现延迟初始化和线程安全的一次性设置
+    // Note: Currently reserved for future implementation
+    #[allow(dead_code)]
     background_refresh_rule: std::sync::OnceLock<Arc<crate::matcher::RuntimeRule>>,
 }
 
@@ -408,7 +410,9 @@ impl Engine {
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to initialize GeoIpManager, running without GeoIP support");
                 // Create a dummy manager that always returns empty results
-                GeoIpManager::new(None).unwrap()
+                // This should never fail with None parameter
+                GeoIpManager::new(None)
+                    .expect("GeoIpManager::new(None) should always succeed")
             }
         };
 
@@ -1112,7 +1116,19 @@ impl Engine {
             // ASCII is always valid UTF-8, so this is safe
             // 安全性：qname_bytes 在 parse_quick() 中已验证为 ASCII
             // ASCII 始终是有效的 UTF-8，所以这是安全的
-            let qname_str = unsafe { std::str::from_utf8_unchecked(q.qname_bytes) };
+            //
+            // In debug builds, we validate to catch any issues early
+            // 在 debug 构建中，我们验证以尽早发现问题
+            let qname_str = {
+                #[cfg(debug_assertions)]
+                {
+                    std::str::from_utf8(q.qname_bytes).expect("qname_bytes should be valid UTF-8")
+                }
+                #[cfg(not(debug_assertions))]
+                unsafe {
+                    std::str::from_utf8_unchecked(q.qname_bytes)
+                }
+            };
             (std::borrow::Cow::Borrowed(qname_str), hickory_proto::rr::RecordType::from(q.qtype), DNSClass::from(q.qclass), q.tx_id, q.edns_present)
         } else {
             // Fallback to full parse if quick parse fails (unlikely for standard queries) / 如果快速解析失败则回退到完整解析（对于标准查询不太可能）
@@ -2420,7 +2436,7 @@ impl Engine {
                 Ok((up, res, dur)) => {
                     if res.is_ok() {
                         // 网络层面成功，检查 DNS 响应码 / Network success, check DNS rcode
-                        let bytes = res.as_ref().unwrap();
+                        let bytes = res.as_ref().expect("res.is_ok() was true, but res.as_ref() failed");
 
                         // 快速解析响应码 / Quick parse response code
                         let should_accept = if let Some(qr) = crate::proto_utils::parse_response_quick(bytes) {
@@ -2555,7 +2571,7 @@ impl Engine {
         qname: &str,
         qtype: hickory_proto::rr::RecordType,
         qclass: DNSClass,
-        upstream: Option<&str>,
+        _upstream: Option<&str>,  // Reserved for future use
     ) {
         // FIX: Check if already refreshing to prevent duplicate refreshes
         // 修复：检查是否已在刷新，防止重复刷新
@@ -2613,7 +2629,7 @@ impl Engine {
             let result = engine.handle_packet_internal(&packet, peer_addr, true).await;
             
             match result {
-                Ok(resp_bytes) => {
+                Ok(_resp_bytes) => {
                     tracing::debug!(
                         event = "background_refresh_success",
                         qname = %qname_owned,
@@ -2657,7 +2673,7 @@ impl Engine {
         &self,
         qname: &str,
         qtype: hickory_proto::rr::RecordType,
-        qclass: DNSClass,
+        _qclass: DNSClass,  // Currently defaults to IN class, parameter reserved for future use
     ) -> anyhow::Result<Bytes> {
         use hickory_proto::op::{Message, MessageType, Query};
         use hickory_proto::rr::Name;
@@ -3472,7 +3488,7 @@ impl UdpClient {
             if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
                 warn!("failed to set udp send buffer size: {}", e);
             }
-            socket.bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into()).expect("bind");
+            socket.bind(&"0.0.0.0:0".parse::<SocketAddr>().expect("parse ephemeral address").into()).expect("bind");
             socket.set_nonblocking(true).expect("set nonblocking");
             
             let std_sock: std::net::UdpSocket = socket.into();
@@ -3884,7 +3900,7 @@ impl TcpMuxClient {
         self.consecutive_errors.store(0, Ordering::Release);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_millis() as u64;
         self.last_request_time.store(now, Ordering::Release);
     }
@@ -3897,7 +3913,7 @@ impl TcpMuxClient {
     async fn check_connection_health(&self) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_millis() as u64;
 
         // Check connection aging / 检查连接老化
@@ -3954,7 +3970,7 @@ impl TcpMuxClient {
         const HEALTH_CHECK_INTERVAL_MS: u64 = 30_000;  // 30 秒
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime should be after UNIX_EPOCH")
             .as_millis() as u64;
         let last_check = self.last_health_check_time.load(Ordering::Relaxed);
         if last_check == 0 || now.saturating_sub(last_check) >= HEALTH_CHECK_INTERVAL_MS {
@@ -4116,7 +4132,7 @@ impl TcpMuxClient {
             // Set connection creation time
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime should be after UNIX_EPOCH")
                 .as_millis() as u64;
             self.conn_create_time.store(now, Ordering::Release);
             self.last_request_time.store(now, Ordering::Release);

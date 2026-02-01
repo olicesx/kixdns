@@ -3,7 +3,7 @@ use std::hash::Hasher;
 /// 快速解析结果，零拷贝实现 / Quick parse result with zero-copy implementation
 pub struct QuickQuery<'a> {
     pub tx_id: u16,
-    pub qname_bytes: &'a [u8],  // 零拷贝：直接引用已小写化的缓冲区
+    pub qname_bytes: &'a [u8], // 零拷贝：直接引用已小写化的缓冲区
     pub qtype: u16,
     pub qclass: u16,
     pub edns_present: bool,
@@ -98,12 +98,12 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
                 break;
             }
         }
-        
+
         // Copy label bytes to buffer
         if buf_pos + label_len > buf.len() {
             return None;
         }
-        
+
         if needs_lowercase {
             // Only lowercase if necessary
             for &b in label_bytes {
@@ -200,7 +200,7 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     // The buf already contains the lowercased domain name from the parsing loop above.
     Some(QuickQuery {
         tx_id,
-        qname_bytes: &buf[..buf_pos],  // 零拷贝：直接引用已小写化的缓冲区
+        qname_bytes: &buf[..buf_pos], // 零拷贝：直接引用已小写化的缓冲区
         qtype,
         qclass,
         edns_present,
@@ -231,7 +231,7 @@ fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
 impl QuickQuery<'_> {
     /// 检查 qname 是否匹配指定的域名（忽略大小写）
     /// Check if qname matches the specified domain name (case-insensitive)
-    /// 
+    ///
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
@@ -240,7 +240,7 @@ impl QuickQuery<'_> {
     /// assert!(query.qname_matches("GOOGLE.COM"));  // 大写匹配
     /// assert!(!query.qname_matches("example.com"));  // 不匹配
     /// ```
-    /// 
+    ///
     /// # Performance
     /// This function is optimized for hot path usage:
     /// - No allocation / 无分配
@@ -252,7 +252,7 @@ impl QuickQuery<'_> {
         if self.qname_bytes.len() != pattern.len() {
             return false;
         }
-        
+
         // Byte-by-byte comparison with ASCII lowercasing / 逐字节比较并转为小写
         // qname_bytes is already lowercased from parse_quick() / qname_bytes 在 parse_quick() 中已经转为小写
         // So we only need to lowercase the pattern bytes / 所以我们只需要将 pattern 字节转为小写
@@ -264,11 +264,11 @@ impl QuickQuery<'_> {
 
     /// 获取 qname 的字符串表示（用于调试和日志）
     /// Get string representation of qname (for debugging and logging)
-    /// 
+    ///
     /// # Performance Warning
     /// This function allocates a new String. Use sparingly in hot paths.
     /// 此函数分配新的 String。在热路径中谨慎使用。
-    /// 
+    ///
     /// # Safety
     /// qname_bytes is guaranteed to be valid ASCII (and thus UTF-8) by parse_quick().
     /// parse_quick() validates ASCII before returning QuickQuery.
@@ -276,7 +276,7 @@ impl QuickQuery<'_> {
     /// qname_bytes 由 parse_quick() 保证为有效的 ASCII（因此也是 UTF-8）。
     /// parse_quick() 在返回 QuickQuery 之前验证 ASCII。
     /// ASCII 始终是有效的 UTF-8，所以 from_utf8_unchecked 是安全的。
-    /// 
+    ///
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
@@ -289,6 +289,16 @@ impl QuickQuery<'_> {
         // ASCII is always valid UTF-8
         // 安全性：qname_bytes 在 parse_quick() 中已验证为 ASCII
         // ASCII 始终是有效的 UTF-8
+        //
+        // In debug builds, we validate to catch any issues early
+        // 在 debug 构建中，我们验证以尽早发现问题
+        #[cfg(debug_assertions)]
+        {
+            std::str::from_utf8(self.qname_bytes)
+                .expect("qname_bytes should be valid UTF-8")
+                .to_string()
+        }
+        #[cfg(not(debug_assertions))]
         unsafe {
             std::str::from_utf8_unchecked(self.qname_bytes).to_string()
         }
@@ -296,19 +306,21 @@ impl QuickQuery<'_> {
 
     /// 获取 qname 的 &str 表示（零分配，但受生命周期限制）
     /// Get &str representation of qname (zero-allocation, but lifetime-bound)
-    /// 
+    ///
     /// # Performance
     /// This is the preferred method for string operations in hot paths.
     /// 这是热路径中字符串操作的首选方法。
-    /// 
+    ///
     /// # Safety
     /// qname_bytes is guaranteed to be valid ASCII (and thus UTF-8) by parse_quick().
     /// parse_quick() validates ASCII before returning QuickQuery.
     /// If parse_quick() succeeds, qname_bytes is always valid ASCII/UTF-8.
+    /// In debug builds, we validate to catch any issues early.
     /// qname_bytes 由 parse_quick() 保证为有效的 ASCII（因此也是 UTF-8）。
     /// parse_quick() 在返回 QuickQuery 之前验证 ASCII。
     /// 如果 parse_quick() 成功，qname_bytes 始终是有效的 ASCII/UTF-8。
-    /// 
+    /// 在 debug 构建中，我们验证以尽早发现问题。
+    ///
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
@@ -321,6 +333,14 @@ impl QuickQuery<'_> {
         // ASCII is always valid UTF-8
         // 安全性：qname_bytes 在 parse_quick() 中已验证为 ASCII
         // ASCII 始终是有效的 UTF-8
+        //
+        // In debug builds, we validate to catch any issues early
+        // 在 debug 构建中，我们验证以尽早发现问题
+        #[cfg(debug_assertions)]
+        {
+            std::str::from_utf8(self.qname_bytes).expect("qname_bytes should be valid UTF-8")
+        }
+        #[cfg(not(debug_assertions))]
         unsafe {
             std::str::from_utf8_unchecked(self.qname_bytes)
         }
@@ -328,7 +348,7 @@ impl QuickQuery<'_> {
 
     /// 获取 qname 的哈希值（用于缓存键计算）
     /// Get hash value of qname (for cache key calculation)
-    /// 
+    ///
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
@@ -365,7 +385,7 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     // Byte 2: QR(1) Opcode(4) AA(1) TC(1) RD(1)
     // Byte 3: RA(1) Z(3) RCODE(4)
     let flags_byte2 = packet[2];
-    let truncated = (flags_byte2 & 0x02) != 0;  // TC bit at position 1
+    let truncated = (flags_byte2 & 0x02) != 0; // TC bit at position 1
 
     let rcode_u8 = packet[3] & 0x0F;
     let rcode = hickory_proto::op::ResponseCode::from(0, rcode_u8);
@@ -377,7 +397,12 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     // For caching, we usually care about Answer section TTLs. / 对于缓存，我们通常关心 Answer 部分的 TTL
 
     if an_count == 0 {
-        return Some(QuickResponse { rcode, min_ttl: 0, max_ttl: 0, truncated });
+        return Some(QuickResponse {
+            rcode,
+            min_ttl: 0,
+            max_ttl: 0,
+            truncated,
+        });
     }
 
     let mut pos = 12;
@@ -478,7 +503,12 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
         max_ttl = 0;
     }
 
-    Some(QuickResponse { rcode, min_ttl, max_ttl, truncated })
+    Some(QuickResponse {
+        rcode,
+        min_ttl,
+        max_ttl,
+        truncated,
+    })
 }
 
 /// 批量修正 DNS 响应包中的 TTL 值 / Batch patch TTL values in a DNS response packet
@@ -526,21 +556,21 @@ pub fn patch_all_ttls(packet: &mut [u8], decrement: u32) {
             packet[ttl_offset + 2],
             packet[ttl_offset + 3],
         ]);
-        
+
         // RFC 1035: Decrement TTL, floor at 0
         let new_ttl = old_ttl.saturating_sub(decrement);
         let ttl_bytes = new_ttl.to_be_bytes();
         packet[ttl_offset..ttl_offset + 4].copy_from_slice(&ttl_bytes);
 
         let rd_len = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
-        
+
         // Ensure the entire record (10 bytes header + RData) fits within remaining packet
         // and handle potential overflow for the next iteration's position
         let record_total_len = 10usize.saturating_add(rd_len);
         if pos.saturating_add(record_total_len) > packet_len {
             return;
         }
-        
+
         pos += record_total_len;
     }
 }
@@ -557,18 +587,18 @@ mod tests {
         // Header: ID=0, QR=1, QDCOUNT=1, ANCOUNT=1
         let mut packet = vec![0u8; 12];
         packet[2] = 0x80; // QR=1
-        packet[5] = 1;    // QDCOUNT=1
-        packet[7] = 1;    // ANCOUNT=1
-        
+        packet[5] = 1; // QDCOUNT=1
+        packet[7] = 1; // ANCOUNT=1
+
         // Question: example.com (7example3com0), Type A, Class IN
         packet.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
-        
+
         // Answer: same name (compressed), Type A, Class IN, TTL=600, RDLen=4, IP=1.2.3.4
         let answer_start = packet.len();
         packet.extend_from_slice(b"\xc0\x0c\x00\x01\x00\x01");
         packet.extend_from_slice(&600u32.to_be_bytes()); // TTL at answer_start + 6
         packet.extend_from_slice(b"\x00\x04\x01\x02\x03\x04");
-        
+
         let ttl_offset = answer_start + 6;
         let original_ttl = u32::from_be_bytes([
             packet[ttl_offset],
@@ -580,7 +610,7 @@ mod tests {
 
         // Act: Patch TTLs with decrement of 100
         patch_all_ttls(&mut packet, 100);
-        
+
         // Assert: TTL should be decremented by 100
         let new_ttl = u32::from_be_bytes([
             packet[ttl_offset],
@@ -602,10 +632,10 @@ mod tests {
         packet.extend_from_slice(b"\xc0\x0c\x00\x01\x00\x01"); // Answer
         packet.extend_from_slice(&50u32.to_be_bytes()); // TTL=50
         packet.extend_from_slice(b"\x00\x04\x01\x02\x03\x04");
-        
+
         // Act: Patch TTLs with decrement of 100 (greater than original TTL)
         patch_all_ttls(&mut packet, 100); // 50 - 100 should floor at 0
-        
+
         // Assert: TTL should be saturated at 0
         let ttl_offset = answer_start + 6;
         let new_ttl = u32::from_be_bytes([
@@ -614,7 +644,10 @@ mod tests {
             packet[ttl_offset + 2],
             packet[ttl_offset + 3],
         ]);
-        assert_eq!(new_ttl, 0, "TTL should be saturated at 0 when decrement exceeds original value");
+        assert_eq!(
+            new_ttl, 0,
+            "TTL should be saturated at 0 when decrement exceeds original value"
+        );
     }
 
     #[test]
@@ -625,30 +658,30 @@ mod tests {
         packet[7] = 1; // AN
         packet[9] = 1; // NS
         packet[11] = 1; // AR
-        
+
         packet.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01"); // Question
-        
+
         // AN section with TTL=1000
         let an_ttl_off = packet.len() + 6;
         packet.extend_from_slice(b"\xc0\x0c\x00\x01\x00\x01");
         packet.extend_from_slice(&1000u32.to_be_bytes());
         packet.extend_from_slice(b"\x00\x04\x01\x02\x03\x04");
-        
+
         // NS section with TTL=2000
         let ns_ttl_off = packet.len() + 6;
         packet.extend_from_slice(b"\xc0\x0c\x00\x02\x00\x01");
         packet.extend_from_slice(&2000u32.to_be_bytes());
         packet.extend_from_slice(b"\x00\x04\x01\x02\x03\x04");
-        
+
         // AR section with TTL=3000
         let ar_ttl_off = packet.len() + 6;
         packet.extend_from_slice(b"\xc0\x0c\x00\x01\x00\x01");
         packet.extend_from_slice(&3000u32.to_be_bytes());
         packet.extend_from_slice(b"\x00\x04\x01\x02\x03\x04");
-        
+
         // Act: Patch all TTLs with decrement of 500
         patch_all_ttls(&mut packet, 500);
-        
+
         // Assert: All TTLs should be decremented by 500
         let an_ttl = u32::from_be_bytes([
             packet[an_ttl_off],
@@ -656,22 +689,31 @@ mod tests {
             packet[an_ttl_off + 2],
             packet[an_ttl_off + 3],
         ]);
-        assert_eq!(an_ttl, 500, "Answer section TTL should be decremented from 1000 to 500");
-        
+        assert_eq!(
+            an_ttl, 500,
+            "Answer section TTL should be decremented from 1000 to 500"
+        );
+
         let ns_ttl = u32::from_be_bytes([
             packet[ns_ttl_off],
             packet[ns_ttl_off + 1],
             packet[ns_ttl_off + 2],
             packet[ns_ttl_off + 3],
         ]);
-        assert_eq!(ns_ttl, 1500, "Authority section TTL should be decremented from 2000 to 1500");
-        
+        assert_eq!(
+            ns_ttl, 1500,
+            "Authority section TTL should be decremented from 2000 to 1500"
+        );
+
         let ar_ttl = u32::from_be_bytes([
             packet[ar_ttl_off],
             packet[ar_ttl_off + 1],
             packet[ar_ttl_off + 2],
             packet[ar_ttl_off + 3],
         ]);
-        assert_eq!(ar_ttl, 2500, "Additional section TTL should be decremented from 3000 to 2500");
+        assert_eq!(
+            ar_ttl, 2500,
+            "Additional section TTL should be decremented from 3000 to 2500"
+        );
     }
 }

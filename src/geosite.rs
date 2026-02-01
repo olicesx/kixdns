@@ -9,13 +9,13 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Context;
-use rustc_hash::FxHashMap;
 use moka::sync::Cache as MokaCache;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
+use rustc_hash::FxHashMap;
 use rustc_hash::FxHasher;
 use serde::Deserialize;
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 /// 域名匹配器类型 / Domain matcher type
 #[derive(Debug, Clone)]
@@ -34,9 +34,7 @@ impl DomainMatcher {
     /// 检查域名是否匹配 / Check if domain matches
     pub fn matches(&self, domain: &str) -> bool {
         match self {
-            DomainMatcher::Full(pattern) => {
-                domain.eq_ignore_ascii_case(pattern)
-            }
+            DomainMatcher::Full(pattern) => domain.eq_ignore_ascii_case(pattern),
             DomainMatcher::Suffix(suffix) => {
                 // 移除前导点后再进行匹配，让 .github.com 也能匹配 github.com
                 // Remove leading dot for matching, so .github.com can match github.com
@@ -54,12 +52,12 @@ impl DomainMatcher {
                     domain.contains(keyword)
                 } else {
                     // 需要转换 / Need conversion
-                    domain.to_ascii_lowercase().contains(&keyword.to_ascii_lowercase())
+                    domain
+                        .to_ascii_lowercase()
+                        .contains(&keyword.to_ascii_lowercase())
                 }
             }
-            DomainMatcher::Regex(regex) => {
-                regex.is_match(domain)
-            }
+            DomainMatcher::Regex(regex) => regex.is_match(domain),
         }
     }
 }
@@ -80,7 +78,7 @@ impl GeoSiteEntry {
                 DomainMatcher::Full(domain) => *domain = domain.to_ascii_lowercase(),
                 DomainMatcher::Suffix(suffix) => *suffix = suffix.to_ascii_lowercase(),
                 DomainMatcher::Keyword(keyword) => *keyword = keyword.to_ascii_lowercase(),
-                DomainMatcher::Regex(_) => {}  // 正则不转换 / Regex not converted
+                DomainMatcher::Regex(_) => {} // 正则不转换 / Regex not converted
             }
         }
         self
@@ -105,9 +103,7 @@ impl GeoSiteManager {
         Self {
             database: FxHashMap::default(),
             suffix_index: FxHashMap::default(),
-            cache: MokaCache::builder()
-                .max_capacity(1000)
-                .build(),
+            cache: MokaCache::builder().max_capacity(1000).build(),
         }
     }
 
@@ -115,7 +111,9 @@ impl GeoSiteManager {
     fn rebuild_cache(&mut self) {
         // 根据实际加载的域名数量设置缓存大小
         // 统计所有标签的域名总数
-        let total_domains: usize = self.database.iter()
+        let total_domains: usize = self
+            .database
+            .iter()
             .map(|(_, matchers)| matchers.len())
             .sum();
 
@@ -129,9 +127,7 @@ impl GeoSiteManager {
             "Rebuilding GeoSite cache"
         );
 
-        self.cache = MokaCache::builder()
-            .max_capacity(cache_capacity)
-            .build();
+        self.cache = MokaCache::builder().max_capacity(cache_capacity).build();
     }
 
     /// 添加 GeoSite 条目 / Add GeoSite entry
@@ -154,11 +150,11 @@ impl GeoSiteManager {
     }
 
     /// 检查域名是否匹配指定的 GeoSite 标签 / Check if domain matches specified GeoSite tag
-    /// 
+    ///
     /// # 参数 / Parameters
     /// - `tag`: GeoSite 标签（如 "cn", "google", "category-ads"）/ GeoSite tag
     /// - `domain`: 要检查的域名 / Domain to check
-    /// 
+    ///
     /// # 返回 / Returns
     /// - `true`: 域名匹配该标签 / Domain matches the tag
     /// - `false`: 域名不匹配该标签 / Domain does not match the tag
@@ -170,7 +166,7 @@ impl GeoSiteManager {
         tag.hash(&mut hasher);
         domain.hash(&mut hasher);
         let key = hasher.finish();
-        
+
         // 检查缓存 / Check cache
         if let Some(result) = self.cache.get(&key) {
             return result;
@@ -209,11 +205,7 @@ impl GeoSiteManager {
                 // s 已经在加载时预小写 / s already lowercased during loading
                 // 移除前导点后再进行匹配，让 .github.com 也能匹配 github.com
                 // Remove leading dot for matching, so .github.com can match github.com
-                let s_clean = if s.starts_with('.') {
-                    &s[1..]
-                } else {
-                    s
-                };
+                let s_clean = if s.starts_with('.') { &s[1..] } else { s };
 
                 // 先尝试完全匹配（快速路径）/ Try exact match first (fast path)
                 if domain.eq_ignore_ascii_case(s_clean) {
@@ -247,14 +239,14 @@ impl GeoSiteManager {
     }
 
     /// 重新加载数据库 / Reload database
-    /// 
+    ///
     /// # 参数 / Parameters
     /// - `entries`: 新的 GeoSite 条目列表 / New GeoSite entries
     pub fn reload(&mut self, entries: Vec<GeoSiteEntry>) {
         self.database.clear();
         self.suffix_index.clear();
         self.cache.invalidate_all();
-        
+
         for entry in entries {
             self.add_entry(entry);
         }
@@ -286,40 +278,64 @@ mod tests {
     fn test_domain_matcher_full() {
         // Arrange: Create a full domain matcher
         let matcher = DomainMatcher::Full("google.com".to_string());
-        
+
         // Act & Assert: Verify exact match
         assert!(matcher.matches("google.com"), "Should match exact domain");
-        assert!(matcher.matches("GOOGLE.COM"), "Should match case-insensitively");
-        assert!(!matcher.matches("www.google.com"), "Should not match subdomain");
+        assert!(
+            matcher.matches("GOOGLE.COM"),
+            "Should match case-insensitively"
+        );
+        assert!(
+            !matcher.matches("www.google.com"),
+            "Should not match subdomain"
+        );
     }
 
     #[test]
     fn test_domain_matcher_suffix() {
         // Arrange: Create a suffix domain matcher
         let matcher = DomainMatcher::Suffix(".google.com".to_string());
-        
+
         // Act & Assert: Verify suffix matching
-        assert!(matcher.matches("www.google.com"), "Should match subdomain with suffix");
-        assert!(matcher.matches("mail.google.com"), "Should match subdomain with suffix");
-        assert!(!matcher.matches("google.com.hk"), "Should not match different TLD");
+        assert!(
+            matcher.matches("www.google.com"),
+            "Should match subdomain with suffix"
+        );
+        assert!(
+            matcher.matches("mail.google.com"),
+            "Should match subdomain with suffix"
+        );
+        assert!(
+            !matcher.matches("google.com.hk"),
+            "Should not match different TLD"
+        );
     }
 
     #[test]
     fn test_domain_matcher_keyword() {
         // Arrange: Create a keyword domain matcher
         let matcher = DomainMatcher::Keyword("google".to_string());
-        
+
         // Act & Assert: Verify keyword matching
-        assert!(matcher.matches("www.google.com"), "Should match domain containing keyword");
-        assert!(matcher.matches("googleapis.com"), "Should match domain containing keyword");
-        assert!(!matcher.matches("www.bing.com"), "Should not match domain without keyword");
+        assert!(
+            matcher.matches("www.google.com"),
+            "Should match domain containing keyword"
+        );
+        assert!(
+            matcher.matches("googleapis.com"),
+            "Should match domain containing keyword"
+        );
+        assert!(
+            !matcher.matches("www.bing.com"),
+            "Should not match domain without keyword"
+        );
     }
 
     #[test]
     fn test_geosite_manager() {
         // Arrange: Create GeoSite manager and add Google category
         let mut manager = GeoSiteManager::new();
-        
+
         manager.add_entry(GeoSiteEntry {
             tag: "google".to_string(),
             matchers: vec![
@@ -330,44 +346,56 @@ mod tests {
         });
 
         // Act & Assert: Test Google domain matches
-        assert!(manager.matches("google", "google.com"), 
-            "Should match exact Google domain");
-        assert!(manager.matches("google", "www.google.com"), 
-            "Should match Google subdomain");
-        assert!(manager.matches("google", "mail.google.com"), 
-            "Should match Google subdomain");
-        assert!(manager.matches("google", "dns.googleapis.com"), 
-            "Should match Google APIs domain");
-        assert!(!manager.matches("google", "www.bing.com"), 
-            "Should not match non-Google domain");
+        assert!(
+            manager.matches("google", "google.com"),
+            "Should match exact Google domain"
+        );
+        assert!(
+            manager.matches("google", "www.google.com"),
+            "Should match Google subdomain"
+        );
+        assert!(
+            manager.matches("google", "mail.google.com"),
+            "Should match Google subdomain"
+        );
+        assert!(
+            manager.matches("google", "dns.googleapis.com"),
+            "Should match Google APIs domain"
+        );
+        assert!(
+            !manager.matches("google", "www.bing.com"),
+            "Should not match non-Google domain"
+        );
     }
 
     #[test]
     fn test_geosite_manager_cache() {
         // Arrange: Create GeoSite manager and add test entry
         let mut manager = GeoSiteManager::new();
-        
+
         manager.add_entry(GeoSiteEntry {
             tag: "test".to_string(),
-            matchers: vec![
-                DomainMatcher::Full("example.com".to_string()),
-            ],
+            matchers: vec![DomainMatcher::Full("example.com".to_string())],
         });
 
         // Act & Assert: First call - not cached
-        assert!(manager.matches("test", "example.com"), 
-            "Should match domain on first call");
-        
+        assert!(
+            manager.matches("test", "example.com"),
+            "Should match domain on first call"
+        );
+
         // Act & Assert: Second call - should use cache
-        assert!(manager.matches("test", "example.com"), 
-            "Should match domain from cache");
+        assert!(
+            manager.matches("test", "example.com"),
+            "Should match domain from cache"
+        );
     }
 
     #[test]
     fn test_geosite_manager_multiple_tags() {
         // Arrange: Create GeoSite manager and add multiple categories
         let mut manager = GeoSiteManager::new();
-        
+
         // Add CN category
         manager.add_entry(GeoSiteEntry {
             tag: "cn".to_string(),
@@ -388,20 +416,32 @@ mod tests {
         });
 
         // Act & Assert: Test CN matches
-        assert!(manager.matches("cn", "www.baidu.com"), 
-            "Should match CN domain with baidu keyword");
-        assert!(manager.matches("cn", "example.com.cn"), 
-            "Should match CN domain with .com.cn suffix");
-        assert!(!manager.matches("cn", "www.google.com"), 
-            "Should not match non-CN domain");
+        assert!(
+            manager.matches("cn", "www.baidu.com"),
+            "Should match CN domain with baidu keyword"
+        );
+        assert!(
+            manager.matches("cn", "example.com.cn"),
+            "Should match CN domain with .com.cn suffix"
+        );
+        assert!(
+            !manager.matches("cn", "www.google.com"),
+            "Should not match non-CN domain"
+        );
 
         // Act & Assert: Test ads matches
-        assert!(manager.matches("category-ads", "ads.google.com"), 
-            "Should match ads domain with ads keyword");
-        assert!(manager.matches("category-ads", "tracker.adserver.com"), 
-            "Should match ads domain with .adserver.com suffix");
-        assert!(!manager.matches("category-ads", "www.google.com"), 
-            "Should not match non-ads domain");
+        assert!(
+            manager.matches("category-ads", "ads.google.com"),
+            "Should match ads domain with ads keyword"
+        );
+        assert!(
+            manager.matches("category-ads", "tracker.adserver.com"),
+            "Should match ads domain with .adserver.com suffix"
+        );
+        assert!(
+            !manager.matches("category-ads", "www.google.com"),
+            "Should not match non-ads domain"
+        );
     }
 }
 
@@ -409,12 +449,12 @@ mod tests {
 mod dat_format {
     /// 文件头魔数 / File header magic number
     pub const HEADER_MAGIC: &[u8; 4] = b"\x0D\x0A\x0D\x0A";
-    
+
     /// 域名类型常量 / Domain type constants
-    pub const TYPE_FULL: u8 = 0x01;      // 完整匹配 / Full match
+    pub const TYPE_FULL: u8 = 0x01; // 完整匹配 / Full match
     pub const TYPE_SUBDOMAIN: u8 = 0x02; // 子域名匹配 / Subdomain match
-    pub const TYPE_KEYWORD: u8 = 0x03;   // 关键词匹配 / Keyword match
-    pub const TYPE_REGEX: u8 = 0x04;     // 正则匹配 / Regex match
+    pub const TYPE_KEYWORD: u8 = 0x03; // 关键词匹配 / Keyword match
+    pub const TYPE_REGEX: u8 = 0x04; // 正则匹配 / Regex match
 }
 
 /// V2Ray GeoSite 数据格式 / V2Ray GeoSite data format
@@ -448,7 +488,7 @@ struct DatIndexEntry {
 fn parse_varint(data: &[u8], pos: &mut usize) -> anyhow::Result<usize> {
     let mut result = 0usize;
     let mut shift = 0;
-    
+
     loop {
         if *pos >= data.len() {
             anyhow::bail!("unexpected end of file");
@@ -461,22 +501,22 @@ fn parse_varint(data: &[u8], pos: &mut usize) -> anyhow::Result<usize> {
             break;
         }
     }
-    
+
     Ok(result)
 }
 
 impl GeoSiteManager {
     /// 从 V2Ray 格式文件加载 GeoSite 数据 / Load GeoSite data from V2Ray format file
-    /// 
+    ///
     /// # 参数 / Parameters
     /// - `path`: 文件路径 / File path
-    /// 
+    ///
     /// # 返回 / Returns
     /// 返回加载的条目数量 / Returns the number of loaded entries
-    /// 
+    ///
     /// # 错误 / Errors
     /// 如果文件不存在或格式错误，返回错误 / Returns error if file doesn't exist or format is invalid
-    /// 
+    ///
     /// # 示例 / Example
     /// ```no_run
     /// use kixdns::geosite::GeoSiteManager;
@@ -486,54 +526,55 @@ impl GeoSiteManager {
     /// ```
     pub fn load_from_v2ray_file<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<usize> {
         let path = path.as_ref();
-        
+
         // 检测文件格式：.dat 或 .json / Detect file format: .dat or .json
-        let is_dat = path.extension()
+        let is_dat = path
+            .extension()
             .and_then(|s| s.to_str())
             .map(|s| s.eq_ignore_ascii_case("dat"))
             .unwrap_or(false);
-        
+
         if is_dat {
             // 加载 .dat 格式 / Load .dat format
             return self.load_from_dat_file(path);
         }
-        
+
         // 加载 JSON 格式 / Load JSON format
         let content = fs::read_to_string(path)
             .with_context(|| format!("read geosite file: {}", path.display()))?;
-        
-        let v2ray_data: V2RayGeoSiteList = serde_json::from_str(&content)
-            .with_context(|| "parse V2Ray GeoSite JSON format")?;
-        
+
+        let v2ray_data: V2RayGeoSiteList =
+            serde_json::from_str(&content).with_context(|| "parse V2Ray GeoSite JSON format")?;
+
         let count = v2ray_data.entries.len();
-        
+
         let entries = self.convert_v2ray_to_entries(v2ray_data);
-        
+
         for entry in entries {
             self.add_entry(entry);
         }
-        
+
         Ok(count)
     }
-    
+
     /// 从 .dat 文件按需加载指定的 GeoSite tags / Load specified GeoSite tags from .dat file on-demand
-    /// 
+    ///
     /// # 参数 / Parameters
     /// - `path`: .dat 文件路径 / .dat file path
     /// - `tags`: 需要加载的 tag 列表 / List of tags to load
-    /// 
+    ///
     /// # 返回 / Returns
     /// 返回实际加载的条目数量 / Returns the number of entries actually loaded
-    /// 
+    ///
     /// # 错误 / Errors
     /// 如果文件不存在或格式错误，返回错误 / Returns error if file doesn't exist or format is invalid
     pub fn load_from_dat_file<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<usize> {
         let path = path.as_ref();
-        
+
         // 读取文件内容 / Read file content
-        let content = fs::read(path)
-            .with_context(|| format!("read .dat file: {}", path.display()))?;
-        
+        let content =
+            fs::read(path).with_context(|| format!("read .dat file: {}", path.display()))?;
+
         // V2Ray .dat 文件格式分析 / V2Ray .dat file format analysis
         // 外层结构：repeated GeoSite 条目 / Outer structure: repeated GeoSite entries
         // 每个 GeoSite 条目包含 / Each GeoSite entry contains:
@@ -542,50 +583,51 @@ impl GeoSiteManager {
         //     每个域名包含 / Each domain contains:
         //       - type (uint64, field tag 0x08)
         //       - value (string, field tag 0x12)
-        
+
         let mut pos = 0;
         let mut loaded_count = 0;
-        
+
         while pos < content.len() {
             // 读取外层字段标签 / Read outer field tag
             if pos >= content.len() {
                 break;
             }
-            
+
             let field_tag = content[pos];
             pos += 1;
-            
+
             // 解析 varint 长度 / Parse varint length
             let entry_len = parse_varint(&content, &mut pos)?;
-            
+
             // 检查是否有足够的数据 / Check if we have enough data
             if pos + entry_len > content.len() {
                 break;
             }
-            
+
             let entry_end = pos + entry_len;
-            
+
             // field_tag = 0x0A 表示 GeoSite 条目 (field 1, wire type 2: string)
             // field_tag = 0x0A indicates GeoSite entry (field 1, wire type 2: string)
             if field_tag == 0x0A {
                 let mut tag = String::new();
                 let mut matchers: Vec<DomainMatcher> = Vec::new();
-                
+
                 // 解析 GeoSite 条目内容 / Parse GeoSite entry content
                 while pos < entry_end {
                     let inner_tag = content[pos];
                     pos += 1;
-                    
+
                     let inner_len = parse_varint(&content, &mut pos)?;
-                    
+
                     if pos + inner_len > entry_end {
                         break;
                     }
-                    
+
                     match inner_tag {
                         // 0x0A: country_code (string, field 1)
                         0x0A => {
-                            if let Ok(tag_str) = std::str::from_utf8(&content[pos..pos + inner_len]) {
+                            if let Ok(tag_str) = std::str::from_utf8(&content[pos..pos + inner_len])
+                            {
                                 tag = tag_str.to_string();
                                 tracing::debug!(target = "geosite", tag = %tag_str, "parsed GeoSite country_code");
                             }
@@ -619,7 +661,7 @@ impl GeoSiteManager {
                         }
                     }
                 }
-                
+
                 // 使用解析好的 matchers / Use parsed matchers
                 if !tag.is_empty() && !matchers.is_empty() {
                     tracing::info!(target = "geosite", tag = %tag, 
@@ -644,16 +686,19 @@ impl GeoSiteManager {
         // 根据实际加载的条数重建缓存
         self.rebuild_cache();
 
-        info!(target = "geosite", loaded_count = loaded_count,
-             "loaded GeoSite data from V2Ray .dat file");
+        info!(
+            target = "geosite",
+            loaded_count = loaded_count,
+            "loaded GeoSite data from V2Ray .dat file"
+        );
         Ok(loaded_count)
     }
-    
+
     /// 解析 varint / Parse varint
     fn parse_varint(data: &[u8], pos: &mut usize) -> anyhow::Result<usize> {
         let mut result = 0usize;
         let mut shift = 0;
-        
+
         loop {
             if *pos >= data.len() {
                 anyhow::bail!("unexpected end of file");
@@ -666,25 +711,25 @@ impl GeoSiteManager {
                 break;
             }
         }
-        
+
         Ok(result)
     }
-    
+
     /// 从 .dat 文件按需加载指定的 GeoSite tags / Load specified GeoSite tags from .dat file on-demand
-    /// 
+    ///
     /// # 参数 / Parameters
     /// - `path`: .dat 文件路径 / .dat file path
     /// - `tags`: 需要加载的 tag 列表 / List of tags to load
-    /// 
+    ///
     /// # 返回 / Returns
     /// 返回实际加载的条目数量 / Returns the number of entries actually loaded
-    /// 
+    ///
     /// # 错误 / Errors
     /// 如果文件不存在或格式错误，返回错误 / Returns error if file doesn't exist or format is invalid
     pub fn load_from_dat_file_selective<P: AsRef<Path>>(
         &mut self,
         path: P,
-        tags: &[String]
+        tags: &[String],
     ) -> anyhow::Result<usize> {
         if tags.is_empty() {
             return Ok(0);
@@ -754,10 +799,11 @@ impl GeoSiteManager {
                                       "loading requested tag");
                             } else {
                                 debug!(target = "geosite", tag = %tag_str,
-                                      "skipping unwanted tag");
+                                       "skipping unwanted tag");
                             }
                         }
-                        pos += inner_len;
+                        // Skip remaining tag field data and break
+                        // pos += inner_len is implicitly handled by break
                         break; // tag 字段后直接跳过，不再继续解析 / Skip after tag field
                     }
 
@@ -784,7 +830,9 @@ impl GeoSiteManager {
                         match inner_tag {
                             // 0x0A: tag (string, field 1)
                             0x0A => {
-                                if let Ok(tag_str) = std::str::from_utf8(&content[pos..pos + inner_len]) {
+                                if let Ok(tag_str) =
+                                    std::str::from_utf8(&content[pos..pos + inner_len])
+                                {
                                     tag = tag_str.to_string();
                                 }
                                 pos += inner_len;
@@ -833,74 +881,75 @@ impl GeoSiteManager {
             }
         }
 
-        info!(target = "geosite", loaded_count = loaded_count,
-             requested_count = tags.len(),
-             "selectively loaded GeoSite data from .dat file");
+        info!(
+            target = "geosite",
+            loaded_count = loaded_count,
+            requested_count = tags.len(),
+            "selectively loaded GeoSite data from .dat file"
+        );
 
         Ok(loaded_count)
     }
-    
+
     /// 解析 .dat 格式的域名列表 / Parse domain list in .dat format
     fn parse_dat_domain_list(&self, data: &[u8]) -> anyhow::Result<Vec<DomainMatcher>> {
         let mut matchers = Vec::new();
         let mut pos = 0;
-        
+
         while pos < data.len() {
             // 读取域名类型 / Read domain type
             let domain_type = data[pos];
             pos += 1;
-            
+
             // 读取域名长度 / Read domain length
             if pos + 2 > data.len() {
                 break;
             }
             let domain_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
-            
+
             if pos + domain_len > data.len() {
                 anyhow::bail!("invalid domain data: incomplete domain string");
             }
-            
+
             // 读取域名字符串 / Read domain string
             let domain = String::from_utf8_lossy(&data[pos..pos + domain_len]).to_string();
             pos += domain_len;
-            
+
             // 根据类型创建匹配器 / Create matcher based on type
             let matcher = match domain_type {
                 dat_format::TYPE_FULL => DomainMatcher::Full(domain),
                 dat_format::TYPE_SUBDOMAIN => DomainMatcher::Suffix(domain),
                 dat_format::TYPE_KEYWORD => DomainMatcher::Keyword(domain),
-                dat_format::TYPE_REGEX => {
-                    match Regex::new(&domain) {
-                        Ok(re) => DomainMatcher::Regex(re),
-                        Err(err) => {
-                            warn!(target = "geosite", pattern = %domain, error = %err,
+                dat_format::TYPE_REGEX => match Regex::new(&domain) {
+                    Ok(re) => DomainMatcher::Regex(re),
+                    Err(err) => {
+                        warn!(target = "geosite", pattern = %domain, error = %err,
                                  "invalid regex pattern, using empty regex");
-                            DomainMatcher::Regex(Regex::new(r"^$").unwrap())
-                        }
+                        DomainMatcher::Regex(Regex::new(r"^$").unwrap())
                     }
-                }
+                },
                 _ => {
                     warn!(target = "geosite", type = domain_type, 
                          "unknown domain type, using suffix matcher");
                     DomainMatcher::Suffix(domain)
                 }
             };
-            
+
             matchers.push(matcher);
         }
-        
+
         Ok(matchers)
     }
-    
+
     /// 解析 V2Ray protobuf 格式的 Domain 消息列表 / Parse V2Ray protobuf format Domain message list
-    /// 
+    ///
     /// V2Ray .dat 文件中的 domains 字段是 repeated Domain 消息
     /// The domains field in V2Ray .dat file is repeated Domain messages
     /// 每个 Domain 消息包含: type (field 1, varint) 和 value (field 2, string)
     /// Each Domain message contains: type (field 1, varint) and value (field 2, string)
     /// 解析 V2Ray protobuf 格式的 Domain 消息列表 / Parse V2Ray protobuf format Domain message list
-    /// 
+    ///
     /// V2Ray .dat 文件中的 domains 字段是 repeated Domain 消息
     /// The domains field in V2Ray .dat file is repeated Domain messages
     /// 每个 Domain 消息包含: type (field 1, varint) 和 value (field 2, string)
@@ -908,13 +957,22 @@ impl GeoSiteManager {
     fn parse_v2ray_domains(&self, data: &[u8]) -> anyhow::Result<Vec<DomainMatcher>> {
         let mut matchers = Vec::new();
         let mut pos = 0;
-        
-        tracing::debug!(target = "geosite", data_len = data.len(), "starting to parse V2Ray domains");
-        
+
+        tracing::debug!(
+            target = "geosite",
+            data_len = data.len(),
+            "starting to parse V2Ray domains"
+        );
+
         // 打印前 20 字节的十六进制数据 / Print first 20 bytes in hex
-        let hex_data: String = data.iter().take(20).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+        let hex_data: String = data
+            .iter()
+            .take(20)
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
         tracing::debug!(target = "geosite", hex_data = %hex_data, "first 20 bytes of data");
-        
+
         while pos < data.len() {
             // 读取 field tag 和 wire type / Read field tag and wire type
             let field_tag = data[pos] >> 3;
@@ -930,7 +988,11 @@ impl GeoSiteManager {
                     // 对于 varint,直接读取值 / For varint, read value directly
                     let domain_type = parse_varint(data, &mut pos)?;
 
-                    tracing::debug!(target = "geosite", domain_type = domain_type, "parsed domain type");
+                    tracing::debug!(
+                        target = "geosite",
+                        domain_type = domain_type,
+                        "parsed domain type"
+                    );
 
                     // 读取 field 2: value (string, wire_type 2)
                     if pos >= data.len() || data[pos] >> 3 != 2 {
@@ -940,20 +1002,25 @@ impl GeoSiteManager {
 
                     let value_len = parse_varint(data, &mut pos)?;
 
-                    tracing::debug!(target = "geosite", value_len = value_len, "parsed value length");
+                    tracing::debug!(
+                        target = "geosite",
+                        value_len = value_len,
+                        "parsed value length"
+                    );
 
                     if pos + value_len > data.len() {
                         anyhow::bail!("invalid domain data: incomplete value string");
                     }
 
-                    let domain_value = String::from_utf8_lossy(&data[pos..pos + value_len]).to_string();
+                    let domain_value =
+                        String::from_utf8_lossy(&data[pos..pos + value_len]).to_string();
                     pos += value_len;
 
                     tracing::debug!(target = "geosite", domain_value = %domain_value, "parsed domain value");
 
                     // 根据 V2Ray Domain.Type 创建匹配器 / Create matcher based on V2Ray Domain.Type
                     let matcher = match domain_type {
-                        0 => DomainMatcher::Keyword(domain_value),  // Plain
+                        0 => DomainMatcher::Keyword(domain_value), // Plain
                         1 => {
                             // Regex
                             match Regex::new(&domain_value) {
@@ -969,7 +1036,7 @@ impl GeoSiteManager {
                             // RootDomain - 转换为 Suffix 匹配器 / Convert to Suffix matcher
                             DomainMatcher::Suffix(format!(".{}", domain_value))
                         }
-                        3 => DomainMatcher::Full(domain_value),  // Full
+                        3 => DomainMatcher::Full(domain_value), // Full
                         _ => {
                             warn!(target = "geosite", type = domain_type,
                                  "unknown V2Ray domain type, using full matcher");
@@ -1024,30 +1091,34 @@ impl GeoSiteManager {
                 }
             }
         }
-        
-        tracing::debug!(target = "geosite", matcher_count = matchers.len(), "parsed V2Ray domains");
-        
+
+        tracing::debug!(
+            target = "geosite",
+            matcher_count = matchers.len(),
+            "parsed V2Ray domains"
+        );
+
         Ok(matchers)
     }
-    
+
     /// 从 V2Ray 格式字符串加载 GeoSite 数据 / Load GeoSite data from V2Ray format string
-    /// 
+    ///
     /// # 参数 / Parameters
     /// - `json_str`: JSON 字符串 / JSON string
-    /// 
+    ///
     /// # 返回 / Returns
     /// 返回加载的条目数量 / Returns the number of loaded entries
-    /// 
+    ///
     /// # 错误 / Errors
     /// 如果 JSON 格式错误，返回错误 / Returns error if JSON format is invalid
     pub fn load_from_v2ray_string(&mut self, json_str: &str) -> anyhow::Result<usize> {
-        let v2ray_data: V2RayGeoSiteList = serde_json::from_str(json_str)
-            .with_context(|| "parse V2Ray GeoSite JSON format")?;
-        
+        let v2ray_data: V2RayGeoSiteList =
+            serde_json::from_str(json_str).with_context(|| "parse V2Ray GeoSite JSON format")?;
+
         let count = v2ray_data.entries.len();
-        
+
         let entries = self.convert_v2ray_to_entries(v2ray_data);
-        
+
         // 逐个添加条目，保留现有数据 / Add entries one by one, preserving existing data
         for entry in entries {
             self.add_entry(entry);
@@ -1058,48 +1129,57 @@ impl GeoSiteManager {
 
         Ok(count)
     }
-    
+
     /// 转换 V2Ray 格式为 GeoSiteEntry 列表 / Convert V2Ray format to GeoSiteEntry list
     fn convert_v2ray_to_entries(&self, v2ray_data: V2RayGeoSiteList) -> Vec<GeoSiteEntry> {
-        v2ray_data.entries.into_iter().map(|v2ray_entry| {
-            // 将域名列表转换为 DomainMatcher 列表
-            // Convert domain list to DomainMatcher list
-            let matchers = v2ray_entry.domains.into_iter().map(|domain| {
-                // 根据域名格式选择合适的匹配器
-                // Select appropriate matcher based on domain format
-                if domain.starts_with("regexp:") {
-                    // 正则匹配器 / Regex matcher
-                    let pattern = domain.trim_start_matches("regexp:");
-                    DomainMatcher::Regex(
-                        Regex::new(pattern).unwrap_or_else(|_| Regex::new(r"^$").unwrap())
-                    )
-                } else if domain.starts_with("domain:") {
-                    // 完整域名匹配器 / Full domain matcher
-                    let pattern = domain.trim_start_matches("domain:");
-                    DomainMatcher::Full(pattern.to_string())
-                } else if domain.starts_with("keyword:") {
-                    // 关键词匹配器 / Keyword matcher
-                    let pattern = domain.trim_start_matches("keyword:");
-                    DomainMatcher::Keyword(pattern.to_string())
-                } else {
-                    // 默认为后缀匹配器 / Default to suffix matcher
-                    // 如果域名包含通配符，使用正则
-                    if domain.contains('*') {
-                        let pattern = domain.replace('.', r"\.").replace('*', ".*");
-                        DomainMatcher::Regex(
-                            Regex::new(&format!("^{}$", pattern)).unwrap_or_else(|_| Regex::new(r"^$").unwrap())
-                        )
-                    } else {
-                        DomainMatcher::Suffix(domain)
-                    }
+        v2ray_data
+            .entries
+            .into_iter()
+            .map(|v2ray_entry| {
+                // 将域名列表转换为 DomainMatcher 列表
+                // Convert domain list to DomainMatcher list
+                let matchers = v2ray_entry
+                    .domains
+                    .into_iter()
+                    .map(|domain| {
+                        // 根据域名格式选择合适的匹配器
+                        // Select appropriate matcher based on domain format
+                        if domain.starts_with("regexp:") {
+                            // 正则匹配器 / Regex matcher
+                            let pattern = domain.trim_start_matches("regexp:");
+                            DomainMatcher::Regex(
+                                Regex::new(pattern).unwrap_or_else(|_| Regex::new(r"^$").unwrap()),
+                            )
+                        } else if domain.starts_with("domain:") {
+                            // 完整域名匹配器 / Full domain matcher
+                            let pattern = domain.trim_start_matches("domain:");
+                            DomainMatcher::Full(pattern.to_string())
+                        } else if domain.starts_with("keyword:") {
+                            // 关键词匹配器 / Keyword matcher
+                            let pattern = domain.trim_start_matches("keyword:");
+                            DomainMatcher::Keyword(pattern.to_string())
+                        } else {
+                            // 默认为后缀匹配器 / Default to suffix matcher
+                            // 如果域名包含通配符，使用正则
+                            if domain.contains('*') {
+                                let pattern = domain.replace('.', r"\.").replace('*', ".*");
+                                DomainMatcher::Regex(
+                                    Regex::new(&format!("^{}$", pattern))
+                                        .unwrap_or_else(|_| Regex::new(r"^$").unwrap()),
+                                )
+                            } else {
+                                DomainMatcher::Suffix(domain)
+                            }
+                        }
+                    })
+                    .collect();
+
+                GeoSiteEntry {
+                    tag: v2ray_entry.tag,
+                    matchers,
                 }
-            }).collect();
-            
-            GeoSiteEntry {
-                tag: v2ray_entry.tag,
-                matchers,
-            }
-        }).collect()
+            })
+            .collect()
     }
 }
 
@@ -1112,7 +1192,7 @@ impl GeoSiteManager {
 pub fn spawn_geosite_watcher(
     paths: Vec<PathBuf>,
     manager: Arc<std::sync::RwLock<GeoSiteManager>>,
-    tags: Vec<String>
+    tags: Vec<String>,
 ) {
     if paths.is_empty() {
         return;
@@ -1135,7 +1215,7 @@ fn run_geosite_watcher(
 ) -> notify::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher: RecommendedWatcher = Watcher::new(tx, Config::default())?;
-    
+
     // 监听所有 GeoSite 数据文件 / Watch all GeoSite data files
     for path in &paths {
         watcher.watch(path, RecursiveMode::NonRecursive)?;
@@ -1153,13 +1233,14 @@ fn run_geosite_watcher(
                 }
 
                 let path = &event.paths[0];
-                
+
                 // 检测文件格式 / Detect file format
-                let is_dat = path.extension()
+                let is_dat = path
+                    .extension()
                     .and_then(|s| s.to_str())
                     .map(|s| s.eq_ignore_ascii_case("dat"))
                     .unwrap_or(false);
-                
+
                 // 简单的重试机制来处理文件写入竞争 / Simple retry mechanism to handle file write races
                 let mut retries = 5;
                 while retries > 0 {
@@ -1178,7 +1259,10 @@ fn run_geosite_watcher(
                             }
                             Err(e) => {
                                 let mut guard = e.into_inner();
-                                warn!(target = "geosite_watcher", "RwLock was poisoned, recovering and attempting reload");
+                                warn!(
+                                    target = "geosite_watcher",
+                                    "RwLock was poisoned, recovering and attempting reload"
+                                );
                                 if tags.is_empty() {
                                     guard.load_from_dat_file(path)
                                 } else {
@@ -1205,7 +1289,10 @@ fn run_geosite_watcher(
                                     }
                                     Err(e) => {
                                         let mut guard = e.into_inner();
-                                        warn!(target = "geosite_watcher", "RwLock was poisoned during JSON reload, recovering");
+                                        warn!(
+                                            target = "geosite_watcher",
+                                            "RwLock was poisoned during JSON reload, recovering"
+                                        );
                                         let entries = guard.convert_v2ray_to_entries(v2ray_data);
                                         let loaded_count = entries.len();
                                         guard.reload(entries);
@@ -1214,7 +1301,7 @@ fn run_geosite_watcher(
                                 }
                             })
                     };
-                    
+
                     match load_result {
                         Ok(loaded_count) => {
                             info!(target = "geosite_watcher", path = %path.display(), 
@@ -1243,4 +1330,3 @@ fn run_geosite_watcher(
     }
     Ok(())
 }
-

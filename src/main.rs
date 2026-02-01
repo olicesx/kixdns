@@ -2,11 +2,13 @@ mod advanced_rule;
 mod cache;
 mod config;
 mod engine;
+mod error_utils;
 mod geoip;
 mod geoip_converter;
 mod geosite;
 mod matcher;
 mod proto_utils;
+mod socket_utils;
 mod watcher;
 
 use std::net::SocketAddr;
@@ -386,43 +388,15 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
     // 这使得我们可以安全地使用零拷贝的 recv_buf_from
     // This allows us to safely use zero-copy recv_buf_from
     if domain == Domain::IPV6 {
-        #[allow(unused_imports)]
-        use libc::{IPV6_V6ONLY, IPPROTO_IPV6, c_int, c_void, setsockopt, socklen_t};
-        let val: c_int = 1;  // 1 = 仅 IPv6 / 1 = IPv6 only
-        let fd = socket.as_raw_fd();
-        let ret = unsafe {
-            setsockopt(
-                fd,
-                IPPROTO_IPV6,
-                IPV6_V6ONLY,
-                &val as *const _ as *const c_void,
-                std::mem::size_of_val(&val) as socklen_t,
-            )
-        };
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            tracing::warn!("Failed to set IPV6_V6ONLY=1: {}, this may cause issues on OpenBSD", err);
+        if let Err(e) = crate::socket_utils::set_ipv6_v6only(&socket, true) {
+            tracing::warn!("Failed to set IPV6_V6ONLY=1: {}, this may cause issues on OpenBSD", e);
         }
     }
 
-    // Try to set SO_REUSEPORT via libc to avoid depending on socket2 method availability / 尝试通过 libc 设置 SO_REUSEPORT，避免依赖 socket2 方法的可用性
-    #[allow(unused_imports)]
-    use libc::{SO_REUSEPORT, SOL_SOCKET, c_int, c_void, setsockopt, socklen_t};
-    let val: c_int = 1;
-    let fd = socket.as_raw_fd();
-    let ret = unsafe {
-        setsockopt(
-            fd,
-            SOL_SOCKET,
-            SO_REUSEPORT,
-            &val as *const _ as *const c_void,
-            std::mem::size_of_val(&val) as socklen_t,
-        )
-    };
-    if ret != 0 {
+    // Try to set SO_REUSEPORT via safe wrapper / 尝试通过安全封装设置 SO_REUSEPORT
+    if let Err(e) = crate::socket_utils::set_reuseport(&socket, true) {
         // Log warning if SO_REUSEPORT fails / SO_REUSEPORT 失败时记录警告
-        let err = std::io::Error::last_os_error();
-        tracing::warn!("SO_REUSEPORT failed: {}, falling back to shared socket", err);
+        tracing::warn!("SO_REUSEPORT failed: {}, falling back to shared socket", e);
     }
 
     // Set buffer sizes to prevent packet loss under load

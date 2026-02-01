@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 // Re-export from geoip_converter module
 // Note: geoip_converter is a sibling module at the crate root level
-pub use crate::geoip_converter::{ConversionStats, convert_dat_to_mmdb};
+pub use crate::geoip_converter::{convert_dat_to_mmdb, ConversionStats};
 
 /// MaxMind GeoLite2-Country 数据库结构 / MaxMind GeoLite2-Country database structure
 #[derive(Deserialize)]
@@ -64,6 +64,8 @@ pub struct GeoIpManager {
     /// MaxMind DB reader (使用内存映射，线程安全) / MaxMind DB reader (memory-mapped, thread-safe)
     reader: Arc<Option<maxminddb::Reader<Vec<u8>>>>,
     /// MMDB 文件路径（用于延迟加载）/ MMDB file path (for lazy loading)
+    /// Note: Reserved for future hot-reload functionality
+    #[allow(dead_code)]
     db_path: Option<String>,
     /// IP 范围列表（从 .dat 文件加载）/ IP range list (loaded from .dat file)
     ip_ranges: Vec<IpRange>,
@@ -91,9 +93,7 @@ impl GeoIpManager {
     /// This method loads the MMDB file immediately (if path is configured), no longer using lazy loading.
     pub fn new(db_path: Option<String>) -> anyhow::Result<Self> {
         // 初始时创建一个小缓存，加载数据后会根据实际条数重建
-        let cache = MokaCache::builder()
-            .max_capacity(1000)
-            .build();
+        let cache = MokaCache::builder().max_capacity(1000).build();
 
         // 立即加载 MMDB 文件（如果配置了）/ Load MMDB file immediately (if configured)
         let reader = if let Some(ref path) = db_path {
@@ -137,9 +137,7 @@ impl GeoIpManager {
             "Rebuilding GeoIP cache"
         );
 
-        self.cache = MokaCache::builder()
-            .max_capacity(cache_capacity)
-            .build();
+        self.cache = MokaCache::builder().max_capacity(cache_capacity).build();
     }
 
     /// 查询 IP 的 GeoIP 信息 / Lookup GeoIP information for an IP address
@@ -228,7 +226,10 @@ impl GeoIpManager {
         };
 
         // 使用二分查找 / Use binary search
-        match self.ip_ranges.binary_search_by_key(&ip_u32, |range| range.start) {
+        match self
+            .ip_ranges
+            .binary_search_by_key(&ip_u32, |range| range.start)
+        {
             Ok(idx) => {
                 // 完全匹配起始 IP / Exact match on start IP
                 let range = &self.ip_ranges[idx];
@@ -318,13 +319,13 @@ impl GeoIpManager {
     /// - Header: 4 bytes magic (0x0D 0x0A 0x0D 0x0A)
     /// - Index section: country_code_count (2 bytes) + entries
     /// - Data section: IP ranges for each country
-/// 从 V2Ray .dat 文件加载 GeoIP 数据
-    /// 
+    /// 从 V2Ray .dat 文件加载 GeoIP 数据
+    ///
     /// V2Ray .dat 文件使用 protobuf 编码，包含国家代码和 IP 范围
     /// V2Ray .dat files use protobuf encoding, containing country codes and IP ranges
     pub fn load_from_dat_file(&mut self, path: &Path) -> anyhow::Result<usize> {
         let data = std::fs::read(path)?;
-        
+
         // V2Ray .dat 文件格式分析 / V2Ray .dat file format analysis
         // 外层结构：repeated GeoIP 条目 / Outer structure: repeated GeoIP entries
         // 每个 GeoIP 条目包含 / Each GeoIP entry contains:
@@ -333,45 +334,45 @@ impl GeoIpManager {
         // 每个 IP 范围包含 / Each IP range contains:
         //   - ip_range (bytes, field tag 0x0A) - 4字节起始IP + 4字节结束IP
         //   - prefix_len (uint32, field tag 0x10) - 前缀长度
-        
+
         self.ip_ranges.clear();
         let mut pos = 0;
         let mut count = 0;
-        
+
         while pos < data.len() {
             // 读取外层字段标签 / Read outer field tag
             if pos >= data.len() {
                 break;
             }
-            
+
             let field_tag = data[pos];
             pos += 1;
-            
+
             // 解析 varint 长度 / Parse varint length
             let entry_len = parse_varint(&data, &mut pos)?;
-            
+
             // 检查是否有足够的数据 / Check if we have enough data
             if pos + entry_len > data.len() {
                 break;
             }
-            
+
             let entry_end = pos + entry_len;
-            
+
             // field_tag = 0x0A 表示 GeoIP 条目 / field_tag = 0x0A indicates GeoIP entry
             if field_tag == 0x0A {
                 let mut country_code = String::new();
-                
+
                 // 解析 GeoIP 条目内容 / Parse GeoIP entry content
                 while pos < entry_end {
                     let inner_tag = data[pos];
                     pos += 1;
-                    
+
                     let inner_len = parse_varint(&data, &mut pos)?;
-                    
+
                     if pos + inner_len > entry_end {
                         break;
                     }
-                    
+
                     match inner_tag {
                         // 0x0A: country_code (string)
                         0x0A => {
@@ -483,8 +484,13 @@ impl GeoIpManager {
             self.ip_ranges.sort_by_key(|r| r.start);
             tracing::debug!("First 3 IP ranges (after sorting):");
             for (i, range) in self.ip_ranges.iter().take(3).enumerate() {
-                tracing::debug!("  {}: 0x{:08x} - 0x{:08x} -> {}",
-                    i, range.start, range.end, range.country_code);
+                tracing::debug!(
+                    "  {}: 0x{:08x} - 0x{:08x} -> {}",
+                    i,
+                    range.start,
+                    range.end,
+                    range.country_code
+                );
             }
         }
 
@@ -552,10 +558,7 @@ impl GeoIpManager {
     /// # 参数 / Parameters
     /// - `dat_path`: V2Ray .dat 文件路径 / V2Ray .dat file path
     /// - `mmdb_path`: 输出 MMDB 文件路径 / Output MMDB file path
-    pub fn auto_convert_and_load(
-        dat_path: &Path,
-        mmdb_path: &Path,
-    ) -> anyhow::Result<Self> {
+    pub fn auto_convert_and_load(dat_path: &Path, mmdb_path: &Path) -> anyhow::Result<Self> {
         // Check if MMDB already exists
         if mmdb_path.exists() {
             tracing::info!(
@@ -599,7 +602,7 @@ impl GeoIpManager {
 fn parse_varint(data: &[u8], pos: &mut usize) -> anyhow::Result<usize> {
     let mut result = 0usize;
     let mut shift = 0;
-    
+
     loop {
         if *pos >= data.len() {
             anyhow::bail!("unexpected end of file");
@@ -612,7 +615,7 @@ fn parse_varint(data: &[u8], pos: &mut usize) -> anyhow::Result<usize> {
             break;
         }
     }
-    
+
     Ok(result)
 }
 
@@ -621,17 +624,14 @@ fn parse_varint(data: &[u8], pos: &mut usize) -> anyhow::Result<usize> {
 pub fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => {
-            ipv4.is_loopback()
-                || ipv4.is_private()
-                || ipv4.is_link_local()
-                || ipv4.is_broadcast()
+            ipv4.is_loopback() || ipv4.is_private() || ipv4.is_link_local() || ipv4.is_broadcast()
         }
         IpAddr::V6(ipv6) => {
             let seg0 = ipv6.segments()[0];
             ipv6.is_loopback()
                 || ipv6.is_unspecified()
                 || (seg0 & 0xffc0) == 0xfe80  // Link-local addresses (fe80::/10)
-                || (seg0 & 0xfe00) == 0xfc00  // Unique Local Addresses (fc00::/7)
+                || (seg0 & 0xfe00) == 0xfc00 // Unique Local Addresses (fc00::/7)
         }
     }
 }
@@ -646,34 +646,40 @@ mod tests {
     fn test_is_private_ip() {
         // Arrange: Define test IPs for various private and public ranges
         // IPv4 private addresses / IPv4 私有地址
-        let ipv4_private = vec![
-            "10.0.0.1", "192.168.1.1", "172.16.0.1", "127.0.0.1"
-        ];
+        let ipv4_private = vec!["10.0.0.1", "192.168.1.1", "172.16.0.1", "127.0.0.1"];
         // IPv4 public addresses / IPv4 公网地址
-        let ipv4_public = vec![
-            "8.8.8.8", "1.1.1.1"
-        ];
+        let ipv4_public = vec!["8.8.8.8", "1.1.1.1"];
         // IPv6 loopback and ULA / IPv6 回环地址和ULA
-        let ipv6_private = vec![
-            "::1", "fe80::1", "fc00::1", "fd00::1"
-        ];
-        
+        let ipv6_private = vec!["::1", "fe80::1", "fc00::1", "fd00::1"];
+
         // Act & Assert: Verify IPv4 private addresses are detected
         for ip_str in ipv4_private {
             let ip: IpAddr = ip_str.parse().unwrap();
-            assert!(is_private_ip(ip), "{} should be detected as private", ip_str);
+            assert!(
+                is_private_ip(ip),
+                "{} should be detected as private",
+                ip_str
+            );
         }
-        
+
         // Act & Assert: Verify IPv4 public addresses are not private
         for ip_str in ipv4_public {
             let ip: IpAddr = ip_str.parse().unwrap();
-            assert!(!is_private_ip(ip), "{} should not be detected as private", ip_str);
+            assert!(
+                !is_private_ip(ip),
+                "{} should not be detected as private",
+                ip_str
+            );
         }
-        
+
         // Act & Assert: Verify IPv6 private addresses are detected
         for ip_str in ipv6_private {
             let ip: IpAddr = ip_str.parse().unwrap();
-            assert!(is_private_ip(ip), "{} should be detected as private", ip_str);
+            assert!(
+                is_private_ip(ip),
+                "{} should be detected as private",
+                ip_str
+            );
         }
     }
 
@@ -682,16 +688,25 @@ mod tests {
         // Arrange: Create GeoIpManager without MMDB file
         let manager = GeoIpManager::new(None).unwrap();
         let test_ip: IpAddr = "8.8.8.8".parse().unwrap();
-        
+
         // Act & Assert: Verify manager is not loaded
-        assert!(!manager.is_loaded(), "Manager should not be loaded without MMDB file");
-        
+        assert!(
+            !manager.is_loaded(),
+            "Manager should not be loaded without MMDB file"
+        );
+
         // Act: Lookup IP address
         let result = manager.lookup(test_ip);
-        
+
         // Assert: Verify lookup returns empty result for unloaded manager
-        assert_eq!(result.country_code, None, "Country code should be None without MMDB");
-        assert!(!is_private_ip(test_ip), "8.8.8.8 should not be a private IP");
+        assert_eq!(
+            result.country_code, None,
+            "Country code should be None without MMDB"
+        );
+        assert!(
+            !is_private_ip(test_ip),
+            "8.8.8.8 should not be a private IP"
+        );
     }
 
     #[test]
@@ -700,35 +715,45 @@ mod tests {
         let db_path = "tests/data/GeoLite2-Country.mmdb";
         let us_ip: IpAddr = "8.8.8.8".parse().unwrap();
         let cn_ip: IpAddr = "1.2.4.0".parse().unwrap();
-        
+
         // Act & Assert: Skip test if MMDB file not available
         if !std::path::Path::new(db_path).exists() {
-            println!("Skipping test_geoip_country_code_extraction: MMDB file not found at {}", db_path);
+            println!(
+                "Skipping test_geoip_country_code_extraction: MMDB file not found at {}",
+                db_path
+            );
             return;
         }
-        
+
         // Act: Create GeoIpManager with MMDB file
-        let manager = GeoIpManager::new(
-            Some(db_path.to_string()),
-        ).unwrap();
-        
+        let manager = GeoIpManager::new(Some(db_path.to_string())).unwrap();
+
         // Assert: Verify manager is loaded
-        assert!(manager.is_loaded(), "Manager should be loaded with MMDB file");
-        
+        assert!(
+            manager.is_loaded(),
+            "Manager should be loaded with MMDB file"
+        );
+
         // Act: Lookup US IP (8.8.8.8 is Google DNS)
         let result = manager.lookup(us_ip);
-        
+
         // Assert: Verify US country code
-        assert_eq!(result.country_code.as_deref(), Some("US"), 
-            "8.8.8.8 should resolve to US country code");
+        assert_eq!(
+            result.country_code.as_deref(),
+            Some("US"),
+            "8.8.8.8 should resolve to US country code"
+        );
         assert!(!result.is_private, "8.8.8.8 should not be private IP");
-        
+
         // Act: Lookup CN IP (1.2.4.0 is China)
         let result = manager.lookup(cn_ip);
-        
+
         // Assert: Verify CN country code
-        assert_eq!(result.country_code.as_deref(), Some("CN"), 
-            "1.2.4.0 should resolve to CN country code");
+        assert_eq!(
+            result.country_code.as_deref(),
+            Some("CN"),
+            "1.2.4.0 should resolve to CN country code"
+        );
         assert!(!result.is_private, "1.2.4.0 should not be private IP");
     }
 
@@ -754,15 +779,18 @@ mod tests {
         // Act: Parse the configuration
         let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).unwrap();
         let rule = &cfg.pipelines[0].rules[0];
-        
+
         // Assert: Verify rule name and matcher count
         assert_eq!(rule.name, "china_rule", "Rule name should match");
         assert_eq!(rule.matchers.len(), 1, "Should have exactly one matcher");
-        
+
         // Assert: Verify GeoipCountry matcher with country codes
         if let crate::config::Matcher::GeoipCountry { country_codes } = &rule.matchers[0].matcher {
-            assert_eq!(country_codes, &vec!["CN".to_string(), "US".to_string(), "JP".to_string()],
-                "Country codes should match configuration");
+            assert_eq!(
+                country_codes,
+                &vec!["CN".to_string(), "US".to_string(), "JP".to_string()],
+                "Country codes should match configuration"
+            );
         } else {
             panic!("Expected GeoipCountry matcher");
         }
@@ -790,11 +818,11 @@ mod tests {
         // Act: Parse the configuration
         let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).unwrap();
         let rule = &cfg.pipelines[0].rules[0];
-        
+
         // Assert: Verify rule name and matcher count
         assert_eq!(rule.name, "private_rule", "Rule name should match");
         assert_eq!(rule.matchers.len(), 1, "Should have exactly one matcher");
-        
+
         // Assert: Verify GeoipPrivate matcher with expect value
         if let crate::config::Matcher::GeoipPrivate { expect } = &rule.matchers[0].matcher {
             assert_eq!(*expect, true, "GeoipPrivate expect should be true");
@@ -832,8 +860,9 @@ fn run_geoip_watcher(
     manager: Arc<std::sync::RwLock<GeoIpManager>>,
 ) -> notify::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut watcher: notify::RecommendedWatcher = notify::Watcher::new(tx, notify::Config::default())?;
-    
+    let mut watcher: notify::RecommendedWatcher =
+        notify::Watcher::new(tx, notify::Config::default())?;
+
     // 监听 GeoIP .dat 文件 / Watch GeoIP .dat file
     watcher.watch(&path, notify::RecursiveMode::NonRecursive)?;
     tracing::info!(target = "geoip_watcher", path = %path.display(), "watching GeoIP file");
@@ -849,13 +878,14 @@ fn run_geoip_watcher(
                 }
 
                 let event_path = &event.paths[0];
-                
+
                 // 检测文件格式 / Detect file format
-                let is_dat = event_path.extension()
+                let is_dat = event_path
+                    .extension()
                     .and_then(|s| s.to_str())
                     .map(|s| s.eq_ignore_ascii_case("dat"))
                     .unwrap_or(false);
-                
+
                 // 简单的重试机制来处理文件写入竞争 / Simple retry mechanism to handle file write races
                 let mut retries = 5;
                 while retries > 0 {
@@ -865,7 +895,10 @@ fn run_geoip_watcher(
                         match manager.write() {
                             Ok(mut guard) => guard.load_from_dat_file(event_path),
                             Err(e) => {
-                                tracing::warn!(target = "geoip_watcher", "RwLock was poisoned during .dat reload, recovering");
+                                tracing::warn!(
+                                    target = "geoip_watcher",
+                                    "RwLock was poisoned during .dat reload, recovering"
+                                );
                                 e.into_inner().load_from_dat_file(event_path)
                             }
                         }
@@ -876,12 +909,15 @@ fn run_geoip_watcher(
                             Ok(mut guard) => guard.load_from_v2ray_file(event_path),
                             Err(e) => {
                                 let mut guard = e.into_inner();
-                                tracing::warn!(target = "geoip_watcher", "RwLock was poisoned during JSON reload, recovering");
+                                tracing::warn!(
+                                    target = "geoip_watcher",
+                                    "RwLock was poisoned during JSON reload, recovering"
+                                );
                                 guard.load_from_v2ray_file(event_path)
                             }
                         }
                     };
-                    
+
                     match load_result {
                         Ok(count) => {
                             tracing::info!(

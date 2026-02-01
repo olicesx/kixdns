@@ -32,7 +32,10 @@ impl TxtMatchMode {
             "exact" => Ok(TxtMatchMode::Exact),
             "prefix" => Ok(TxtMatchMode::Prefix),
             "regex" => Ok(TxtMatchMode::Regex),
-            _ => anyhow::bail!("invalid TXT match mode: {}, must be one of: exact, prefix, regex", s),
+            _ => anyhow::bail!(
+                "invalid TXT match mode: {}, must be one of: exact, prefix, regex",
+                s
+            ),
         }
     }
 }
@@ -66,14 +69,14 @@ mod matcher_helpers {
         country_codes: &[String],
     ) -> bool {
         let result = manager.lookup(ip);
-        
+
         // ✅ 优化：提前返回，避免闭包分配
         // ✅ Optimization: Early return to avoid closure allocation
         let country_code = match result.country_code.as_ref() {
             Some(code) => code,
             None => return false,
         };
-        
+
         // ✅ 优化：直接迭代，避免 any() 的闭包开销
         // ✅ Optimization: Direct iteration to avoid closure overhead of any()
         for code in country_codes {
@@ -334,7 +337,8 @@ impl RuntimePipelineConfig {
 
         // ✅ 验证超时配置的合理性
         // ✅ Validate timeout configuration sanity
-        cfg.settings.validate_timeouts()
+        cfg.settings
+            .validate_timeouts()
             .context("validate timeout configuration")?;
 
         let mut pipelines = Vec::new();
@@ -422,18 +426,18 @@ impl RuntimePipelineConfig {
                                     .push(idx);
                                 indexed = true;
                             }
-                            RuntimeMatcher::DomainRegex { .. } | RuntimeMatcher::ClientIp { .. }
-                            | RuntimeMatcher::GeoipCountry { .. } | RuntimeMatcher::GeoipPrivate { .. }
-                            | RuntimeMatcher::GeoSite { .. } | RuntimeMatcher::GeoSiteNot { .. }
+                            RuntimeMatcher::DomainRegex { .. }
+                            | RuntimeMatcher::ClientIp { .. }
+                            | RuntimeMatcher::GeoipCountry { .. }
+                            | RuntimeMatcher::GeoipPrivate { .. }
+                            | RuntimeMatcher::GeoSite { .. }
+                            | RuntimeMatcher::GeoSiteNot { .. }
                             | RuntimeMatcher::EdnsPresent { .. } => {
                                 // 这些匹配器无法基于域名/类型索引，跳过
                                 // These matchers cannot be indexed by domain/type, skip
                             }
                             RuntimeMatcher::Qtype { value } => {
-                                query_type_index
-                                    .entry(*value)
-                                    .or_default()
-                                    .push(idx);
+                                query_type_index.entry(*value).or_default().push(idx);
                                 indexed = true;
                             }
                             RuntimeMatcher::Qclass { .. } => {
@@ -467,10 +471,16 @@ impl RuntimePipelineConfig {
                         pipeline_uses_client_ip = true;
                         break;
                     }
-                    if matches!(m.matcher, RuntimeMatcher::GeoipCountry { .. } | RuntimeMatcher::GeoipPrivate { .. }) {
+                    if matches!(
+                        m.matcher,
+                        RuntimeMatcher::GeoipCountry { .. } | RuntimeMatcher::GeoipPrivate { .. }
+                    ) {
                         pipeline_uses_geoip = true;
                     }
-                    if matches!(m.matcher, RuntimeMatcher::GeoSite { .. } | RuntimeMatcher::GeoSiteNot { .. }) {
+                    if matches!(
+                        m.matcher,
+                        RuntimeMatcher::GeoSite { .. } | RuntimeMatcher::GeoSiteNot { .. }
+                    ) {
                         pipeline_uses_geosite = true;
                     }
                 }
@@ -483,9 +493,9 @@ impl RuntimePipelineConfig {
                 id: Arc::from(p.id),
                 rules,
                 uses_client_ip: pipeline_uses_client_ip,
-                domain_exact_index,  // 添加完全匹配索引 / Add exact match index
+                domain_exact_index, // 添加完全匹配索引 / Add exact match index
                 domain_suffix_index,
-                query_type_index,  // 添加 query_type 索引 / Add query_type index
+                query_type_index, // 添加 query_type 索引 / Add query_type index
                 always_check_rules,
             });
         }
@@ -532,7 +542,8 @@ impl RuntimePipelineConfig {
 
         // ✅ 新增：处理后台刷新专用规则
         // ✅ New: Process background refresh dedicated rule
-        let background_refresh_rule = match cfg.background_refresh_rule {
+        // Note: Currently unused, reserved for future implementation
+        let _background_refresh_rule = match cfg.background_refresh_rule {
             Some(rule) => {
                 // 转换配置的规则为运行时规则
                 // Convert configured rule to runtime rule
@@ -543,7 +554,7 @@ impl RuntimePipelineConfig {
                         matcher: RuntimeMatcher::from_config(m.matcher)?,
                     });
                 }
-                
+
                 let mut response_matchers = Vec::new();
                 for rm in rule.response_matchers {
                     response_matchers.push(RuntimeResponseMatcherWithOp {
@@ -551,7 +562,7 @@ impl RuntimePipelineConfig {
                         matcher: RuntimeResponseMatcher::from_config(rm.matcher)?,
                     });
                 }
-                
+
                 Some(RuntimeRule {
                     name: Arc::from(rule.name),
                     matcher_operator: rule.matcher_operator,
@@ -563,7 +574,7 @@ impl RuntimePipelineConfig {
                     response_actions_on_miss: rule.response_actions_on_miss,
                 })
             }
-            None => None,  // 未配置，将在 Engine::new 中使用默认规则
+            None => None, // 未配置，将在 Engine::new 中使用默认规则
         };
 
         Ok(Self {
@@ -594,22 +605,16 @@ impl RuntimeMatcher {
             config::Matcher::DomainRegex { value } => RuntimeMatcher::DomainRegex {
                 regex: Regex::new(&value)?,
             },
-            config::Matcher::GeoipCountry { country_codes } => RuntimeMatcher::GeoipCountry {
-                country_codes,
-            },
-            config::Matcher::GeoipPrivate { expect } => RuntimeMatcher::GeoipPrivate {
-                expect,
-            },
+            config::Matcher::GeoipCountry { country_codes } => {
+                RuntimeMatcher::GeoipCountry { country_codes }
+            }
+            config::Matcher::GeoipPrivate { expect } => RuntimeMatcher::GeoipPrivate { expect },
             config::Matcher::Qclass { value } => RuntimeMatcher::Qclass {
                 value: parse_dns_class(&value)?,
             },
             config::Matcher::EdnsPresent { expect } => RuntimeMatcher::EdnsPresent { expect },
-            config::Matcher::GeoSite { value } => RuntimeMatcher::GeoSite {
-                tag: value,
-            },
-            config::Matcher::GeoSiteNot { value } => RuntimeMatcher::GeoSiteNot {
-                tag: value,
-            },
+            config::Matcher::GeoSite { value } => RuntimeMatcher::GeoSite { tag: value },
+            config::Matcher::GeoSiteNot { value } => RuntimeMatcher::GeoSiteNot { tag: value },
             config::Matcher::Qtype { value } => RuntimeMatcher::Qtype {
                 value: parse_dns_type(&value)?,
             },
@@ -666,9 +671,7 @@ impl RuntimeMatcher {
             RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
             RuntimeMatcher::GeoSite { tag } => {
                 // 使用辅助函数进行 GeoSite 匹配 / Use helper for GeoSite matching
-                geosite_manager.map_or(false, |mgr| {
-                    matcher_helpers::match_geosite(mgr, qname, tag)
-                })
+                geosite_manager.map_or(false, |mgr| matcher_helpers::match_geosite(mgr, qname, tag))
             }
             RuntimeMatcher::GeoSiteNot { tag } => {
                 // 使用辅助函数进行 GeoSite 非匹配 / Use helper for GeoSite NOT matching
@@ -720,9 +723,7 @@ impl RuntimeMatcher {
             RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
             RuntimeMatcher::GeoSite { tag } => {
                 // 使用辅助函数进行 GeoSite 匹配 / Use helper for GeoSite matching
-                geosite_manager.map_or(false, |mgr| {
-                    matcher_helpers::match_geosite(mgr, qname, tag)
-                })
+                geosite_manager.map_or(false, |mgr| matcher_helpers::match_geosite(mgr, qname, tag))
             }
             RuntimeMatcher::GeoSiteNot { tag } => {
                 // 使用辅助函数进行 GeoSite 非匹配 / Use helper for GeoSite NOT matching
@@ -739,9 +740,7 @@ impl RuntimePipelineSelectorMatcher {
     fn from_config(m: config::PipelineSelectorMatcher) -> anyhow::Result<Self> {
         Ok(match m {
             config::PipelineSelectorMatcher::ListenerLabel { value } => {
-                RuntimePipelineSelectorMatcher::ListenerLabel {
-                    value,
-                }
+                RuntimePipelineSelectorMatcher::ListenerLabel { value }
             }
             config::PipelineSelectorMatcher::ClientIp { cidr } => {
                 RuntimePipelineSelectorMatcher::ClientIp { net: cidr.parse()? }
@@ -766,19 +765,13 @@ impl RuntimePipelineSelectorMatcher {
                 RuntimePipelineSelectorMatcher::EdnsPresent { expect }
             }
             config::PipelineSelectorMatcher::GeoSite { value } => {
-                RuntimePipelineSelectorMatcher::GeoSite {
-                    tag: value,
-                }
+                RuntimePipelineSelectorMatcher::GeoSite { tag: value }
             }
             config::PipelineSelectorMatcher::GeoSiteNot { value } => {
-                RuntimePipelineSelectorMatcher::GeoSiteNot {
-                    tag: value,
-                }
+                RuntimePipelineSelectorMatcher::GeoSiteNot { tag: value }
             }
             config::PipelineSelectorMatcher::GeoipCountry { country_codes } => {
-                RuntimePipelineSelectorMatcher::GeoipCountry {
-                    country_codes,
-                }
+                RuntimePipelineSelectorMatcher::GeoipCountry { country_codes }
             }
             config::PipelineSelectorMatcher::GeoipPrivate { expect } => {
                 RuntimePipelineSelectorMatcher::GeoipPrivate { expect }
@@ -802,7 +795,16 @@ impl RuntimePipelineSelectorMatcher {
         geoip_manager: Option<&crate::geoip::GeoIpManager>,
         geosite_manager: Option<&crate::geosite::GeoSiteManager>,
     ) -> bool {
-        self.matches_with_qtype(listener_label, client_ip, qname, qclass, edns_present, hickory_proto::rr::RecordType::A, geoip_manager, geosite_manager)
+        self.matches_with_qtype(
+            listener_label,
+            client_ip,
+            qname,
+            qclass,
+            edns_present,
+            hickory_proto::rr::RecordType::A,
+            geoip_manager,
+            geosite_manager,
+        )
     }
 
     #[inline]
@@ -848,8 +850,7 @@ impl RuntimePipelineSelectorMatcher {
                 if let Some(manager) = geoip_manager {
                     let result = manager.lookup(client_ip);
                     if let Some(cc) = result.country_code {
-                        country_codes.iter()
-                            .any(|c| c.eq_ignore_ascii_case(&cc))
+                        country_codes.iter().any(|c| c.eq_ignore_ascii_case(&cc))
                     } else {
                         false
                     }
@@ -999,9 +1000,7 @@ impl RuntimeResponseMatcher {
                 RuntimeResponseMatcher::ResponseEdnsPresent { expect }
             }
             config::ResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } => {
-                RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry {
-                    country_codes,
-                }
+                RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes }
             }
             config::ResponseMatcher::ResponseAnswerIpGeoipPrivate { expect } => {
                 RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { expect }
@@ -1032,7 +1031,7 @@ impl RuntimeResponseMatcher {
                                 .size_limit(1000) // 限制正则引擎状态空间 / limit regex engine state space
                                 .dfa_size_limit(1000) // 限制DFA状态数 / limit DFA states
                                 .build()
-                                .map_err(|e| anyhow::anyhow!("invalid regex: {}", e))?
+                                .map_err(|e| anyhow::anyhow!("invalid regex: {}", e))?,
                         )
                     }
                     _ => None,
@@ -1102,16 +1101,18 @@ impl RuntimeResponseMatcher {
                 };
 
                 // 检查是否所有 IP 都匹配指定的国家代码 / Check if all IPs match specified country codes
-                all_ips.iter().all(|ip| {
-                    matcher_helpers::match_geoip_country(manager, *ip, country_codes)
-                })
+                all_ips
+                    .iter()
+                    .all(|ip| matcher_helpers::match_geoip_country(manager, *ip, country_codes))
             }
             RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { expect } => {
                 // 检查 Answer 中是否有任意 IP 为私有 IP
                 use hickory_proto::rr::RData;
                 let mut has_private_ip = msg.answers().iter().any(|record| match record.data() {
                     Some(RData::A(a)) => crate::geoip::is_private_ip(std::net::IpAddr::V4(a.0)),
-                    Some(RData::AAAA(aaaa)) => crate::geoip::is_private_ip(std::net::IpAddr::V6(aaaa.0)),
+                    Some(RData::AAAA(aaaa)) => {
+                        crate::geoip::is_private_ip(std::net::IpAddr::V6(aaaa.0))
+                    }
                     _ => false,
                 });
 
@@ -1119,7 +1120,9 @@ impl RuntimeResponseMatcher {
                     // 检查 additionals
                     has_private_ip = msg.additionals().iter().any(|record| match record.data() {
                         Some(RData::A(a)) => crate::geoip::is_private_ip(std::net::IpAddr::V4(a.0)),
-                        Some(RData::AAAA(aaaa)) => crate::geoip::is_private_ip(std::net::IpAddr::V6(aaaa.0)),
+                        Some(RData::AAAA(aaaa)) => {
+                            crate::geoip::is_private_ip(std::net::IpAddr::V6(aaaa.0))
+                        }
                         _ => false,
                     });
                 }
@@ -1140,8 +1143,10 @@ impl RuntimeResponseMatcher {
             }
             RuntimeResponseMatcher::ResponseTxtContent { mode, value, regex } => {
                 // 从响应中提取 TXT 记录 / Extract TXT records from response
-                use hickory_proto::rr::{RData, rdata::TXT};
-                let txt_data = msg.answers().iter()
+                use hickory_proto::rr::RData;
+                let txt_data = msg
+                    .answers()
+                    .iter()
                     .filter_map(|r| {
                         if let Some(RData::TXT(txt)) = r.data() {
                             Some(txt)
@@ -1177,8 +1182,8 @@ impl RuntimeResponseMatcher {
 mod tests {
     use super::*;
     use hickory_proto::op::{Edns, ResponseCode};
-    use hickory_proto::rr::Name;
     use hickory_proto::rr::rdata::{A, AAAA};
+    use hickory_proto::rr::Name;
     use hickory_proto::rr::{RData, Record};
     use regex::Regex;
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -1196,12 +1201,20 @@ mod tests {
         // Act & Assert: Test case-insensitive matching with private IPs
         // GeoIpManager without MMDB will return None for country_code
         assert!(
-            !matcher_helpers::match_geoip_country(&manager, "192.168.1.1".parse().unwrap(), &["cn".to_string()]),
+            !matcher_helpers::match_geoip_country(
+                &manager,
+                "192.168.1.1".parse().unwrap(),
+                &["cn".to_string()]
+            ),
             "Should return false for IP without country data"
         );
 
         assert!(
-            !matcher_helpers::match_geoip_country(&manager, "10.0.0.1".parse().unwrap(), &["CN".to_string(), "US".to_string()]),
+            !matcher_helpers::match_geoip_country(
+                &manager,
+                "10.0.0.1".parse().unwrap(),
+                &["CN".to_string(), "US".to_string()]
+            ),
             "Should return false when multiple country codes provided but no data"
         );
     }
@@ -1213,7 +1226,11 @@ mod tests {
 
         // Act & Assert: Test IP with no country data
         assert!(
-            !matcher_helpers::match_geoip_country(&manager, "192.168.1.1".parse().unwrap(), &["CN".to_string()]),
+            !matcher_helpers::match_geoip_country(
+                &manager,
+                "192.168.1.1".parse().unwrap(),
+                &["CN".to_string()]
+            ),
             "Should return false for IP without country data"
         );
     }
@@ -1224,7 +1241,7 @@ mod tests {
         let mut manager = crate::geosite::GeoSiteManager::new();
 
         // Add test entries using correct API
-        use crate::geosite::{GeoSiteEntry, DomainMatcher};
+        use crate::geosite::{DomainMatcher, GeoSiteEntry};
 
         manager.add_entry(GeoSiteEntry {
             tag: "cn".to_string(),
@@ -1263,20 +1280,41 @@ mod tests {
         let name = Name::from_str("example.com").unwrap();
 
         // Add A records
-        msg.add_answer(Record::from_rdata(name.clone(), 300, RData::A(A(Ipv4Addr::new(1, 2, 3, 4)))));
-        msg.add_answer(Record::from_rdata(name.clone(), 300, RData::A(A(Ipv4Addr::new(5, 6, 7, 8)))));
+        msg.add_answer(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
+        ));
+        msg.add_answer(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(5, 6, 7, 8))),
+        ));
 
         // Add AAAA record
-        msg.add_answer(Record::from_rdata(name.clone(), 300, RData::AAAA(AAAA(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)))));
+        msg.add_answer(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::AAAA(AAAA(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
+        ));
 
         // Act: Collect IPs
         let ips = matcher_helpers::collect_ips_from_message(&msg);
 
         // Assert: Verify collected IPs
         assert_eq!(ips.len(), 3, "Should collect 3 IP addresses");
-        assert!(ips.contains(&"1.2.3.4".parse::<IpAddr>().unwrap()), "Should contain first IPv4");
-        assert!(ips.contains(&"5.6.7.8".parse::<IpAddr>().unwrap()), "Should contain second IPv4");
-        assert!(ips.contains(&IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))), "Should contain IPv6");
+        assert!(
+            ips.contains(&"1.2.3.4".parse::<IpAddr>().unwrap()),
+            "Should contain first IPv4"
+        );
+        assert!(
+            ips.contains(&"5.6.7.8".parse::<IpAddr>().unwrap()),
+            "Should contain second IPv4"
+        );
+        assert!(
+            ips.contains(&IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
+            "Should contain IPv6"
+        );
     }
 
     #[test]
@@ -1297,8 +1335,16 @@ mod tests {
         // Arrange: Build test message with multiple IPs
         let mut msg = Message::new();
         let name = Name::from_str("example.com").unwrap();
-        msg.add_answer(Record::from_rdata(name.clone(), 300, RData::A(A(Ipv4Addr::new(1, 2, 3, 4)))));
-        msg.add_answer(Record::from_rdata(name.clone(), 300, RData::A(A(Ipv4Addr::new(192, 168, 1, 1)))));
+        msg.add_answer(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
+        ));
+        msg.add_answer(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(192, 168, 1, 1))),
+        ));
 
         let nets = vec!["1.2.3.0/24".parse::<IpNet>().unwrap()];
 
@@ -1314,7 +1360,11 @@ mod tests {
         // Arrange: Build test message with IPs
         let mut msg = Message::new();
         let name = Name::from_str("example.com").unwrap();
-        msg.add_answer(Record::from_rdata(name.clone(), 300, RData::A(A(Ipv4Addr::new(8, 8, 8, 8)))));
+        msg.add_answer(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(8, 8, 8, 8))),
+        ));
 
         let nets = vec!["1.2.3.0/24".parse::<IpNet>().unwrap()];
 
@@ -1331,9 +1381,17 @@ mod tests {
         let mut msg = Message::new();
         let name = Name::from_str("example.com").unwrap();
         // Add non-matching IP to answers
-        msg.add_answer(Record::from_rdata(name.clone(), 300, RData::A(A(Ipv4Addr::new(8, 8, 8, 8)))));
+        msg.add_answer(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(8, 8, 8, 8))),
+        ));
         // Add matching IP to additionals
-        let additionals = vec![Record::from_rdata(name.clone(), 300, RData::A(A(Ipv4Addr::new(1, 2, 3, 4))))];
+        let additionals = vec![Record::from_rdata(
+            name.clone(),
+            300,
+            RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
+        )];
         msg.add_additionals(additionals);
 
         let nets = vec!["1.2.3.0/24".parse::<IpNet>().unwrap()];
@@ -1350,7 +1408,11 @@ mod tests {
         // Arrange: Build test message with IPv6
         let mut msg = Message::new();
         let name = Name::from_str("example.com").unwrap();
-        msg.add_answer(Record::from_rdata(name, 300, RData::AAAA(AAAA(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)))));
+        msg.add_answer(Record::from_rdata(
+            name,
+            300,
+            RData::AAAA(AAAA(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
+        ));
 
         let nets = vec!["2001:db8::/48".parse::<IpNet>().unwrap()];
 
@@ -1479,7 +1541,15 @@ mod tests {
             RuntimeResponseMatcher::ResponseType {
                 value: "AAAA".into()
             }
-            .matches(&upstream, qname, RecordType::AAAA, qclass, &msg_ipv6, None, None),
+            .matches(
+                &upstream,
+                qname,
+                RecordType::AAAA,
+                qclass,
+                &msg_ipv6,
+                None,
+                None
+            ),
             "ResponseType matcher should match AAAA record type"
         );
     }
@@ -1487,7 +1557,7 @@ mod tests {
     #[test]
     fn test_apply_match_operator_request_matchers() {
         use std::net::IpAddr;
-        
+
         // Arrange: Setup test data
         let qname = "a.sub.example.com";
         let client_ip = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
@@ -1662,7 +1732,7 @@ mod tests {
         // Arrange: Setup empty iterator
         let empty: Vec<bool> = vec![];
         let it = empty.into_iter();
-        
+
         // Act & Assert: And over empty iterator -> true (all true)
         assert!(
             apply_match_operator(&MatchOperator::And, it.clone()),
@@ -1687,7 +1757,7 @@ mod tests {
     #[test]
     fn test_runtime_pipeline_selector_matchers() {
         use std::net::IpAddr;
-        
+
         // Arrange: Setup test data
         let listener_label = "edge-internal";
         let client_ip = IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 2, 3));
@@ -1698,7 +1768,15 @@ mod tests {
             RuntimePipelineSelectorMatcher::ListenerLabel {
                 value: "edge-internal".into()
             }
-            .matches(listener_label, client_ip, qname, DNSClass::IN, false, None, None),
+            .matches(
+                listener_label,
+                client_ip,
+                qname,
+                DNSClass::IN,
+                false,
+                None,
+                None
+            ),
             "ListenerLabel matcher should match when listener labels are equal"
         );
 
@@ -1707,7 +1785,15 @@ mod tests {
             RuntimePipelineSelectorMatcher::ClientIp {
                 net: "10.1.2.0/24".parse().unwrap()
             }
-            .matches(listener_label, client_ip, qname, DNSClass::IN, false, None, None),
+            .matches(
+                listener_label,
+                client_ip,
+                qname,
+                DNSClass::IN,
+                false,
+                None,
+                None
+            ),
             "ClientIp matcher should match when client IP is in CIDR range"
         );
 
@@ -1716,7 +1802,15 @@ mod tests {
             RuntimePipelineSelectorMatcher::DomainSuffix {
                 value: "example.com".into()
             }
-            .matches(listener_label, client_ip, qname, DNSClass::IN, false, None, None),
+            .matches(
+                listener_label,
+                client_ip,
+                qname,
+                DNSClass::IN,
+                false,
+                None,
+                None
+            ),
             "DomainSuffix matcher should match domain suffix"
         );
     }
@@ -1724,7 +1818,7 @@ mod tests {
     #[test]
     fn test_runtime_matcher_basic_behaviors() {
         use std::net::IpAddr;
-        
+
         // Arrange: Setup test data
         let qname = "Foo.Example.COM".to_ascii_lowercase();
         let client_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 5));
@@ -1810,24 +1904,30 @@ mod tests {
     fn test_domain_regex_case_insensitive_flag() {
         // Arrange: Setup test data
         let qname = "Foo.Example.COM";
-        
+
         // Act & Assert: Without (?i) should not match assuming case-sensitive regex
         let re_cs = Regex::new("example\\.com$").unwrap();
-        assert!(!RuntimeMatcher::DomainRegex { regex: re_cs }.matches(
-            &qname,
-            DNSClass::IN,
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-            false
-        ), "Case-sensitive regex should not match different case");
+        assert!(
+            !RuntimeMatcher::DomainRegex { regex: re_cs }.matches(
+                &qname,
+                DNSClass::IN,
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                false
+            ),
+            "Case-sensitive regex should not match different case"
+        );
 
         // Act & Assert: With (?i) should match
         let re_ci = Regex::new("(?i)example\\.com$").unwrap();
-        assert!(RuntimeMatcher::DomainRegex { regex: re_ci }.matches(
-            &qname,
-            DNSClass::IN,
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-            false
-        ), "Case-insensitive regex should match different case");
+        assert!(
+            RuntimeMatcher::DomainRegex { regex: re_ci }.matches(
+                &qname,
+                DNSClass::IN,
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                false
+            ),
+            "Case-insensitive regex should match different case"
+        );
     }
 
     #[test]
@@ -1858,7 +1958,7 @@ mod tests {
 
     // Integration Tests for New Matchers
     // 新匹配器的集成测试
-    
+
     #[test]
     fn test_qtype_matcher_all_types() {
         // Arrange: Setup test data with all supported DNS record types
@@ -1874,27 +1974,23 @@ mod tests {
             ("SRV", RecordType::SRV),
             ("OPT", RecordType::OPT),
         ];
-        
+
         for (type_str, expected_type) in qtypes {
             // Act & Assert: Test parsing
             let parsed = parse_dns_type(type_str);
-            assert!(
-                parsed.is_ok(), 
-                "Failed to parse qtype: {}", 
-                type_str
-            );
+            assert!(parsed.is_ok(), "Failed to parse qtype: {}", type_str);
             assert_eq!(
-                parsed.unwrap(), 
-                expected_type, 
-                "Qtype mismatch for: {}", 
+                parsed.unwrap(),
+                expected_type,
+                "Qtype mismatch for: {}",
                 type_str
             );
-            
+
             // Act & Assert: Test matcher
             let matcher = RuntimeMatcher::Qtype {
                 value: expected_type,
             };
-            
+
             // Act & Assert: Test matching
             assert!(
                 matcher.matches_with_qtype(
@@ -1905,8 +2001,8 @@ mod tests {
                     expected_type,
                     None,
                     None,
-                ), 
-                "Qtype {} should match itself", 
+                ),
+                "Qtype {} should match itself",
                 type_str
             );
         }
