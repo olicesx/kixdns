@@ -874,6 +874,7 @@ impl RuntimePipelineSelectorMatcher {
 }
 
 #[allow(dead_code)]
+#[inline]
 pub fn apply_match_operator(op: &MatchOperator, mut results: impl Iterator<Item = bool>) -> bool {
     match op {
         MatchOperator::And => results.all(|b| b),
@@ -935,6 +936,7 @@ pub fn eval_match_chain<T>(
     acc
 }
 
+#[inline]
 fn try_parse_upstream_ip(upstream: &str) -> Option<IpAddr> {
     upstream
         .parse::<SocketAddr>()

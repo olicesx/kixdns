@@ -18,30 +18,30 @@ pub struct PipelineConfig {
     pub pipeline_select: Vec<PipelineSelectRule>,
     #[serde(default)]
     pub pipelines: Vec<Pipeline>,
-    
+
     /// 后台刷新专用规则（可选）。如果未配置，将使用默认规则（Any 匹配 + Forward 到原始 upstream）。
     /// Background refresh dedicated rule (optional). If not configured, will use default rule (Any matcher + Forward to original upstream).
-    /// 
+    ///
     /// # Purpose
-    /// 
+    ///
     /// 为后台刷新提供独立的规则配置，允许自定义后台刷新的行为。
     /// Provide independent rule configuration for background refresh, allowing custom behavior.
-    /// 
+    ///
     /// # Design Philosophy
-    /// 
+    ///
     /// **后台刷新 = 调用 handle_packet(skip_cache=true)**
-    /// 
+    ///
     /// 后台刷新本质上就是向规则引擎发起一个特殊的查询请求，
-     /// 使用"后台刷新专用规则"，完全复用规则引擎的所有逻辑。
-    /// 
+    /// 使用"后台刷新专用规则"，完全复用规则引擎的所有逻辑。
+    ///
     /// **Background refresh = Call handle_packet(skip_cache=true)**
-    /// 
+    ///
     /// 后台刷新与正常查询的唯一区别：
     /// - 正常查询：检查缓存 → 规则引擎 → 执行查询
     /// - 后台刷新：跳过缓存 → 规则引擎 → 执行查询
-    /// 
+    ///
     /// # Example
-    /// 
+    ///
     /// ```json
     /// {
     ///   "background_refresh_rule": {
@@ -176,7 +176,7 @@ impl Default for GlobalSettings {
             default_upstream: default_upstream(),
             default_upstream_pre_split: None,
             upstream_timeout_ms: default_upstream_timeout_ms(),
-            request_timeout_ms: None,  // 默认自动计算 / Auto-calculated by default
+            request_timeout_ms: None, // 默认自动计算 / Auto-calculated by default
             response_jump_limit: default_response_jump_limit(),
             udp_pool_size: default_udp_pool_size(),
             tcp_pool_size: default_tcp_pool_size(),
@@ -285,7 +285,9 @@ pub enum Matcher {
         value: String,
     },
     /// 请求 QTYPE（如 A/AAAA/CNAME/TXT/MX 等）。 / Request QTYPE (e.g., A/AAAA/CNAME/TXT/MX, etc.)
-    Qtype { value: String },
+    Qtype {
+        value: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -306,21 +308,13 @@ pub enum PipelineSelectorMatcher {
     /// 请求是否携带 EDNS。 / Whether request carries EDNS
     EdnsPresent { expect: bool },
     /// GeoSite 分类匹配（如 "cn", "google", "category-ads"）。 / GeoSite category matching (e.g., "cn", "google", "category-ads")
-    GeoSite {
-        value: String,
-    },
+    GeoSite { value: String },
     /// GeoSite 否定匹配（匹配不在该分类的域名）。 / GeoSite negation matching (match domains NOT in category)
-    GeoSiteNot {
-        value: String,
-    },
+    GeoSiteNot { value: String },
     /// 匹配客户端IP的GeoIP国家代码（大小写不敏感）。 / Match client IP GeoIP country code (case insensitive)
-    GeoipCountry {
-        country_codes: Vec<String>,
-    },
+    GeoipCountry { country_codes: Vec<String> },
     /// 匹配客户端IP是否为私有IP（内网）。 / Match whether client IP is private (internal network)
-    GeoipPrivate {
-        expect: bool,
-    },
+    GeoipPrivate { expect: bool },
     /// 请求 QTYPE（如 A/AAAA/CNAME/TXT/MX 等）。 / Request QTYPE (e.g., A/AAAA/CNAME/TXT/MX, etc.)
     Qtype { value: String },
 }
@@ -443,8 +437,14 @@ pub enum Action {
 /// Action 辅助函数 / Action helper functions
 impl Action {
     /// 预分割 upstream 字符串以优化性能（在配置加载时调用）/ Pre-split upstream string for performance (call during config loading)
+    #[inline]
     pub fn pre_split_upstreams(&mut self) {
-        if let Action::Forward { upstream, pre_split_upstreams, .. } = self {
+        if let Action::Forward {
+            upstream,
+            pre_split_upstreams,
+            ..
+        } = self
+        {
             if let Some(upstream_str) = upstream {
                 let split: Vec<String> = upstream_str
                     .split(',')
@@ -459,8 +459,10 @@ impl Action {
 
 impl GlobalSettings {
     /// 预分割默认 upstream 字符串以优化性能（在配置加载时调用）/ Pre-split default upstream string for performance (call during config loading)
+    #[inline]
     pub fn pre_split_default_upstream(&mut self) {
-        let split: Vec<String> = self.default_upstream
+        let split: Vec<String> = self
+            .default_upstream
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -511,7 +513,6 @@ pub enum Transport {
     Tcp,
 }
 
-
 #[derive(Debug, Clone, Deserialize, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MatchOperator {
@@ -545,7 +546,7 @@ pub fn load_config(path: &Path) -> Result<PipelineConfig> {
     // 预分割 upstream 字符串以提高性能 / Pre-split upstream strings for better performance
     // 预分割默认 upstream 以支持并发查询 / Pre-split default upstream for concurrent queries
     cfg.settings.pre_split_default_upstream();
-    
+
     for pipeline in &mut cfg.pipelines {
         for rule in &mut pipeline.rules {
             for action in &mut rule.actions {
@@ -616,16 +617,20 @@ mod tests {
                 }
             ]
         });
-        
+
         // Act: Parse the configuration
         let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
         let rule = &cfg.pipelines[0].rules[0];
-        
+
         // Assert: Verify response action fields default to empty vectors
-        assert!(rule.response_actions_on_match.is_empty(), 
-            "response_actions_on_match should default to empty vector");
-        assert!(rule.response_actions_on_miss.is_empty(), 
-            "response_actions_on_miss should default to empty vector");
+        assert!(
+            rule.response_actions_on_match.is_empty(),
+            "response_actions_on_match should default to empty vector"
+        );
+        assert!(
+            rule.response_actions_on_miss.is_empty(),
+            "response_actions_on_miss should default to empty vector"
+        );
     }
 
     #[test]
@@ -649,12 +654,18 @@ mod tests {
         // Act: Parse the configuration
         let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
         let rule = &cfg.pipelines[0].rules[0];
-        
+
         // Assert: Verify operators default to MatchOperator::And
-        assert_eq!(rule.matcher_operator, MatchOperator::And,
-            "matcher_operator should default to And");
-        assert_eq!(rule.response_matcher_operator, MatchOperator::And,
-            "response_matcher_operator should default to And");
+        assert_eq!(
+            rule.matcher_operator,
+            MatchOperator::And,
+            "matcher_operator should default to And"
+        );
+        assert_eq!(
+            rule.response_matcher_operator,
+            MatchOperator::And,
+            "response_matcher_operator should default to And"
+        );
     }
 
     #[test]
@@ -671,18 +682,28 @@ mod tests {
 
         // Act: Parse the configuration
         let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        
+
         // Assert: Verify flow control settings have correct defaults
-        assert_eq!(cfg.settings.flow_control_initial_permits, 500,
-            "flow_control_initial_permits should default to 500");
-        assert_eq!(cfg.settings.flow_control_min_permits, 100,
-            "flow_control_min_permits should default to 100");
-        assert_eq!(cfg.settings.flow_control_max_permits, 800,
-            "flow_control_max_permits should default to 800");
-        assert_eq!(cfg.settings.flow_control_latency_threshold_ms, 100,
-            "flow_control_latency_threshold_ms should default to 100");
-        assert_eq!(cfg.settings.flow_control_adjustment_interval_secs, 5,
-            "flow_control_adjustment_interval_secs should default to 5");
+        assert_eq!(
+            cfg.settings.flow_control_initial_permits, 500,
+            "flow_control_initial_permits should default to 500"
+        );
+        assert_eq!(
+            cfg.settings.flow_control_min_permits, 100,
+            "flow_control_min_permits should default to 100"
+        );
+        assert_eq!(
+            cfg.settings.flow_control_max_permits, 800,
+            "flow_control_max_permits should default to 800"
+        );
+        assert_eq!(
+            cfg.settings.flow_control_latency_threshold_ms, 100,
+            "flow_control_latency_threshold_ms should default to 100"
+        );
+        assert_eq!(
+            cfg.settings.flow_control_adjustment_interval_secs, 5,
+            "flow_control_adjustment_interval_secs should default to 5"
+        );
     }
 
     #[test]
@@ -706,18 +727,28 @@ mod tests {
 
         // Act: Parse the configuration
         let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        
+
         // Assert: Verify custom flow control settings
-        assert_eq!(cfg.settings.flow_control_initial_permits, 200,
-            "flow_control_initial_permits should match configured value");
-        assert_eq!(cfg.settings.flow_control_min_permits, 50,
-            "flow_control_min_permits should match configured value");
-        assert_eq!(cfg.settings.flow_control_max_permits, 400,
-            "flow_control_max_permits should match configured value");
-        assert_eq!(cfg.settings.flow_control_latency_threshold_ms, 150,
-            "flow_control_latency_threshold_ms should match configured value");
-        assert_eq!(cfg.settings.flow_control_adjustment_interval_secs, 10,
-            "flow_control_adjustment_interval_secs should match configured value");
+        assert_eq!(
+            cfg.settings.flow_control_initial_permits, 200,
+            "flow_control_initial_permits should match configured value"
+        );
+        assert_eq!(
+            cfg.settings.flow_control_min_permits, 50,
+            "flow_control_min_permits should match configured value"
+        );
+        assert_eq!(
+            cfg.settings.flow_control_max_permits, 400,
+            "flow_control_max_permits should match configured value"
+        );
+        assert_eq!(
+            cfg.settings.flow_control_latency_threshold_ms, 150,
+            "flow_control_latency_threshold_ms should match configured value"
+        );
+        assert_eq!(
+            cfg.settings.flow_control_adjustment_interval_secs, 10,
+            "flow_control_adjustment_interval_secs should match configured value"
+        );
     }
 }
 
@@ -754,15 +785,15 @@ fn default_tcp_pool_size() -> usize {
 }
 
 fn default_tcp_health_check_error_threshold() -> usize {
-    3  // 连续 3 次失败后重置连接 / Reset connection after 3 consecutive failures
+    3 // 连续 3 次失败后重置连接 / Reset connection after 3 consecutive failures
 }
 
 fn default_tcp_connection_max_age_seconds() -> u64 {
-    300  // 5 分钟 / 5 minutes
+    300 // 5 分钟 / 5 minutes
 }
 
 fn default_tcp_connection_idle_timeout_seconds() -> u64 {
-    60  // 1 分钟 / 1 minute
+    60 // 1 分钟 / 1 minute
 }
 
 fn default_flow_control_initial_permits() -> usize {

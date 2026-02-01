@@ -208,6 +208,7 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
 }
 
 /// 跳过 DNS 名称并返回下一个位置 / Skip DNS name and return next position
+#[inline]
 fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
     let packet_len = packet.len();
     loop {

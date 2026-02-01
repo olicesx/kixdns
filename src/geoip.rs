@@ -53,6 +53,7 @@ pub struct IpRange {
 
 impl IpRange {
     /// 检查 IP 是否在范围内 / Check if IP is in range
+    #[inline]
     pub fn contains(&self, ip: u32) -> bool {
         ip >= self.start && ip <= self.end
     }
@@ -304,11 +305,13 @@ impl GeoIpManager {
     }
 
     /// 检查 MMDB 是否已加载 / Check if MMDB is loaded
+    #[inline]
     pub fn is_loaded(&self) -> bool {
         self.reader.is_some()
     }
 
     /// 获取 IP 范围数量(仅用于调试)/ Get IP range count (debug only)
+    #[inline]
     pub fn ip_range_count(&self) -> usize {
         self.ip_ranges.len()
     }

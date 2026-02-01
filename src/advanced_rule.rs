@@ -9,7 +9,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::config::{Action, MatchOperator};
-use crate::engine::{Decision, make_static_ip_answer};
+use crate::engine::{make_static_ip_answer, Decision};
 use crate::matcher::eval_match_chain;
 use crate::matcher::{RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig, RuntimeRule};
 
@@ -129,7 +129,12 @@ impl RuleIndex {
 
     /// Get candidate rule indices into provided SmallVec to avoid allocation
     /// SmallVec<[usize; 32]> keeps up to 32 candidates on stack (typical case)
-    pub fn get_candidates_into(&self, qname: &str, qtype: RecordType, out: &mut SmallVec<[usize; 32]>) {
+    pub fn get_candidates_into(
+        &self,
+        qname: &str,
+        qtype: RecordType,
+        out: &mut SmallVec<[usize; 32]>,
+    ) {
         out.extend_from_slice(&self.always_check);
 
         if let Some(indices) = self.domain_exact.get(qname) {
@@ -232,14 +237,10 @@ fn compile_matcher(m: &RuntimeMatcher) -> CompiledMatcher {
             matcher: RuntimeMatcher::EdnsPresent { expect: *expect },
         },
         RuntimeMatcher::GeoSite { tag } => CompiledMatcher::Complex {
-            matcher: RuntimeMatcher::GeoSite {
-                tag: tag.clone(),
-            },
+            matcher: RuntimeMatcher::GeoSite { tag: tag.clone() },
         },
         RuntimeMatcher::GeoSiteNot { tag } => CompiledMatcher::Complex {
-            matcher: RuntimeMatcher::GeoSiteNot {
-                tag: tag.clone(),
-            },
+            matcher: RuntimeMatcher::GeoSiteNot { tag: tag.clone() },
         },
         RuntimeMatcher::Qtype { value } => CompiledMatcher::QueryType { qtype: *value },
     }
@@ -358,6 +359,7 @@ fn compiled_matcher_matches(
     }
 }
 
+#[inline]
 fn parse_rcode(rcode: &str) -> Option<ResponseCode> {
     match rcode.to_ascii_uppercase().as_str() {
         "NOERROR" => Some(ResponseCode::NoError),

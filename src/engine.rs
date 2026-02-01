@@ -213,16 +213,19 @@ impl PermitManager {
     }
     
     /// Get current inflight permits count / 获取当前进行中的 permits 数
+    #[inline]
     pub fn inflight(&self) -> usize {
         self.active_permits.load(Ordering::Acquire)
     }
-    
+
     /// Update max permits for dynamic adjustment / 更新最大 permits 用于动态调整
+    #[inline]
     pub fn set_max_permits(&self, new_max: usize) {
         self.max_permits.store(new_max, Ordering::Release);
     }
-    
+
     /// Get current max permits / 获取当前最大 permits
+    #[inline]
     pub fn max_permits(&self) -> usize {
         self.max_permits.load(Ordering::Acquire)
     }
@@ -5335,6 +5338,7 @@ fn build_response(
     Ok(Bytes::from(out))
 }
 
+#[inline]
 pub fn extract_ttl(msg: &Message) -> u64 {
     // Extract minimum TTL for cache entry (RFC 1035 §5.2)
     // 提取最小 TTL 用于缓存条目 (RFC 1035 §5.2)
@@ -5350,6 +5354,7 @@ pub fn extract_ttl(msg: &Message) -> u64 {
 /// 从 DNS 响应中提取最大 TTL 用于后台刷新时机 / Extract maximum TTL from DNS response for background refresh timing
 ///
 /// 理由：当多个 A/AAAA 记录有不同的 TTL 时，使用 min() 会导致过早刷新，使用 max() 确保缓存保持有效直到所有记录过期，这与减少上游查询的目标一致 / Rationale: When multiple A/AAAA records have different TTLs, using min() causes premature refresh, using max() ensures cache stays valid until ALL records expire, aligning with the goal of reducing upstream queries
+#[inline]
 pub fn extract_ttl_for_refresh(msg: &Message) -> u64 {
     msg.answers()
         .iter()
@@ -5480,6 +5485,7 @@ fn fast_hash_str(s: &str) -> u64 {
     h.finish()
 }
 
+#[inline]
 fn contains_continue(actions: &[Action]) -> bool {
     actions.iter().any(|action| matches!(action, Action::Continue))
 }

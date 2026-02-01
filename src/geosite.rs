@@ -72,6 +72,7 @@ pub struct GeoSiteEntry {
 impl GeoSiteEntry {
     /// 标准化：将所有匹配器转换为小写（配置加载时调用）
     /// Normalization: convert all matchers to lowercase (called during config loading)
+    #[inline]
     pub fn normalized(mut self) -> Self {
         for matcher in &mut self.matchers {
             match matcher {
@@ -253,16 +254,19 @@ impl GeoSiteManager {
     }
 
     /// 获取已加载的标签列表 / Get list of loaded tags
+    #[inline]
     pub fn tags(&self) -> Vec<String> {
         self.database.iter().map(|(tag, _)| tag.clone()).collect()
     }
 
     /// 检查标签是否已加载 / Check if tag is loaded
+    #[inline]
     pub fn has_tag(&self, tag: &str) -> bool {
         self.database.contains_key(tag)
     }
 
     /// 获取标签的所有域名匹配器（仅用于调试）/ Get all domain matchers for a tag (debug only)
+    #[inline]
     pub fn get_tag_matchers(&self, tag: &str) -> Option<Vec<DomainMatcher>> {
         self.database.get(tag).map(|matchers| matchers.clone())
     }

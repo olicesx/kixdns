@@ -18,6 +18,7 @@ use std::os::fd::AsRawFd;
 /// * `Ok(())` - Option set successfully
 /// * `Err(io::Error)` - Failed to set option (non-fatal, logged as warning)
 #[cfg(unix)]
+#[inline]
 pub fn set_ipv6_v6only(socket: &Socket, enabled: bool) -> io::Result<()> {
     use libc::{c_int, setsockopt, socklen_t, IPPROTO_IPV6, IPV6_V6ONLY};
 
@@ -52,6 +53,7 @@ pub fn set_ipv6_v6only(socket: &Socket, enabled: bool) -> io::Result<()> {
 /// * `Ok(())` - Option set successfully
 /// * `Err(io::Error)` - Failed to set option or not supported
 #[cfg(unix)]
+#[inline]
 pub fn set_reuseport(socket: &Socket, enabled: bool) -> io::Result<()> {
     use libc::{c_int, setsockopt, socklen_t, SOL_SOCKET, SO_REUSEPORT};
 
@@ -79,6 +81,7 @@ pub fn set_reuseport(socket: &Socket, enabled: bool) -> io::Result<()> {
 /// 非 Unix 系统的存根实现（Windows 和其他平台）
 #[cfg(not(unix))]
 #[allow(dead_code)] // Stub implementations for cross-platform compatibility
+#[inline]
 pub fn set_ipv6_v6only(_socket: &socket2::Socket, _enabled: bool) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -88,6 +91,7 @@ pub fn set_ipv6_v6only(_socket: &socket2::Socket, _enabled: bool) -> io::Result<
 
 #[cfg(not(unix))]
 #[allow(dead_code)] // Stub implementation for cross-platform compatibility
+#[inline]
 pub fn set_reuseport(_socket: &socket2::Socket, _enabled: bool) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
