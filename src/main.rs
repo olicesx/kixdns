@@ -134,7 +134,7 @@ async fn run_dns_server(
 
             info!(bind_udp = %bind_addr, bind_tcp = %bind_tcp, udp_workers_count = udp_workers_final, "dns server started");
 
-            let mut udp_handles = Vec::with_capacity(udp_workers_final);
+            let mut all_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
             #[cfg(unix)]
             {
@@ -162,7 +162,7 @@ async fn run_dns_server(
                     } else {
                         udp_workers_final
                     };
-                    spawn_ipv4_udp_workers(bind_addr, workers_per_family, engine.clone(), &mut udp_handles)?;
+                    spawn_ipv4_udp_workers(bind_addr, workers_per_family, engine.clone(), &mut all_handles)?;
                 }
 
                 if needs_ipv6 {
@@ -171,7 +171,7 @@ async fn run_dns_server(
                     } else {
                         udp_workers_final
                     };
-                    spawn_ipv6_udp_workers(bind_addr, workers_per_family, engine.clone(), &mut udp_handles)?;
+                    spawn_ipv6_udp_workers(bind_addr, workers_per_family, engine.clone(), &mut all_handles)?;
                 }
             }
 
@@ -224,24 +224,58 @@ async fn run_dns_server(
                             error!(worker_id, error = %err, "udp worker exited");
                         }
                     });
-                    udp_handles.push(handle);
+                    all_handles.push(handle);
                 }
             }
 
             // TCP listener / TCP 监听器
-            let tcp_listener = TcpListener::bind(bind_tcp)
-                .await
-                .context("bind tcp listener")?;
-            let tcp_engine = engine.clone();
-            let tcp_handle = tokio::spawn(async move {
-                if let Err(err) = run_tcp(tcp_listener, tcp_engine).await {
-                    error!(error = %err, "tcp server exited");
-                }
-            });
+            // ✅ 双 socket 方案，与 UDP 行为一致 / Dual-socket approach, consistent with UDP
+            let needs_ipv4_tcp = bind_tcp.is_ipv4() || (bind_tcp.is_ipv6() && bind_tcp.ip().is_unspecified());
+
+            // --- 启动 IPv4 TCP 监听 / Start IPv4 TCP listener ---
+            if needs_ipv4_tcp {
+                let addr = if bind_tcp.is_ipv4() {
+                    bind_tcp
+                } else {
+                    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), bind_tcp.port())
+                };
+                // 纯 IPv4 绑定，不受 bindv6only 影响 / Pure IPv4 bind, unaffected by bindv6only
+                let listener = TcpListener::bind(addr).await.context("bind ipv4 tcp")?;
+                let engine = engine.clone();
+                let h = tokio::spawn(async move {
+                    if let Err(err) = run_tcp(listener, engine).await {
+                        error!(error = %err, "ipv4 tcp server exited");
+                    }
+                });
+                all_handles.push(h);
+            }
+
+            // --- 启动 IPv6 TCP 监听 / Start IPv6 TCP listener ---
+            if bind_tcp.is_ipv6() {
+                use socket2::{Domain, Protocol, Socket, Type};
+                let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+
+                // ⭐️ 核心：强制 IPV6_V6ONLY=1，避免和 IPv4 监听器冲突
+                // ⭐️ Key: force IPV6_V6ONLY=1 to avoid conflict with IPv4 listener
+                socket.set_only_v6(true).context("set ipv6 only for kixdns")?;
+                socket.set_reuse_address(true)?;
+
+                socket.bind(&bind_tcp.into()).context("bind ipv6 tcp socket")?;
+                socket.listen(128)?;
+                socket.set_nonblocking(true)?;
+
+                let listener = TcpListener::from_std(socket.into())?;
+                let engine = engine.clone();
+                let h = tokio::spawn(async move {
+                    if let Err(err) = run_tcp(listener, engine).await {
+                        error!(error = %err, "ipv6 tcp server exited");
+                    }
+                });
+                all_handles.push(h);
+            }
 
             // 等待所有任务 / Wait for all tasks
-            let _ = tcp_handle.await;
-            for h in udp_handles {
+            for h in all_handles {
                 let _ = h.await;
             }
 
@@ -270,7 +304,7 @@ fn spawn_ipv4_udp_workers(
     bind_addr: SocketAddr,
     worker_count: usize,
     engine: Engine,
-    udp_handles: &mut Vec<tokio::task::JoinHandle<()>>,
+    all_handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> anyhow::Result<()> {
     let ipv4_addr: SocketAddr = if bind_addr.is_ipv4() {
         bind_addr
@@ -292,7 +326,7 @@ fn spawn_ipv4_udp_workers(
                 error!(worker_id, error = %err, "IPv4 udp worker exited");
             }
         });
-        udp_handles.push(handle);
+        all_handles.push(handle);
     }
 
     Ok(())
@@ -304,7 +338,7 @@ fn spawn_ipv6_udp_workers(
     bind_addr: SocketAddr,
     worker_count: usize,
     engine: Engine,
-    udp_handles: &mut Vec<tokio::task::JoinHandle<()>>,
+    all_handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> anyhow::Result<()> {
     let ipv6_addr: SocketAddr = if bind_addr.is_ipv6() {
         bind_addr
@@ -326,7 +360,7 @@ fn spawn_ipv6_udp_workers(
                 error!(worker_id, error = %err, "IPv6 udp worker exited");
             }
         });
-        udp_handles.push(handle);
+        all_handles.push(handle);
     }
 
     Ok(())
