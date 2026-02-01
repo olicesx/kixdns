@@ -266,9 +266,8 @@ fn spawn_ipv4_udp_workers(
         bind_addr
     } else {
         // 预编译的常量地址，避免 unwrap / Precompiled constant address, avoid unwrap
-        "0.0.0.0:5353"
-            .parse()
-            .expect("Hardcoded default IPv4 address should always be valid")
+        // 使用配置中的端口号而非硬编码 / Use port from config instead of hardcoded
+        SocketAddr::new(std::net::Ipv4Addr::new(0, 0, 0, 0), bind_addr.port())
     };
 
     info!(bind_addr = %ipv4_addr, workers = worker_count, "Starting IPv4 UDP workers");
@@ -301,9 +300,8 @@ fn spawn_ipv6_udp_workers(
         bind_addr
     } else {
         // 预编译的常量地址，避免 unwrap / Precompiled constant address, avoid unwrap
-        "[::]:5353"
-            .parse()
-            .expect("Hardcoded default IPv6 address should always be valid")
+        // 使用配置中的端口号而非硬编码 / Use port from config instead of hardcoded
+        SocketAddr::new(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), bind_addr.port())
     };
 
     info!(bind_addr = %ipv6_addr, workers = worker_count, "Starting IPv6 UDP workers");
