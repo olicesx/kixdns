@@ -4,6 +4,9 @@
 use socket2::Socket;
 use std::io;
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
 /// Safely set IPV6_V6ONLY option on a socket
 /// 安全地设置 socket 的 IPV6_V6ONLY 选项
 ///
@@ -75,6 +78,7 @@ pub fn set_reuseport(socket: &Socket, enabled: bool) -> io::Result<()> {
 /// Non-Unix stub implementations (Windows and other platforms)
 /// 非 Unix 系统的存根实现（Windows 和其他平台）
 #[cfg(not(unix))]
+#[allow(dead_code)] // Stub implementations for cross-platform compatibility
 pub fn set_ipv6_v6only(_socket: &socket2::Socket, _enabled: bool) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -83,6 +87,7 @@ pub fn set_ipv6_v6only(_socket: &socket2::Socket, _enabled: bool) -> io::Result<
 }
 
 #[cfg(not(unix))]
+#[allow(dead_code)] // Stub implementation for cross-platform compatibility
 pub fn set_reuseport(_socket: &socket2::Socket, _enabled: bool) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,

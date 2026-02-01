@@ -631,6 +631,7 @@ impl Engine {
     /// - Subsequent calls: Returns cached rule
     /// - 首次调用：从配置或默认创建规则
     /// - 后续调用：返回缓存的规则
+    #[allow(dead_code)]
     fn get_background_refresh_rule(&self) -> Option<Arc<crate::matcher::RuntimeRule>> {
         // 暂时返回 None，等待 RuntimePipelineConfig 结构更新
         // Temporarily return None, waiting for RuntimePipelineConfig structure update
@@ -2719,6 +2720,7 @@ impl Engine {
     /// - Background refresh timing should use max TTL to avoid premature refresh
     /// 
     #[inline]
+    #[allow(dead_code)]  // Reserved for future use
     fn extract_ttl_from_msg(&self, msg: &Message, for_refresh: bool) -> u32 {
         if for_refresh {
             // Use max TTL for refresh timing to avoid premature refresh
@@ -2756,6 +2758,7 @@ impl Engine {
     /// The new implementation (u32 return type) is above at line 2505
     /// 新实现（u32 返回类型）在上方第 2505 行
     #[deprecated(note = "Use extract_ttl_from_msg with u32 return type instead")]
+    #[allow(dead_code)]  // Deprecated method, kept for compatibility
     fn extract_ttl_from_msg_legacy(&self, msg: &Message, for_refresh: bool) -> u64 {
         if for_refresh {
             // Use max TTL for refresh timing to avoid premature refresh

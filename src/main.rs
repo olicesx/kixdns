@@ -372,7 +372,6 @@ fn spawn_ipv6_udp_workers(
 #[cfg(unix)]
 fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
-    use std::os::unix::io::AsRawFd;
     let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {

@@ -448,12 +448,19 @@ mod tests {
 /// V2Ray .dat 文件格式常量 / V2Ray .dat file format constants
 mod dat_format {
     /// 文件头魔数 / File header magic number
+    /// Note: Reserved for future dat file format parsing
+    #[allow(dead_code)]
     pub const HEADER_MAGIC: &[u8; 4] = b"\x0D\x0A\x0D\x0A";
 
     /// 域名类型常量 / Domain type constants
+    /// Note: Reserved for future use in dat file parsing
+    #[allow(dead_code)]
     pub const TYPE_FULL: u8 = 0x01; // 完整匹配 / Full match
+    #[allow(dead_code)]
     pub const TYPE_SUBDOMAIN: u8 = 0x02; // 子域名匹配 / Subdomain match
+    #[allow(dead_code)]
     pub const TYPE_KEYWORD: u8 = 0x03; // 关键词匹配 / Keyword match
+    #[allow(dead_code)]
     pub const TYPE_REGEX: u8 = 0x04; // 正则匹配 / Regex match
 }
 
@@ -474,6 +481,8 @@ pub struct V2RayGeoSiteList {
 }
 
 /// .dat 文件索引条目 / .dat file index entry
+/// Note: Reserved for future optimization of dat file parsing
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct DatIndexEntry {
     /// Tag 名称 / Tag name
@@ -695,6 +704,8 @@ impl GeoSiteManager {
     }
 
     /// 解析 varint / Parse varint
+    /// Note: Reserved for future use in dat file parsing
+    #[allow(dead_code)]
     fn parse_varint(data: &[u8], pos: &mut usize) -> anyhow::Result<usize> {
         let mut result = 0usize;
         let mut shift = 0;
@@ -892,6 +903,8 @@ impl GeoSiteManager {
     }
 
     /// 解析 .dat 格式的域名列表 / Parse domain list in .dat format
+    /// Note: Reserved for future use in dat file parsing
+    #[allow(dead_code)]
     fn parse_dat_domain_list(&self, data: &[u8]) -> anyhow::Result<Vec<DomainMatcher>> {
         let mut matchers = Vec::new();
         let mut pos = 0;
