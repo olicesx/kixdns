@@ -3500,7 +3500,7 @@ impl UdpClient {
             let std_sock: std::net::UdpSocket = socket.into();
             let socket = Arc::new(tokio::net::UdpSocket::from_std(std_sock).expect("from_std"));
             let inflight = Arc::new(DashMap::with_hasher(FxBuildHasher::default()));
-            
+
             let state = UdpSocketState {
                 socket: socket.clone(),
                 inflight: inflight.clone(),
@@ -3531,20 +3531,38 @@ impl UdpClient {
                                         // 零拷贝优化：使用 split_to 复用已有容量，避免分配新内存
                                         // Zero-copy optimization: use split_to to reuse existing capacity, avoid allocation
                                         let response = buf.split_to(len).freeze();
-                                        let _ = tx.send(Ok(response));
+                                        // 修复：检查 channel 是否已关闭，防止残留条目
+                                        // Fix: Check if channel is closed to prevent stale entries
+                                        if tx.send(Ok(response)).is_err() {
+                                            tracing::debug!(
+                                                socket_idx = idx,
+                                                response_id = id,
+                                                "Failed to send UDP response, channel already closed"
+                                            );
+                                        }
                                     } else {
-                                        // 地址不匹配：这不是我们的响应，可能是ID冲突
-                                        // 将条目放回去，等待正确的响应
-                                        // Address mismatch: not our response, possible ID collision
-                                        // Put the entry back and wait for the correct response
-                                        inflight_clone.insert(id, (original_id, expected_addr, tx));
-                                        tracing::warn!(
-                                            socket_idx = idx,
-                                            response_id = id,
-                                            expected_addr = %expected_addr,
-                                            actual_addr = %src,
-                                            "UDP response address mismatch, possible ID collision"
-                                        );
+                                        // 地址不匹配：检查 channel 是否已关闭
+                                        // Address mismatch: check if channel is closed
+                                        if tx.is_closed() {
+                                            // channel 已关闭，说明请求已超时或失败，不要放回 inflight
+                                            tracing::debug!(
+                                                socket_idx = idx,
+                                                response_id = id,
+                                                expected_addr = %expected_addr,
+                                                actual_addr = %src,
+                                                "UDP response address mismatch but channel closed, dropping stale response"
+                                            );
+                                        } else {
+                                            // channel 仍然打开，放回等待正确响应
+                                            inflight_clone.insert(id, (original_id, expected_addr, tx));
+                                            tracing::warn!(
+                                                socket_idx = idx,
+                                                response_id = id,
+                                                expected_addr = %expected_addr,
+                                                actual_addr = %src,
+                                                "UDP response address mismatch, possible ID collision"
+                                            );
+                                        }
                                     }
                                 }
                             }
