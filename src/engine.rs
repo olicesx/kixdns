@@ -1,11 +1,10 @@
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
-use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicUsize, AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -3472,20 +3471,11 @@ struct UdpSocketState {
     // Value: (Original ID, Upstream Address, Sender)
     inflight: Arc<DashMap<u16, (u16, SocketAddr, oneshot::Sender<anyhow::Result<Bytes>>), FxBuildHasher>>,
     next_id: AtomicU16,
-    // Health monitoring fields for UDP socket error recovery
-    // UDP socket 错误恢复的健康监控字段
-    consecutive_errors: Arc<AtomicUsize>,        // 连续错误计数 / Consecutive error count
-    health_threshold: Arc<AtomicUsize>,          // 错误阈值 / Error threshold
-    last_error_time: Arc<AtomicU64>,             // 最后错误时间戳（毫秒） / Last error timestamp (ms)
-    recv_loop_running: Arc<AtomicBool>,          // 接收循环运行状态 / Recv loop running status
 }
 
-/// 高性能 UDP 客户端池 / High-performance UDP client pool
-/// 使用 DashMap 支持原子性的 socket 替换
-/// Uses DashMap for atomic socket replacement
+/// 高性能 UDP 客户端池，使用 channel 分发 socket / High-performance UDP client pool using channel for socket distribution
 struct UdpClient {
-    pool: DashMap<usize, Arc<UdpSocketState>, FxBuildHasher>,
-    pool_size: usize,
+    pool: Vec<UdpSocketState>,
     next_idx: AtomicUsize,
 }
 
@@ -3493,255 +3483,130 @@ impl UdpClient {
     fn new(size: usize) -> Self {
         // Prevent port exhaustion by enforcing minimum pool size
         let effective_size = if size == 0 { 1 } else { size };
-        let pool = DashMap::with_capacity_and_hasher(effective_size, FxBuildHasher::default());
-
+        let mut pool = Vec::with_capacity(effective_size);
         for idx in 0..effective_size {
-            let state = Self::create_socket_state(idx);
-            pool.insert(idx, Arc::new(state));
-        }
+            // Use socket2 to set buffer sizes
+            let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("create socket");
+            // Set buffer sizes to 4MB to prevent packet loss under load
+            if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
+                warn!("failed to set udp recv buffer size: {}", e);
+            }
+            if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
+                warn!("failed to set udp send buffer size: {}", e);
+            }
+            socket.bind(&"0.0.0.0:0".parse::<SocketAddr>().expect("parse ephemeral address").into()).expect("bind");
+            socket.set_nonblocking(true).expect("set nonblocking");
+            
+            let std_sock: std::net::UdpSocket = socket.into();
+            let socket = Arc::new(tokio::net::UdpSocket::from_std(std_sock).expect("from_std"));
+            let inflight = Arc::new(DashMap::with_hasher(FxBuildHasher::default()));
 
+            let state = UdpSocketState {
+                socket: socket.clone(),
+                inflight: inflight.clone(),
+                next_id: AtomicU16::new(0),
+            };
+            pool.push(state);
+
+            let socket_clone = socket.clone();
+            let inflight_clone = inflight.clone();
+            tokio::spawn(async move {
+                // Use BytesMut for efficient buffer management
+                let mut buf = BytesMut::with_capacity(4096);
+                buf.resize(4096, 0);
+                loop {
+                    match socket_clone.recv_from(&mut buf).await {
+                        Ok((len, src)) => {
+                            if len >= 2 {
+                                let id = u16::from_be_bytes([buf[0], buf[1]]);
+                                // 修复：使用try_remove，只有在地址匹配时才移除inflight
+                                // Fix: Only remove inflight if address matches (use try_remove logic)
+                                if let Some((_, (original_id, expected_addr, tx))) = inflight_clone.remove(&id) {
+                                    if src == expected_addr {
+                                        // Restore original TXID
+                                        let orig_bytes = original_id.to_be_bytes();
+                                        buf[0] = orig_bytes[0];
+                                        buf[1] = orig_bytes[1];
+
+                                        // 零拷贝优化：使用 split_to 复用已有容量，避免分配新内存
+                                        // Zero-copy optimization: use split_to to reuse existing capacity, avoid allocation
+                                        let response = buf.split_to(len).freeze();
+                                        // 修复：检查 channel 是否已关闭，防止残留条目
+                                        // Fix: Check if channel is closed to prevent stale entries
+                                        if tx.send(Ok(response)).is_err() {
+                                            tracing::debug!(
+                                                socket_idx = idx,
+                                                response_id = id,
+                                                "Failed to send UDP response, channel already closed"
+                                            );
+                                        }
+                                    } else {
+                                        // 地址不匹配：检查 channel 是否已关闭
+                                        // Address mismatch: check if channel is closed
+                                        if tx.is_closed() {
+                                            // channel 已关闭，说明请求已超时或失败，不要放回 inflight
+                                            tracing::debug!(
+                                                socket_idx = idx,
+                                                response_id = id,
+                                                expected_addr = %expected_addr,
+                                                actual_addr = %src,
+                                                "UDP response address mismatch but channel closed, dropping stale response"
+                                            );
+                                        } else {
+                                            // channel 仍然打开，放回等待正确响应
+                                            inflight_clone.insert(id, (original_id, expected_addr, tx));
+                                            tracing::warn!(
+                                                socket_idx = idx,
+                                                response_id = id,
+                                                expected_addr = %expected_addr,
+                                                actual_addr = %src,
+                                                "UDP response address mismatch, possible ID collision"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("UDP pool recv error: {}", e);
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            });
+        }
         Self {
             pool,
-            pool_size: effective_size,
             next_idx: AtomicUsize::new(0),
         }
     }
 
-    /// Create a new UdpSocketState with socket and recv loop
-    /// 创建新的 UdpSocketState，包含 socket 和接收循环
-    fn create_socket_state(idx: usize) -> UdpSocketState {
-        // Use socket2 to set buffer sizes
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("create socket");
-        // Set buffer sizes to 4MB to prevent packet loss under load
-        if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
-            warn!("failed to set udp recv buffer size: {}", e);
-        }
-        if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
-            warn!("failed to set udp send buffer size: {}", e);
-        }
-        socket.bind(&"0.0.0.0:0".parse::<SocketAddr>().expect("parse ephemeral address").into()).expect("bind");
-        socket.set_nonblocking(true).expect("set nonblocking");
-
-        let std_sock: std::net::UdpSocket = socket.into();
-        let socket = Arc::new(tokio::net::UdpSocket::from_std(std_sock).expect("from_std"));
-        let inflight: Arc<DashMap<u16, (u16, SocketAddr, oneshot::Sender<anyhow::Result<Bytes>>), FxBuildHasher>> =
-            Arc::new(DashMap::with_hasher(FxBuildHasher::default()));
-
-        // Create health monitoring fields for tracking error rate
-        // 创建健康监控字段用于追踪错误率
-        let consecutive_errors = Arc::new(AtomicUsize::new(0));
-        let health_threshold = Arc::new(AtomicUsize::new(10));
-        let last_error_time = Arc::new(AtomicU64::new(0));
-        let recv_loop_running = Arc::new(AtomicBool::new(true));
-
-        let socket_clone = socket.clone();
-        let inflight_clone = inflight.clone();
-        // Clone health monitoring fields for use in recv loop
-        // 克隆健康监控字段供 recv loop 使用
-        let consecutive_errors_clone = consecutive_errors.clone();
-        let health_threshold_clone = health_threshold.clone();
-        let last_error_time_clone = last_error_time.clone();
-        let recv_loop_running_clone = recv_loop_running.clone();
-
-        tokio::spawn(async move {
-            // Use BytesMut for efficient buffer management
-            let mut buf = BytesMut::with_capacity(4096);
-            buf.resize(4096, 0);
-            loop {
-                match socket_clone.recv_from(&mut buf).await {
-                    Ok((len, src)) => {
-                        // Successfully received packet, clear error counter
-                        // 成功接收数据包，清零错误计数
-                        consecutive_errors_clone.store(0, Ordering::Release);
-
-                        if len >= 2 {
-                            let id = u16::from_be_bytes([buf[0], buf[1]]);
-                            // 修复：使用try_remove，只有在地址匹配时才移除inflight
-                            // Fix: Only remove inflight if address matches (use try_remove logic)
-                            if let Some((_, (original_id, expected_addr, tx))) = inflight_clone.remove(&id) {
-                                if src == expected_addr {
-                                    // Restore original TXID
-                                    let orig_bytes = original_id.to_be_bytes();
-                                    buf[0] = orig_bytes[0];
-                                    buf[1] = orig_bytes[1];
-
-                                    // 零拷贝优化：使用 split_to 复用已有容量，避免分配新内存
-                                    // Zero-copy optimization: use split_to to reuse existing capacity, avoid allocation
-                                    let response = buf.split_to(len).freeze();
-                                    // 修复：检查 channel 是否已关闭，防止残留条目
-                                    // Fix: Check if channel is closed to prevent stale entries
-                                    if tx.send(Ok(response)).is_err() {
-                                        tracing::debug!(
-                                            socket_idx = idx,
-                                            response_id = id,
-                                            "Failed to send UDP response, channel already closed"
-                                        );
-                                    }
-                                } else {
-                                    // 地址不匹配：检查 channel 是否已关闭
-                                    // Address mismatch: check if channel is closed
-                                    if tx.is_closed() {
-                                        // channel 已关闭，说明请求已超时或失败，不要放回 inflight
-                                        tracing::debug!(
-                                            socket_idx = idx,
-                                            response_id = id,
-                                            expected_addr = %expected_addr,
-                                            actual_addr = %src,
-                                            "UDP response address mismatch but channel closed, dropping stale response"
-                                        );
-                                    } else {
-                                        // channel 仍然打开，放回等待正确响应
-                                        inflight_clone.insert(id, (original_id, expected_addr, tx));
-                                        tracing::warn!(
-                                            socket_idx = idx,
-                                            response_id = id,
-                                            expected_addr = %expected_addr,
-                                            actual_addr = %src,
-                                            "UDP response address mismatch, possible ID collision"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // Rust 最佳实践：区分错误类型
-                        // Rust best practice: distinguish error types
-                        match e.kind() {
-                            ErrorKind::Interrupted => {
-                                // 信号中断：立即重试，不计数
-                                // Signal interrupt: retry immediately, don't count
-                                continue;
-                            }
-                            ErrorKind::WouldBlock => {
-                                // Tokio 已经处理了，不应该发生
-                                // Tokio handles this, should not happen
-                                unreachable!("Tokio handles WouldBlock internally");
-                            }
-                            ErrorKind::ConnectionReset |
-                            ErrorKind::ConnectionAborted |
-                            ErrorKind::BrokenPipe => {
-                                // 致命错误：停止 recv loop
-                                // Fatal error: stop recv loop
-                                tracing::error!(
-                                    socket_idx = idx,
-                                    error = %e,
-                                    error_kind = ?e.kind(),
-                                    "Fatal UDP socket error (connection error), stopping recv loop"
-                                );
-                                recv_loop_running_clone.store(false, Ordering::Release);
-                                break;
-                            }
-                            _ => {
-                                // 其他错误：记录并使用指数退避重试
-                                // Other errors: log and retry with exponential backoff
-                                let errors = consecutive_errors_clone.fetch_add(1, Ordering::Release) + 1;
-                                let threshold = health_threshold_clone.load(Ordering::Acquire);
-
-                                tracing::error!(
-                                    socket_idx = idx,
-                                    consecutive_errors = errors,
-                                    threshold = threshold,
-                                    error = %e,
-                                    error_kind = ?e.kind(),
-                                    "UDP recv error"
-                                );
-
-                                // 记录错误时间戳
-                                // Record error timestamp
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_millis() as u64;
-                                last_error_time_clone.store(now, Ordering::Release);
-
-                                // 如果连续错误太多，停止 recv loop
-                                if errors >= threshold {
-                                    tracing::error!(
-                                        socket_idx = idx,
-                                        consecutive_errors = errors,
-                                        "Too many consecutive UDP errors, stopping recv loop"
-                                    );
-                                    recv_loop_running_clone.store(false, Ordering::Release);
-                                    break;
-                                }
-
-                                // 使用指数退避：100ms → 200ms → 400ms → 800ms → max 1s
-                                // Use exponential backoff
-                                let backoff_ms = 100u64 * (1u64 << (errors.min(5) as u64)).min(10);
-                                let backoff = Duration::from_millis(backoff_ms);
-
-                                tracing::debug!(
-                                    socket_idx = idx,
-                                    consecutive_errors = errors,
-                                    backoff_ms = backoff_ms,
-                                    "UDP recv error, using exponential backoff"
-                                );
-
-                                tokio::time::sleep(backoff).await;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        UdpSocketState {
-            socket,
-            inflight,
-            next_id: AtomicU16::new(0),
-            consecutive_errors,
-            health_threshold,
-            last_error_time,
-            recv_loop_running,
-        }
-    }
-
-    /// Recreate a failed socket
-    /// 重建失败的 socket
-    async fn recreate_socket(&self, idx: usize) -> anyhow::Result<()> {
-        tracing::info!(
-            socket_idx = idx,
-            "Recreating UDP socket"
-        );
-
-        // Create new socket state
-        // 创建新的 socket 状态
-        let new_state = Arc::new(Self::create_socket_state(idx));
-
-        // Atomically replace in DashMap
-        // 在 DashMap 中原子性地替换
-        self.pool.insert(idx, new_state);
-
-        tracing::info!(
-            socket_idx = idx,
-            "UDP socket recreated successfully"
-        );
-
-        Ok(())
-    }
-
-    /// Send packet using a specific socket state
-    /// 使用指定的 socket state 发送数据包
-    async fn send_with_socket(
+    #[inline]
+    async fn send(
         &self,
-        state: &Arc<UdpSocketState>,
-        socket_idx: usize,
         packet: &[u8],
-        addr: SocketAddr,
+        upstream: &str,
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
+        if self.pool.is_empty() {
+            return Err(anyhow::anyhow!("UDP pool not initialized"));
+        }
+
+        // Pool logic
+        let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % self.pool.len();
+        let state = &self.pool[idx];
+        let addr: SocketAddr = upstream.parse().context("invalid upstream address")?;
+
         if packet.len() < 2 {
             return Err(anyhow::anyhow!("packet too short"));
         }
         let original_id = u16::from_be_bytes([packet[0], packet[1]]);
 
         // Find a free ID using atomic entry API to avoid race conditions and double locking
-        // 使用原子 entry API 查找空闲 ID，避免竞态条件和双重锁定
         let mut attempts = 0;
         let mut new_id;
         let (tx, rx) = oneshot::channel();
-
+        
         loop {
             new_id = state.next_id.fetch_add(1, Ordering::Relaxed);
             match state.inflight.entry(new_id) {
@@ -3752,7 +3617,7 @@ impl UdpClient {
                 dashmap::mapref::entry::Entry::Occupied(_) => {
                     attempts += 1;
                     if attempts > 100 {
-                        warn!("udp pool exhausted: socket_idx={} inflight_count={}", socket_idx, state.inflight.len());
+                        warn!("udp pool exhausted: socket_idx={} inflight_count={}", idx, state.inflight.len());
                         return Err(anyhow::anyhow!("udp pool exhausted (too many inflight requests)"));
                     }
                 }
@@ -3760,7 +3625,6 @@ impl UdpClient {
         }
 
         // Rewrite packet with new ID using BytesMut to avoid full copy
-        // 使用 BytesMut 重写数据包的 ID，避免完全复制
         let mut new_packet = BytesMut::with_capacity(packet.len());
         new_packet.extend_from_slice(packet);
         let id_bytes = new_id.to_be_bytes();
@@ -3775,7 +3639,6 @@ impl UdpClient {
         match timeout(timeout_dur, rx).await {
             Ok(Ok(res)) => res,
             Ok(Err(_)) => {
-                // Fix: remove inflight entry when channel closes to prevent resource leak
                 // 修复：channel关闭时也要移除inflight条目，防止资源泄漏
                 state.inflight.remove(&new_id);
                 Err(anyhow::anyhow!("channel closed"))
@@ -3785,189 +3648,6 @@ impl UdpClient {
                 Err(anyhow::anyhow!("upstream timeout"))
             }
         }
-    }
-
-    /// Send packet with automatic retry on different sockets
-    /// 发送数据包，支持在不同 socket 上自动重试
-    #[inline]
-    async fn send(
-        &self,
-        packet: &[u8],
-        upstream: &str,
-        timeout_dur: Duration,
-    ) -> anyhow::Result<Bytes> {
-        if self.pool.is_empty() {
-            return Err(anyhow::anyhow!("UDP pool not initialized"));
-        }
-
-        let addr: SocketAddr = upstream.parse().context("invalid upstream address")?;
-
-        // Round-robin starting position
-        // 轮询起始位置
-        let start_idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % self.pool_size;
-
-        // Try up to pool_size times, each time with a different socket
-        // 最多尝试 pool_size 次，每次使用不同的 socket
-        for attempt in 0..self.pool_size {
-            let idx = (start_idx + attempt) % self.pool_size;
-
-            // Get socket state from DashMap
-            // 从 DashMap 获取 socket 状态
-            let state_ref = self.pool.get(&idx)
-                .ok_or_else(|| anyhow::anyhow!("UDP socket {} not found in pool", idx))?;
-
-            // Clone Arc to extend lifetime beyond the DashMap reference
-            // 克隆 Arc 以延长生命周期超过 DashMap 引用
-            let state = state_ref.value().clone();
-
-            // Check if recv loop is still running
-            // 检查接收循环是否仍在运行
-            if !state.recv_loop_running.load(Ordering::Acquire) {
-                // Socket failed, attempt to recreate (only on first encounter)
-                // Socket 失败，尝试重建（只在第一次遇到时）
-                if attempt == 0 {
-                    // Attempt to atomically claim recreation rights using compare_exchange
-                    // 尝试使用 compare_exchange 原子性地获取重建权限
-                    let recreation_won = state.recv_loop_running.compare_exchange(
-                        false,  // Expected: recv loop is stopped
-                        true,   // New value: mark as running (recreation in progress)
-                        Ordering::AcqRel,
-                        Ordering::Acquire
-                    );
-
-                    match recreation_won {
-                        Ok(_) => {
-                            // We won the race! This task is responsible for recreation
-                            // 我们赢得了竞争！此任务负责重建
-                            tracing::warn!(
-                                socket_idx = idx,
-                                "Socket {} recv loop stopped, attempting recreation",
-                                idx
-                            );
-
-                            if let Err(e) = self.recreate_socket(idx).await {
-                                // Recreation failed, restore state to false so other tasks can try
-                                // 重建失败，恢复状态为 false 以便其他任务尝试
-                                state.recv_loop_running.store(false, Ordering::Release);
-                                tracing::error!(
-                                    socket_idx = idx,
-                                    error = %e,
-                                    "Failed to recreate UDP socket"
-                                );
-                                // Continue to next socket instead of returning error
-                                // 继续尝试下一个 socket 而不是返回错误
-                                continue;
-                            }
-
-                            tracing::info!(
-                                socket_idx = idx,
-                                "UDP socket {} recreated successfully",
-                                idx
-                            );
-
-                            // Get the new state after recreation
-                            // 获取重建后的新状态
-                            let state_ref = self.pool.get(&idx)
-                                .ok_or_else(|| anyhow::anyhow!("UDP socket {} not found after recreation", idx))?;
-                            let state = state_ref.value().clone();
-
-                            if !state.recv_loop_running.load(Ordering::Acquire) {
-                                // Recreated socket still not healthy, try next socket
-                                // 重建的 socket 仍然不健康，尝试下一个 socket
-                                tracing::warn!(
-                                    socket_idx = idx,
-                                    "Recreated socket {} still not healthy, trying next socket",
-                                    idx
-                                );
-                                continue;
-                            }
-
-                            // Try sending with the recreated socket
-                            // 尝试使用重建的 socket 发送
-                            let result = self.send_with_socket(&state, idx, packet, addr, timeout_dur).await;
-                            if result.is_ok() {
-                                return result;
-                            }
-                            // Send failed, try next socket
-                            // 发送失败，尝试下一个 socket
-                            tracing::debug!(
-                                socket_idx = idx,
-                                "Sending with recreated socket {} failed, trying next socket",
-                                idx
-                            );
-                            continue;
-                        }
-                        Err(_) => {
-                            // Another task is recreating the socket, try next socket immediately
-                            // 其他任务正在重建 socket，立即尝试下一个 socket
-                            tracing::debug!(
-                                socket_idx = idx,
-                                "Socket {} is being recreated by another task, trying next socket",
-                                idx
-                            );
-                            continue;
-                        }
-                    }
-                } else {
-                    // Not the first attempt, just skip to next socket
-                    // 不是第一次尝试，直接跳过到下一个 socket
-                    tracing::debug!(
-                        socket_idx = idx,
-                        attempt = attempt,
-                        "Socket {} not healthy, trying next socket",
-                        idx
-                    );
-                    continue;
-                }
-            }
-
-            // Socket is healthy, try sending
-            // Socket 健康，尝试发送
-            match self.send_with_socket(&state, idx, packet, addr, timeout_dur).await {
-                Ok(response) => {
-                    // Success! Return the response
-                    // 成功！返回响应
-                    if attempt > 0 {
-                        tracing::debug!(
-                            socket_idx = idx,
-                            attempt = attempt,
-                            "Successfully sent using socket {} after {} retries",
-                            idx, attempt
-                        );
-                    }
-                    return Ok(response);
-                }
-                Err(e) => {
-                    // Send failed, try next socket if not the last attempt
-                    // 发送失败，如果不是最后一次尝试，尝试下一个 socket
-                    if attempt < self.pool_size - 1 {
-                        tracing::debug!(
-                            socket_idx = idx,
-                            attempt = attempt,
-                            error = %e,
-                            "Sending with socket {} failed, trying next socket",
-                            idx
-                        );
-                        continue;
-                    } else {
-                        // Last attempt failed, return error
-                        // 最后一次尝试失败，返回错误
-                        tracing::error!(
-                            socket_idx = idx,
-                            attempt = attempt,
-                            error = %e,
-                            "All {} UDP sockets failed",
-                            self.pool_size
-                        );
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
-        // Should never reach here, but handle gracefully
-        // 理论上不会到达这里，但优雅处理
-        Err(anyhow::anyhow!("UDP pool exhausted: all sockets failed"))
     }
 }
 
