@@ -724,11 +724,8 @@ impl Engine {
             (pm, None)
         };
 
-        // TCP uses independent permit manager (separate from UDP)
-        // TCP 使用独立的 permit manager（与 UDP 分离）
-        // TCP permit limit = tcp_pool_size (one permit per connection)
-        // TCP permit 上限 = tcp_pool_size（每个连接一个 permit）
-        let tcp_permit_manager = Arc::new(PermitManager::new(tcp_pool_size));
+        // TCP pool size is per-upstream; each upstream gets its own permit manager
+        // TCP 连接池大小为“每个 upstream”独立配置；每个 upstream 有各自的 permit manager
 
         Self {
             state,
@@ -736,7 +733,6 @@ impl Engine {
             udp_client: Arc::new(UdpClient::new(udp_pool_size)),
             tcp_mux: Arc::new(TcpMultiplexer::new(
                 tcp_pool_size,
-                tcp_permit_manager,
                 tcp_health_error_threshold,
                 tcp_max_age_secs,
                 tcp_idle_timeout_secs,
@@ -3849,9 +3845,8 @@ impl UdpClient {
 struct TcpMultiplexer {
     pools: dashmap::DashMap<Arc<str>, Arc<TcpConnectionPool>, FxBuildHasher>,
     pool_size: usize,
-    /// Shared permit manager for unified TCP/UDP concurrency control
-    /// 共享 permit manager 用于统一的 TCP/UDP 并发控制
-    permit_manager: Arc<PermitManager>,
+    /// Per-upstream permit manager is created when pool is initialized
+    /// 每个 upstream 在初始化连接池时创建独立的 permit manager
     /// 健康检查配置 / Health check configuration
     health_error_threshold: usize,
     max_age_secs: u64,
@@ -3866,7 +3861,6 @@ struct TcpConnectionPool {
 impl TcpMultiplexer {
     fn new(
         pool_size: usize,
-        permit_manager: Arc<PermitManager>,
         health_error_threshold: usize,
         max_age_secs: u64,
         idle_timeout_secs: u64,
@@ -3874,11 +3868,42 @@ impl TcpMultiplexer {
         Self {
             pools: dashmap::DashMap::with_hasher(FxBuildHasher::default()),
             pool_size,
-            permit_manager,
             health_error_threshold,
             max_age_secs,
             idle_timeout_secs,
         }
+    }
+
+    /// Test-only helper to initialize or get a pool without network operations
+    /// This mirrors the production pool initialization logic used in send().
+    #[cfg(test)]
+    fn get_or_init_pool_for_test(&self, upstream: &str) -> Arc<TcpConnectionPool> {
+        let upstream_key: Arc<str> = Arc::from(upstream);
+        self.pools
+            .entry(upstream_key.clone())
+            .or_insert_with(|| {
+                let mut clients = Vec::with_capacity(self.pool_size);
+                let size = if self.pool_size == 0 { 1 } else { self.pool_size };
+                // Create per-upstream permit manager to avoid global TCP limit
+                let permit_mgr = Arc::new(PermitManager::new(size));
+                for _ in 0..size {
+                    let client = Arc::new(TcpMuxClient::new(
+                        upstream_key.clone(),
+                        Arc::clone(&permit_mgr),
+                    ));
+                    client.set_health_check_config(
+                        self.health_error_threshold,
+                        self.max_age_secs,
+                        self.idle_timeout_secs,
+                    );
+                    clients.push(client);
+                }
+                Arc::new(TcpConnectionPool {
+                    clients,
+                    next_idx: AtomicUsize::new(0),
+                })
+            })
+            .clone()
     }
 
     #[inline]
@@ -3895,7 +3920,9 @@ impl TcpMultiplexer {
             .or_insert_with(|| {
                 let mut clients = Vec::with_capacity(self.pool_size);
                 let size = if self.pool_size == 0 { 1 } else { self.pool_size };
-                let permit_mgr = Arc::clone(&self.permit_manager);
+                // Create per-upstream permit manager to avoid global TCP limit
+                // 为每个 upstream 创建独立的 permit manager，避免全局 TCP 限制
+                let permit_mgr = Arc::new(PermitManager::new(size));
                 for _ in 0..size {
                     let client = Arc::new(TcpMuxClient::new(
                         upstream_key.clone(),
@@ -3973,8 +4000,8 @@ struct TcpMuxClient {
     conn: Arc<Mutex<Option<OwnedWriteHalf>>>,
     pending: Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
     next_id: AtomicU16,
-    /// Shared permit manager for TCP connection-level control (unified with UDP)
-    /// TCP 连接级别并发控制共享 permit manager（与 UDP 统一）
+    /// Per-upstream permit manager for TCP connection-level control
+    /// TCP 连接级别并发控制的 per-upstream permit manager
     permit_manager: Arc<PermitManager>,
     /// Connection-level permit (acquired when connection is established, held for connection lifetime)
     /// 连接级别 permit（连接建立时获取，连接生命周期内持有）
@@ -4569,6 +4596,7 @@ mod tests {
     use crate::config::{GlobalSettings, MatchOperator};
     use hickory_proto::rr::RecordType;
     use hickory_proto::op::{Message, OpCode, Query};
+    use std::sync::Arc;
 
     // ========================================================================
     // Engine Helper Functions Unit Tests / 引擎辅助函数单元测试
@@ -4735,6 +4763,36 @@ mod tests {
         // Assert: Verify ServFail response and empty answers
         assert_eq!(rcode, ResponseCode::ServFail, "Should return ServFail for invalid IP");
         assert!(answers.is_empty(), "Should have no answers for invalid IP");
+    }
+
+    #[test]
+    fn test_tcp_pool_per_upstream_permit_manager_isolated() {
+        // ========== Arrange ==========
+        let mux = TcpMultiplexer::new(2, 3, 0, 0);
+
+        // ========== Act ==========
+        let pool_a = mux.get_or_init_pool_for_test("1.1.1.1:53");
+        let pool_b = mux.get_or_init_pool_for_test("8.8.8.8:53");
+        let permit_a = Arc::clone(&pool_a.clients[0].permit_manager);
+        let permit_b = Arc::clone(&pool_b.clients[0].permit_manager);
+
+        // ========== Assert ==========
+        assert_eq!(pool_a.clients.len(), 2, "Pool A should have two clients");
+        assert_eq!(pool_b.clients.len(), 2, "Pool B should have two clients");
+        assert!(
+            Arc::ptr_eq(&permit_a, &pool_a.clients[1].permit_manager),
+            "All clients in the same pool should share one permit manager"
+        );
+        assert!(
+            Arc::ptr_eq(&permit_b, &pool_b.clients[1].permit_manager),
+            "All clients in the same pool should share one permit manager"
+        );
+        assert!(
+            !Arc::ptr_eq(&permit_a, &permit_b),
+            "Different upstreams should have distinct permit managers"
+        );
+        assert_eq!(permit_a.max_permits(), 2, "Permit manager should match pool size for upstream A");
+        assert_eq!(permit_b.max_permits(), 2, "Permit manager should match pool size for upstream B");
     }
 
     #[test]

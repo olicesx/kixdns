@@ -79,6 +79,7 @@ macro_rules! safe_some {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
     #[test]
     fn test_safe_parse() {
@@ -98,13 +99,19 @@ mod tests {
 
     #[test]
     fn test_safe_parse_ip() {
-        let ip = safe_parse_ip!("8.8.8.8", std::net::Ipv4Addr::UNSPECIFIED);
+        let ip = safe_parse_ip!(
+            "8.8.8.8",
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        );
         assert_eq!(ip, "8.8.8.8".parse::<std::net::IpAddr>().unwrap());
     }
 
     #[test]
     fn test_safe_parse_ip_invalid() {
-        let ip = safe_parse_ip!("invalid", std::net::Ipv4Addr::UNSPECIFIED);
-        assert_eq!(ip, std::net::Ipv4Addr::UNSPECIFIED);
+        let ip = safe_parse_ip!(
+            "invalid",
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        );
+        assert_eq!(ip, std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
     }
 }
