@@ -139,8 +139,8 @@ pub struct Engine {
     pub permit_manager: Arc<PermitManager>,
     // Latest upstream latency for adaptive flow control / 用于自适应流控的最新上游延迟
     pub metrics_last_upstream_latency_ns: Arc<AtomicU64>,
-    // Adaptive flow control state / 自适应流控状态
-    pub flow_control_state: Arc<FlowControlState>,
+    // Adaptive flow control state (None when flow control is disabled) / 自适应流控状态（禁用流控时为None）
+    pub flow_control_state: Option<Arc<FlowControlState>>,
     // Cache background refresh settings / 缓存后台刷新设置
     cache_background_refresh: bool,
     cache_refresh_threshold_percent: u8,
@@ -188,6 +188,17 @@ impl PermitManager {
         Self {
             active_permits: AtomicUsize::new(0),
             max_permits: AtomicUsize::new(initial_permits),
+            last_recovery_ms: AtomicU64::new(0),
+            dropped_requests: AtomicU64::new(0),
+        }
+    }
+
+    /// 创建一个无限制的PermitManager（用于rustdns风格的无流控模式）
+    /// Create an unlimited PermitManager (for rustdns-style no-flow-control mode)
+    pub fn new_unlimited() -> Self {
+        Self {
+            active_permits: AtomicUsize::new(0),
+            max_permits: AtomicUsize::new(usize::MAX),
             last_recovery_ms: AtomicU64::new(0),
             dropped_requests: AtomicU64::new(0),
         }
@@ -511,6 +522,7 @@ impl Engine {
         // Extract flow control settings before moving cfg / 在 move cfg 之前提取流控设置
         let udp_pool_size = cfg.settings.udp_pool_size;
         let tcp_pool_size = cfg.settings.tcp_pool_size;
+        let flow_control_enabled = cfg.settings.flow_control_enabled;
         let flow_control_initial_permits = cfg.settings.flow_control_initial_permits;
         let flow_control_min_permits = cfg.settings.flow_control_min_permits;
         let flow_control_max_permits = cfg.settings.flow_control_max_permits;
@@ -691,7 +703,26 @@ impl Engine {
             critical_latency_threshold_ns: flow_control_latency_threshold_ms * 1_000_000,
             adjustment_interval_ms: flow_control_adjustment_interval_secs * 1000,
         });
-        let permit_manager = Arc::new(PermitManager::new(flow_control_initial_permits));
+
+        // 根据配置决定是否启用流控 / Decide whether to enable flow control based on configuration
+        // 如果禁用流控，使用usize::MAX作为max_permits，实现"无限制"模式
+        // When flow control is disabled, use usize::MAX as max_permits for "unlimited" mode
+        let (permit_manager, flow_control_state) = if flow_control_enabled {
+            let pm = Arc::new(PermitManager::new(flow_control_initial_permits));
+            pm.set_max_permits(flow_control_max_permits);
+            (pm, Some(Arc::new(FlowControlState {
+                max_permits: AtomicUsize::new(flow_control_max_permits),
+                min_permits: flow_control_min_permits,
+                last_adjustment_ms: AtomicU64::new(0),
+                critical_latency_threshold_ns: flow_control_latency_threshold_ms * 1_000_000,
+                adjustment_interval_ms: flow_control_adjustment_interval_secs * 1000,
+            })))
+        } else {
+            // 无限制模式：创建一个max_permits=usize::MAX的PermitManager
+            // Unlimited mode: create a PermitManager with max_permits=usize::MAX
+            let pm = Arc::new(PermitManager::new_unlimited());
+            (pm, None)
+        };
 
         // TCP uses independent permit manager (separate from UDP)
         // TCP 使用独立的 permit manager（与 UDP 分离）
@@ -785,7 +816,11 @@ impl Engine {
 
     /// 动态调整 flow control permits 基于系统负载和延迟 / Adaptively adjust flow control permits based on system load and latency
     pub fn adjust_flow_control(&self) {
-        let state = &self.flow_control_state;
+        // 如果流控被禁用，直接返回 / If flow control is disabled, return early
+        let state = match &self.flow_control_state {
+            Some(s) => s,
+            None => return,
+        };
 
         // Get current time in milliseconds
         let now_ms = std::time::SystemTime::now()

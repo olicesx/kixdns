@@ -126,19 +126,26 @@ pub struct GlobalSettings {
     /// 0 表示禁用空闲超时检查 / 0 means disable idle timeout check
     #[serde(default = "default_tcp_connection_idle_timeout_seconds")]
     pub tcp_connection_idle_timeout_seconds: u64,
-    /// 自适应流控初始 permits 数量。 / Initial permits for adaptive flow control
+    /// 是否启用自适应流控（默认false，推荐禁用以获得更好的性能和更简单的行为）
+    /// Enable adaptive flow control (default false, recommended disabled for better performance and simpler behavior)
+    /// 
+    /// 禁用后采用rustdns风格：不限制并发，依赖tokio runtime调度和超时保护
+    /// When disabled, use rustdns style: no concurrency limit, rely on tokio runtime scheduling and timeout protection
+    #[serde(default = "default_flow_control_enabled")]
+    pub flow_control_enabled: bool,
+    /// 自适应流控初始 permits 数量（仅在flow_control_enabled=true时有效） / Initial permits for adaptive flow control (only effective when flow_control_enabled=true)
     #[serde(default = "default_flow_control_initial_permits")]
     pub flow_control_initial_permits: usize,
-    /// 自适应流控最小 permits 数量。 / Minimum permits for adaptive flow control
+    /// 自适应流控最小 permits 数量（仅在flow_control_enabled=true时有效） / Minimum permits for adaptive flow control (only effective when flow_control_enabled=true)
     #[serde(default = "default_flow_control_min_permits")]
     pub flow_control_min_permits: usize,
-    /// 自适应流控最大 permits 数量。 / Maximum permits for adaptive flow control
+    /// 自适应流控最大 permits 数量（仅在flow_control_enabled=true时有效） / Maximum permits for adaptive flow control (only effective when flow_control_enabled=true)
     #[serde(default = "default_flow_control_max_permits")]
     pub flow_control_max_permits: usize,
-    /// 上游延迟告急阈值（毫秒）。 / Critical latency threshold (milliseconds)
+    /// 上游延迟告急阈值（毫秒，仅在flow_control_enabled=true时有效） / Critical latency threshold (milliseconds, only effective when flow_control_enabled=true)
     #[serde(default = "default_flow_control_latency_threshold_ms")]
     pub flow_control_latency_threshold_ms: u64,
-    /// 流控调整间隔（秒）。 / Flow control adjustment interval (seconds)
+    /// 流控调整间隔（秒，仅在flow_control_enabled=true时有效） / Flow control adjustment interval (seconds, only effective when flow_control_enabled=true)
     #[serde(default = "default_flow_control_adjustment_interval_secs")]
     pub flow_control_adjustment_interval_secs: u64,
     /// 缓存后台刷新是否启用（默认false） / Enable cache background refresh (default false)
@@ -183,6 +190,7 @@ impl Default for GlobalSettings {
             tcp_health_check_error_threshold: default_tcp_health_check_error_threshold(),
             tcp_connection_max_age_seconds: default_tcp_connection_max_age_seconds(),
             tcp_connection_idle_timeout_seconds: default_tcp_connection_idle_timeout_seconds(),
+            flow_control_enabled: default_flow_control_enabled(),
             flow_control_initial_permits: default_flow_control_initial_permits(),
             flow_control_min_permits: default_flow_control_min_permits(),
             flow_control_max_permits: default_flow_control_max_permits(),
@@ -794,6 +802,10 @@ fn default_tcp_connection_max_age_seconds() -> u64 {
 
 fn default_tcp_connection_idle_timeout_seconds() -> u64 {
     60 // 1 分钟 / 1 minute
+}
+
+fn default_flow_control_enabled() -> bool {
+    false  // 默认禁用，采用rustdns风格 / Default disabled, use rustdns style
 }
 
 fn default_flow_control_initial_permits() -> usize {
