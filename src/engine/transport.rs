@@ -20,6 +20,19 @@ use super::concurrency::{PermitManager, PermitGuard};
 /// ID -> (OriginalID, ExpectedAddr, Sender)
 type UdpInflightMap = DashMap<u16, (u16, SocketAddr, oneshot::Sender<anyhow::Result<Bytes>>), FxBuildHasher>;
 
+/// RAII Guard to ensure inflight entries are removed even on cancellation/panic
+/// RAII Guard 确保即使在取消或 panic 时也能移除 inflight 条目
+struct InflightGuard {
+    inflight: Arc<UdpInflightMap>,
+    id: u16,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.inflight.remove(&self.id);
+    }
+}
+
 struct UdpSocketState {
     socket: Arc<tokio::net::UdpSocket>,
     /// Inflight map: ID -> (OriginalID, ExpectedAddr, Sender)
@@ -166,11 +179,12 @@ impl UdpClient {
         }
         let original_id = u16::from_be_bytes([packet[0], packet[1]]);
 
-        // Find a free ID using atomic entry API to avoid race conditions and double locking
+        // Find a free ID using atomic entry API
+        // 使用原子 Entry API 查找空闲 ID
         let mut attempts = 0;
         let mut new_id;
         let (tx, rx) = oneshot::channel();
-        
+
         loop {
             new_id = state.next_id.fetch_add(1, Ordering::Relaxed);
             match state.inflight.entry(new_id) {
@@ -188,6 +202,14 @@ impl UdpClient {
             }
         }
 
+        // RAII Guard: ensures entry is removed from map when guard is dropped
+        // (e.g. timeout, cancel, early return)
+        // RAII Guard：确保在 guard 丢弃时（超时、取消、提前返回）移除条目
+        let _guard = InflightGuard {
+            inflight: state.inflight.clone(),
+            id: new_id,
+        };
+
         // Rewrite packet with new ID using BytesMut to avoid full copy
         let mut new_packet = BytesMut::with_capacity(packet.len());
         new_packet.extend_from_slice(packet);
@@ -196,19 +218,17 @@ impl UdpClient {
         new_packet[1] = id_bytes[1];
 
         if let Err(e) = state.socket.send_to(&new_packet, addr).await {
-            state.inflight.remove(&new_id);
+            // Guard will remove inflight entry automatically
             return Err(e.into());
         }
 
         match timeout(timeout_dur, rx).await {
             Ok(Ok(res)) => res,
             Ok(Err(_)) => {
-                // 修复：channel关闭时也要移除inflight条目，防止资源泄漏
-                state.inflight.remove(&new_id);
+                // Channel closed by receiver (should not happen normally unless logic error or panic)
                 Err(anyhow::anyhow!("channel closed"))
             }
             Err(_) => {
-                state.inflight.remove(&new_id);
                 Err(anyhow::anyhow!("upstream timeout"))
             }
         }
@@ -451,6 +471,18 @@ pub struct TcpMuxClient {
 struct Pending {
     original_id: u16,
     tx: oneshot::Sender<anyhow::Result<Bytes>>,
+}
+
+/// RAII Guard for TCP pending requests to ensure cleanup on cancellation
+struct TcpPendingGuard {
+    pending: Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
+    id: u16,
+}
+
+impl Drop for TcpPendingGuard {
+    fn drop(&mut self) {
+        self.pending.remove(&self.id);
+    }
 }
 
 impl TcpMuxClient {
@@ -697,6 +729,13 @@ impl TcpMuxClient {
         // 原子操作：分配 ID 并注册到 pending map，避免竞态条件
         let (new_packet, new_id) = self.register_pending(packet, original_id, tx).await?;
 
+        // RAII Guard: ensures entry is removed from map when guard is dropped
+        // RAII Guard：确保在 guard 丢弃时（超时、取消、提前返回）移除条目
+        let _guard = TcpPendingGuard {
+            pending: self.pending.clone(),
+            id: new_id,
+        };
+
         // 2. Write request with remaining timeout (connection already ensured)
         // 2. 写入请求（连接已确保）
         let write_res = timeout(remaining, async {
@@ -719,7 +758,9 @@ impl TcpMuxClient {
         match write_res {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
-                self.remove_pending(new_id).await;
+                // Guard will remove pending entry automatically
+                // Guard 会自动移除 pending 条目
+                
                 // Record error and check if reset is needed
                 // 记录错误并检查是否需要重置
                 self.record_error().await;
@@ -729,7 +770,8 @@ impl TcpMuxClient {
                 ));
             }
             Err(_) => {
-                self.remove_pending(new_id).await;
+                // Guard will remove pending entry automatically
+                
                 // Record error and check if reset is needed
                 // 记录错误并检查是否需要重置
                 self.record_error().await;
@@ -745,7 +787,8 @@ impl TcpMuxClient {
         // 3. 等待响应
         let elapsed_after_write = start.elapsed();
         if elapsed_after_write >= timeout_dur {
-            self.remove_pending(new_id).await;
+            // Guard will remove pending entry automatically
+            
             // Record error and check if reset is needed
             // 记录错误并检查是否需要重置
             self.record_error().await;
@@ -766,7 +809,8 @@ impl TcpMuxClient {
                 r?
             }
             Ok(Err(_canceled)) => {
-                self.remove_pending(new_id).await;
+                // Guard will remove pending entry automatically
+                
                 // Record error and check if reset is needed
                 // 记录错误并检查是否需要重置
                 self.record_error().await;
@@ -776,7 +820,8 @@ impl TcpMuxClient {
                 ));
             }
             Err(_elapsed) => {
-                self.remove_pending(new_id).await;
+                // Guard will remove pending entry automatically
+                
                 // Record error and check if reset is needed
                 // 记录错误并检查是否需要重置
                 self.record_error().await;
@@ -805,6 +850,20 @@ impl TcpMuxClient {
     /// - 连接关闭/重置时释放
     /// - 允许同一连接上无限请求（TCP 多路复用）
     async fn ensure_connection(&self) -> anyhow::Result<()> {
+        // First, check if we need to reconnect based on error state
+        // 首先，根据错误状态检查是否需要重连
+        let errors = self.consecutive_errors.load(Ordering::Acquire);
+        let needs_reset = errors > 0;
+
+        if needs_reset {
+            debug!(
+                upstream = %self.upstream,
+                consecutive_errors = errors,
+                "TCP connection has errors, resetting before ensure"
+            );
+            Self::reset_conn(&self.conn, &self.conn_permit).await;
+        }
+
         let mut guard = self.conn.lock().await;
 
         if guard.is_none() {
@@ -839,6 +898,10 @@ impl TcpMuxClient {
                 .as_millis() as u64;
             self.conn_create_time.store(now, Ordering::Release);
             self.last_request_time.store(now, Ordering::Release);
+
+            // Clear error count for new connection
+            // 清除新连接的错误计数
+            self.consecutive_errors.store(0, Ordering::Release);
 
             info!(
                 upstream = %self.upstream,
@@ -877,10 +940,6 @@ impl TcpMuxClient {
         buf.extend_from_slice(packet);
         buf[0..2].copy_from_slice(&new_id.to_be_bytes());
         Ok((buf, new_id))
-    }
-
-    async fn remove_pending(&self, id: u16) {
-        self.pending.remove(&id);
     }
 
     async fn fail_all_async(
