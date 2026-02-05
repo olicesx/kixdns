@@ -7,7 +7,7 @@ use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use dashmap::mapref::entry;
 use rustc_hash::FxBuildHasher;
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, Socket, Type, SockRef, TcpKeepalive};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, tcp::{OwnedReadHalf, OwnedWriteHalf}};
 use tokio::sync::{Mutex, oneshot};
@@ -698,6 +698,55 @@ impl TcpMuxClient {
             anyhow::bail!("dns packet too short for tcp");
         }
 
+        // Check if we are reusing an existing connection (for potential retry strategy)
+        // 检查我们是否在重用现有连接（用于潜在的重试策略）
+        let is_reused = {
+             let guard = self.conn.lock().await;
+             guard.is_some()
+        };
+
+        match self.send_attempt(packet, timeout_dur).await {
+            Ok(res) => Ok(res),
+            Err(err) => {
+                // TRANSPARENT RETRY: If connection was reused and failed with transport error, retry once with fresh connection
+                // 透明重试：如果连接是复用的并且因传输错误失败，则使用新连接重试一次
+                if is_reused {
+                    let elapsed = start.elapsed();
+                    // Calculate remaining budget, but ensure at least 1.5s for the fresh attempt
+                    // 计算剩余预算，但确认为新尝试保留至少 1.5s
+                    let remaining = if timeout_dur > elapsed {
+                        timeout_dur - elapsed
+                    } else {
+                        Duration::from_millis(0)
+                    };
+
+                    // Only retry if we have budget OR if we decide reliability > strict timeout
+                    // Strategy: If剩余时间 < 1s, we grant a "grace period" of 1s to save the query
+                    let retry_timeout = if remaining.as_millis() < 1000 {
+                        Duration::from_millis(1500)
+                    } else {
+                        remaining
+                    };
+
+                    tracing::warn!(
+                        upstream = %self.upstream,
+                        error = %err,
+                        retry_timeout_ms = retry_timeout.as_millis(),
+                        "Connection reuse failed, performing transparent retry with fresh connection"
+                    );
+
+                    // Connection should have been reset by send_attempt already upon error
+                    // send_attempt 出错时连接应该已经被重置
+                    return self.send_attempt(packet, retry_timeout).await;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    async fn send_attempt(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes> {
+        let start = tokio::time::Instant::now();
+
         // 性能优化：仅在距离上次检查超过 30 秒时才执行健康检查
         // Performance: Only check connection health if 30 seconds have passed since last check
         const HEALTH_CHECK_INTERVAL_MS: u64 = 30_000;  // 30 秒
@@ -761,9 +810,12 @@ impl TcpMuxClient {
                 // Guard will remove pending entry automatically
                 // Guard 会自动移除 pending 条目
                 
-                // Record error and check if reset is needed
-                // 记录错误并检查是否需要重置
+                // Record error and FORCE RESET on write failure (socket likely dead)
+                // 记录错误并在写入失败时强制重置（socket 可能已死）
                 self.record_error().await;
+                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                self.consecutive_errors.store(0, Ordering::Release);
+
                 return Err(err).context(format!(
                     "TCP write/connect failed for upstream {upstream}",
                     upstream = self.upstream
@@ -772,9 +824,12 @@ impl TcpMuxClient {
             Err(_) => {
                 // Guard will remove pending entry automatically
                 
-                // Record error and check if reset is needed
-                // 记录错误并检查是否需要重置
+                // Record error and FORCE RESET on write timeout
+                // 记录错误并在写入超时时强制重置
                 self.record_error().await;
+                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                self.consecutive_errors.store(0, Ordering::Release);
+                
                 return Err(anyhow::anyhow!(
                     "TCP write/connect timeout for upstream {upstream} (timeout: {timeout_ms}ms)",
                     upstream = self.upstream,
@@ -789,9 +844,12 @@ impl TcpMuxClient {
         if elapsed_after_write >= timeout_dur {
             // Guard will remove pending entry automatically
             
-            // Record error and check if reset is needed
-            // 记录错误并检查是否需要重置
+            // Record error and FORCE RESET on prereq timeout
+            // 记录错误并在超时时强制重置
             self.record_error().await;
+            Self::reset_conn(&self.conn, &self.conn_permit).await;
+            self.consecutive_errors.store(0, Ordering::Release);
+
             return Err(anyhow::anyhow!(
                 "TCP timeout before waiting for response from upstream {upstream} (elapsed: {elapsed_ms}ms, timeout: {timeout_ms}ms)",
                 upstream = self.upstream,
@@ -811,8 +869,8 @@ impl TcpMuxClient {
             Ok(Err(_canceled)) => {
                 // Guard will remove pending entry automatically
                 
-                // Record error and check if reset is needed
-                // 记录错误并检查是否需要重置
+                // Record error but DO NOT reset - Mux handles ignored responses
+                // 记录错误但不重置 - Mux 会处理被忽略的响应
                 self.record_error().await;
                 return Err(anyhow::anyhow!(
                     "TCP response canceled for upstream {upstream}",
@@ -822,9 +880,12 @@ impl TcpMuxClient {
             Err(_elapsed) => {
                 // Guard will remove pending entry automatically
                 
-                // Record error and check if reset is needed
-                // 记录错误并检查是否需要重置
+                // Record error and FORCE RESET on response timeout (connection likely dead/stalled)
+                // 记录错误并在响应超时时强制重置（连接可能死锁/停滞）
                 self.record_error().await;
+                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                self.consecutive_errors.store(0, Ordering::Release);
+                
                 return Err(anyhow::anyhow!(
                     "TCP response timeout from upstream {upstream} (remaining: {timeout_ms}ms)",
                     upstream = self.upstream,
@@ -876,6 +937,19 @@ impl TcpMuxClient {
             // 建立 TCP 连接
             let stream = TcpStream::connect(&*self.upstream).await
                 .map_err(|e| anyhow::anyhow!("tcp connect failed: {}", e))?;
+
+            // Configure socket options for robustness
+            // 配置 socket 选项以增强健壮性
+            let _ = stream.set_nodelay(true);
+
+            // Set Check to 15s to detect dead connections faster
+            let sock = SockRef::from(&stream);
+            let mut ka = TcpKeepalive::new();
+            ka = ka.with_time(Duration::from_secs(15));
+            ka = ka.with_interval(Duration::from_secs(5));
+            if let Err(e) = sock.set_tcp_keepalive(&ka) {
+                warn!(upstream = %self.upstream, error = %e, "Failed to set TCP keepalive");
+            }
 
             let (read_half, write_half) = stream.into_split();
 
