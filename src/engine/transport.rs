@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
+use dashmap::mapref::entry;
 use rustc_hash::FxBuildHasher;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -66,26 +67,38 @@ impl UdpClient {
             tokio::spawn(async move {
                 // Use BytesMut for efficient buffer management
                 let mut buf = BytesMut::with_capacity(4096);
-                buf.resize(4096, 0);
                 loop {
-                    match socket_clone.recv_from(&mut buf).await {
-                        Ok((len, src)) => {
+                    // Reset buffer: keep capacity but length=0
+                    // 重置缓冲区：保留容量但长度设为 0
+                    buf.clear();
+                    
+                    // Use recv_buf_from to write directly into uninitialized memory part of BytesMut
+                    // avoid zero-filling overhead from resize()
+                    // 使用 recv_buf_from 直接写入 BytesMut 的未初始化内存部分，避免 resize() 的置零开销
+                    if buf.capacity() < 4096 {
+                        buf.reserve(4096 - buf.capacity());
+                    }
+
+                    match socket_clone.recv_buf_from(&mut buf).await {
+                        Ok((_len, src)) => {
+                            let len = buf.len();
                             if len >= 2 {
                                 let id = u16::from_be_bytes([buf[0], buf[1]]);
-                                // 修复：使用try_remove，只有在地址匹配时才移除inflight
-                                // Fix: Only remove inflight if address matches (use try_remove logic)
-                                if let Some((_, (original_id, expected_addr, tx))) = inflight_clone.remove(&id) {
-                                    if src == expected_addr {
+                                // 修复：使用 Entry API 原子操作，避免 remove-then-insert 导致的竞态条件
+                                // Fix: Use Entry API for atomic operations to avoid remove-then-insert race condition
+                                if let entry::Entry::Occupied(entry) = inflight_clone.entry(id) {
+                                    let (_, expected_addr, _) = entry.get();
+                                    if src == *expected_addr {
+                                        let (_, (original_id, _, tx)) = entry.remove_entry();
+
                                         // Restore original TXID
                                         let orig_bytes = original_id.to_be_bytes();
                                         buf[0] = orig_bytes[0];
                                         buf[1] = orig_bytes[1];
 
                                         // 零拷贝优化：使用 split_to 复用已有容量，避免分配新内存
-                                        // Zero-copy optimization: use split_to to reuse existing capacity, avoid allocation
                                         let response = buf.split_to(len).freeze();
-                                        // 修复：检查 channel 是否已关闭，防止残留条目
-                                        // Fix: Check if channel is closed to prevent stale entries
+
                                         if tx.send(Ok(response)).is_err() {
                                             tracing::debug!(
                                                 socket_idx = idx,
@@ -94,28 +107,15 @@ impl UdpClient {
                                             );
                                         }
                                     } else {
-                                        // 地址不匹配：检查 channel 是否已关闭
-                                        // Address mismatch: check if channel is closed
-                                        if tx.is_closed() {
-                                            // channel 已关闭，说明请求已超时或失败，不要放回 inflight
-                                            tracing::debug!(
-                                                socket_idx = idx,
-                                                response_id = id,
-                                                expected_addr = %expected_addr,
-                                                actual_addr = %src,
-                                                "UDP response address mismatch but channel closed, dropping stale response"
-                                            );
-                                        } else {
-                                            // channel 仍然打开，放回等待正确响应
-                                            inflight_clone.insert(id, (original_id, expected_addr, tx));
-                                            tracing::warn!(
-                                                socket_idx = idx,
-                                                response_id = id,
-                                                expected_addr = %expected_addr,
-                                                actual_addr = %src,
-                                                "UDP response address mismatch, possible ID collision"
-                                            );
-                                        }
+                                        // Address mismatch: keep entry and wait for correct response
+                                        // 地址不匹配：保留条目等待正确响应（可能是网络攻击或路由异常）
+                                        tracing::warn!(
+                                            socket_idx = idx,
+                                            response_id = id,
+                                            expected_addr = %expected_addr,
+                                            actual_addr = %src,
+                                            "UDP response address mismatch, possible spoofing or routing anomaly"
+                                        );
                                     }
                                 }
                             }
@@ -163,11 +163,11 @@ impl UdpClient {
         loop {
             new_id = state.next_id.fetch_add(1, Ordering::Relaxed);
             match state.inflight.entry(new_id) {
-                dashmap::mapref::entry::Entry::Vacant(e) => {
+                entry::Entry::Vacant(e) => {
                     e.insert((original_id, addr, tx));
                     break;
                 }
-                dashmap::mapref::entry::Entry::Occupied(_) => {
+                entry::Entry::Occupied(_) => {
                     attempts += 1;
                     if attempts > 100 {
                         warn!("udp pool exhausted: socket_idx={} inflight_count={}", idx, state.inflight.len());
@@ -428,6 +428,12 @@ impl TcpMuxClient {
             // DNS TCP max is 65535 bytes, but typical responses are much smaller
             let mut reusable_buf = BytesMut::with_capacity(4096);
             loop {
+                // Ensure buffer has enough space for length prefix
+                // 确保缓冲区有足够空间读取长度前缀
+                if reusable_buf.capacity() < 2 {
+                     reusable_buf.reserve(4096);
+                }
+
                 let mut len_buf = [0u8; 2];
                 if let Err(err) = reader.read_exact(&mut len_buf).await {
                     debug!(target = "tcp_mux", upstream = %upstream, error = %err, "tcp read len failed");
@@ -437,8 +443,11 @@ impl TcpMuxClient {
                 }
                 let resp_len = u16::from_be_bytes(len_buf) as usize;
 
-                // Resize buffer if needed, reusing allocation
+                // Resize buffer if needed, reusing allocation (and ensure capacity)
                 // resize() handles both truncation and extension, no need for clear()
+                if reusable_buf.capacity() < resp_len {
+                    reusable_buf.reserve(resp_len.max(4096));
+                }
                 reusable_buf.resize(resp_len, 0);
 
                 if let Err(err) = reader.read_exact(&mut reusable_buf[..resp_len]).await {
@@ -597,10 +606,12 @@ impl TcpMuxClient {
         let remaining = timeout_dur - elapsed;
 
         let original_id = u16::from_be_bytes([packet[0], packet[1]]);
-        let (new_packet, new_id) = self.rewrite_id(packet).await?;
-
+        
+        // 生成通道
         let (tx, rx) = oneshot::channel();
-        self.pending.insert(new_id, Pending { original_id, tx });
+        
+        // 原子操作：分配 ID 并注册到 pending map，避免竞态条件
+        let (new_packet, new_id) = self.register_pending(packet, original_id, tx).await?;
 
         // 2. Write request with remaining timeout (connection already ensured)
         // 2. 写入请求（连接已确保）
@@ -754,16 +765,26 @@ impl TcpMuxClient {
         Ok(())
     }
 
-    /// Rewrite DNS transaction ID, returning BytesMut for efficient further operations
-    async fn rewrite_id(&self, packet: &[u8]) -> anyhow::Result<(BytesMut, u16)> {
+    /// Rewrite DNS transaction ID and register in pending map atomically, returning BytesMut for efficient further operations
+    /// 原子操作：重写 DNS 事务 ID 并注册到 pending map，返回 BytesMut 以进行高效的后续操作
+    async fn register_pending(
+        &self, 
+        packet: &[u8], 
+        original_id: u16, 
+        tx: oneshot::Sender<anyhow::Result<Bytes>>
+    ) -> anyhow::Result<(BytesMut, u16)> {
         let mut tries = 0;
         let new_id = loop {
             let cand = self.next_id.fetch_add(1, Ordering::Relaxed);
             tries += 1;
-            let in_use = self.pending.contains_key(&cand);
-            if !in_use {
+            
+            // Use Entry API to check vacancy and insert atomically
+            // 使用 Entry API 检查空位并原子插入
+            if let entry::Entry::Vacant(e) = self.pending.entry(cand) {
+                e.insert(Pending { original_id, tx });
                 break cand;
             }
+
             if tries > u16::MAX as usize {
                 anyhow::bail!("no available dns ids for tcp mux");
             }
@@ -832,25 +853,26 @@ mod tests {
             );
         }
 
-        // Act: Spawn many concurrent rewrite_id calls to test contention handling
+        // Act: Spawn many concurrent register_pending calls to test contention handling
         let tasks = (0..64)
             .map(|_| {
                 let client = Arc::clone(&client);
                 async move {
                     let dummy = vec![0u8; 4];
-                    client.rewrite_id(&dummy).await.map(|(_, id)| id)
+                    let (tx, _) = oneshot::channel();
+                    client.register_pending(&dummy, 0, tx).await.map(|(_, id)| id)
                 }
             })
             .collect::<Vec<_>>();
 
         let results = timeout(Duration::from_millis(500), join_all(tasks))
             .await
-            .expect("rewrite_id stalled under contention");
+            .expect("register_pending stalled under contention");
 
         // Assert: Verify all IDs are unique (no duplicates under contention)
         let mut ids = std::collections::HashSet::new();
         for r in results {
-            let id = r.expect("rewrite_id failed");
+            let id = r.expect("register_pending failed");
             assert!(ids.insert(id), "duplicate id allocated under contention");
         }
     }

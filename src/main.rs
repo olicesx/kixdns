@@ -10,6 +10,9 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{error, info, debug, warn};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
+// Import BinDecodable for Message::from_bytes
+use hickory_proto::serialize::binary::BinDecodable;
+
 use kixdns::config::load_config;
 use kixdns::engine::{Engine, FastPathResponse};
 use kixdns::matcher::RuntimePipelineConfig;
@@ -405,6 +408,15 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
     Ok(socket.into())
 }
 
+/// Attempt to send SERVFAIL response to client / 尝试向客户端发送 SERVFAIL 响应
+async fn send_servfail_response(socket: &UdpSocket, packet: &[u8], peer: SocketAddr) {
+    if let Ok(req) = hickory_proto::op::Message::from_bytes(packet) {
+        if let Ok(resp) = kixdns::engine::engine_helpers::build_servfail_response(&req) {
+            let _ = socket.send_to(&resp, peer).await;
+        }
+    }
+}
+
 /// 高性能 UDP worker：直接在接收循环中处理请求，避免 spawn 开销 / High-performance UDP worker: process requests directly in receive loop, avoiding spawn overhead
 async fn run_udp_worker(
     worker_id: usize,
@@ -501,6 +513,7 @@ async fn run_udp_worker(
                                     }
                                     Ok(Err(e)) => {
                                         debug!(error = %e, "handle_packet error");
+                                        send_servfail_response(&socket, &packet_bytes, peer).await;
                                     }
                                     Err(_) => {
                                         // 超时：permit 会被 _permit 的 Drop 自动释放
@@ -510,6 +523,7 @@ async fn run_udp_worker(
                                             upstream_timeout_ms = engine.get_upstream_timeout_ms(),
                                             "request timeout after hedge and fallback exhausted"
                                         );
+                                        send_servfail_response(&socket, &packet_bytes, peer).await;
                                     }
                                 }
                             });
