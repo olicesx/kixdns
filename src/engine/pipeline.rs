@@ -206,6 +206,18 @@ impl Engine {
         }
 
         // 3. Execute Rules
+        // 优化：提取 MatcherContext 到循环外部，避免重复构造
+        // Optimization: Extract MatcherContext outside loop to avoid repeated construction
+        let ctx = MatcherContext {
+            qname,
+            qclass,
+            client_ip,
+            edns_present,
+            qtype,
+            geoip_manager: Some(&self.geoip_manager),
+            geosite_manager: Some(&self.geosite_manager),
+        };
+
         'rules: for idx in candidate_indices {
             let rule = match pipeline.rules.get(idx) {
                 Some(r) => r,
@@ -220,15 +232,6 @@ impl Engine {
                 |m| {
                     // 直接传递 Arc<RwLock<T>>，让 matcher 内部按需获取锁
                     // Pass Arc<RwLock<T>> directly, let matcher acquire locks on-demand
-                    let ctx = MatcherContext {
-                        qname,
-                        qclass,
-                        client_ip,
-                        edns_present,
-                        qtype,
-                        geoip_manager: Some(&self.geoip_manager),
-                        geosite_manager: Some(&self.geosite_manager),
-                    };
                     matcher_matches(&m.matcher, &ctx)
                 },
             );
