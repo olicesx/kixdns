@@ -722,8 +722,8 @@ impl RuntimeMatcher {
         qclass: DNSClass,
         client_ip: IpAddr,
         edns_present: bool,
-        geoip_manager: Option<&crate::matcher::geoip::GeoIpManager>,
-        geosite_manager: Option<&crate::matcher::geosite::GeoSiteManager>,
+        geoip_manager: Option<&std::sync::Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>>,
+        geosite_manager: Option<&std::sync::Arc<crate::lock::RwLock<crate::matcher::geosite::GeoSiteManager>>>,
     ) -> bool {
         match self {
             RuntimeMatcher::Any => true,
@@ -735,15 +735,16 @@ impl RuntimeMatcher {
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes } => {
-                // 使用辅助函数进行 GeoIP 国家代码匹配 / Use helper for GeoIP country matching
-                geoip_manager.is_some_and(|mgr| {
-                    matcher_helpers::match_geoip_country(mgr, client_ip, country_codes)
+                // 按需获取锁：只在GeoIP matcher时才获取 / On-demand lock: only acquire for GeoIP matcher
+                geoip_manager.and_then(|mgr| Some(mgr.read())).is_some_and(|guard| {
+                    matcher_helpers::match_geoip_country(&guard, client_ip, country_codes)
                 })
             }
             RuntimeMatcher::GeoipPrivate { expect } => {
-                // GeoIP private IP detection with GeoIpManager
+                // 按需获取锁：只在GeoIP matcher时才获取
                 if let Some(manager) = geoip_manager {
-                    let result = manager.lookup(client_ip);
+                    let guard = manager.read();
+                    let result = guard.lookup(client_ip);
                     result.is_private == *expect
                 } else {
                     // Fallback to basic private IP check
@@ -753,14 +754,19 @@ impl RuntimeMatcher {
             RuntimeMatcher::Qclass { value } => &qclass == value,
             RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
             RuntimeMatcher::GeoSite { tag } => {
-                // 使用辅助函数进行 GeoSite 匹配 / Use helper for GeoSite matching
-                geosite_manager.is_some_and(|mgr| matcher_helpers::match_geosite(mgr, qname, tag))
+                // 按需获取锁：只在GeoSite matcher时才获取 / On-demand lock: only acquire for GeoSite matcher
+                geosite_manager.and_then(|mgr| Some(mgr.read())).is_some_and(|guard| {
+                    matcher_helpers::match_geosite(&guard, qname, tag)
+                })
             }
             RuntimeMatcher::GeoSiteNot { tag } => {
-                // 使用辅助函数进行 GeoSite 非匹配 / Use helper for GeoSite NOT matching
-                geosite_manager.is_some_and(|mgr| {
-                    !matcher_helpers::match_geosite(mgr, qname, tag)
-                })
+                // 按需获取锁：只在GeoSite matcher时才获取
+                if let Some(manager) = geosite_manager {
+                    let guard = manager.read();
+                    !matcher_helpers::match_geosite(&guard, qname, tag)
+                } else {
+                    true // 无GeoSite管理器时，GeoSiteNot返回true
+                }
             }
             RuntimeMatcher::Qtype { .. } => false, // Qtype matching requires qtype parameter
         }
@@ -774,8 +780,8 @@ impl RuntimeMatcher {
         client_ip: IpAddr,
         edns_present: bool,
         qtype: RecordType,
-        geoip_manager: Option<&crate::matcher::geoip::GeoIpManager>,
-        geosite_manager: Option<&crate::matcher::geosite::GeoSiteManager>,
+        geoip_manager: Option<&std::sync::Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>>,
+        geosite_manager: Option<&std::sync::Arc<crate::lock::RwLock<crate::matcher::geosite::GeoSiteManager>>>,
     ) -> bool {
         match self {
             RuntimeMatcher::Any => true,
@@ -787,15 +793,16 @@ impl RuntimeMatcher {
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes } => {
-                // 使用辅助函数进行 GeoIP 国家代码匹配 / Use helper for GeoIP country matching
-                geoip_manager.is_some_and(|mgr| {
-                    matcher_helpers::match_geoip_country(mgr, client_ip, country_codes)
+                // 按需获取锁：只在GeoIP matcher时才获取 / On-demand lock: only acquire for GeoIP matcher
+                geoip_manager.and_then(|mgr| Some(mgr.read())).is_some_and(|guard| {
+                    matcher_helpers::match_geoip_country(&guard, client_ip, country_codes)
                 })
             }
             RuntimeMatcher::GeoipPrivate { expect } => {
-                // GeoIP private IP detection with GeoIpManager
+                // 按需获取锁：只在GeoIP matcher时才获取
                 if let Some(manager) = geoip_manager {
-                    let result = manager.lookup(client_ip);
+                    let guard = manager.read();
+                    let result = guard.lookup(client_ip);
                     result.is_private == *expect
                 } else {
                     // Fallback to basic private IP check
@@ -805,14 +812,19 @@ impl RuntimeMatcher {
             RuntimeMatcher::Qclass { value } => &qclass == value,
             RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
             RuntimeMatcher::GeoSite { tag } => {
-                // 使用辅助函数进行 GeoSite 匹配 / Use helper for GeoSite matching
-                geosite_manager.is_some_and(|mgr| matcher_helpers::match_geosite(mgr, qname, tag))
+                // 按需获取锁：只在GeoSite matcher时才获取 / On-demand lock: only acquire for GeoSite matcher
+                geosite_manager.and_then(|mgr| Some(mgr.read())).is_some_and(|guard| {
+                    matcher_helpers::match_geosite(&guard, qname, tag)
+                })
             }
             RuntimeMatcher::GeoSiteNot { tag } => {
-                // 使用辅助函数进行 GeoSite 非匹配 / Use helper for GeoSite NOT matching
-                geosite_manager.is_some_and(|mgr| {
-                    !matcher_helpers::match_geosite(mgr, qname, tag)
-                })
+                // 按需获取锁：只在GeoSite matcher时才获取
+                if let Some(manager) = geosite_manager {
+                    let guard = manager.read();
+                    !matcher_helpers::match_geosite(&guard, qname, tag)
+                } else {
+                    true // 无GeoSite管理器时，GeoSiteNot返回true
+                }
             }
             RuntimeMatcher::Qtype { value } => *value == qtype,
         }
@@ -875,8 +887,8 @@ impl RuntimePipelineSelectorMatcher {
         qname: &str,
         qclass: DNSClass,
         edns_present: bool,
-        geoip_manager: Option<&crate::matcher::geoip::GeoIpManager>,
-        geosite_manager: Option<&crate::matcher::geosite::GeoSiteManager>,
+        geoip_manager: Option<&std::sync::Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>>,
+        geosite_manager: Option<&std::sync::Arc<crate::lock::RwLock<crate::matcher::geosite::GeoSiteManager>>>,
     ) -> bool {
         self.matches_with_qtype(
             listener_label,
@@ -899,8 +911,8 @@ impl RuntimePipelineSelectorMatcher {
         qclass: DNSClass,
         edns_present: bool,
         qtype: RecordType,
-        geoip_manager: Option<&crate::matcher::geoip::GeoIpManager>,
-        geosite_manager: Option<&crate::matcher::geosite::GeoSiteManager>,
+        geoip_manager: Option<&std::sync::Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>>,
+        geosite_manager: Option<&std::sync::Arc<crate::lock::RwLock<crate::matcher::geosite::GeoSiteManager>>>,
     ) -> bool {
         match self {
             RuntimePipelineSelectorMatcher::ListenerLabel { value } => {
@@ -913,38 +925,36 @@ impl RuntimePipelineSelectorMatcher {
             RuntimePipelineSelectorMatcher::Qclass { value } => value == &qclass,
             RuntimePipelineSelectorMatcher::EdnsPresent { expect } => *expect == edns_present,
             RuntimePipelineSelectorMatcher::GeoSite { tag } => {
-                // GeoSite matching with GeoSiteManager
-                if let Some(manager) = geosite_manager {
-                    manager.matches(tag, qname)
-                } else {
-                    false
-                }
+                // 按需获取锁：只在GeoSite matcher时才获取 / On-demand lock: only acquire for GeoSite matcher
+                geosite_manager.and_then(|mgr| Some(mgr.read())).is_some_and(|guard| {
+                    guard.matches(tag, qname)
+                })
             }
             RuntimePipelineSelectorMatcher::GeoSiteNot { tag } => {
-                // GeoSite negation matching with GeoSiteManager
+                // 按需获取锁：只在GeoSite matcher时才获取
                 if let Some(manager) = geosite_manager {
-                    !manager.matches(tag, qname)
+                    let guard = manager.read();
+                    !guard.matches(tag, qname)
                 } else {
                     false
                 }
             }
             RuntimePipelineSelectorMatcher::GeoipCountry { country_codes } => {
-                // GeoIP matching with GeoIpManager
-                if let Some(manager) = geoip_manager {
-                    let result = manager.lookup(client_ip);
+                // 按需获取锁：只在GeoIP matcher时才获取 / On-demand lock: only acquire for GeoIP matcher
+                geoip_manager.and_then(|mgr| Some(mgr.read())).is_some_and(|guard| {
+                    let result = guard.lookup(client_ip);
                     if let Some(cc) = result.country_code {
                         country_codes.iter().any(|c| c.eq_ignore_ascii_case(&cc))
                     } else {
                         false
                     }
-                } else {
-                    false
-                }
+                })
             }
             RuntimePipelineSelectorMatcher::GeoipPrivate { expect } => {
-                // GeoIP private IP matching with GeoIpManager
+                // 按需获取锁：只在GeoIP matcher时才获取
                 if let Some(manager) = geoip_manager {
-                    let result = manager.lookup(client_ip);
+                    let guard = manager.read();
+                    let result = guard.lookup(client_ip);
                     result.is_private == *expect
                 } else {
                     // Fallback to basic private IP check

@@ -22,22 +22,16 @@ pub struct MatcherContext<'a> {
 }
 
 pub fn matcher_matches(matcher: &RuntimeMatcher, ctx: &MatcherContext<'_>) -> bool {
-    // Resolve managers inline to avoid lifetime issues
-    // parking_lot::RwLock::read() returns a guard directly, not Result
-    // parking_lot::RwLock::read() 直接返回 guard，不是 Result
-    let geosite_mgr_ref = ctx.geosite_manager.map(|m| m.read());
-    let geosite_mgr_deref = geosite_mgr_ref.as_deref();
-    let geoip_mgr_ref = ctx.geoip_manager.map(|m| m.read());
-    let geoip_mgr_deref = geoip_mgr_ref.as_deref();
-
+    // 直接传递 Arc<RwLock<T>>，让 matches_with_qtype 内部按需获取锁
+    // Pass Arc<RwLock<T>> directly, let matches_with_qtype acquire locks on-demand
     matcher.matches_with_qtype(
         ctx.qname,
         ctx.qclass,
         ctx.client_ip,
         ctx.edns_present,
         ctx.qtype,
-        geoip_mgr_deref,
-        geosite_mgr_deref,
+        ctx.geoip_manager,
+        ctx.geosite_manager,
     )
 }
 

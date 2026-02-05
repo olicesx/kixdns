@@ -38,14 +38,9 @@ pub fn select_pipeline<'a>(
             &rule.matchers,
             |m| m.operator,
             |m| {
-                // 获取 GeoSiteManager 和 GeoIpManager 的引用 / Get GeoSiteManager and GeoIpManager references
-                // parking_lot::RwLock::read() 返回 guard 直接，不是 Result
-                let geosite_mgr_ref = geosite_manager.map(|m| m.read());
-                let geosite_mgr_ref_deref = geosite_mgr_ref.as_deref();
-                let geoip_mgr_ref = geoip_manager.map(|m| m.read());
-                let geoip_mgr_ref_deref = geoip_mgr_ref.as_deref();
-
-                m.matcher.matches_with_qtype(listener_label, client_ip, qname, qclass, edns_present, qtype, geoip_mgr_ref_deref, geosite_mgr_ref_deref)
+                // 直接传递 Arc<RwLock<T>>，让 matcher 内部按需获取锁
+                // Pass Arc<RwLock<T>> directly, let matcher acquire locks on-demand
+                m.matcher.matches_with_qtype(listener_label, client_ip, qname, qclass, edns_present, qtype, geoip_manager, geosite_manager)
             },
         );
         if matched {
@@ -209,10 +204,8 @@ impl Engine {
                 &rule.matchers,
                 |m| m.operator,
                 |m| {
-                    // GeoSiteManager 现在使用 DashMap，无需 Mutex 锁
-                    // GeoSiteManager now uses DashMap, no Mutex lock needed
-                    // GeoIpManager 现在使用 Mutex，需要获取锁
-                    // GeoIpManager now uses Mutex, need to acquire lock
+                    // 直接传递 Arc<RwLock<T>>，让 matcher 内部按需获取锁
+                    // Pass Arc<RwLock<T>> directly, let matcher acquire locks on-demand
                     let ctx = MatcherContext {
                         qname,
                         qclass,
