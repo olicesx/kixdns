@@ -322,8 +322,8 @@ pub async fn handle_forward_decision(
             let effective_ttl = Duration::from_secs(ttl_secs.max(min_ttl.as_secs()));
 
             let (resp_match_ok, msg) = {
-                let geoip_manager = engine.geoip_manager.try_read().ok();
-                let geosite_manager = engine.geosite_manager.try_read().ok();
+                let geoip_manager = engine.geoip_manager.try_read();
+                let geosite_manager = engine.geosite_manager.try_read();
                 let geoip_manager_ref = geoip_manager.as_deref();
                 let geosite_manager_ref = geosite_manager.as_deref();
 

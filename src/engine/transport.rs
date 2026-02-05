@@ -237,6 +237,58 @@ impl TcpMultiplexer {
         }
     }
 
+    /// Warm up connection pools for given upstreams.
+    /// 为给定的 upstream 预热连接池。
+    ///
+    /// This creates a minimal pool with 1 connection per upstream to avoid
+    /// lazy initialization overhead on first query.
+    /// 这会为每个 upstream 创建只包含 1 个连接的最小连接池，以避免首次查询时的懒加载开销。
+    pub fn warm_up_pools(&self, upstreams: &std::collections::HashSet<String>) {
+        use tracing::info;
+
+        if upstreams.is_empty() {
+            info!("No TCP upstreams to warm up");
+            return;
+        }
+
+        info!(
+            count = upstreams.len(),
+            "Warming up TCP connection pools..."
+        );
+
+        for upstream in upstreams {
+            let upstream_key: Arc<str> = Arc::from(upstream.as_str());
+            // Use entry().or_insert_with() to create pool only if it doesn't exist
+            // 使用 entry().or_insert_with() 仅在连接池不存在时创建
+            self.pools.entry(upstream_key.clone()).or_insert_with(|| {
+                // Warm up: create only 1 client instead of full pool_size
+                // 预热：只创建 1 个客户端而不是完整的 pool_size
+                let permit_mgr = Arc::new(PermitManager::new(1));
+                let client = Arc::new(TcpMuxClient::new(
+                    upstream_key.clone(),
+                    Arc::clone(&permit_mgr),
+                ));
+                client.set_health_check_config(
+                    self.health_error_threshold,
+                    self.max_age_secs,
+                    self.idle_timeout_secs,
+                );
+                Arc::new(TcpConnectionPool {
+                    clients: vec![client],
+                    next_idx: AtomicUsize::new(0),
+                })
+            });
+
+            // Drop the reference immediately, we just wanted to ensure the pool exists
+            // 立即释放引用，我们只是想确保连接池存在
+        }
+
+        info!(
+            count = upstreams.len(),
+            "TCP connection pools warmed up successfully"
+        );
+    }
+
     /// Test-only helper to initialize or get a pool without network operations
     /// This mirrors the production pool initialization logic used in send().
     #[cfg(test)]

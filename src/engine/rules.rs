@@ -245,8 +245,8 @@ pub(crate) async fn apply_response_actions(
                 if let Some(resp_ctx) = ctx.ctx_opt {
                     // Get manager references for GeoIP/GeoSite matching
                     // 获取 manager 引用以用于 GeoIP/GeoSite 匹配
-                    let geoip_manager = ctx.engine.geoip_manager.try_read().ok();
-                    let geosite_manager = ctx.engine.geosite_manager.try_read().ok();
+                    let geoip_manager = ctx.engine.geoip_manager.try_read();
+                    let geosite_manager = ctx.engine.geosite_manager.try_read();
                     let geoip_manager_ref = geoip_manager.as_deref();
                     let geosite_manager_ref = geosite_manager.as_deref();
 
@@ -386,8 +386,8 @@ pub(crate) async fn apply_response_actions(
     if let Some(resp_ctx) = ctx.ctx_opt {
         // Get manager references for GeoIP/GeoSite matching
         // 获取 manager 引用以用于 GeoIP/GeoSite 匹配
-        let geoip_manager = ctx.engine.geoip_manager.try_read().ok();
-        let geosite_manager = ctx.engine.geosite_manager.try_read().ok();
+        let geoip_manager = ctx.engine.geoip_manager.try_read();
+        let geosite_manager = ctx.engine.geosite_manager.try_read();
         let geoip_manager_ref = geoip_manager.as_deref();
         let geosite_manager_ref = geosite_manager.as_deref();
 
@@ -693,8 +693,8 @@ pub(crate) async fn process_response_jump(
                         // 获取 manager 引用以用于响应匹配器中的 GeoIP/GeoSite 匹配
                         // Use scope to ensure locks are released immediately after use / 使用作用域确保锁在使用后立即释放
                         let resp_match_ok = {
-                            let geoip_manager = engine.geoip_manager.try_read().ok();
-                            let geosite_manager = engine.geosite_manager.try_read().ok();
+                            let geoip_manager = engine.geoip_manager.try_read();
+                            let geosite_manager = engine.geosite_manager.try_read();
                             let geoip_manager_ref = geoip_manager.as_deref();
                             let geosite_manager_ref = geosite_manager.as_deref();
 

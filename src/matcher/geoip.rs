@@ -9,6 +9,7 @@ use serde::Deserialize;
 
 // Re-export from geoip_converter module
 // Note: geoip_converter is a sibling module at the crate root level
+pub use crate::lock::RwLock;
 pub use crate::matcher::geoip_converter::{convert_dat_to_mmdb, ConversionStats};
 
 /// MaxMind GeoLite2-Country 数据库结构 / MaxMind GeoLite2-Country database structure
@@ -645,7 +646,7 @@ pub fn is_private_ip(ip: IpAddr) -> bool {
 /// Watches .dat file changes and automatically reloads GeoIP data
 pub fn spawn_geoip_watcher(
     dat_path: Option<PathBuf>,
-    manager: Arc<std::sync::RwLock<GeoIpManager>>,
+    manager: Arc<RwLock<GeoIpManager>>,
 ) {
     let path = match dat_path {
         Some(p) => p,
@@ -664,7 +665,7 @@ pub fn spawn_geoip_watcher(
 /// 运行 GeoIP watcher / Run GeoIP watcher
 fn run_geoip_watcher(
     path: PathBuf,
-    manager: Arc<std::sync::RwLock<GeoIpManager>>,
+    manager: Arc<RwLock<GeoIpManager>>,
 ) -> notify::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher: notify::RecommendedWatcher =
@@ -696,33 +697,12 @@ fn run_geoip_watcher(
                 // 简单的重试机制来处理文件写入竞争 / Simple retry mechanism to handle file write races
                 let mut retries = 5;
                 while retries > 0 {
+                    // parking_lot::RwLock::write() 返回 guard 直接，不会中毒
+                    // parking_lot::RwLock does not have poison state
                     let load_result = if is_dat {
-                        // 加载 .dat 格式 / Load .dat format
-                        // 安全地获取写锁 / Safely acquire write lock
-                        match manager.write() {
-                            Ok(mut guard) => guard.load_from_dat_file(event_path),
-                            Err(e) => {
-                                tracing::warn!(
-                                    target = "geoip_watcher",
-                                    "RwLock was poisoned during .dat reload, recovering"
-                                );
-                                e.into_inner().load_from_dat_file(event_path)
-                            }
-                        }
+                        manager.write().load_from_dat_file(event_path)
                     } else {
-                        // 加载 V2Ray JSON 格式 / Load V2Ray JSON format
-                        // 安全地获取写锁 / Safely acquire write lock
-                        match manager.write() {
-                            Ok(mut guard) => guard.load_from_v2ray_file(event_path),
-                            Err(e) => {
-                                let mut guard = e.into_inner();
-                                tracing::warn!(
-                                    target = "geoip_watcher",
-                                    "RwLock was poisoned during JSON reload, recovering"
-                                );
-                                guard.load_from_v2ray_file(event_path)
-                            }
-                        }
+                        manager.write().load_from_v2ray_file(event_path)
                     };
 
                     match load_result {

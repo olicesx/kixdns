@@ -9,9 +9,10 @@ use rustc_hash::FxBuildHasher;
 use tracing::{info, warn};
 
 use crate::cache::{DnsCache, new_cache};
+use crate::lock::RwLock;
 use crate::matcher::RuntimePipelineConfig;
 use crate::matcher::geoip::GeoIpManager;
-use crate::matcher::geosite::GeoSiteManager; // Added import
+use crate::matcher::geosite::GeoSiteManager;
 use crate::matcher::advanced_rule::compile_pipelines;
 use super::utils::{extract_geosite_tags_from_config, uses_geoip_matchers};
 
@@ -68,10 +69,10 @@ pub struct Engine {
     pub(crate) cache_refresh_threshold_percent: u8,
     pub(crate) cache_refresh_min_ttl: u32,
     // GeoIP manager for geographic IP-based routing / GeoIP 管理器用于基于地理位置的 IP 路由
-    pub geoip_manager: Arc<std::sync::RwLock<GeoIpManager>>,
+    pub geoip_manager: Arc<RwLock<GeoIpManager>>,
     // GeoSite manager for domain category-based routing / GeoSite 管理器用于域名分类路由
     // 使用 RwLock 允许并发读操作，写操作独占 / Uses RwLock for concurrent reads, exclusive writes
-    pub geosite_manager: Arc<std::sync::RwLock<GeoSiteManager>>,
+    pub geosite_manager: Arc<RwLock<GeoSiteManager>>,
     // Background refresh dedicated rule / 后台刷新专用规则
     // Design: Background refresh calls handle_packet(skip_cache=true) with this rule
     // 设计：后台刷新调用 handle_packet(skip_cache=true) 使用此规则
@@ -192,12 +193,12 @@ impl Engine {
             }
         }
 
-        let geoip_manager = Arc::new(std::sync::RwLock::new(geoip_manager));
+        let geoip_manager = Arc::new(RwLock::new(geoip_manager));
 
         // Initialize GeoSiteManager / 初始化 GeoSiteManager
         // GeoSiteManager starts empty and is populated via add_entry() calls
         // Cache will be automatically rebuilt after loading data
-        let geosite_manager = Arc::new(std::sync::RwLock::new(
+        let geosite_manager = Arc::new(RwLock::new(
             crate::matcher::geosite::GeoSiteManager::new(),
         ));
         
@@ -215,29 +216,23 @@ impl Engine {
                     .and_then(|s| s.to_str())
                     .map(|s| s.eq_ignore_ascii_case("dat"))
                     .unwrap_or(false);
-                
+
                 let load_result = if is_dat {
                     // 使用按需加载 / Use selective loading
-                    if let Ok(mut manager) = geosite_manager.write() {
-                        if used_geosite_tags.is_empty() {
+                    // parking_lot::RwLock::write() 返回 guard 直接，不会中毒
+                    let mut manager = geosite_manager.write();
+                    if used_geosite_tags.is_empty() {
                         // 没有使用 GeoSite 标签，跳过加载 / No GeoSite tags used, skip loading
                         info!("No GeoSite tags used in config, skipping GeoSite data loading");
                         Ok(0)
                     } else {
-                            manager.load_from_dat_file_selective(&path, &used_geosite_tags)
-                        }
-                    } else {
-                        tracing::error!("GeoSite RwLock is poisoned during .dat config load, skipping GeoSite loading");
-                        Ok(0) // Skip loading but continue with other files
+                        manager.load_from_dat_file_selective(&path, &used_geosite_tags)
                     }
                 } else {
                     // JSON 格式：全量加载 / JSON format: load all
-                    if let Ok(mut manager) = geosite_manager.write() {
-                        manager.load_from_v2ray_file(&path)
-                    } else {
-                        tracing::error!("GeoSite RwLock is poisoned during JSON config load, skipping GeoSite loading");
-                        Ok(0) // Skip loading but continue with other files
-                    }
+                    // parking_lot::RwLock::write() 返回 guard 直接，不会中毒
+                    let mut manager = geosite_manager.write();
+                    manager.load_from_v2ray_file(&path)
                 };
                 
                 match load_result {
@@ -292,18 +287,27 @@ impl Engine {
         };
 
         // TCP pool size is per-upstream; each upstream gets its own permit manager
-        // TCP 连接池大小为“每个 upstream”独立配置；每个 upstream 有各自的 permit manager
+        // TCP 连接池大小为"每个 upstream"独立配置；每个 upstream 有各自的 permit manager
+
+        // Collect TCP upstreams for warmup / 收集 TCP upstream 用于预热
+        let tcp_upstreams = state.load().pipeline.collect_tcp_upstreams();
+
+        let tcp_mux = Arc::new(TcpMultiplexer::new(
+            tcp_pool_size,
+            tcp_health_error_threshold,
+            tcp_max_age_secs,
+            tcp_idle_timeout_secs,
+        ));
+
+        // Warm up TCP connection pools (create 1 connection per upstream)
+        // 预热 TCP 连接池（每个 upstream 创建 1 个连接）
+        tcp_mux.warm_up_pools(&tcp_upstreams);
 
         Self {
             state,
             cache,
             udp_client: Arc::new(UdpClient::new(udp_pool_size)),
-            tcp_mux: Arc::new(TcpMultiplexer::new(
-                tcp_pool_size,
-                tcp_health_error_threshold,
-                tcp_max_age_secs,
-                tcp_idle_timeout_secs,
-            )),
+            tcp_mux,
             listener_label: Arc::from(listener_label),
             rule_cache,
             metrics_inflight: Arc::new(AtomicUsize::new(0)),

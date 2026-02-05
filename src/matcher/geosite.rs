@@ -17,6 +17,8 @@ use rustc_hash::FxHasher;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
+use crate::lock::RwLock;
+
 /// 域名匹配器类型 / Domain matcher type
 #[derive(Debug, Clone)]
 pub enum DomainMatcher {
@@ -1035,7 +1037,7 @@ impl GeoSiteManager {
 /// - `tags`: 需要加载的 tag 列表（空表示全部加载）/ List of tags to load (empty means load all)
 pub fn spawn_geosite_watcher(
     paths: Vec<PathBuf>,
-    manager: Arc<std::sync::RwLock<GeoSiteManager>>,
+    manager: Arc<RwLock<GeoSiteManager>>,
     tags: Vec<String>,
 ) {
     if paths.is_empty() {
@@ -1054,7 +1056,7 @@ pub fn spawn_geosite_watcher(
 /// 运行 GeoSite watcher / Run GeoSite watcher
 fn run_geosite_watcher(
     paths: Vec<PathBuf>,
-    manager: Arc<std::sync::RwLock<GeoSiteManager>>,
+    manager: Arc<RwLock<GeoSiteManager>>,
     tags: Vec<String>,
 ) -> notify::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1088,31 +1090,15 @@ fn run_geosite_watcher(
                 // 简单的重试机制来处理文件写入竞争 / Simple retry mechanism to handle file write races
                 let mut retries = 5;
                 while retries > 0 {
+                    // parking_lot::RwLock::write() 返回 guard 直接，不会中毒
+                    // parking_lot::RwLock does not have poison state
                     let load_result = if is_dat {
                         // 加载 .dat 格式 / Load .dat format
-                        // 安全地获取写锁，避免 RwLock 被污染时 panic / Safely acquire write lock to avoid panic if RwLock is poisoned
-                        match manager.write() {
-                            Ok(mut guard) => {
-                                if tags.is_empty() {
-                                    // 加载所有 tags / Load all tags
-                                    guard.load_from_dat_file(path)
-                                } else {
-                                    // 按需加载指定的 tags / Load specified tags on-demand
-                                    guard.load_from_dat_file_selective(path, &tags)
-                                }
-                            }
-                            Err(e) => {
-                                let mut guard = e.into_inner();
-                                warn!(
-                                    target = "geosite_watcher",
-                                    "RwLock was poisoned, recovering and attempting reload"
-                                );
-                                if tags.is_empty() {
-                                    guard.load_from_dat_file(path)
-                                } else {
-                                    guard.load_from_dat_file_selective(path, &tags)
-                                }
-                            }
+                        let mut guard = manager.write();
+                        if tags.is_empty() {
+                            guard.load_from_dat_file(path)
+                        } else {
+                            guard.load_from_dat_file_selective(path, &tags)
                         }
                     } else {
                         // 加载 JSON 格式 / Load JSON format
@@ -1123,26 +1109,11 @@ fn run_geosite_watcher(
                                     .with_context(|| "parse V2Ray GeoSite JSON format")
                             })
                             .map(|v2ray_data| {
-                                // 安全地获取写锁 / Safely acquire write lock
-                                match manager.write() {
-                                    Ok(mut guard) => {
-                                        let entries = guard.convert_v2ray_to_entries(v2ray_data);
-                                        let loaded_count = entries.len();
-                                        guard.reload(entries);
-                                        loaded_count
-                                    }
-                                    Err(e) => {
-                                        let mut guard = e.into_inner();
-                                        warn!(
-                                            target = "geosite_watcher",
-                                            "RwLock was poisoned during JSON reload, recovering"
-                                        );
-                                        let entries = guard.convert_v2ray_to_entries(v2ray_data);
-                                        let loaded_count = entries.len();
-                                        guard.reload(entries);
-                                        loaded_count
-                                    }
-                                }
+                                let mut guard = manager.write();
+                                let entries = guard.convert_v2ray_to_entries(v2ray_data);
+                                let loaded_count = entries.len();
+                                guard.reload(entries);
+                                loaded_count
                             })
                     };
 

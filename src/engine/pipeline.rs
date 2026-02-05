@@ -10,6 +10,7 @@ use hickory_proto::op::ResponseCode;
 use tracing::info;
 
 use crate::config::{Action, Transport};
+use crate::lock::RwLock;
 use crate::matcher::{RuntimePipeline, RuntimePipelineConfig, eval_match_chain};
 use crate::matcher::advanced_rule::CompiledPipeline;
 use crate::matcher::geosite::GeoSiteManager;
@@ -29,8 +30,8 @@ pub fn select_pipeline<'a>(
     edns_present: bool,
     qtype: RecordType,
     listener_label: &str,
-    geosite_manager: Option<&Arc<std::sync::RwLock<GeoSiteManager>>>,
-    geoip_manager: Option<&Arc<std::sync::RwLock<GeoIpManager>>>,
+    geosite_manager: Option<&Arc<RwLock<GeoSiteManager>>>,
+    geoip_manager: Option<&Arc<RwLock<GeoIpManager>>>,
 ) -> (Option<&'a RuntimePipeline>, Arc<str>) {
     for rule in &cfg.pipeline_select {
         let matched = eval_match_chain(
@@ -38,10 +39,10 @@ pub fn select_pipeline<'a>(
             |m| m.operator,
             |m| {
                 // 获取 GeoSiteManager 和 GeoIpManager 的引用 / Get GeoSiteManager and GeoIpManager references
-                // 简化 RwLock 读取路径以提高性能 / Simplified RwLock read path for better performance
-                let geosite_mgr_ref = geosite_manager.and_then(|m| m.read().ok());
+                // parking_lot::RwLock::read() 返回 guard 直接，不是 Result
+                let geosite_mgr_ref = geosite_manager.map(|m| m.read());
                 let geosite_mgr_ref_deref = geosite_mgr_ref.as_deref();
-                let geoip_mgr_ref = geoip_manager.and_then(|m| m.read().ok());
+                let geoip_mgr_ref = geoip_manager.map(|m| m.read());
                 let geoip_mgr_ref_deref = geoip_mgr_ref.as_deref();
 
                 m.matcher.matches_with_qtype(listener_label, client_ip, qname, qclass, edns_present, qtype, geoip_mgr_ref_deref, geosite_mgr_ref_deref)
@@ -263,6 +264,11 @@ impl Engine {
                                             tcp_upstreams.insert(format!("tcp://{}", addr));
                                         }
                                         Transport::Udp => {
+                                            udp_upstreams.insert(format!("udp://{}", addr));
+                                        }
+                                        Transport::TcpUdp => {
+                                            // TcpUdp uses both transports, add to both sets
+                                            tcp_upstreams.insert(format!("tcp://{}", addr));
                                             udp_upstreams.insert(format!("udp://{}", addr));
                                         }
                                     }

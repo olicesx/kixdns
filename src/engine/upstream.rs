@@ -6,12 +6,81 @@ use bytes::Bytes;
 use tokio::task::JoinSet;
 use tracing::{debug};
 use hickory_proto::op::ResponseCode;
+use futures::future::select;
 
 use crate::config::Transport;
 use super::Engine;
 
+/// Parse upstream address with optional protocol prefix.
+/// 解析带有可选协议前缀的 upstream 地址。
+///
+/// Returns (address_without_prefix, transport).
+/// 返回 (去除前缀的地址, 传输协议)。
+///
+/// Examples:
+/// - "tcp://1.1.1.1:53" -> ("1.1.1.1:53", Transport::Tcp)
+/// - "udp://1.1.1.1:53" -> ("1.1.1.1:53", Transport::Udp)
+/// - "1.1.1.1:53" -> ("1.1.1.1:53", default_transport)
+fn parse_upstream_addr(addr: &str, default_transport: Transport) -> (&str, Transport) {
+    if let Some(idx) = addr.find("://") {
+        let protocol = &addr[..idx];
+        let address = &addr[idx + 3..];
+        let transport = match protocol.to_lowercase().as_str() {
+            "tcp" => Transport::Tcp,
+            "udp" => Transport::Udp,
+            _ => default_transport,
+        };
+        (address, transport)
+    } else {
+        (addr, default_transport)
+    }
+}
+
 /// Hedge 超时除数：第一次尝试使用 1/N 的时间，为 TCP fallback 预留时间 / Hedge timeout divisor: first attempt uses 1/N of the budget to reserve time for TCP fallback
 const HEDGE_TIMEOUT_DIVISOR: u32 = 3;
+
+/// Send both TCP and UDP concurrently, return first successful response (hedged request).
+/// 同时发送 TCP 和 UDP，返回第一个成功响应（对冲请求）。
+///
+/// Returns (response_bytes, protocol_name).
+/// 返回 (响应字节, 协议名称)。
+async fn forward_tcp_udp_dual(
+    engine: &Engine,
+    packet: &[u8],
+    addr: &str,
+    timeout_dur: Duration,
+) -> anyhow::Result<(Bytes, &'static str)> {
+    let engine_udp = engine.clone();
+    let engine_tcp = engine.clone();
+    let packet_udp = packet.to_vec();
+    let packet_tcp = packet.to_vec();
+    let addr_udp = addr.to_string();
+    let addr_tcp = addr.to_string();
+
+    let udp_task = tokio::spawn(async move {
+        forward_udp_smart(&engine_udp, &packet_udp, &addr_udp, timeout_dur).await
+    });
+
+    let tcp_task = tokio::spawn(async move {
+        engine_tcp.tcp_mux.send(&packet_tcp, &addr_tcp, timeout_dur).await
+    });
+
+    // Wait for first successful response / 等待第一个成功响应
+    match select(Box::pin(udp_task), Box::pin(tcp_task)).await {
+        futures::future::Either::Left((result, tcp_task)) => {
+            tcp_task.abort();
+            let proto = "udp";
+            // result: Result<Result<Bytes, Error>, JoinError>
+            // First unwrap JoinError, then map Ok(Bytes) to (Bytes, proto)
+            result.map_err(|e| anyhow::anyhow!("udp task error: {}", e))?.map(|r| (r, proto))
+        }
+        futures::future::Either::Right((result, udp_task)) => {
+            udp_task.abort();
+            let proto = "tcp";
+            result.map_err(|e| anyhow::anyhow!("tcp task error: {}", e))?.map(|r| (r, proto))
+        }
+    }
+}
 
 /// 默认最小 hedge 超时毫秒数（当计算值过小时使用） / Default minimum hedge timeout in milliseconds (used when calculated value is too small)
 const DEFAULT_HEDGE_TIMEOUT_MS: u64 = 100;
@@ -47,20 +116,32 @@ pub async fn forward_upstream(
     // Fast path: direct call when only one upstream, avoiding spawn overhead
     if upstreams.len() == 1 {
         let up = &upstreams[0];
-        
-        // 构造返回的 protocol prefix (tcp:.../udp:...)
-        // Construct return protocol prefix
-        let upstream_with_proto = match default_transport {
-            Transport::Tcp => format!("tcp:{}", up),
-            Transport::Udp => format!("udp:{}", up),
-        };
+
+        // 解析地址中的协议前缀 / Parse protocol prefix from address
+        let (addr, transport_for_addr) = parse_upstream_addr(up, default_transport);
 
         let start = std::time::Instant::now();
-        let res = match default_transport {
-             Transport::Udp => forward_udp_smart(engine, packet, up, timeout_dur).await,
-             Transport::Tcp => engine.tcp_mux.send(packet, up, timeout_dur).await,
+        let (res, proto): (anyhow::Result<Bytes>, &str) = match transport_for_addr {
+            Transport::Udp => {
+                let r = forward_udp_smart(engine, packet, addr, timeout_dur).await;
+                (r, "udp")
+            }
+            Transport::Tcp => {
+                let r = engine.tcp_mux.send(packet, addr, timeout_dur).await;
+                (r, "tcp")
+            }
+            Transport::TcpUdp => {
+                // Dual-send: spawn both TCP and UDP concurrently, use first response
+                // 双发：同时发送 TCP 和 UDP，使用第一个响应
+                forward_tcp_udp_dual(engine, packet, addr, timeout_dur)
+                    .await
+                    .map(|(bytes, proto)| (Ok(bytes), proto))
+                    .unwrap_or_else(|e| (Err(e), "udp"))
+            }
         };
         let dur = start.elapsed();
+
+        let upstream_with_proto = format!("{}:{}", proto, addr);
 
         if let Ok(ref bytes) = res {
              // 记录成功指标 / Record success metrics
@@ -87,22 +168,37 @@ pub async fn forward_upstream(
     let packet_owned = packet.to_vec();
 
     for up in upstreams {
-        // No to_string() allocation needed, Arc<str> is cheap to clone
+        // 解析地址中的协议前缀 / Parse protocol prefix from address
+        let (addr, transport_for_task) = parse_upstream_addr(&up, default_transport);
+
         let engine = engine.clone();
         let packet = packet_owned.clone();
-        let transport_for_task = default_transport;
+        let addr_owned = addr.to_string();
 
         tasks.spawn(async move {
-            let upstream_with_proto = match transport_for_task {
-                Transport::Tcp => format!("tcp:{}", up),
-                Transport::Udp => format!("udp:{}", up),
+            let (proto, res) = match transport_for_task {
+                Transport::Udp => {
+                    let r = forward_udp_smart(&engine, &packet, &addr_owned, timeout_dur).await;
+                    ("udp", r)
+                }
+                Transport::Tcp => {
+                    let r = engine.tcp_mux.send(&packet, &addr_owned, timeout_dur).await;
+                    ("tcp", r)
+                }
+                Transport::TcpUdp => {
+                    // Dual-send: spawn both TCP and UDP concurrently, use first response
+                    // 双发：同时发送 TCP 和 UDP，使用第一个响应
+                    match forward_tcp_udp_dual(&engine, &packet, &addr_owned, timeout_dur).await {
+                        Ok((bytes, proto)) => (proto, Ok(bytes)),
+                        Err(e) => ("udp", Err(e)),
+                    }
+                }
             };
 
             let start = std::time::Instant::now();
-            let res = match transport_for_task {
-                Transport::Udp => forward_udp_smart(&engine, &packet, &up, timeout_dur).await,
-                Transport::Tcp => engine.tcp_mux.send(&packet, &up, timeout_dur).await,
-            };
+            // Note: for TcpUdp, timing includes both tasks' spawn/abort overhead
+            // 注意：对于 TcpUdp，计时包含两个任务的 spawn/abort 开销
+            let upstream_with_proto = format!("{}:{}", proto, addr_owned);
             let dur = start.elapsed();
             (upstream_with_proto, res, dur)
         });

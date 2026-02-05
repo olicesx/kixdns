@@ -1,10 +1,10 @@
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::net::IpAddr;
 use hickory_proto::rr::DNSClass;
 use hickory_proto::rr::RecordType;
 use tracing;
 
+use crate::lock::RwLock;
 use crate::matcher::RuntimeMatcher;
 use crate::matcher::geoip::GeoIpManager;
 use crate::matcher::geosite::GeoSiteManager;
@@ -23,11 +23,11 @@ pub struct MatcherContext<'a> {
 
 pub fn matcher_matches(matcher: &RuntimeMatcher, ctx: &MatcherContext<'_>) -> bool {
     // Resolve managers inline to avoid lifetime issues
-    // GeoSiteManager 现在使用 DashMap，无需 Mutex 锁
-    let geosite_mgr_ref = ctx.geosite_manager.and_then(|m| m.read().ok());
+    // parking_lot::RwLock::read() returns a guard directly, not Result
+    // parking_lot::RwLock::read() 直接返回 guard，不是 Result
+    let geosite_mgr_ref = ctx.geosite_manager.map(|m| m.read());
     let geosite_mgr_deref = geosite_mgr_ref.as_deref();
-    // GeoIpManager 现在使用 Mutex，需要获取锁
-    let geoip_mgr_ref = ctx.geoip_manager.and_then(|m| m.read().ok());
+    let geoip_mgr_ref = ctx.geoip_manager.map(|m| m.read());
     let geoip_mgr_deref = geoip_mgr_ref.as_deref();
 
     matcher.matches_with_qtype(

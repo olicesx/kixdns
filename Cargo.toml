@@ -34,12 +34,13 @@ smallvec = "1.13"
 maxminddb = "0.24"
 maxminddb-writer = "0.1"
 futures = "0.3"
+parking_lot = "0.12"
 [dev-dependencies]
 criterion = "0.5"
 
 [profile.release]
 opt-level = 3
-lto = fat
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true

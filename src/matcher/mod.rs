@@ -597,6 +597,82 @@ impl RuntimePipelineConfig {
     pub fn upstream_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.settings.upstream_timeout_ms)
     }
+
+    /// Collect all unique TCP upstreams from the configuration for warmup.
+    /// 收集配置中所有唯一的 TCP upstream 用于预热。
+    ///
+    /// Returns a HashSet of upstream addresses that use TCP transport.
+    /// 返回使用 TCP transport 的 upstream 地址的 HashSet。
+    pub fn collect_tcp_upstreams(&self) -> std::collections::HashSet<String> {
+        use crate::config::Transport;
+        let mut upstreams = std::collections::HashSet::new();
+
+        for pipeline in &self.pipelines {
+            for rule in &pipeline.rules {
+                // Check request phase actions / 检查请求阶段 actions
+                for action in &rule.actions {
+                    if let crate::config::Action::Forward { upstream, transport, .. } = action {
+                        let transport = transport.unwrap_or(Transport::Udp);
+                        if matches!(transport, Transport::Tcp | Transport::TcpUdp) {
+                            if let Some(u) = upstream {
+                                // Handle comma-separated upstreams / 处理逗号分隔的 upstreams
+                                for addr in u.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                                    upstreams.insert(normalize_upstream_addr(addr));
+                                }
+                            }
+                        }
+                    }
+                }
+                // Check response phase actions / 检查响应阶段 actions
+                for action in &rule.response_actions_on_match {
+                    if let crate::config::Action::Forward { upstream, transport, .. } = action {
+                        let transport = transport.unwrap_or(Transport::Udp);
+                        if matches!(transport, Transport::Tcp | Transport::TcpUdp) {
+                            if let Some(u) = upstream {
+                                for addr in u.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                                    upstreams.insert(normalize_upstream_addr(addr));
+                                }
+                            }
+                        }
+                    }
+                }
+                for action in &rule.response_actions_on_miss {
+                    if let crate::config::Action::Forward { upstream, transport, .. } = action {
+                        let transport = transport.unwrap_or(Transport::Udp);
+                        if matches!(transport, Transport::Tcp | Transport::TcpUdp) {
+                            if let Some(u) = upstream {
+                                for addr in u.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                                    upstreams.insert(normalize_upstream_addr(addr));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        upstreams
+    }
+}
+
+/// Normalize upstream address by stripping any protocol prefix.
+/// 去除 upstream 地址中的协议前缀。
+///
+/// This function removes protocols like "tcp://", "udp://", "tcp+udp://" etc.
+/// because the underlying network functions (TcpStream::connect, UdpSocket::send_to)
+/// only accept raw "host:port" format.
+///
+/// 此函数移除 "tcp://", "udp://", "tcp+udp://" 等协议前缀，
+/// 因为底层网络函数 (TcpStream::connect, UdpSocket::send_to)
+/// 只接受原始的 "host:port" 格式。
+fn normalize_upstream_addr(addr: &str) -> String {
+    if let Some(idx) = addr.find("://") {
+        // Strip protocol prefix (e.g., "tcp://", "udp://", "tcp+udp://")
+        // 去除协议前缀
+        addr[idx + 3..].to_string()
+    } else {
+        addr.to_string()
+    }
 }
 
 impl RuntimeMatcher {

@@ -523,6 +523,9 @@ impl GlobalSettings {
 pub enum Transport {
     Udp,
     Tcp,
+    /// Send both TCP and UDP concurrently, use first response (hedged request)
+    /// 同时发送 TCP 和 UDP，使用第一个响应（对冲请求）
+    TcpUdp,
 }
 
 #[derive(Debug, Clone, Deserialize, Copy, PartialEq, Eq)]

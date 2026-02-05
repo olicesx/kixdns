@@ -741,6 +741,7 @@ dependencies = [
  "moka",
  "notify",
  "num_cpus",
+ "parking_lot",
  "regex",
  "rustc-hash",
  "serde",
