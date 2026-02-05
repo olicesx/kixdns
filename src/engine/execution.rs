@@ -37,6 +37,18 @@ use super::utils::{
 };
 use crate::engine::rules::{ResponseContext, calculate_rule_hash, Decision};
 
+/// Pre-parsed data from handle_packet_fast to avoid re-parsing
+/// 来自 handle_packet_fast 的预解析数据，避免重新解析
+#[derive(Debug)]
+pub struct PreParsedData {
+    qname: String,
+    qtype: hickory_proto::rr::RecordType,
+    qclass: DNSClass,
+    tx_id: u16,
+    edns_present: bool,
+    pipeline_id: Arc<str>,
+}
+
 
 
 // ============================================================================
@@ -144,6 +156,23 @@ impl Engine {
         }
     }
 
+    /// Get parse_quick failure statistics
+    /// 获取快速解析失败统计信息
+    ///
+    /// Returns (total_requests, parse_quick_failures, failure_rate)
+    /// 返回 (总请求数, 快速解析失败数, 失败率)
+    #[inline]
+    pub fn get_parse_quick_stats(&self) -> (u64, u64, f64) {
+        let total = self.metrics_total_requests.load(Ordering::Relaxed);
+        let failures = self.metrics_parse_quick_failures.load(Ordering::Relaxed);
+        let rate = if total > 0 {
+            (failures as f64) / (total as f64) * 100.0
+        } else {
+            0.0
+        };
+        (total, failures, rate)
+    }
+
     /// Mark TCP external timeout for a specific upstream
     /// 标记特定上游的 TCP 外部超时
     ///
@@ -163,6 +192,12 @@ impl Engine {
     #[inline]
     fn incr_fastpath_hits(&self) {
         self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment parse_quick_failures counter using simple atomic operation
+    #[inline]
+    fn incr_parse_quick_failures(&self) {
+        self.metrics_parse_quick_failures.fetch_add(1, Ordering::Relaxed);
     }
 
 
@@ -246,6 +281,7 @@ impl Engine {
             Some(q) => q,
             None => {
                 // Quick parse failed, fallback to async path / 快速解析失败，回退到异步路径
+                self.incr_parse_quick_failures();
                 return Ok(None);
             }
         };
@@ -409,20 +445,57 @@ impl Engine {
                 }
             }
         }
-        
+
         // Cache miss, need async processing / 缓存未命中，需要异步处理
-        Ok(None)
+        // Return AsyncNeeded with pre-parsed data to avoid re-parsing in handle_packet
+        // 返回 AsyncNeeded 包含预解析数据，避免在 handle_packet 中重新解析
+        Ok(Some(FastPathResponse::AsyncNeeded {
+            qname: qname_str.to_string(),
+            qtype: q.qtype,
+            qclass: q.qclass,
+            tx_id: q.tx_id,
+            edns_present: q.edns_present,
+            pipeline_id,
+        }))
     }
 
 
 
     pub async fn handle_packet(&self, packet: &[u8], peer: SocketAddr) -> anyhow::Result<Bytes> {
-        self.handle_packet_internal(packet, peer, false).await
+        self.handle_packet_internal(packet, peer, false, None).await
+    }
+
+    /// Public wrapper for handle_packet_internal with pre-parsed data
+    /// handle_packet_internal 的公共包装，接受预解析数据
+    ///
+    /// This method is used by UDP worker to avoid re-parsing when cache miss occurs
+    /// 此方法由 UDP worker 使用，在缓存未命中时避免重新解析
+    pub async fn handle_packet_internal_with_pre_parsed(
+        &self,
+        packet: &[u8],
+        peer: SocketAddr,
+        skip_cache: bool,
+        qname: String,
+        qtype: u16,
+        qclass: u16,
+        tx_id: u16,
+        edns_present: bool,
+        pipeline_id: Arc<str>,
+    ) -> anyhow::Result<Bytes> {
+        let pre_parsed = PreParsedData {
+            qname,
+            qtype: hickory_proto::rr::RecordType::from(qtype),
+            qclass: DNSClass::from(qclass),
+            tx_id,
+            edns_present,
+            pipeline_id,
+        };
+        self.handle_packet_internal(packet, peer, skip_cache, Some(pre_parsed)).await
     }
 
     /// Internal handle_packet implementation with skip_cache option
     /// 内部 handle_packet 实现，支持跳过缓存选项
-    /// 
+    ///
     /// Design: Background refresh calls this with skip_cache=true to:
     /// 设计：后台刷新使用 skip_cache=true 调用以：
     /// 1. Skip cache lookup (avoid returning stale cache)
@@ -431,7 +504,16 @@ impl Engine {
     /// 1. 跳过缓存查找（避免返回陈旧缓存）
     /// 2. 跳过缓存命中指标（避免虚高命中率）
     /// 3. 始终查询上游（获取最新数据）
-    pub(crate) async fn handle_packet_internal(&self, packet: &[u8], peer: SocketAddr, skip_cache: bool) -> anyhow::Result<Bytes> {
+    ///
+    /// pre_parsed: Optional pre-parsed data from handle_packet_fast to avoid re-parsing
+    /// pre_parsed: 来自 handle_packet_fast 的可选预解析数据，避免重新解析
+    pub(crate) async fn handle_packet_internal(
+        &self,
+        packet: &[u8],
+        peer: SocketAddr,
+        skip_cache: bool,
+        pre_parsed: Option<PreParsedData>,
+    ) -> anyhow::Result<Bytes> {
         // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
         let _req_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
         self.incr_total_requests();
@@ -449,61 +531,73 @@ impl Engine {
         let upstream_timeout = cfg.upstream_timeout();
         let response_jump_limit = cfg.settings.response_jump_limit as usize;
 
-        // Lazy Parse: Use quick parse first / 延迟解析：首先使用快速解析
-        let mut qname_buf = [0u8; 256];
-        let (qname_cow, qtype, qclass, tx_id, edns_present) = if let Some(q) = parse_quick(packet, &mut qname_buf) {
-            // Use unchecked conversion to avoid double allocation / 使用未检查转换避免双重分配
-            // SAFETY: qname_bytes is validated ASCII from parse_quick()
-            // ASCII is always valid UTF-8, so this is safe
-            // 安全性：qname_bytes 在 parse_quick() 中已验证为 ASCII
-            // ASCII 始终是有效的 UTF-8，所以这是安全的
-            //
-            // In debug builds, we validate to catch any issues early
-            // 在 debug 构建中，我们验证以尽早发现问题
-            let qname_str = {
-                #[cfg(debug_assertions)]
-                {
-                    std::str::from_utf8(q.qname_bytes).expect("qname_bytes should be valid UTF-8")
-                }
-                #[cfg(not(debug_assertions))]
-                unsafe {
-                    std::str::from_utf8_unchecked(q.qname_bytes)
-                }
-            };
-            (std::borrow::Cow::Borrowed(qname_str), hickory_proto::rr::RecordType::from(q.qtype), DNSClass::from(q.qclass), q.tx_id, q.edns_present)
-        } else {
-            // Fallback to full parse if quick parse fails (unlikely for standard queries) / 如果快速解析失败则回退到完整解析（对于标准查询不太可能）
-            let req = Message::from_bytes(packet).context("parse request")?;
-            let question = req.queries().first().context("empty question")?;
+        // Use pre-parsed data if available, otherwise parse / 如果有预解析数据则使用，否则解析
+        let (qname_cow, qtype, qclass, tx_id, edns_present, pipeline_id) = if let Some(pre) = pre_parsed {
             (
-                std::borrow::Cow::Owned(question.name().to_lowercase().to_string()),
-                question.query_type(),
-                question.query_class(),
-                req.id(),
-                req.extensions().is_some(),
+                std::borrow::Cow::Owned(pre.qname),
+                pre.qtype,
+                pre.qclass,
+                pre.tx_id,
+                pre.edns_present,
+                pre.pipeline_id,
             )
-        };
-        let qname_ref = &qname_cow;
+        } else {
+            // Lazy Parse: Use quick parse first / 延迟解析：首先使用快速解析
+            // Allocate qname_buf outside the if-else to extend lifetime
+            // 在 if-else 外部分配 qname_buf 以延长生命周期
+            let mut qname_buf = [0u8; 256];
+            let q = parse_quick(packet, &mut qname_buf);
 
+            let (qname_cow, qtype, qclass, tx_id, edns_present) = if let Some(q) = q {
+                // Use unchecked conversion to avoid double allocation / 使用未检查转换避免双重分配
+                // SAFETY: qname_bytes is validated ASCII from parse_quick()
+                // ASCII is always valid UTF-8, so this is safe
+                // 安全性：qname_bytes 在 parse_quick() 中已验证为 ASCII
+                // ASCII 始终是有效的 UTF-8，所以这是安全的
+                let qname_str = unsafe {
+                    std::str::from_utf8_unchecked(q.qname_bytes)
+                };
+                (std::borrow::Cow::Owned(qname_str.to_string()), hickory_proto::rr::RecordType::from(q.qtype), DNSClass::from(q.qclass), q.tx_id, q.edns_present)
+            } else {
+                // Fallback to full parse if quick parse fails (unlikely for standard queries) / 如果快速解析失败则回退到完整解析（对于标准查询不太可能）
+                let req = Message::from_bytes(packet).context("parse request")?;
+                let question = req.queries().first().context("empty question")?;
+                (
+                    std::borrow::Cow::Owned(question.name().to_lowercase().to_string()),
+                    question.query_type(),
+                    question.query_class(),
+                    req.id(),
+                    req.extensions().is_some(),
+                )
+            };
+
+            // Scope geosite_mgr to ensure lock is released before await
+            // 限制 geosite_mgr 的作用域，确保在 await 之前释放锁
+            let pipeline_id = {
+                // GeoSiteManager now uses DashMap, no Mutex lock needed
+                // GeoSiteManager 现在使用 DashMap，无需 Mutex 锁
+                let (_, pipeline_id) = select_pipeline(
+                    cfg,
+                    &qname_cow,
+                    peer.ip(),
+                    qclass,
+                    edns_present,
+                    qtype,
+                    &self.listener_label,
+                    Some(&self.geosite_manager),
+                    Some(&self.geoip_manager),
+                );
+                pipeline_id
+            }; // geosite_mgr 在这里释放 / geosite_mgr released here
+
+            (qname_cow, qtype, qclass, tx_id, edns_present, pipeline_id)
+        };
+
+        let qname_ref = &qname_cow;
         let start = std::time::Instant::now();
 
-        // Scope geosite_mgr to ensure lock is released before await
-        // 限制 geosite_mgr 的作用域，确保在 await 之前释放锁
-        let (pipeline_opt, pipeline_id) = {
-            // GeoSiteManager now uses DashMap, no Mutex lock needed
-            // GeoSiteManager 现在使用 DashMap，无需 Mutex 锁
-            select_pipeline(
-                cfg,
-                qname_ref,
-                peer.ip(),
-                qclass,
-                edns_present,
-                qtype,
-                &self.listener_label,
-                Some(&self.geosite_manager),
-                Some(&self.geoip_manager),
-            )
-        }; // geosite_mgr 在这里释放 / geosite_mgr released here
+        // Find pipeline_opt from pipeline_id / 从 pipeline_id 查找 pipeline_opt
+        let pipeline_opt = cfg.pipelines.iter().find(|p| p.id.as_ref() == pipeline_id.as_ref());
 
         // Convert qname_ref to bytes for hash calculation / 将 qname_ref 转换为 bytes 进行哈希计算
         let qname_bytes = qname_ref.as_bytes();

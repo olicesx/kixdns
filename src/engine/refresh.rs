@@ -64,7 +64,7 @@ pub fn spawn_background_refresh(
 
         // Call handle_packet_internal with skip_cache=true
         // 调用 handle_packet_internal 并设置 skip_cache=true
-        let result = engine.handle_packet_internal(&packet, peer_addr, true).await;
+        let result = engine.handle_packet_internal(&packet, peer_addr, true, None).await;
 
         match result {
             Ok(_resp_bytes) => {

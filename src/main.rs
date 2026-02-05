@@ -427,8 +427,6 @@ async fn run_udp_worker(
     // 使用 BytesMut 避免 Bytes::copy_from_slice 的内存分配 / Use BytesMut to avoid memory allocation in Bytes::copy_from_slice
     use bytes::BytesMut;
     let mut buf = BytesMut::with_capacity(4096);
-    // 复用发送缓冲区：用于缓存命中时 patch TXID，避免每包堆分配 / Reuse send buffer to patch TXID on cache hits, avoiding per-packet heap allocation
-    let mut send_buf = BytesMut::with_capacity(512);
 
     // 自适应流控：每 100 个请求检查一次是否需要调整 permits
     // Adaptive flow control: check if adjustment needed every 100 requests
@@ -458,56 +456,62 @@ async fn run_udp_worker(
                     engine.adjust_flow_control(); // Now synchronous with atomic CAS
                 }
 
-                // 快速路径：尝试同步处理（缓存命中等场景） / Fast path: try synchronous handling (cache hit scenarios, etc.)
+                // ✅ 优化：使用 handle_packet_fast 避免重复解析
+                // ✅ Optimization: Use handle_packet_fast to avoid re-parsing
+                // 如果缓存命中，直接返回；如果缓存未命中，返回预解析的数据
+                // If cache hit, return directly; if cache miss, return pre-parsed data
                 match engine.handle_packet_fast(&packet_bytes, peer) {
-                    Ok(Some(resp)) => match resp {
-                        FastPathResponse::Direct(bytes) => {
-                            // 已包含正确 TXID，可直接发送 / Already contains correct TXID
-                            let _ = socket.send_to(&bytes, peer).await;
-                        }
-                        FastPathResponse::CacheHit { cached, tx_id, inserted_at } => {
-                            // 复用 send_buf：copy + patch TXID / Reuse send_buf: copy + patch TXID
-                            send_buf.clear();
-                            if send_buf.capacity() < cached.len() {
-                                send_buf.reserve(cached.len() - send_buf.capacity());
-                            }
-                            send_buf.extend_from_slice(&cached);
+                    Ok(Some(FastPathResponse::Direct(bytes))) => {
+                        // 已包含正确 TXID，可直接发送 / Already contains correct TXID
+                        let _ = socket.send_to(&bytes, peer).await;
+                    }
+                    Ok(Some(FastPathResponse::CacheHit { cached, tx_id, inserted_at })) => {
+                        // 复用 send_buf：copy + patch TXID / Reuse send_buf: copy + patch TXID
+                        let mut send_buf = bytes::BytesMut::with_capacity(cached.len());
+                        send_buf.extend_from_slice(&cached);
 
-                            // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
-                            let elapsed = inserted_at.elapsed().as_secs() as u32;
-                            if elapsed > 0 {
-                                kixdns::proto_utils::patch_all_ttls(&mut send_buf, elapsed);
-                            }
-
-                            if send_buf.len() >= 2 {
-                                let id_bytes = tx_id.to_be_bytes();
-                                send_buf[0] = id_bytes[0];
-                                send_buf[1] = id_bytes[1];
-                            }
-                            let _ = socket.send_to(&send_buf, peer).await;
+                        // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
+                        let elapsed = inserted_at.elapsed().as_secs() as u32;
+                        if elapsed > 0 {
+                            kixdns::proto_utils::patch_all_ttls(&mut send_buf, elapsed);
                         }
-                    },
-                    Ok(None) => {
-                        // 需要异步处理（上游转发），尝试获取 permit 以限制并发任务数
-                        // Need async processing, try to acquire permit for backpressure
+
+                        if send_buf.len() >= 2 {
+                            let id_bytes = tx_id.to_be_bytes();
+                            send_buf[0] = id_bytes[0];
+                            send_buf[1] = id_bytes[1];
+                        }
+                        let _ = socket.send_to(&send_buf, peer).await;
+                    }
+                    Ok(Some(FastPathResponse::AsyncNeeded { qname, qtype, qclass, tx_id, edns_present, pipeline_id })) => {
+                        // 缓存未命中，使用预解析的数据避免重复解析
+                        // Cache miss, use pre-parsed data to avoid re-parsing
                         let permit_mgr = Arc::clone(&engine.permit_manager);
-
-                        // ✅ 获取整体请求超时（包含 hedge + TCP fallback）
-                        // ✅ Get overall request timeout (including hedge + TCP fallback)
                         let timeout_ms = engine.get_request_timeout_ms();
 
-                        // 非阻塞式尝试获取 permit，避免 async 等待导致的延迟
-                        // Non-blocking try_acquire to avoid async waiting in the hot path
                         if let Some(permit) = permit_mgr.try_acquire() {
                             let engine = engine.clone();
                             let socket = Arc::clone(&socket);
                             tokio::spawn(async move {
-                                let _permit = permit; // 任务完成时自动释放 / Auto-release on task completion
-
-                                // ✅ 添加外层超时保护，防止上游抽风时任务卡住
-                                // ✅ Add outer timeout protection to prevent task stuck when upstream is unstable
+                                let _permit = permit;
                                 let timeout_dur = Duration::from_millis(timeout_ms);
-                                match tokio::time::timeout(timeout_dur, engine.handle_packet(&packet_bytes, peer)).await {
+
+                                // ✅ 传递预解析数据给 handle_packet_internal，避免重复解析
+                                // ✅ Pass pre-parsed data to handle_packet_internal to avoid re-parsing
+                                match tokio::time::timeout(
+                                    timeout_dur,
+                                    engine.handle_packet_internal_with_pre_parsed(
+                                        &packet_bytes,
+                                        peer,
+                                        false,
+                                        qname,
+                                        qtype,
+                                        qclass,
+                                        tx_id,
+                                        edns_present,
+                                        pipeline_id,
+                                    )
+                                ).await {
                                     Ok(Ok(resp)) => {
                                         let _ = socket.send_to(&resp, peer).await;
                                     }
@@ -516,8 +520,6 @@ async fn run_udp_worker(
                                         send_servfail_response(&socket, &packet_bytes, peer).await;
                                     }
                                     Err(_) => {
-                                        // 超时：permit 会被 _permit 的 Drop 自动释放
-                                        // Timeout: permit will be auto-released by _permit's Drop
                                         warn!(
                                             timeout_ms,
                                             upstream_timeout_ms = engine.get_upstream_timeout_ms(),
@@ -528,8 +530,39 @@ async fn run_udp_worker(
                                 }
                             });
                         }
-                        // 如果 PermitManager 已满，直接丢弃请求（客户端将等待超时）
-                        // If permit manager is full, drop the request (client will timeout)
+                    }
+                    Ok(None) => {
+                        // 快速解析失败，回退到完整处理
+                        // Fast parse failed, fallback to full processing
+                        let permit_mgr = Arc::clone(&engine.permit_manager);
+                        let timeout_ms = engine.get_request_timeout_ms();
+
+                        if let Some(permit) = permit_mgr.try_acquire() {
+                            let engine = engine.clone();
+                            let socket = Arc::clone(&socket);
+                            let packet_bytes_clone = packet_bytes.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                let timeout_dur = Duration::from_millis(timeout_ms);
+                                match tokio::time::timeout(timeout_dur, engine.handle_packet(&packet_bytes_clone, peer)).await {
+                                    Ok(Ok(resp)) => {
+                                        let _ = socket.send_to(&resp, peer).await;
+                                    }
+                                    Ok(Err(e)) => {
+                                        debug!(error = %e, "handle_packet error");
+                                        send_servfail_response(&socket, &packet_bytes_clone, peer).await;
+                                    }
+                                    Err(_) => {
+                                        warn!(
+                                            timeout_ms,
+                                            upstream_timeout_ms = engine.get_upstream_timeout_ms(),
+                                            "request timeout"
+                                        );
+                                        send_servfail_response(&socket, &packet_bytes_clone, peer).await;
+                                    }
+                                }
+                            });
+                        }
                     }
                     Err(_) => {
                         // 解析错误，忽略 / Parse error, ignore
@@ -591,19 +624,84 @@ async fn handle_tcp_conn(
             return Ok(());
         }
 
-        // ✅ 添加外层超时保护，防止上游抽风时任务卡住
-        // ✅ Add outer timeout protection to prevent task stuck when upstream is unstable
+        // ✅ 优化：使用 handle_packet_fast 进行快速路径检查
+        // ✅ Optimization: Use handle_packet_fast for fast path check
+        // 统一 UDP 和 TCP 的行为，避免重复解析
+        // Unify UDP and TCP behavior to avoid re-parsing
+        let packet_bytes = buf.split().freeze();
         let timeout_dur = Duration::from_millis(timeout_ms);
-        let resp = match tokio::time::timeout(timeout_dur, engine.handle_packet(&buf, peer)).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(_)) => return Ok(()),
+
+        let resp = match engine.handle_packet_fast(&packet_bytes, peer) {
+            Ok(Some(FastPathResponse::Direct(bytes))) => {
+                // 快速路径命中：直接返回 / Fast path hit: return directly
+                bytes
+            }
+            Ok(Some(FastPathResponse::CacheHit { cached, tx_id, inserted_at })) => {
+                // 缓存命中：patch TXID / Cache hit: patch TXID
+                let mut resp_buf = bytes::BytesMut::with_capacity(cached.len());
+                resp_buf.extend_from_slice(&cached);
+
+                // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
+                let elapsed = inserted_at.elapsed().as_secs() as u32;
+                if elapsed > 0 {
+                    kixdns::proto_utils::patch_all_ttls(&mut resp_buf, elapsed);
+                }
+
+                if resp_buf.len() >= 2 {
+                    let id_bytes = tx_id.to_be_bytes();
+                    resp_buf[0] = id_bytes[0];
+                    resp_buf[1] = id_bytes[1];
+                }
+                resp_buf.freeze()
+            }
+            Ok(Some(FastPathResponse::AsyncNeeded { qname, qtype, qclass, tx_id, edns_present, pipeline_id })) => {
+                // 缓存未命中：使用预解析数据避免重复解析
+                // Cache miss: use pre-parsed data to avoid re-parsing
+                match tokio::time::timeout(
+                    timeout_dur,
+                    engine.handle_packet_internal_with_pre_parsed(
+                        &packet_bytes,
+                        peer,
+                        false,
+                        qname,
+                        qtype,
+                        qclass,
+                        tx_id,
+                        edns_present,
+                        pipeline_id,
+                    )
+                ).await {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(_)) => return Ok(()),
+                    Err(_) => {
+                        warn!(
+                            timeout_ms,
+                            upstream_timeout_ms = engine.get_upstream_timeout_ms(),
+                            "TCP request timeout after hedge and fallback exhausted"
+                        );
+                        return Ok(()); // 关闭连接 / Close connection
+                    }
+                }
+            }
+            Ok(None) => {
+                // 快速解析失败，回退到完整处理
+                // Fast parse failed, fallback to full processing
+                match tokio::time::timeout(timeout_dur, engine.handle_packet(&packet_bytes, peer)).await {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(_)) => return Ok(()),
+                    Err(_) => {
+                        warn!(
+                            timeout_ms,
+                            upstream_timeout_ms = engine.get_upstream_timeout_ms(),
+                            "TCP request timeout"
+                        );
+                        return Ok(()); // 关闭连接 / Close connection
+                    }
+                }
+            }
             Err(_) => {
-                warn!(
-                    timeout_ms,
-                    upstream_timeout_ms = engine.get_upstream_timeout_ms(),
-                    "TCP request timeout after hedge and fallback exhausted"
-                );
-                return Ok(()); // 关闭连接 / Close connection
+                // 解析错误，关闭连接 / Parse error, close connection
+                return Ok(());
             }
         };
 

@@ -35,6 +35,7 @@ pub struct Engine {
     pub metrics_inflight: Arc<AtomicUsize>,
     pub metrics_total_requests: Arc<AtomicU64>,
     pub metrics_fastpath_hits: Arc<AtomicU64>,
+    pub metrics_parse_quick_failures: Arc<AtomicU64>,
     pub metrics_upstream_ns_total: Arc<AtomicU64>,
     pub metrics_upstream_calls: Arc<AtomicU64>,
     // Per-request id generator for tracing / 每个请求的 ID 生成器用于追踪
@@ -313,6 +314,7 @@ impl Engine {
             metrics_inflight: Arc::new(AtomicUsize::new(0)),
             metrics_total_requests: Arc::new(AtomicU64::new(0)),
             metrics_fastpath_hits: Arc::new(AtomicU64::new(0)),
+            metrics_parse_quick_failures: Arc::new(AtomicU64::new(0)),
             metrics_upstream_ns_total: Arc::new(AtomicU64::new(0)),
             metrics_upstream_calls: Arc::new(AtomicU64::new(0)),
             metrics_last_upstream_latency_ns: Arc::new(AtomicU64::new(0)),
