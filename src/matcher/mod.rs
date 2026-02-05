@@ -112,31 +112,6 @@ mod matcher_helpers {
         manager.matches(tag, domain)
     }
 
-    /// 从 DNS 响应消息中收集所有 IP 地址（A 和 AAAA 记录）
-    /// Collect all IP addresses from DNS response message (A and AAAA records)
-    ///
-    /// # 参数 / Parameters
-    /// - `msg`: DNS 响应消息 / DNS response message
-    ///
-    /// # 返回 / Returns
-    /// 包含所有 IP 地址的向量 / Vector containing all IP addresses
-    #[inline]
-    pub fn collect_ips_from_message(msg: &Message) -> Vec<IpAddr> {
-        use hickory_proto::rr::RData;
-        let mut ips = Vec::new();
-
-        // 从 Answer 中收集 IP / Collect IPs from Answer
-        for record in msg.answers() {
-            match record.data() {
-                Some(RData::A(a)) => ips.push(IpAddr::V4(a.0)),
-                Some(RData::AAAA(aaaa)) => ips.push(IpAddr::V6(aaaa.0)),
-                _ => {}
-            }
-        }
-
-        ips
-    }
-
     /// 检查响应消息中是否有任意 IP 匹配指定的 CIDR 列表
     /// Check if any IP in response message matches the specified CIDR list
     ///
@@ -903,6 +878,63 @@ impl RuntimePipelineSelectorMatcher {
     }
 
     #[inline]
+    pub fn matches_with_ready_managers(
+        &self,
+        listener_label: &str,
+        client_ip: IpAddr,
+        qname: &str,
+        qclass: DNSClass,
+        edns_present: bool,
+        qtype: RecordType,
+        geoip_ready: Option<&crate::matcher::geoip::GeoIpManager>,
+        geosite_ready: Option<&crate::matcher::geosite::GeoSiteManager>,
+    ) -> bool {
+        match self {
+            RuntimePipelineSelectorMatcher::ListenerLabel { value } => {
+                value.eq_ignore_ascii_case(listener_label)
+            }
+            RuntimePipelineSelectorMatcher::ClientIp { net } => net.contains(&client_ip),
+            RuntimePipelineSelectorMatcher::DomainSuffix { value } => qname.ends_with(value.as_ref()),
+            RuntimePipelineSelectorMatcher::DomainRegex { regex } => regex.is_match(qname),
+            RuntimePipelineSelectorMatcher::Any => true,
+            RuntimePipelineSelectorMatcher::Qclass { value } => value == &qclass,
+            RuntimePipelineSelectorMatcher::EdnsPresent { expect } => *expect == edns_present,
+            RuntimePipelineSelectorMatcher::GeoSite { tag } => {
+                geosite_ready.is_some_and(|mgr| mgr.matches(tag, qname))
+            }
+            RuntimePipelineSelectorMatcher::GeoSiteNot { tag } => {
+                if let Some(mgr) = geosite_ready {
+                    !mgr.matches(tag, qname)
+                } else {
+                    false
+                }
+            }
+            RuntimePipelineSelectorMatcher::GeoipCountry { country_codes } => {
+                if let Some(mgr) = geoip_ready {
+                    let result = mgr.lookup(client_ip);
+                    if let Some(cc) = result.country_code {
+                        country_codes.iter().any(|c| c.eq_ignore_ascii_case(&cc))
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            RuntimePipelineSelectorMatcher::GeoipPrivate { expect } => {
+                if let Some(mgr) = geoip_ready {
+                    let result = mgr.lookup(client_ip);
+                    result.is_private == *expect
+                } else {
+                    // Fallback to basic private IP check
+                    crate::matcher::geoip::is_private_ip(client_ip) == *expect
+                }
+            }
+            RuntimePipelineSelectorMatcher::Qtype { value } => *value == qtype,
+        }
+    }
+
+    #[inline]
     pub fn matches_with_qtype(
         &self,
         listener_label: &str,
@@ -1183,22 +1215,52 @@ impl RuntimeResponseMatcher {
                 edns == *expect
             }
             RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } => {
-                // 使用辅助函数收集 IP 并进行 GeoIP 国家代码匹配 / Use helper to collect IPs and match GeoIP country
-                let all_ips = matcher_helpers::collect_ips_from_message(msg);
+                // 优化：直接迭代 DNS 记录以避免分配 Vec，并在首次不匹配时短路
+                // Optimization: Iterate DNS records directly to avoid Vec allocation, and short-circuit on first mismatch
+                use hickory_proto::rr::RData;
 
-                // 如果没有 IP 或没有 GeoIpManager，不匹配 / No match if no IPs or no GeoIpManager
-                if all_ips.is_empty() {
+                let mut has_ip = false;
+
+                // 检查 Answers
+                let all_match_answers = msg.answers().iter().all(|record| {
+                    let ip = match record.data() {
+                        Some(RData::A(a)) => Some(IpAddr::V4(a.0)),
+                        Some(RData::AAAA(aaaa)) => Some(IpAddr::V6(aaaa.0)),
+                        _ => None,
+                    };
+
+                    if let Some(ip) = ip {
+                        has_ip = true;
+                        // 如果没有管理器，则无法匹配，视为失败
+                        // If no manager, cannot match, consider failure
+                        if let Some(manager) = geoip_manager {
+                            matcher_helpers::match_geoip_country(manager, ip, country_codes)
+                        } else {
+                            false
+                        }
+                    } else {
+                        // 非 IP 记录忽略，继续检查其他记录
+                        // Ignore non-IP records, continue checking others
+                        true
+                    }
+                });
+
+                if !all_match_answers {
                     return false;
                 }
 
-                let Some(manager) = geoip_manager else {
-                    return false;
-                };
-
-                // 检查是否所有 IP 都匹配指定的国家代码 / Check if all IPs match specified country codes
-                all_ips
-                    .iter()
-                    .all(|ip| matcher_helpers::match_geoip_country(manager, *ip, country_codes))
+                // 也检查 Additionals (如果策略要求检查整个消息中的 IP)
+                // Check Additionals as well (if policy requires checking IPs in entire message)
+                // 注意：通常 ResponseAnswerIp 只关注 Answers。这里保持与原 collect_ips_from_message 行为一致吗？
+                // 原 collect_ips_from_message 只迭代了 msg.answers()！
+                // Check matcher_helpers code: "for record in msg.answers() { ... }" - YES, only answers.
+                // 原代码逻辑：如果 answers 为空，返回 false (all_ips.is_empty check)
+                
+                if !has_ip {
+                   return false;
+                }
+                
+                true
             }
             RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { expect } => {
                 // 检查 Answer 中是否有任意 IP 为私有 IP

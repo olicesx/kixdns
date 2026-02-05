@@ -33,14 +33,28 @@ pub fn select_pipeline<'a>(
     geosite_manager: Option<&Arc<RwLock<GeoSiteManager>>>,
     geoip_manager: Option<&Arc<RwLock<GeoIpManager>>>,
 ) -> (Option<&'a RuntimePipeline>, Arc<str>) {
+    // 优化：提前获取读锁，避免在循环中重复获取/释放
+    // Optimization: Acquire read locks upfront to avoid repeated acquire/release in loop
+    let geosite_guard = geosite_manager.map(|m| m.read());
+    let geoip_guard = geoip_manager.map(|m| m.read());
+    let geosite_ref = geosite_guard.as_deref();
+    let geoip_ref = geoip_guard.as_deref();
+
     for rule in &cfg.pipeline_select {
         let matched = eval_match_chain(
             &rule.matchers,
             |m| m.operator,
             |m| {
-                // 直接传递 Arc<RwLock<T>>，让 matcher 内部按需获取锁
-                // Pass Arc<RwLock<T>> directly, let matcher acquire locks on-demand
-                m.matcher.matches_with_qtype(listener_label, client_ip, qname, qclass, edns_present, qtype, geoip_manager, geosite_manager)
+                m.matcher.matches_with_ready_managers(
+                    listener_label,
+                    client_ip,
+                    qname,
+                    qclass,
+                    edns_present,
+                    qtype,
+                    geoip_ref,
+                    geosite_ref,
+                )
             },
         );
         if matched {
