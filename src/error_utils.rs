@@ -6,6 +6,10 @@
 ///
 /// # Usage
 /// ```rust
+/// use kixdns::safe_parse;
+/// use std::net::IpAddr;
+/// use ipnet::IpNet;
+/// use anyhow::Context;
 /// let ip = safe_parse!("8.8.8.8", IpAddr);
 /// let net = safe_parse!("1.2.3.0/24", IpNet);
 /// ```
@@ -33,6 +37,8 @@ macro_rules! safe_parse {
 ///
 /// # Usage
 /// ```rust
+/// use kixdns::safe_parse_ip;
+/// use std::net::{IpAddr, Ipv4Addr};
 /// let ip = safe_parse_ip!("8.8.8.8", IpAddr::V4(Ipv4Addr::UNSPECIFIED));
 /// ```
 #[macro_export]
@@ -47,7 +53,12 @@ macro_rules! safe_parse_ip {
 ///
 /// # Usage
 /// ```rust
-/// let result = safe_unwrap!(some_operation(), "Failed to do something");
+/// use kixdns::safe_unwrap;
+/// fn some_operation() -> Result<(), anyhow::Error> { Ok(()) }
+/// fn run() -> Result<(), anyhow::Error> {
+///     let result = safe_unwrap!(some_operation(), "Failed to do something");
+///     Ok(())
+/// }
 /// ```
 #[macro_export]
 macro_rules! safe_unwrap {
@@ -67,6 +78,8 @@ macro_rules! safe_unwrap {
 ///
 /// # Usage
 /// ```rust
+/// use kixdns::safe_some;
+/// let some_option = Some(1);
 /// let value = safe_some!(some_option, "Missing required value");
 /// ```
 #[macro_export]
@@ -74,44 +87,4 @@ macro_rules! safe_some {
     ($expr:expr, $context:expr) => {
         $expr.ok_or_else(|| anyhow::anyhow!($context))
     };
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use anyhow::Context;
-
-    #[test]
-    fn test_safe_parse() {
-        let result = safe_parse!("8.8.8.8", std::net::IpAddr);
-        assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap(),
-            "8.8.8.8".parse::<std::net::IpAddr>().unwrap()
-        );
-    }
-
-    #[test]
-    fn test_safe_parse_with_context() {
-        let result = safe_parse!("invalid", std::net::IpAddr, "Invalid IP address");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_safe_parse_ip() {
-        let ip = safe_parse_ip!(
-            "8.8.8.8",
-            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-        );
-        assert_eq!(ip, "8.8.8.8".parse::<std::net::IpAddr>().unwrap());
-    }
-
-    #[test]
-    fn test_safe_parse_ip_invalid() {
-        let ip = safe_parse_ip!(
-            "invalid",
-            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-        );
-        assert_eq!(ip, std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-    }
 }

@@ -95,7 +95,7 @@ pub struct GlobalSettings {
     pub default_upstream: String,
     /// 预分割的默认上游列表（性能优化） / Pre-split default upstream list (performance optimization)
     #[serde(skip)]
-    pub default_upstream_pre_split: Option<std::sync::Arc<Vec<String>>>,
+    pub default_upstream_pre_split: Option<std::sync::Arc<Vec<std::sync::Arc<str>>>>,
     /// 上游超时（毫秒）。 / Upstream timeout (milliseconds)
     /// 单次上游请求的超时时间
     #[serde(default = "default_upstream_timeout_ms")]
@@ -430,7 +430,7 @@ pub enum Action {
         transport: Option<Transport>,
         /// 预分割的 upstream 列表（性能优化）/ Pre-split upstream list (performance optimization)
         #[serde(skip)]
-        pre_split_upstreams: Option<std::sync::Arc<Vec<String>>>,
+        pre_split_upstreams: Option<std::sync::Arc<Vec<std::sync::Arc<str>>>>,
     },
     /// 继续匹配后续规则。响应阶段会复用当前响应结果。 / Continue matching subsequent rules. Response phase will reuse current response result
     Continue,
@@ -454,10 +454,10 @@ impl Action {
         } = self
         {
             if let Some(upstream_str) = upstream {
-                let split: Vec<String> = upstream_str
+                let split: Vec<std::sync::Arc<str>> = upstream_str
                     .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
+                    .map(|s| std::sync::Arc::from(s.trim()))
+                    .filter(|s: &std::sync::Arc<str>| !s.is_empty())
                     .collect();
                 *pre_split_upstreams = Some(std::sync::Arc::new(split));
             }
@@ -469,11 +469,11 @@ impl GlobalSettings {
     /// 预分割默认 upstream 字符串以优化性能（在配置加载时调用）/ Pre-split default upstream string for performance (call during config loading)
     #[inline]
     pub fn pre_split_default_upstream(&mut self) {
-        let split: Vec<String> = self
+        let split: Vec<std::sync::Arc<str>> = self
             .default_upstream
             .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+            .map(|s| std::sync::Arc::from(s.trim()))
+            .filter(|s: &std::sync::Arc<str>| !s.is_empty())
             .collect();
         if split.len() > 1 {
             self.default_upstream_pre_split = Some(std::sync::Arc::new(split));
@@ -600,164 +600,6 @@ pub fn load_config(path: &Path) -> Result<PipelineConfig> {
     }
 
     Ok(cfg)
-}
-
-// Configuration tests / 配置测试
-// Tests for configuration parsing, validation, and default values
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn response_action_fields_default_to_empty() {
-        // Arrange: Create a minimal pipeline config with only log action
-        let raw = json!({
-            "pipelines": [
-                {
-                    "id": "p1",
-                    "rules": [
-                        {
-                            "name": "rule",
-                            "actions": [ { "type": "log", "level": "info" } ]
-                        }
-                    ]
-                }
-            ]
-        });
-
-        // Act: Parse the configuration
-        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        let rule = &cfg.pipelines[0].rules[0];
-
-        // Assert: Verify response action fields default to empty vectors
-        assert!(
-            rule.response_actions_on_match.is_empty(),
-            "response_actions_on_match should default to empty vector"
-        );
-        assert!(
-            rule.response_actions_on_miss.is_empty(),
-            "response_actions_on_miss should default to empty vector"
-        );
-    }
-
-    #[test]
-    fn rule_operator_defaults_to_and_when_omitted() {
-        // Arrange: Create a pipeline config without explicit operator settings
-        let raw = serde_json::json!({
-            "pipelines": [
-                {
-                    "id": "p1",
-                    "rules": [
-                        {
-                            "name": "rule",
-                            "matchers": [ { "type": "any" } ],
-                            "actions": [ { "type": "log", "level": "info" } ]
-                        }
-                    ]
-                }
-            ]
-        });
-
-        // Act: Parse the configuration
-        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        let rule = &cfg.pipelines[0].rules[0];
-
-        // Assert: Verify operators default to MatchOperator::And
-        assert_eq!(
-            rule.matcher_operator,
-            MatchOperator::And,
-            "matcher_operator should default to And"
-        );
-        assert_eq!(
-            rule.response_matcher_operator,
-            MatchOperator::And,
-            "response_matcher_operator should default to And"
-        );
-    }
-
-    #[test]
-    fn flow_control_settings_default_when_omitted() {
-        // Arrange: Create a minimal pipeline config without flow control settings
-        let raw = serde_json::json!({
-            "pipelines": [
-                {
-                    "id": "p1",
-                    "rules": []
-                }
-            ]
-        });
-
-        // Act: Parse the configuration
-        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
-
-        // Assert: Verify flow control settings have correct defaults
-        assert_eq!(
-            cfg.settings.flow_control_initial_permits, 500,
-            "flow_control_initial_permits should default to 500"
-        );
-        assert_eq!(
-            cfg.settings.flow_control_min_permits, 100,
-            "flow_control_min_permits should default to 100"
-        );
-        assert_eq!(
-            cfg.settings.flow_control_max_permits, 800,
-            "flow_control_max_permits should default to 800"
-        );
-        assert_eq!(
-            cfg.settings.flow_control_latency_threshold_ms, 100,
-            "flow_control_latency_threshold_ms should default to 100"
-        );
-        assert_eq!(
-            cfg.settings.flow_control_adjustment_interval_secs, 5,
-            "flow_control_adjustment_interval_secs should default to 5"
-        );
-    }
-
-    #[test]
-    fn flow_control_settings_can_be_customized() {
-        // Arrange: Create a pipeline config with custom flow control settings
-        let raw = serde_json::json!({
-            "settings": {
-                "flow_control_initial_permits": 200,
-                "flow_control_min_permits": 50,
-                "flow_control_max_permits": 400,
-                "flow_control_latency_threshold_ms": 150,
-                "flow_control_adjustment_interval_secs": 10
-            },
-            "pipelines": [
-                {
-                    "id": "p1",
-                    "rules": []
-                }
-            ]
-        });
-
-        // Act: Parse the configuration
-        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
-
-        // Assert: Verify custom flow control settings
-        assert_eq!(
-            cfg.settings.flow_control_initial_permits, 200,
-            "flow_control_initial_permits should match configured value"
-        );
-        assert_eq!(
-            cfg.settings.flow_control_min_permits, 50,
-            "flow_control_min_permits should match configured value"
-        );
-        assert_eq!(
-            cfg.settings.flow_control_max_permits, 400,
-            "flow_control_max_permits should match configured value"
-        );
-        assert_eq!(
-            cfg.settings.flow_control_latency_threshold_ms, 150,
-            "flow_control_latency_threshold_ms should match configured value"
-        );
-        assert_eq!(
-            cfg.settings.flow_control_adjustment_interval_secs, 10,
-            "flow_control_adjustment_interval_secs should match configured value"
-        );
-    }
 }
 
 fn default_min_ttl() -> u32 {

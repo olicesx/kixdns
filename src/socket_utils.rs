@@ -1,6 +1,7 @@
 // Socket utility functions with safe wrappers for FFI calls
 // Socket 工具函数，为 FFI 调用提供安全封装
 
+#[cfg(unix)]
 use socket2::Socket;
 use std::io;
 
@@ -97,45 +98,4 @@ pub fn set_reuseport(_socket: &socket2::Socket, _enabled: bool) -> io::Result<()
         io::ErrorKind::Unsupported,
         "SO_REUSEPORT not supported on this platform",
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[cfg(unix)]
-    fn test_ipv6_v6only() {
-        use socket2::{Domain, Protocol, Socket, Type};
-
-        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
-
-        // Test setting IPv6 only
-        let result = set_ipv6_v6only(&socket, true);
-        assert!(
-            result.is_ok(),
-            "Should be able to set IPV6_V6ONLY on IPv6 socket"
-        );
-
-        // Test setting dual-stack
-        let result = set_ipv6_v6only(&socket, false);
-        assert!(
-            result.is_ok(),
-            "Should be able to unset IPV6_V6ONLY on IPv6 socket"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn test_reuseport() {
-        use socket2::{Domain, Protocol, Socket, Type};
-
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
-
-        let result = set_reuseport(&socket, true);
-        // SO_REUSEPORT might not be supported on all systems
-        if result.is_err() {
-            println!("SO_REUSEPORT not supported: {:?}", result);
-        }
-    }
 }

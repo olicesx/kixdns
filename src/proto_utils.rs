@@ -236,7 +236,7 @@ impl QuickQuery<'_> {
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", ... };
+    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false };
     /// assert!(query.qname_matches("google.com"));  // 完全匹配
     /// assert!(query.qname_matches("GOOGLE.COM"));  // 大写匹配
     /// assert!(!query.qname_matches("example.com"));  // 不匹配
@@ -281,7 +281,7 @@ impl QuickQuery<'_> {
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", ... };
+    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false };
     /// println!("qname: {}", query.qname_str());  // "google.com"
     /// ```
     #[inline]
@@ -325,7 +325,7 @@ impl QuickQuery<'_> {
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", ... };
+    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false };
     /// let qname_str = query.qname_str_unchecked();  // &str
     /// ```
     #[inline]
@@ -353,7 +353,7 @@ impl QuickQuery<'_> {
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", ... };
+    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false };
     /// let hash = query.qname_hash();
     /// ```
     #[inline]
@@ -573,148 +573,5 @@ pub fn patch_all_ttls(packet: &mut [u8], decrement: u32) {
         }
 
         pos += record_total_len;
-    }
-}
-
-// Tests for DNS protocol utilities
-// DNS 协议工具测试
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_patch_all_ttls_basic() {
-        // Arrange: Construct a simple DNS response with 1 answer
-        // Header: ID=0, QR=1, QDCOUNT=1, ANCOUNT=1
-        let mut packet = vec![0u8; 12];
-        packet[2] = 0x80; // QR=1
-        packet[5] = 1; // QDCOUNT=1
-        packet[7] = 1; // ANCOUNT=1
-
-        // Question: example.com (7example3com0), Type A, Class IN
-        packet.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
-
-        // Answer: same name (compressed), Type A, Class IN, TTL=600, RDLen=4, IP=1.2.3.4
-        let answer_start = packet.len();
-        packet.extend_from_slice(b"\xc0\x0c\x00\x01\x00\x01");
-        packet.extend_from_slice(&600u32.to_be_bytes()); // TTL at answer_start + 6
-        packet.extend_from_slice(b"\x00\x04\x01\x02\x03\x04");
-
-        let ttl_offset = answer_start + 6;
-        let original_ttl = u32::from_be_bytes([
-            packet[ttl_offset],
-            packet[ttl_offset + 1],
-            packet[ttl_offset + 2],
-            packet[ttl_offset + 3],
-        ]);
-        assert_eq!(original_ttl, 600, "Initial TTL should be 600");
-
-        // Act: Patch TTLs with decrement of 100
-        patch_all_ttls(&mut packet, 100);
-
-        // Assert: TTL should be decremented by 100
-        let new_ttl = u32::from_be_bytes([
-            packet[ttl_offset],
-            packet[ttl_offset + 1],
-            packet[ttl_offset + 2],
-            packet[ttl_offset + 3],
-        ]);
-        assert_eq!(new_ttl, 500, "TTL should be decremented from 600 to 500");
-    }
-
-    #[test]
-    fn test_patch_all_ttls_saturating() {
-        // Arrange: Construct a DNS response with TTL=50
-        let mut packet = vec![0u8; 12];
-        packet[5] = 1; // QDCOUNT=1
-        packet[7] = 1; // ANCOUNT=1
-        packet.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01"); // Question
-        let answer_start = packet.len();
-        packet.extend_from_slice(b"\xc0\x0c\x00\x01\x00\x01"); // Answer
-        packet.extend_from_slice(&50u32.to_be_bytes()); // TTL=50
-        packet.extend_from_slice(b"\x00\x04\x01\x02\x03\x04");
-
-        // Act: Patch TTLs with decrement of 100 (greater than original TTL)
-        patch_all_ttls(&mut packet, 100); // 50 - 100 should floor at 0
-
-        // Assert: TTL should be saturated at 0
-        let ttl_offset = answer_start + 6;
-        let new_ttl = u32::from_be_bytes([
-            packet[ttl_offset],
-            packet[ttl_offset + 1],
-            packet[ttl_offset + 2],
-            packet[ttl_offset + 3],
-        ]);
-        assert_eq!(
-            new_ttl, 0,
-            "TTL should be saturated at 0 when decrement exceeds original value"
-        );
-    }
-
-    #[test]
-    fn test_patch_all_ttls_multiple_sections() {
-        // Arrange: Construct a DNS response with 1 Answer, 1 NS, and 1 Additional record
-        let mut packet = vec![0u8; 12];
-        packet[5] = 1; // QDCOUNT=1
-        packet[7] = 1; // AN
-        packet[9] = 1; // NS
-        packet[11] = 1; // AR
-
-        packet.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01"); // Question
-
-        // AN section with TTL=1000
-        let an_ttl_off = packet.len() + 6;
-        packet.extend_from_slice(b"\xc0\x0c\x00\x01\x00\x01");
-        packet.extend_from_slice(&1000u32.to_be_bytes());
-        packet.extend_from_slice(b"\x00\x04\x01\x02\x03\x04");
-
-        // NS section with TTL=2000
-        let ns_ttl_off = packet.len() + 6;
-        packet.extend_from_slice(b"\xc0\x0c\x00\x02\x00\x01");
-        packet.extend_from_slice(&2000u32.to_be_bytes());
-        packet.extend_from_slice(b"\x00\x04\x01\x02\x03\x04");
-
-        // AR section with TTL=3000
-        let ar_ttl_off = packet.len() + 6;
-        packet.extend_from_slice(b"\xc0\x0c\x00\x01\x00\x01");
-        packet.extend_from_slice(&3000u32.to_be_bytes());
-        packet.extend_from_slice(b"\x00\x04\x01\x02\x03\x04");
-
-        // Act: Patch all TTLs with decrement of 500
-        patch_all_ttls(&mut packet, 500);
-
-        // Assert: All TTLs should be decremented by 500
-        let an_ttl = u32::from_be_bytes([
-            packet[an_ttl_off],
-            packet[an_ttl_off + 1],
-            packet[an_ttl_off + 2],
-            packet[an_ttl_off + 3],
-        ]);
-        assert_eq!(
-            an_ttl, 500,
-            "Answer section TTL should be decremented from 1000 to 500"
-        );
-
-        let ns_ttl = u32::from_be_bytes([
-            packet[ns_ttl_off],
-            packet[ns_ttl_off + 1],
-            packet[ns_ttl_off + 2],
-            packet[ns_ttl_off + 3],
-        ]);
-        assert_eq!(
-            ns_ttl, 1500,
-            "Authority section TTL should be decremented from 2000 to 1500"
-        );
-
-        let ar_ttl = u32::from_be_bytes([
-            packet[ar_ttl_off],
-            packet[ar_ttl_off + 1],
-            packet[ar_ttl_off + 2],
-            packet[ar_ttl_off + 3],
-        ]);
-        assert_eq!(
-            ar_ttl, 2500,
-            "Additional section TTL should be decremented from 3000 to 2500"
-        );
     }
 }

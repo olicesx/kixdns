@@ -1,16 +1,3 @@
-mod advanced_rule;
-mod cache;
-mod config;
-mod engine;
-mod error_utils;
-mod geoip;
-mod geoip_converter;
-mod geosite;
-mod matcher;
-mod proto_utils;
-mod socket_utils;
-mod watcher;
-
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,9 +10,10 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{error, info, debug, warn};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::config::load_config;
-use crate::engine::{Engine, FastPathResponse};
-use crate::matcher::RuntimePipelineConfig;
+use kixdns::config::load_config;
+use kixdns::engine::{Engine, FastPathResponse};
+use kixdns::matcher::RuntimePipelineConfig;
+use kixdns::watcher;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "KixDNS async DNS with hot-reload pipelines", long_about = None)]
@@ -77,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
 
             let filter_slice = filter_countries.as_deref();
 
-            match crate::geoip::GeoIpManager::convert_dat_to_mmdb(&input, &output, filter_slice) {
+            match kixdns::matcher::geoip::GeoIpManager::convert_dat_to_mmdb(&input, &output, filter_slice) {
                 Ok(stats) => {
                     println!("Conversion completed successfully:\n{}", stats);
                     Ok(())
@@ -387,13 +375,13 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
     // 这使得我们可以安全地使用零拷贝的 recv_buf_from
     // This allows us to safely use zero-copy recv_buf_from
     if domain == Domain::IPV6 {
-        if let Err(e) = crate::socket_utils::set_ipv6_v6only(&socket, true) {
+        if let Err(e) = kixdns::socket_utils::set_ipv6_v6only(&socket, true) {
             tracing::warn!("Failed to set IPV6_V6ONLY=1: {}, this may cause issues on OpenBSD", e);
         }
     }
 
     // Try to set SO_REUSEPORT via safe wrapper / 尝试通过安全封装设置 SO_REUSEPORT
-    if let Err(e) = crate::socket_utils::set_reuseport(&socket, true) {
+    if let Err(e) = kixdns::socket_utils::set_reuseport(&socket, true) {
         // Log warning if SO_REUSEPORT fails / SO_REUSEPORT 失败时记录警告
         tracing::warn!("SO_REUSEPORT failed: {}, falling back to shared socket", e);
     }
@@ -476,7 +464,7 @@ async fn run_udp_worker(
                             // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
                             let elapsed = inserted_at.elapsed().as_secs() as u32;
                             if elapsed > 0 {
-                                crate::proto_utils::patch_all_ttls(&mut send_buf, elapsed);
+                                kixdns::proto_utils::patch_all_ttls(&mut send_buf, elapsed);
                             }
 
                             if send_buf.len() >= 2 {

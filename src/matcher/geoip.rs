@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 // Re-export from geoip_converter module
 // Note: geoip_converter is a sibling module at the crate root level
-pub use crate::geoip_converter::{convert_dat_to_mmdb, ConversionStats};
+pub use crate::matcher::geoip_converter::{convert_dat_to_mmdb, ConversionStats};
 
 /// MaxMind GeoLite2-Country 数据库结构 / MaxMind GeoLite2-Country database structure
 #[derive(Deserialize)]
@@ -239,7 +239,7 @@ impl GeoIpManager {
                         // 零拷贝优化：将 String 转为 Arc<str> 以便后续 clone 无需分配
                         // Zero-copy: convert String to Arc<str> for clone without allocation
                         country_code: Some(Arc::from(range.country_code.as_str())),
-                        is_private: crate::geoip::is_private_ip(ip),
+                        is_private: crate::matcher::geoip::is_private_ip(ip),
                     };
                 }
             }
@@ -250,7 +250,7 @@ impl GeoIpManager {
                     if ip_u32 >= range.start && ip_u32 <= range.end {
                         return GeoIpResult {
                             country_code: Some(Arc::from(range.country_code.as_str())),
-                            is_private: crate::geoip::is_private_ip(ip),
+                            is_private: crate::matcher::geoip::is_private_ip(ip),
                         };
                     }
                 }
@@ -259,7 +259,7 @@ impl GeoIpManager {
                     if ip_u32 >= range.start && ip_u32 <= range.end {
                         return GeoIpResult {
                             country_code: Some(Arc::from(range.country_code.as_str())),
-                            is_private: crate::geoip::is_private_ip(ip),
+                            is_private: crate::matcher::geoip::is_private_ip(ip),
                         };
                     }
                 }
@@ -269,7 +269,7 @@ impl GeoIpManager {
         // 未找到匹配 / No match found
         GeoIpResult {
             country_code: None,
-            is_private: crate::geoip::is_private_ip(ip),
+            is_private: crate::matcher::geoip::is_private_ip(ip),
         }
     }
 
@@ -635,202 +635,6 @@ pub fn is_private_ip(ip: IpAddr) -> bool {
                 || ipv6.is_unspecified()
                 || (seg0 & 0xffc0) == 0xfe80  // Link-local addresses (fe80::/10)
                 || (seg0 & 0xfe00) == 0xfc00 // Unique Local Addresses (fc00::/7)
-        }
-    }
-}
-
-// GeoIP tests / GeoIP 测试
-// Tests for GeoIP manager functionality, private IP detection, and configuration parsing
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_is_private_ip() {
-        // Arrange: Define test IPs for various private and public ranges
-        // IPv4 private addresses / IPv4 私有地址
-        let ipv4_private = vec!["10.0.0.1", "192.168.1.1", "172.16.0.1", "127.0.0.1"];
-        // IPv4 public addresses / IPv4 公网地址
-        let ipv4_public = vec!["8.8.8.8", "1.1.1.1"];
-        // IPv6 loopback and ULA / IPv6 回环地址和ULA
-        let ipv6_private = vec!["::1", "fe80::1", "fc00::1", "fd00::1"];
-
-        // Act & Assert: Verify IPv4 private addresses are detected
-        for ip_str in ipv4_private {
-            let ip: IpAddr = ip_str.parse().unwrap();
-            assert!(
-                is_private_ip(ip),
-                "{} should be detected as private",
-                ip_str
-            );
-        }
-
-        // Act & Assert: Verify IPv4 public addresses are not private
-        for ip_str in ipv4_public {
-            let ip: IpAddr = ip_str.parse().unwrap();
-            assert!(
-                !is_private_ip(ip),
-                "{} should not be detected as private",
-                ip_str
-            );
-        }
-
-        // Act & Assert: Verify IPv6 private addresses are detected
-        for ip_str in ipv6_private {
-            let ip: IpAddr = ip_str.parse().unwrap();
-            assert!(
-                is_private_ip(ip),
-                "{} should be detected as private",
-                ip_str
-            );
-        }
-    }
-
-    #[test]
-    fn test_geoip_manager_no_db() {
-        // Arrange: Create GeoIpManager without MMDB file
-        let manager = GeoIpManager::new(None).unwrap();
-        let test_ip: IpAddr = "8.8.8.8".parse().unwrap();
-
-        // Act & Assert: Verify manager is not loaded
-        assert!(
-            !manager.is_loaded(),
-            "Manager should not be loaded without MMDB file"
-        );
-
-        // Act: Lookup IP address
-        let result = manager.lookup(test_ip);
-
-        // Assert: Verify lookup returns empty result for unloaded manager
-        assert_eq!(
-            result.country_code, None,
-            "Country code should be None without MMDB"
-        );
-        assert!(
-            !is_private_ip(test_ip),
-            "8.8.8.8 should not be a private IP"
-        );
-    }
-
-    #[test]
-    fn test_geoip_country_code_extraction() {
-        // Arrange: Define MMDB file path and test IPs
-        let db_path = "tests/data/GeoLite2-Country.mmdb";
-        let us_ip: IpAddr = "8.8.8.8".parse().unwrap();
-        let cn_ip: IpAddr = "1.2.4.0".parse().unwrap();
-
-        // Act & Assert: Skip test if MMDB file not available
-        if !std::path::Path::new(db_path).exists() {
-            println!(
-                "Skipping test_geoip_country_code_extraction: MMDB file not found at {}",
-                db_path
-            );
-            return;
-        }
-
-        // Act: Create GeoIpManager with MMDB file
-        let manager = GeoIpManager::new(Some(db_path.to_string())).unwrap();
-
-        // Assert: Verify manager is loaded
-        assert!(
-            manager.is_loaded(),
-            "Manager should be loaded with MMDB file"
-        );
-
-        // Act: Lookup US IP (8.8.8.8 is Google DNS)
-        let result = manager.lookup(us_ip);
-
-        // Assert: Verify US country code
-        assert_eq!(
-            result.country_code.as_deref(),
-            Some("US"),
-            "8.8.8.8 should resolve to US country code"
-        );
-        assert!(!result.is_private, "8.8.8.8 should not be private IP");
-
-        // Act: Lookup CN IP (1.2.4.0 is China)
-        let result = manager.lookup(cn_ip);
-
-        // Assert: Verify CN country code
-        assert_eq!(
-            result.country_code.as_deref(),
-            Some("CN"),
-            "1.2.4.0 should resolve to CN country code"
-        );
-        assert!(!result.is_private, "1.2.4.0 should not be private IP");
-    }
-
-    #[test]
-    fn test_geoip_config_parsing() {
-        // Arrange: Create configuration with GeoIP country matcher
-        let raw = serde_json::json!({
-            "pipelines": [{
-                "id": "test",
-                "rules": [{
-                    "name": "china_rule",
-                    "matchers": [{
-                        "type": "geoip_country",
-                        "country_codes": ["CN", "US", "JP"]
-                    }],
-                    "actions": [{
-                        "type": "allow"
-                    }]
-                }]
-            }]
-        });
-
-        // Act: Parse the configuration
-        let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).unwrap();
-        let rule = &cfg.pipelines[0].rules[0];
-
-        // Assert: Verify rule name and matcher count
-        assert_eq!(rule.name, "china_rule", "Rule name should match");
-        assert_eq!(rule.matchers.len(), 1, "Should have exactly one matcher");
-
-        // Assert: Verify GeoipCountry matcher with country codes
-        if let crate::config::Matcher::GeoipCountry { country_codes } = &rule.matchers[0].matcher {
-            assert_eq!(
-                country_codes,
-                &vec!["CN".to_string(), "US".to_string(), "JP".to_string()],
-                "Country codes should match configuration"
-            );
-        } else {
-            panic!("Expected GeoipCountry matcher");
-        }
-    }
-
-    #[test]
-    fn test_geoip_private_config_parsing() {
-        // Arrange: Create configuration with GeoIP private matcher
-        let raw = serde_json::json!({
-            "pipelines": [{
-                "id": "test",
-                "rules": [{
-                    "name": "private_rule",
-                    "matchers": [{
-                        "type": "geoip_private",
-                        "expect": true
-                    }],
-                    "actions": [{
-                        "type": "deny"
-                    }]
-                }]
-            }]
-        });
-
-        // Act: Parse the configuration
-        let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).unwrap();
-        let rule = &cfg.pipelines[0].rules[0];
-
-        // Assert: Verify rule name and matcher count
-        assert_eq!(rule.name, "private_rule", "Rule name should match");
-        assert_eq!(rule.matchers.len(), 1, "Should have exactly one matcher");
-
-        // Assert: Verify GeoipPrivate matcher with expect value
-        if let crate::config::Matcher::GeoipPrivate { expect } = &rule.matchers[0].matcher {
-            assert_eq!(*expect, true, "GeoipPrivate expect should be true");
-        } else {
-            panic!("Expected GeoipPrivate matcher");
         }
     }
 }

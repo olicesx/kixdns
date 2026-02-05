@@ -23,8 +23,8 @@ pub struct CacheEntry {
 }
 
 /// Use u64 hash as key to avoid allocation during lookup / 使用 u64 哈希作为键以避免查找时的内存分配
-/// ✅ Performance: Wrap in Arc to reduce atomic operations from 5 to 1 per cache hit
-/// ✅ 性能优化：使用 Arc 包裹，将缓存命中的原子操作从 5 次减少到 1 次
+///  Performance: Wrap in Arc to reduce atomic operations from 5 to 1 per cache hit
+///  性能优化：使用 Arc 包裹，将缓存命中的原子操作从 5 次减少到 1 次
 pub type DnsCache = Cache<u64, Arc<CacheEntry>>;
 
 /// 创建带 TTL 的 DNS 缓存 / Create DNS cache with TTL

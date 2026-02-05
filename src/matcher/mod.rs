@@ -1,3 +1,8 @@
+pub mod advanced_rule;
+pub mod geoip;
+pub mod geoip_converter;
+pub mod geosite;
+
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -64,9 +69,9 @@ mod matcher_helpers {
     /// - `false`: IP 不属于任何指定的国家 / IP does not belong to any specified country
     #[inline]
     pub fn match_geoip_country(
-        manager: &crate::geoip::GeoIpManager,
+        manager: &crate::matcher::geoip::GeoIpManager,
         ip: IpAddr,
-        country_codes: &[String],
+        country_codes: &[Arc<str>],
     ) -> bool {
         let result = manager.lookup(ip);
 
@@ -100,7 +105,7 @@ mod matcher_helpers {
     /// - `false`: 域名不属于该分类 / Domain does not belong to the category
     #[inline]
     pub fn match_geosite(
-        manager: &crate::geosite::GeoSiteManager,
+        manager: &crate::matcher::geosite::GeoSiteManager,
         domain: &str,
         tag: &str,
     ) -> bool {
@@ -184,9 +189,9 @@ pub struct RuntimePipeline {
     pub uses_client_ip: bool,
     // Indices for O(1) lookup
     // 完全域名匹配索引（最高优先级）/ Exact domain match index (highest priority)
-    pub domain_exact_index: FxHashMap<String, Vec<usize>>,
+    pub domain_exact_index: FxHashMap<Arc<str>, Vec<usize>>,
     // Maps domain suffix -> list of rule indices that MUST be checked
-    pub domain_suffix_index: FxHashMap<String, Vec<usize>>,
+    pub domain_suffix_index: FxHashMap<Arc<str>, Vec<usize>>,
     // Maps query type -> list of rule indices (高频过滤条件 / High-frequency filter)
     pub query_type_index: FxHashMap<RecordType, Vec<usize>>,
     // Rules that are NOT indexed by domain (must always be checked)
@@ -217,16 +222,16 @@ pub struct RuntimePipelineSelectRule {
 #[derive(Debug, Clone)]
 pub enum RuntimeMatcher {
     Any,
-    DomainExact { value: String },
-    DomainSuffix { value: String },
+    DomainExact { value: Arc<str> },
+    DomainSuffix { value: Arc<str> },
     ClientIp { net: IpNet },
     DomainRegex { regex: Regex },
-    GeoipCountry { country_codes: Vec<String> },
+    GeoipCountry { country_codes: Vec<Arc<str>> },
     GeoipPrivate { expect: bool },
     Qclass { value: DNSClass },
     EdnsPresent { expect: bool },
-    GeoSite { tag: String },
-    GeoSiteNot { tag: String },
+    GeoSite { tag: Arc<str> },
+    GeoSiteNot { tag: Arc<str> },
     Qtype { value: RecordType },
 }
 
@@ -238,16 +243,16 @@ pub struct RuntimeMatcherWithOp {
 
 #[derive(Debug, Clone)]
 pub enum RuntimePipelineSelectorMatcher {
-    ListenerLabel { value: String },
+    ListenerLabel { value: Arc<str> },
     ClientIp { net: IpNet },
-    DomainSuffix { value: String },
+    DomainSuffix { value: Arc<str> },
     DomainRegex { regex: Regex },
     Any,
     Qclass { value: DNSClass },
     EdnsPresent { expect: bool },
-    GeoSite { tag: String },
-    GeoSiteNot { tag: String },
-    GeoipCountry { country_codes: Vec<String> },
+    GeoSite { tag: Arc<str> },
+    GeoSiteNot { tag: Arc<str> },
+    GeoipCountry { country_codes: Vec<Arc<str>> },
     GeoipPrivate { expect: bool },
     Qtype { value: RecordType },
 }
@@ -261,10 +266,10 @@ pub struct RuntimePipelineSelectorMatcherWithOp {
 #[derive(Debug, Clone)]
 pub enum RuntimeResponseMatcher {
     UpstreamEquals {
-        value: String,
+        value: Arc<str>,
     },
     RequestDomainSuffix {
-        value: String,
+        value: Arc<str>,
     },
     RequestDomainRegex {
         regex: Regex,
@@ -277,10 +282,10 @@ pub enum RuntimeResponseMatcher {
         nets: Vec<IpNet>,
     },
     ResponseType {
-        value: String,
+        value: Arc<str>,
     },
     ResponseRcode {
-        value: String,
+        value: Arc<str>,
     },
     ResponseQclass {
         value: DNSClass,
@@ -290,7 +295,7 @@ pub enum RuntimeResponseMatcher {
     },
     /// 匹配响应中 IP 的 GeoIP 国家代码 / Match GeoIP country code of IPs in response
     ResponseAnswerIpGeoipCountry {
-        country_codes: Vec<String>,
+        country_codes: Vec<Arc<str>>,
     },
     /// 匹配响应中 IP 是否为私有 IP / Match whether IPs in response are private
     ResponseAnswerIpGeoipPrivate {
@@ -298,16 +303,16 @@ pub enum RuntimeResponseMatcher {
     },
     /// 匹配响应中的请求域名是否属于指定 GeoSite 分类 / Match if request domain in response belongs to specified GeoSite category
     ResponseRequestDomainGeoSite {
-        value: String,
+        value: Arc<str>,
     },
     /// 匹配响应中的请求域名是否不属于指定 GeoSite 分类 / Match if request domain in response does NOT belong to specified GeoSite category
     ResponseRequestDomainGeoSiteNot {
-        value: String,
+        value: Arc<str>,
     },
     /// 匹配响应中的 TXT 记录内容 / Match TXT record content in response
     ResponseTxtContent {
         mode: TxtMatchMode,
-        value: String,
+        value: Arc<str>,
         regex: Option<Regex>,
     },
 }
@@ -398,8 +403,8 @@ impl RuntimePipelineConfig {
 
             // Build Indices - 优化：索引所有可索引的匹配器，而不只是第一个
             // Build Indices - Optimized: index all indexable matchers, not just the first one
-            let mut domain_suffix_index: FxHashMap<String, Vec<usize>> = FxHashMap::default();
-            let mut domain_exact_index: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+            let mut domain_suffix_index: FxHashMap<Arc<str>, Vec<usize>> = FxHashMap::default();
+            let mut domain_exact_index: FxHashMap<Arc<str>, Vec<usize>> = FxHashMap::default();
             let mut query_type_index: FxHashMap<RecordType, Vec<usize>> = FxHashMap::default();
             let mut always_check_rules = Vec::new();
 
@@ -599,22 +604,24 @@ impl RuntimeMatcher {
         Ok(match m {
             config::Matcher::Any => RuntimeMatcher::Any,
             config::Matcher::DomainSuffix { value } => RuntimeMatcher::DomainSuffix {
-                value: value.to_ascii_lowercase(),
+                value: Arc::from(value.to_ascii_lowercase()),
             },
             config::Matcher::ClientIp { cidr } => RuntimeMatcher::ClientIp { net: cidr.parse()? },
             config::Matcher::DomainRegex { value } => RuntimeMatcher::DomainRegex {
                 regex: Regex::new(&value)?,
             },
-            config::Matcher::GeoipCountry { country_codes } => {
-                RuntimeMatcher::GeoipCountry { country_codes }
-            }
+            config::Matcher::GeoipCountry { country_codes } => RuntimeMatcher::GeoipCountry {
+                country_codes: country_codes.into_iter().map(Arc::from).collect(),
+            },
             config::Matcher::GeoipPrivate { expect } => RuntimeMatcher::GeoipPrivate { expect },
             config::Matcher::Qclass { value } => RuntimeMatcher::Qclass {
                 value: parse_dns_class(&value)?,
             },
             config::Matcher::EdnsPresent { expect } => RuntimeMatcher::EdnsPresent { expect },
-            config::Matcher::GeoSite { value } => RuntimeMatcher::GeoSite { tag: value },
-            config::Matcher::GeoSiteNot { value } => RuntimeMatcher::GeoSiteNot { tag: value },
+            config::Matcher::GeoSite { value } => RuntimeMatcher::GeoSite { tag: Arc::from(value) },
+            config::Matcher::GeoSiteNot { value } => RuntimeMatcher::GeoSiteNot {
+                tag: Arc::from(value),
+            },
             config::Matcher::Qtype { value } => RuntimeMatcher::Qtype {
                 value: parse_dns_type(&value)?,
             },
@@ -639,8 +646,8 @@ impl RuntimeMatcher {
         qclass: DNSClass,
         client_ip: IpAddr,
         edns_present: bool,
-        geoip_manager: Option<&crate::geoip::GeoIpManager>,
-        geosite_manager: Option<&crate::geosite::GeoSiteManager>,
+        geoip_manager: Option<&crate::matcher::geoip::GeoIpManager>,
+        geosite_manager: Option<&crate::matcher::geosite::GeoSiteManager>,
     ) -> bool {
         match self {
             RuntimeMatcher::Any => true,
@@ -648,12 +655,12 @@ impl RuntimeMatcher {
                 // 完全匹配，大小写不敏感 / Exact match, case insensitive
                 qname.eq_ignore_ascii_case(value)
             }
-            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value),
+            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value.as_ref()),
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes } => {
                 // 使用辅助函数进行 GeoIP 国家代码匹配 / Use helper for GeoIP country matching
-                geoip_manager.map_or(false, |mgr| {
+                geoip_manager.is_some_and(|mgr| {
                     matcher_helpers::match_geoip_country(mgr, client_ip, country_codes)
                 })
             }
@@ -664,18 +671,18 @@ impl RuntimeMatcher {
                     result.is_private == *expect
                 } else {
                     // Fallback to basic private IP check
-                    crate::geoip::is_private_ip(client_ip) == *expect
+                    crate::matcher::geoip::is_private_ip(client_ip) == *expect
                 }
             }
             RuntimeMatcher::Qclass { value } => &qclass == value,
             RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
             RuntimeMatcher::GeoSite { tag } => {
                 // 使用辅助函数进行 GeoSite 匹配 / Use helper for GeoSite matching
-                geosite_manager.map_or(false, |mgr| matcher_helpers::match_geosite(mgr, qname, tag))
+                geosite_manager.is_some_and(|mgr| matcher_helpers::match_geosite(mgr, qname, tag))
             }
             RuntimeMatcher::GeoSiteNot { tag } => {
                 // 使用辅助函数进行 GeoSite 非匹配 / Use helper for GeoSite NOT matching
-                geosite_manager.map_or(false, |mgr| {
+                geosite_manager.is_some_and(|mgr| {
                     !matcher_helpers::match_geosite(mgr, qname, tag)
                 })
             }
@@ -691,8 +698,8 @@ impl RuntimeMatcher {
         client_ip: IpAddr,
         edns_present: bool,
         qtype: RecordType,
-        geoip_manager: Option<&crate::geoip::GeoIpManager>,
-        geosite_manager: Option<&crate::geosite::GeoSiteManager>,
+        geoip_manager: Option<&crate::matcher::geoip::GeoIpManager>,
+        geosite_manager: Option<&crate::matcher::geosite::GeoSiteManager>,
     ) -> bool {
         match self {
             RuntimeMatcher::Any => true,
@@ -700,12 +707,12 @@ impl RuntimeMatcher {
                 // 完全匹配，大小写不敏感 / Exact match, case insensitive
                 qname.eq_ignore_ascii_case(value)
             }
-            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value),
+            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value.as_ref()),
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes } => {
                 // 使用辅助函数进行 GeoIP 国家代码匹配 / Use helper for GeoIP country matching
-                geoip_manager.map_or(false, |mgr| {
+                geoip_manager.is_some_and(|mgr| {
                     matcher_helpers::match_geoip_country(mgr, client_ip, country_codes)
                 })
             }
@@ -716,18 +723,18 @@ impl RuntimeMatcher {
                     result.is_private == *expect
                 } else {
                     // Fallback to basic private IP check
-                    crate::geoip::is_private_ip(client_ip) == *expect
+                    crate::matcher::geoip::is_private_ip(client_ip) == *expect
                 }
             }
             RuntimeMatcher::Qclass { value } => &qclass == value,
             RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
             RuntimeMatcher::GeoSite { tag } => {
                 // 使用辅助函数进行 GeoSite 匹配 / Use helper for GeoSite matching
-                geosite_manager.map_or(false, |mgr| matcher_helpers::match_geosite(mgr, qname, tag))
+                geosite_manager.is_some_and(|mgr| matcher_helpers::match_geosite(mgr, qname, tag))
             }
             RuntimeMatcher::GeoSiteNot { tag } => {
                 // 使用辅助函数进行 GeoSite 非匹配 / Use helper for GeoSite NOT matching
-                geosite_manager.map_or(false, |mgr| {
+                geosite_manager.is_some_and(|mgr| {
                     !matcher_helpers::match_geosite(mgr, qname, tag)
                 })
             }
@@ -740,14 +747,14 @@ impl RuntimePipelineSelectorMatcher {
     fn from_config(m: config::PipelineSelectorMatcher) -> anyhow::Result<Self> {
         Ok(match m {
             config::PipelineSelectorMatcher::ListenerLabel { value } => {
-                RuntimePipelineSelectorMatcher::ListenerLabel { value }
+                RuntimePipelineSelectorMatcher::ListenerLabel { value: Arc::from(value) }
             }
             config::PipelineSelectorMatcher::ClientIp { cidr } => {
                 RuntimePipelineSelectorMatcher::ClientIp { net: cidr.parse()? }
             }
             config::PipelineSelectorMatcher::DomainSuffix { value } => {
                 RuntimePipelineSelectorMatcher::DomainSuffix {
-                    value: value.to_ascii_lowercase(),
+                    value: Arc::from(value.to_ascii_lowercase()),
                 }
             }
             config::PipelineSelectorMatcher::DomainRegex { value } => {
@@ -765,13 +772,13 @@ impl RuntimePipelineSelectorMatcher {
                 RuntimePipelineSelectorMatcher::EdnsPresent { expect }
             }
             config::PipelineSelectorMatcher::GeoSite { value } => {
-                RuntimePipelineSelectorMatcher::GeoSite { tag: value }
+                RuntimePipelineSelectorMatcher::GeoSite { tag: Arc::from(value) }
             }
             config::PipelineSelectorMatcher::GeoSiteNot { value } => {
-                RuntimePipelineSelectorMatcher::GeoSiteNot { tag: value }
+                RuntimePipelineSelectorMatcher::GeoSiteNot { tag: Arc::from(value) }
             }
             config::PipelineSelectorMatcher::GeoipCountry { country_codes } => {
-                RuntimePipelineSelectorMatcher::GeoipCountry { country_codes }
+                RuntimePipelineSelectorMatcher::GeoipCountry { country_codes: country_codes.into_iter().map(Arc::from).collect() }
             }
             config::PipelineSelectorMatcher::GeoipPrivate { expect } => {
                 RuntimePipelineSelectorMatcher::GeoipPrivate { expect }
@@ -792,8 +799,8 @@ impl RuntimePipelineSelectorMatcher {
         qname: &str,
         qclass: DNSClass,
         edns_present: bool,
-        geoip_manager: Option<&crate::geoip::GeoIpManager>,
-        geosite_manager: Option<&crate::geosite::GeoSiteManager>,
+        geoip_manager: Option<&crate::matcher::geoip::GeoIpManager>,
+        geosite_manager: Option<&crate::matcher::geosite::GeoSiteManager>,
     ) -> bool {
         self.matches_with_qtype(
             listener_label,
@@ -816,15 +823,15 @@ impl RuntimePipelineSelectorMatcher {
         qclass: DNSClass,
         edns_present: bool,
         qtype: RecordType,
-        geoip_manager: Option<&crate::geoip::GeoIpManager>,
-        geosite_manager: Option<&crate::geosite::GeoSiteManager>,
+        geoip_manager: Option<&crate::matcher::geoip::GeoIpManager>,
+        geosite_manager: Option<&crate::matcher::geosite::GeoSiteManager>,
     ) -> bool {
         match self {
             RuntimePipelineSelectorMatcher::ListenerLabel { value } => {
                 value.eq_ignore_ascii_case(listener_label)
             }
             RuntimePipelineSelectorMatcher::ClientIp { net } => net.contains(&client_ip),
-            RuntimePipelineSelectorMatcher::DomainSuffix { value } => qname.ends_with(value),
+            RuntimePipelineSelectorMatcher::DomainSuffix { value } => qname.ends_with(value.as_ref()),
             RuntimePipelineSelectorMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimePipelineSelectorMatcher::Any => true,
             RuntimePipelineSelectorMatcher::Qclass { value } => value == &qclass,
@@ -865,7 +872,7 @@ impl RuntimePipelineSelectorMatcher {
                     result.is_private == *expect
                 } else {
                     // Fallback to basic private IP check
-                    crate::geoip::is_private_ip(client_ip) == *expect
+                    crate::matcher::geoip::is_private_ip(client_ip) == *expect
                 }
             }
             RuntimePipelineSelectorMatcher::Qtype { value } => *value == qtype,
@@ -949,11 +956,11 @@ impl RuntimeResponseMatcher {
     pub fn from_config(m: config::ResponseMatcher) -> anyhow::Result<Self> {
         Ok(match m {
             config::ResponseMatcher::UpstreamEquals { value } => {
-                RuntimeResponseMatcher::UpstreamEquals { value }
+                RuntimeResponseMatcher::UpstreamEquals { value: Arc::from(value) }
             }
             config::ResponseMatcher::RequestDomainSuffix { value } => {
                 RuntimeResponseMatcher::RequestDomainSuffix {
-                    value: value.to_ascii_lowercase(),
+                    value: Arc::from(value.to_ascii_lowercase()),
                 }
             }
             config::ResponseMatcher::RequestDomainRegex { value } => {
@@ -985,12 +992,12 @@ impl RuntimeResponseMatcher {
             }
             config::ResponseMatcher::ResponseType { value } => {
                 RuntimeResponseMatcher::ResponseType {
-                    value: value.to_ascii_uppercase(),
+                    value: Arc::from(value.to_ascii_uppercase()),
                 }
             }
             config::ResponseMatcher::ResponseRcode { value } => {
                 RuntimeResponseMatcher::ResponseRcode {
-                    value: value.to_ascii_uppercase(),
+                    value: Arc::from(value.to_ascii_uppercase()),
                 }
             }
             config::ResponseMatcher::ResponseQclass { value } => {
@@ -1002,16 +1009,16 @@ impl RuntimeResponseMatcher {
                 RuntimeResponseMatcher::ResponseEdnsPresent { expect }
             }
             config::ResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } => {
-                RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes }
+                RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes: country_codes.into_iter().map(Arc::from).collect() }
             }
             config::ResponseMatcher::ResponseAnswerIpGeoipPrivate { expect } => {
                 RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { expect }
             }
             config::ResponseMatcher::ResponseRequestDomainGeoSite { value } => {
-                RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value }
+                RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value: Arc::from(value) }
             }
             config::ResponseMatcher::ResponseRequestDomainGeoSiteNot { value } => {
-                RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { value }
+                RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { value: Arc::from(value) }
             }
             config::ResponseMatcher::ResponseTxtContent { mode, value } => {
                 let mode = TxtMatchMode::from_str(&mode)?;
@@ -1038,7 +1045,7 @@ impl RuntimeResponseMatcher {
                     }
                     _ => None,
                 };
-                RuntimeResponseMatcher::ResponseTxtContent { mode, value, regex }
+                RuntimeResponseMatcher::ResponseTxtContent { mode, value: Arc::from(value), regex }
             }
         })
     }
@@ -1050,12 +1057,12 @@ impl RuntimeResponseMatcher {
         qtype: RecordType,
         qclass: DNSClass,
         msg: &Message,
-        geoip_manager: Option<&crate::geoip::GeoIpManager>,
-        geosite_manager: Option<&crate::geosite::GeoSiteManager>,
+        geoip_manager: Option<&crate::matcher::geoip::GeoIpManager>,
+        geosite_manager: Option<&crate::matcher::geosite::GeoSiteManager>,
     ) -> bool {
         match self {
-            RuntimeResponseMatcher::UpstreamEquals { value } => upstream == value,
-            RuntimeResponseMatcher::RequestDomainSuffix { value } => qname.ends_with(value),
+            RuntimeResponseMatcher::UpstreamEquals { value } => upstream == value.as_ref(),
+            RuntimeResponseMatcher::RequestDomainSuffix { value } => qname.ends_with(value.as_ref()),
             RuntimeResponseMatcher::RequestDomainRegex { regex } => regex.is_match(qname),
             RuntimeResponseMatcher::ResponseUpstreamIp { nets } => try_parse_upstream_ip(upstream)
                 .map(|ip| nets.iter().any(|net| net.contains(&ip)))
@@ -1070,7 +1077,7 @@ impl RuntimeResponseMatcher {
                     .first()
                     .map(|r| r.record_type())
                     .unwrap_or(qtype);
-                format!("{}", rrty) == *value
+                format!("{}", rrty) == value.as_ref()
             }
             RuntimeResponseMatcher::ResponseRcode { value } => {
                 let code_str = match msg.response_code() {
@@ -1082,7 +1089,7 @@ impl RuntimeResponseMatcher {
                     hickory_proto::op::ResponseCode::Refused => "REFUSED",
                     _ => "OTHER",
                 };
-                code_str == *value
+                code_str == value.as_ref()
             }
             RuntimeResponseMatcher::ResponseQclass { value } => value == &qclass,
             RuntimeResponseMatcher::ResponseEdnsPresent { expect } => {
@@ -1111,9 +1118,9 @@ impl RuntimeResponseMatcher {
                 // 检查 Answer 中是否有任意 IP 为私有 IP
                 use hickory_proto::rr::RData;
                 let mut has_private_ip = msg.answers().iter().any(|record| match record.data() {
-                    Some(RData::A(a)) => crate::geoip::is_private_ip(std::net::IpAddr::V4(a.0)),
+                    Some(RData::A(a)) => crate::matcher::geoip::is_private_ip(std::net::IpAddr::V4(a.0)),
                     Some(RData::AAAA(aaaa)) => {
-                        crate::geoip::is_private_ip(std::net::IpAddr::V6(aaaa.0))
+                        crate::matcher::geoip::is_private_ip(std::net::IpAddr::V6(aaaa.0))
                     }
                     _ => false,
                 });
@@ -1121,9 +1128,9 @@ impl RuntimeResponseMatcher {
                 if !has_private_ip {
                     // 检查 additionals
                     has_private_ip = msg.additionals().iter().any(|record| match record.data() {
-                        Some(RData::A(a)) => crate::geoip::is_private_ip(std::net::IpAddr::V4(a.0)),
+                        Some(RData::A(a)) => crate::matcher::geoip::is_private_ip(std::net::IpAddr::V4(a.0)),
                         Some(RData::AAAA(aaaa)) => {
-                            crate::geoip::is_private_ip(std::net::IpAddr::V6(aaaa.0))
+                            crate::matcher::geoip::is_private_ip(std::net::IpAddr::V6(aaaa.0))
                         }
                         _ => false,
                     });
@@ -1133,13 +1140,13 @@ impl RuntimeResponseMatcher {
             }
             RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value } => {
                 // 使用辅助函数检查请求域名是否属于指定的 GeoSite 分类 / Use helper to check if request domain belongs to GeoSite category
-                geosite_manager.map_or(false, |mgr| {
+                geosite_manager.is_some_and(|mgr| {
                     matcher_helpers::match_geosite(mgr, qname, value)
                 })
             }
             RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { value } => {
                 // 使用辅助函数检查请求域名是否不属于指定的 GeoSite 分类 / Use helper to check if request domain does NOT belong to GeoSite category
-                geosite_manager.map_or(false, |mgr| {
+                geosite_manager.is_some_and(|mgr| {
                     !matcher_helpers::match_geosite(mgr, qname, value)
                 })
             }
@@ -1163,8 +1170,8 @@ impl RuntimeResponseMatcher {
                 let txt_str = String::from_utf8_lossy(&txt_data);
 
                 match mode {
-                    TxtMatchMode::Exact => &txt_str == value,
-                    TxtMatchMode::Prefix => txt_str.starts_with(value),
+                    TxtMatchMode::Exact => txt_str == value.as_ref(),
+                    TxtMatchMode::Prefix => txt_str.starts_with(value.as_ref()),
                     TxtMatchMode::Regex => {
                         if let Some(re) = regex {
                             re.is_match(&txt_str)
@@ -1174,839 +1181,6 @@ impl RuntimeResponseMatcher {
                     }
                 }
             }
-        }
-    }
-}
-
-// Tests for runtime matcher functionality
-// 运行时匹配器功能测试
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use hickory_proto::op::{Edns, ResponseCode};
-    use hickory_proto::rr::rdata::{A, AAAA};
-    use hickory_proto::rr::Name;
-    use hickory_proto::rr::{RData, Record};
-    use regex::Regex;
-    use std::net::{Ipv4Addr, Ipv6Addr};
-    use std::str::FromStr;
-
-    // ========================================================================
-    // Matcher Helper Functions Unit Tests / 匹配器辅助函数单元测试
-    // ========================================================================
-
-    #[test]
-    fn test_matcher_helpers_match_geoip_country_case_insensitive() {
-        // Arrange: Create GeoIpManager
-        let manager = crate::geoip::GeoIpManager::new(None).unwrap();
-
-        // Act & Assert: Test case-insensitive matching with private IPs
-        // GeoIpManager without MMDB will return None for country_code
-        assert!(
-            !matcher_helpers::match_geoip_country(
-                &manager,
-                "192.168.1.1".parse().unwrap(),
-                &["cn".to_string()]
-            ),
-            "Should return false for IP without country data"
-        );
-
-        assert!(
-            !matcher_helpers::match_geoip_country(
-                &manager,
-                "10.0.0.1".parse().unwrap(),
-                &["CN".to_string(), "US".to_string()]
-            ),
-            "Should return false when multiple country codes provided but no data"
-        );
-    }
-
-    #[test]
-    fn test_matcher_helpers_match_geoip_country_no_match() {
-        // Arrange: Create GeoIpManager
-        let manager = crate::geoip::GeoIpManager::new(None).unwrap();
-
-        // Act & Assert: Test IP with no country data
-        assert!(
-            !matcher_helpers::match_geoip_country(
-                &manager,
-                "192.168.1.1".parse().unwrap(),
-                &["CN".to_string()]
-            ),
-            "Should return false for IP without country data"
-        );
-    }
-
-    #[test]
-    fn test_matcher_helpers_match_geosite() {
-        // Arrange: Create GeoSiteManager with test data
-        let mut manager = crate::geosite::GeoSiteManager::new();
-
-        // Add test entries using correct API
-        use crate::geosite::{DomainMatcher, GeoSiteEntry};
-
-        manager.add_entry(GeoSiteEntry {
-            tag: "cn".to_string(),
-            matchers: vec![
-                DomainMatcher::Suffix(".example.com".to_string()),
-                DomainMatcher::Keyword("test".to_string()),
-            ],
-        });
-
-        // Act & Assert: Test domain matching
-        assert!(
-            matcher_helpers::match_geosite(&manager, "www.example.com", "cn"),
-            "Should match domain in cn category"
-        );
-
-        assert!(
-            matcher_helpers::match_geosite(&manager, "sub.example.com", "cn"),
-            "Should match subdomain in cn category"
-        );
-
-        assert!(
-            !matcher_helpers::match_geosite(&manager, "other.com", "cn"),
-            "Should not match unknown domain"
-        );
-
-        assert!(
-            !matcher_helpers::match_geosite(&manager, "www.example.com", "google"),
-            "Should not match domain in non-existent category"
-        );
-    }
-
-    #[test]
-    fn test_matcher_helpers_collect_ips_from_message() {
-        // Arrange: Build test message with multiple IPs
-        let mut msg = Message::new();
-        let name = Name::from_str("example.com").unwrap();
-
-        // Add A records
-        msg.add_answer(Record::from_rdata(
-            name.clone(),
-            300,
-            RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
-        ));
-        msg.add_answer(Record::from_rdata(
-            name.clone(),
-            300,
-            RData::A(A(Ipv4Addr::new(5, 6, 7, 8))),
-        ));
-
-        // Add AAAA record
-        msg.add_answer(Record::from_rdata(
-            name.clone(),
-            300,
-            RData::AAAA(AAAA(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
-        ));
-
-        // Act: Collect IPs
-        let ips = matcher_helpers::collect_ips_from_message(&msg);
-
-        // Assert: Verify collected IPs
-        assert_eq!(ips.len(), 3, "Should collect 3 IP addresses");
-        assert!(
-            ips.contains(&"1.2.3.4".parse::<IpAddr>().unwrap()),
-            "Should contain first IPv4"
-        );
-        assert!(
-            ips.contains(&"5.6.7.8".parse::<IpAddr>().unwrap()),
-            "Should contain second IPv4"
-        );
-        assert!(
-            ips.contains(&IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
-            "Should contain IPv6"
-        );
-    }
-
-    #[test]
-    fn test_matcher_helpers_collect_ips_from_empty_message() {
-        // Arrange: Build empty message
-        let msg = Message::new();
-
-        // Act: Collect IPs
-        let ips = matcher_helpers::collect_ips_from_message(&msg);
-
-        // Assert: Should return empty vector
-        assert_eq!(ips.len(), 0, "Should return empty vector for empty message");
-        assert!(ips.is_empty(), "Vector should be empty");
-    }
-
-    #[test]
-    fn test_matcher_helpers_any_ip_matches_nets() {
-        // Arrange: Build test message with multiple IPs
-        let mut msg = Message::new();
-        let name = Name::from_str("example.com").unwrap();
-        msg.add_answer(Record::from_rdata(
-            name.clone(),
-            300,
-            RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
-        ));
-        msg.add_answer(Record::from_rdata(
-            name.clone(),
-            300,
-            RData::A(A(Ipv4Addr::new(192, 168, 1, 1))),
-        ));
-
-        let nets = vec!["1.2.3.0/24".parse::<IpNet>().unwrap()];
-
-        // Act: Check if any IP matches
-        let matches = matcher_helpers::any_ip_matches_nets(&msg, &nets);
-
-        // Assert: Should match first IP
-        assert!(matches, "Should find matching IP in answers");
-    }
-
-    #[test]
-    fn test_matcher_helpers_any_ip_matches_nets_no_match() {
-        // Arrange: Build test message with IPs
-        let mut msg = Message::new();
-        let name = Name::from_str("example.com").unwrap();
-        msg.add_answer(Record::from_rdata(
-            name.clone(),
-            300,
-            RData::A(A(Ipv4Addr::new(8, 8, 8, 8))),
-        ));
-
-        let nets = vec!["1.2.3.0/24".parse::<IpNet>().unwrap()];
-
-        // Act: Check if any IP matches
-        let matches = matcher_helpers::any_ip_matches_nets(&msg, &nets);
-
-        // Assert: Should not match
-        assert!(!matches, "Should not find matching IP");
-    }
-
-    #[test]
-    fn test_matcher_helpers_any_ip_matches_nets_in_additionals() {
-        // Arrange: Build message with IPs in additionals
-        let mut msg = Message::new();
-        let name = Name::from_str("example.com").unwrap();
-        // Add non-matching IP to answers
-        msg.add_answer(Record::from_rdata(
-            name.clone(),
-            300,
-            RData::A(A(Ipv4Addr::new(8, 8, 8, 8))),
-        ));
-        // Add matching IP to additionals
-        let additionals = vec![Record::from_rdata(
-            name.clone(),
-            300,
-            RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
-        )];
-        msg.add_additionals(additionals);
-
-        let nets = vec!["1.2.3.0/24".parse::<IpNet>().unwrap()];
-
-        // Act: Check if any IP matches
-        let matches = matcher_helpers::any_ip_matches_nets(&msg, &nets);
-
-        // Assert: Should match IP in additionals
-        assert!(matches, "Should find matching IP in additionals");
-    }
-
-    #[test]
-    fn test_matcher_helpers_any_ip_matches_nets_ipv6() {
-        // Arrange: Build test message with IPv6
-        let mut msg = Message::new();
-        let name = Name::from_str("example.com").unwrap();
-        msg.add_answer(Record::from_rdata(
-            name,
-            300,
-            RData::AAAA(AAAA(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
-        ));
-
-        let nets = vec!["2001:db8::/48".parse::<IpNet>().unwrap()];
-
-        // Act: Check if any IP matches
-        let matches = matcher_helpers::any_ip_matches_nets(&msg, &nets);
-
-        // Assert: Should match IPv6
-        assert!(matches, "Should match IPv6 address");
-    }
-
-    // ========================================================================
-    // Original Tests / 原有测试
-    // ========================================================================
-
-    // Helper function to build test DNS messages
-    // 构建测试DNS消息的辅助函数
-    fn build_message(rcode: ResponseCode, edns_present: bool) -> Message {
-        let mut msg = Message::new();
-        msg.set_response_code(rcode);
-        if edns_present {
-            msg.set_edns(Edns::new());
-        }
-        let name = Name::from_str("example.com").unwrap();
-        let record = Record::from_rdata(name, 300, RData::A(A(Ipv4Addr::new(1, 2, 3, 4))));
-        msg.add_answer(record);
-        msg
-    }
-
-    // Helper function to build test DNS messages with IPv6
-    // 构建包含IPv6的测试DNS消息的辅助函数
-    fn build_message_with_ipv6(rcode: ResponseCode, edns_present: bool) -> Message {
-        let mut msg = Message::new();
-        msg.set_response_code(rcode);
-        if edns_present {
-            msg.set_edns(Edns::new());
-        }
-        let name = Name::from_str("example.com").unwrap();
-        let record = Record::from_rdata(
-            name,
-            300,
-            RData::AAAA(AAAA(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
-        );
-        msg.add_answer(record);
-        msg
-    }
-
-    #[test]
-    fn test_runtime_response_matchers_cover_readme_cases() {
-        // Arrange: Setup test data
-        let qname = "sub.example.com";
-        let upstream = "1.1.1.1:53".to_string();
-        let qtype = RecordType::A;
-        let qclass = DNSClass::IN;
-        let msg = build_message(ResponseCode::NoError, true);
-
-        // Act & Assert: Test various response matchers
-        assert!(
-            RuntimeResponseMatcher::UpstreamEquals {
-                value: upstream.clone()
-            }
-            .matches(&upstream, qname, qtype, qclass, &msg, None, None),
-            "UpstreamEquals matcher should match when upstream values are equal"
-        );
-        assert!(
-            RuntimeResponseMatcher::RequestDomainSuffix {
-                value: "example.com".into()
-            }
-            .matches(&upstream, qname, qtype, qclass, &msg, None, None),
-            "RequestDomainSuffix matcher should match domain suffix"
-        );
-        assert!(
-            RuntimeResponseMatcher::RequestDomainRegex {
-                regex: Regex::new(".*example\\.com$").unwrap()
-            }
-            .matches(&upstream, qname, qtype, qclass, &msg, None, None),
-            "RequestDomainRegex matcher should match regex pattern"
-        );
-        assert!(
-            RuntimeResponseMatcher::ResponseType { value: "A".into() }
-                .matches(&upstream, qname, qtype, qclass, &msg, None, None),
-            "ResponseType matcher should match A record type"
-        );
-        assert!(
-            RuntimeResponseMatcher::ResponseRcode {
-                value: "NOERROR".into()
-            }
-            .matches(&upstream, qname, qtype, qclass, &msg, None, None),
-            "ResponseRcode matcher should match NOERROR response code"
-        );
-        assert!(
-            RuntimeResponseMatcher::ResponseQclass {
-                value: DNSClass::IN
-            }
-            .matches(&upstream, qname, qtype, qclass, &msg, None, None),
-            "ResponseQclass matcher should match IN class"
-        );
-        assert!(
-            RuntimeResponseMatcher::ResponseEdnsPresent { expect: true }
-                .matches(&upstream, qname, qtype, qclass, &msg, None, None),
-            "ResponseEdnsPresent matcher should detect EDNS presence"
-        );
-        assert!(
-            RuntimeResponseMatcher::ResponseUpstreamIp {
-                nets: vec!["1.1.1.0/24".parse().unwrap()],
-            }
-            .matches(&upstream, qname, qtype, qclass, &msg, None, None),
-            "ResponseUpstreamIp matcher should match upstream IP CIDR"
-        );
-
-        let msg_no_edns = build_message(ResponseCode::NXDomain, false);
-        assert!(
-            RuntimeResponseMatcher::ResponseEdnsPresent { expect: false }.matches(
-                &upstream,
-                qname,
-                qtype,
-                qclass,
-                &msg_no_edns,
-                None,
-                None
-            ),
-            "ResponseEdnsPresent matcher should detect absence of EDNS"
-        );
-
-        let msg_ipv6 = build_message_with_ipv6(ResponseCode::NoError, true);
-        assert!(
-            RuntimeResponseMatcher::ResponseType {
-                value: "AAAA".into()
-            }
-            .matches(
-                &upstream,
-                qname,
-                RecordType::AAAA,
-                qclass,
-                &msg_ipv6,
-                None,
-                None
-            ),
-            "ResponseType matcher should match AAAA record type"
-        );
-    }
-
-    #[test]
-    fn test_apply_match_operator_request_matchers() {
-        use std::net::IpAddr;
-
-        // Arrange: Setup test data
-        let qname = "a.sub.example.com";
-        let client_ip = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
-        let qclass = DNSClass::IN;
-
-        // Act & Assert: Test AND operator with matching conditions
-        let m_and_true = vec![
-            RuntimeMatcher::DomainSuffix {
-                value: "example.com".into(),
-            },
-            RuntimeMatcher::Qclass {
-                value: DNSClass::IN,
-            },
-        ];
-        let res_and = m_and_true
-            .iter()
-            .map(|m| m.matches(qname, qclass, client_ip, true));
-        assert!(
-            apply_match_operator(&MatchOperator::And, res_and),
-            "AND operator should return true when all matchers return true"
-        );
-
-        // Act & Assert: Test AND operator with non-matching conditions
-        let m_and_false = vec![
-            RuntimeMatcher::DomainSuffix {
-                value: "example.com".into(),
-            },
-            RuntimeMatcher::Qclass {
-                value: DNSClass::CH,
-            },
-        ];
-        let res_and_false = m_and_false
-            .iter()
-            .map(|m| m.matches(qname, qclass, client_ip, true));
-        assert!(
-            !apply_match_operator(&MatchOperator::And, res_and_false),
-            "AND operator should return false when any matcher returns false"
-        );
-
-        // Act & Assert: Test OR operator with one matching condition
-        let m_or = vec![
-            RuntimeMatcher::DomainSuffix {
-                value: "nomatch.local".into(),
-            },
-            RuntimeMatcher::Qclass {
-                value: DNSClass::IN,
-            },
-        ];
-        let res_or = m_or
-            .iter()
-            .map(|m| m.matches(qname, qclass, client_ip, true));
-        assert!(
-            apply_match_operator(&MatchOperator::Or, res_or),
-            "OR operator should return true when any matcher returns true"
-        );
-
-        // Act & Assert: Test NOT operator with all false matchers
-        let m_not_all_false = vec![
-            RuntimeMatcher::DomainSuffix {
-                value: "nomatch.local".into(),
-            },
-            RuntimeMatcher::Qclass {
-                value: DNSClass::CH,
-            },
-        ];
-        let res_not = m_not_all_false
-            .iter()
-            .map(|m| m.matches(qname, qclass, client_ip, true));
-        assert!(
-            apply_match_operator(&MatchOperator::Not, res_not),
-            "NOT operator should return true when all matchers return false"
-        );
-
-        // Act & Assert: Test NOT operator with one true matcher
-        let m_not_one_true = vec![
-            RuntimeMatcher::DomainSuffix {
-                value: "example.com".into(),
-            },
-            RuntimeMatcher::Qclass {
-                value: DNSClass::CH,
-            },
-        ];
-        let res_not_false = m_not_one_true
-            .iter()
-            .map(|m| m.matches(qname, qclass, client_ip, true));
-        assert!(
-            !apply_match_operator(&MatchOperator::Not, res_not_false),
-            "NOT operator should return false when any matcher returns true"
-        );
-    }
-
-    #[test]
-    fn test_apply_match_operator_response_matchers() {
-        // Arrange: Setup test data
-        let qname = "sub.example.com";
-        let upstream = "9.9.9.9:53".to_string();
-        let qtype = RecordType::A;
-        let qclass = DNSClass::IN;
-        let msg = build_message(ResponseCode::NoError, true);
-
-        // Act & Assert: Test AND operator
-        let rm_and_true = vec![
-            RuntimeResponseMatcher::UpstreamEquals {
-                value: upstream.clone(),
-            },
-            RuntimeResponseMatcher::RequestDomainSuffix {
-                value: "example.com".into(),
-            },
-        ];
-        let res_and = rm_and_true
-            .iter()
-            .map(|m| m.matches(&upstream, qname, qtype, qclass, &msg, None, None));
-        assert!(
-            apply_match_operator(&MatchOperator::And, res_and),
-            "AND operator should return true when all response matchers return true"
-        );
-
-        // Act & Assert: Test OR operator
-        let rm_or = vec![
-            RuntimeResponseMatcher::UpstreamEquals {
-                value: "nope:53".into(),
-            },
-            RuntimeResponseMatcher::RequestDomainSuffix {
-                value: "example.com".into(),
-            },
-        ];
-        let res_or = rm_or
-            .iter()
-            .map(|m| m.matches(&upstream, qname, qtype, qclass, &msg, None, None));
-        assert!(
-            apply_match_operator(&MatchOperator::Or, res_or),
-            "OR operator should return true when any response matcher returns true"
-        );
-
-        // Act & Assert: Test NOT operator with all false matchers
-        let rm_not_all_false = vec![
-            RuntimeResponseMatcher::UpstreamEquals {
-                value: "nope:53".into(),
-            },
-            RuntimeResponseMatcher::RequestDomainSuffix {
-                value: "nomatch.local".into(),
-            },
-        ];
-        let res_not = rm_not_all_false
-            .iter()
-            .map(|m| m.matches(&upstream, qname, qtype, qclass, &msg, None, None));
-        assert!(
-            apply_match_operator(&MatchOperator::Not, res_not),
-            "NOT operator should return true when all response matchers return false"
-        );
-
-        // Act & Assert: Test NOT operator with one true matcher
-        let rm_not_one_true = vec![
-            RuntimeResponseMatcher::UpstreamEquals {
-                value: upstream.clone(),
-            },
-            RuntimeResponseMatcher::RequestDomainSuffix {
-                value: "nomatch.local".into(),
-            },
-        ];
-        let res_not_false = rm_not_one_true
-            .iter()
-            .map(|m| m.matches(&upstream, qname, qtype, qclass, &msg, None, None));
-        assert!(
-            !apply_match_operator(&MatchOperator::Not, res_not_false),
-            "NOT operator should return false when any response matcher returns true"
-        );
-    }
-
-    #[test]
-    fn test_apply_match_operator_empty_iterator_boundary() {
-        // Arrange: Setup empty iterator
-        let empty: Vec<bool> = vec![];
-        let it = empty.into_iter();
-
-        // Act & Assert: And over empty iterator -> true (all true)
-        assert!(
-            apply_match_operator(&MatchOperator::And, it.clone()),
-            "AND operator should return true for empty iterator (all true)"
-        );
-
-        // Act & Assert: Or over empty iterator -> false (any false)
-        let it2 = std::iter::empty::<bool>();
-        assert!(
-            !apply_match_operator(&MatchOperator::Or, it2),
-            "OR operator should return false for empty iterator (any false)"
-        );
-
-        // Act & Assert: Not over empty iterator -> true (!any(empty) == true)
-        let it3 = std::iter::empty::<bool>();
-        assert!(
-            apply_match_operator(&MatchOperator::Not, it3),
-            "NOT operator should return true for empty iterator (!any(empty) == true)"
-        );
-    }
-
-    #[test]
-    fn test_runtime_pipeline_selector_matchers() {
-        use std::net::IpAddr;
-
-        // Arrange: Setup test data
-        let listener_label = "edge-internal";
-        let client_ip = IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 2, 3));
-        let qname = "svc.example.com";
-
-        // Act & Assert: Test ListenerLabel matcher
-        assert!(
-            RuntimePipelineSelectorMatcher::ListenerLabel {
-                value: "edge-internal".into()
-            }
-            .matches(
-                listener_label,
-                client_ip,
-                qname,
-                DNSClass::IN,
-                false,
-                None,
-                None
-            ),
-            "ListenerLabel matcher should match when listener labels are equal"
-        );
-
-        // Act & Assert: Test ClientIp matcher
-        assert!(
-            RuntimePipelineSelectorMatcher::ClientIp {
-                net: "10.1.2.0/24".parse().unwrap()
-            }
-            .matches(
-                listener_label,
-                client_ip,
-                qname,
-                DNSClass::IN,
-                false,
-                None,
-                None
-            ),
-            "ClientIp matcher should match when client IP is in CIDR range"
-        );
-
-        // Act & Assert: Test DomainSuffix matcher
-        assert!(
-            RuntimePipelineSelectorMatcher::DomainSuffix {
-                value: "example.com".into()
-            }
-            .matches(
-                listener_label,
-                client_ip,
-                qname,
-                DNSClass::IN,
-                false,
-                None,
-                None
-            ),
-            "DomainSuffix matcher should match domain suffix"
-        );
-    }
-
-    #[test]
-    fn test_runtime_matcher_basic_behaviors() {
-        use std::net::IpAddr;
-
-        // Arrange: Setup test data
-        let qname = "Foo.Example.COM".to_ascii_lowercase();
-        let client_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 5));
-        let qclass = DNSClass::IN;
-
-        // Act & Assert: Any always matches
-        assert!(
-            RuntimeMatcher::Any.matches(&qname, qclass, client_ip, false),
-            "Any matcher should always match"
-        );
-
-        // Act & Assert: DomainSuffix should match when suffix equals
-        assert!(
-            RuntimeMatcher::DomainSuffix {
-                value: "example.com".into()
-            }
-            .matches(&qname, qclass, client_ip, false),
-            "DomainSuffix matcher should match when suffix equals"
-        );
-
-        // Act & Assert: ClientIp CIDR
-        assert!(
-            RuntimeMatcher::ClientIp {
-                net: "192.0.2.0/24".parse().unwrap()
-            }
-            .matches(&qname, qclass, client_ip, false),
-            "ClientIp matcher should match when client IP is in CIDR range"
-        );
-
-        // Act & Assert: Qclass
-        assert!(
-            RuntimeMatcher::Qclass {
-                value: DNSClass::IN
-            }
-            .matches(&qname, qclass, client_ip, false),
-            "Qclass matcher should match when QCLASS equals"
-        );
-
-        // Act & Assert: EdnsPresent
-        assert!(
-            RuntimeMatcher::EdnsPresent { expect: false }.matches(&qname, qclass, client_ip, false),
-            "EdnsPresent matcher should match when EDNS presence matches expectation"
-        );
-    }
-
-    #[test]
-    fn test_response_upstream_ip_parsing_and_nonparseable() {
-        // Arrange: Setup test data
-        let qname = "sub.example.com";
-        let qtype = RecordType::A;
-        let qclass = DNSClass::IN;
-        let msg = build_message(ResponseCode::NoError, false);
-
-        // Act & Assert: With port
-        assert!(
-            RuntimeResponseMatcher::ResponseUpstreamIp {
-                nets: vec!["1.2.3.0/24".parse().unwrap()]
-            }
-            .matches("1.2.3.4:53", qname, qtype, qclass, &msg, None, None),
-            "ResponseUpstreamIp matcher should match upstream with port"
-        );
-
-        // Act & Assert: Plain ip
-        assert!(
-            RuntimeResponseMatcher::ResponseUpstreamIp {
-                nets: vec!["1.2.3.0/24".parse().unwrap()]
-            }
-            .matches("1.2.3.4", qname, qtype, qclass, &msg, None, None),
-            "ResponseUpstreamIp matcher should match plain IP"
-        );
-
-        // Act & Assert: Non-parseable upstream should return false
-        assert!(
-            !RuntimeResponseMatcher::ResponseUpstreamIp {
-                nets: vec!["1.2.3.0/24".parse().unwrap()]
-            }
-            .matches("not-an-upstream", qname, qtype, qclass, &msg, None, None),
-            "ResponseUpstreamIp matcher should return false for non-parseable upstream"
-        );
-    }
-
-    #[test]
-    fn test_domain_regex_case_insensitive_flag() {
-        // Arrange: Setup test data
-        let qname = "Foo.Example.COM";
-
-        // Act & Assert: Without (?i) should not match assuming case-sensitive regex
-        let re_cs = Regex::new("example\\.com$").unwrap();
-        assert!(
-            !RuntimeMatcher::DomainRegex { regex: re_cs }.matches(
-                &qname,
-                DNSClass::IN,
-                std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-                false
-            ),
-            "Case-sensitive regex should not match different case"
-        );
-
-        // Act & Assert: With (?i) should match
-        let re_ci = Regex::new("(?i)example\\.com$").unwrap();
-        assert!(
-            RuntimeMatcher::DomainRegex { regex: re_ci }.matches(
-                &qname,
-                DNSClass::IN,
-                std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-                false
-            ),
-            "Case-insensitive regex should match different case"
-        );
-    }
-
-    #[test]
-    fn test_response_type_no_answers_uses_qtype_fallback() {
-        // Arrange: Setup message with no answers
-        let mut msg = Message::new();
-        msg.set_response_code(ResponseCode::NoError);
-        // no answers added
-
-        let qname = "x.example.com";
-        let qtype = RecordType::A;
-        let qclass = DNSClass::IN;
-
-        // Act & Assert: Should use qtype fallback when no answers present
-        assert!(
-            RuntimeResponseMatcher::ResponseType { value: "A".into() }.matches(
-                "1.2.3.4:53",
-                qname,
-                qtype,
-                qclass,
-                &msg,
-                None,
-                None
-            ),
-            "ResponseType matcher should use qtype fallback when no answers present"
-        );
-    }
-
-    // Integration Tests for New Matchers
-    // 新匹配器的集成测试
-
-    #[test]
-    fn test_qtype_matcher_all_types() {
-        // Arrange: Setup test data with all supported DNS record types
-        let qtypes = vec![
-            ("A", RecordType::A),
-            ("AAAA", RecordType::AAAA),
-            ("CNAME", RecordType::CNAME),
-            ("MX", RecordType::MX),
-            ("TXT", RecordType::TXT),
-            ("NS", RecordType::NS),
-            ("PTR", RecordType::PTR),
-            ("SOA", RecordType::SOA),
-            ("SRV", RecordType::SRV),
-            ("OPT", RecordType::OPT),
-        ];
-
-        for (type_str, expected_type) in qtypes {
-            // Act & Assert: Test parsing
-            let parsed = parse_dns_type(type_str);
-            assert!(parsed.is_ok(), "Failed to parse qtype: {}", type_str);
-            assert_eq!(
-                parsed.unwrap(),
-                expected_type,
-                "Qtype mismatch for: {}",
-                type_str
-            );
-
-            // Act & Assert: Test matcher
-            let matcher = RuntimeMatcher::Qtype {
-                value: expected_type,
-            };
-
-            // Act & Assert: Test matching
-            assert!(
-                matcher.matches_with_qtype(
-                    "example.com",
-                    DNSClass::IN,
-                    IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-                    false,
-                    expected_type,
-                    None,
-                    None,
-                ),
-                "Qtype {} should match itself",
-                type_str
-            );
         }
     }
 }

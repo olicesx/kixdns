@@ -2,6 +2,13 @@
 name = "kixdns"
 version = "0.1.0"
 edition = "2024"
+authors = ["KixDNS Contributors"]
+description = "High-performance, non-recursive DNS server with hot-reloadable pipeline configuration and advanced routing rules"
+license = "GPL-3.0"
+repository = "https://github.com/kixdns/kixdns"
+keywords = ["dns", "server", "async", "tokio", "dns-server", "routing"]
+categories = ["network-programming", "asynchronous"]
+readme = "README.md"
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal", "sync"] }

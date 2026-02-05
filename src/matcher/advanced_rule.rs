@@ -40,10 +40,10 @@ pub struct CompiledMatcherWithOp {
 pub enum CompiledMatcher {
     #[allow(dead_code)]
     DomainExact {
-        domain: String,
+        domain: Arc<str>,
     },
     DomainSuffix {
-        suffix: String,
+        suffix: Arc<str>,
     },
     ClientIp {
         net: IpNet,
@@ -71,8 +71,8 @@ pub enum PrecomputedAction {
 
 #[derive(Debug, Clone, Default)]
 pub struct RuleIndex {
-    pub domain_exact: FxHashMap<String, Vec<usize>>,
-    pub domain_suffix: FxHashMap<String, Vec<usize>>,
+    pub domain_exact: FxHashMap<Arc<str>, Vec<usize>>,
+    pub domain_suffix: FxHashMap<Arc<str>, Vec<usize>>,
     pub query_type: FxHashMap<RecordType, Vec<usize>>,
     pub always_check: Vec<usize>,
 }
@@ -169,7 +169,7 @@ impl RuleIndex {
 }
 
 pub fn compile_pipelines(cfg: &RuntimePipelineConfig) -> Vec<CompiledPipeline> {
-    cfg.pipelines.iter().map(|p| compile_pipeline(p)).collect()
+    cfg.pipelines.iter().map(compile_pipeline).collect()
 }
 
 fn compile_pipeline(p: &RuntimePipeline) -> CompiledPipeline {
@@ -212,7 +212,7 @@ fn compile_rule(rule: &RuntimeRule, rule_idx: usize) -> CompiledRule {
 fn compile_matcher(m: &RuntimeMatcher) -> CompiledMatcher {
     match m {
         RuntimeMatcher::Any => CompiledMatcher::DomainSuffix {
-            suffix: String::new(),
+            suffix: Arc::from(""),
         },
         RuntimeMatcher::DomainExact { value } => CompiledMatcher::DomainExact {
             domain: value.clone(),
@@ -220,7 +220,7 @@ fn compile_matcher(m: &RuntimeMatcher) -> CompiledMatcher {
         RuntimeMatcher::DomainSuffix { value } => CompiledMatcher::DomainSuffix {
             suffix: value.clone(),
         },
-        RuntimeMatcher::ClientIp { net } => CompiledMatcher::ClientIp { net: net.clone() },
+        RuntimeMatcher::ClientIp { net } => CompiledMatcher::ClientIp { net: *net },
         RuntimeMatcher::DomainRegex { regex } => CompiledMatcher::Regex {
             regex: regex.clone(),
         },
@@ -319,7 +319,7 @@ fn compiled_matcher_matches(
             if suffix.is_empty() {
                 true
             } else {
-                qname.ends_with(suffix)
+                qname.ends_with(suffix.as_ref())
             }
         }
         CompiledMatcher::ClientIp { net } => net.contains(&client_ip),
@@ -329,7 +329,7 @@ fn compiled_matcher_matches(
         CompiledMatcher::Complex { matcher } => match matcher {
             RuntimeMatcher::Any => true,
             RuntimeMatcher::DomainExact { value } => qname.eq_ignore_ascii_case(value),
-            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value),
+            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value.as_ref()),
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes: _ } => {

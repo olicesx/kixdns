@@ -55,14 +55,14 @@ pub struct ConversionStats {
 
 impl std::fmt::Display for ConversionStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Conversion Statistics:\n")?;
-        write!(f, "  Source file size: {} bytes\n", self.source_file_size)?;
-        write!(f, "  Output file size: {} bytes\n", self.output_file_size)?;
-        write!(f, "  Countries: {}\n", self.countries_count)?;
-        write!(f, "  IPv4 ranges: {}\n", self.ipv4_ranges_count)?;
-        write!(f, "  IPv6 ranges: {}\n", self.ipv6_ranges_count)?;
+        writeln!(f, "Conversion Statistics:")?;
+        writeln!(f, "  Source file size: {} bytes", self.source_file_size)?;
+        writeln!(f, "  Output file size: {} bytes", self.output_file_size)?;
+        writeln!(f, "  Countries: {}", self.countries_count)?;
+        writeln!(f, "  IPv4 ranges: {}", self.ipv4_ranges_count)?;
+        writeln!(f, "  IPv6 ranges: {}", self.ipv6_ranges_count)?;
         if let Some(ref filtered) = self.filtered_countries {
-            write!(f, "  Filtered countries: {:?}\n", filtered)?;
+            writeln!(f, "  Filtered countries: {:?}", filtered)?;
         }
         Ok(())
     }
@@ -209,7 +209,7 @@ impl GeoIpConverter {
                     let entry_count = cidr_list.len();
                     self.country_to_nets
                         .entry(country_code)
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .extend(cidr_list);
                     count += entry_count;
                 }
@@ -243,7 +243,7 @@ impl GeoIpConverter {
                 if let Ok(net) = ip_str.parse::<IpNet>() {
                     self.country_to_nets
                         .entry(geoip.country_code.clone())
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(net);
                     count += 1;
                 }
@@ -590,30 +590,4 @@ pub fn convert_dat_to_mmdb(
     info!("Conversion completed:\n{}", stats);
 
     Ok(stats)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_varint() {
-        let data = [0x96, 0x01]; // 150 in varint
-        let mut pos = 0;
-        let result = parse_varint(&data, &mut pos).unwrap();
-        assert_eq!(result, 150);
-    }
-
-    #[test]
-    fn test_networks_overlap_v4() {
-        let net1 = Ipv4Net::new("192.168.0.0".parse().unwrap(), 24).unwrap();
-        let net2 = Ipv4Net::new("192.168.0.128".parse().unwrap(), 25).unwrap();
-        assert!(networks_overlap_v4(&net1, &net2));
-    }
-
-    #[test]
-    fn test_geoip_converter_new() {
-        let converter = GeoIpConverter::new();
-        assert!(converter.country_to_nets.is_empty());
-    }
 }

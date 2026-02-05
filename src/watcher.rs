@@ -36,7 +36,7 @@ fn run_watcher(path: PathBuf, engine: Engine) -> notify::Result<()> {
                 let mut retries = 5;
                 while retries > 0 {
                     match config::load_config(&path)
-                        .and_then(|cfg| RuntimePipelineConfig::from_config(cfg).map_err(Into::into))
+                        .and_then(RuntimePipelineConfig::from_config)
                     {
                         Ok(new_cfg) => {
                             engine.reload(new_cfg);

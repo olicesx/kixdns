@@ -1,0 +1,15 @@
+# .clippy.toml
+# Allow some reasonable warnings
+too-many-arguments-threshold = 8
+type-complexity-threshold = 250
+cognitive-complexity-threshold = 30
+
+# Allowed lints
+allow-expect-used = true  # expect() is reasonable in critical paths
+allow-unwrap-used = false
+allow-print-stdout = true  # main.rs can print
+allow-unreadable-literal = false
+
+# Disallowed lints
+disallowed-methods = []
+disallowed-types = []

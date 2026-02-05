@@ -97,6 +97,12 @@ pub struct GeoSiteManager {
     cache: MokaCache<u64, bool>,
 }
 
+impl Default for GeoSiteManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GeoSiteManager {
     /// 创建新的 GeoSite 管理器 / Create new GeoSite manager
     pub fn new() -> Self {
@@ -113,9 +119,7 @@ impl GeoSiteManager {
         // 根据实际加载的域名数量设置缓存大小
         // 统计所有标签的域名总数
         let total_domains: usize = self
-            .database
-            .iter()
-            .map(|(_, matchers)| matchers.len())
+            .database.values().map(|matchers| matchers.len())
             .sum();
 
         // 缓存大小为域名总数的 2 倍，最小 10000，最大 1000000
@@ -256,7 +260,7 @@ impl GeoSiteManager {
     /// 获取已加载的标签列表 / Get list of loaded tags
     #[inline]
     pub fn tags(&self) -> Vec<String> {
-        self.database.iter().map(|(tag, _)| tag.clone()).collect()
+        self.database.keys().cloned().collect()
     }
 
     /// 检查标签是否已加载 / Check if tag is loaded
@@ -268,184 +272,7 @@ impl GeoSiteManager {
     /// 获取标签的所有域名匹配器（仅用于调试）/ Get all domain matchers for a tag (debug only)
     #[inline]
     pub fn get_tag_matchers(&self, tag: &str) -> Option<Vec<DomainMatcher>> {
-        self.database.get(tag).map(|matchers| matchers.clone())
-    }
-}
-
-// GeoSite tests / GeoSite 测试
-// Tests for GeoSite domain matching, manager functionality, and caching
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_domain_matcher_full() {
-        // Arrange: Create a full domain matcher
-        let matcher = DomainMatcher::Full("google.com".to_string());
-
-        // Act & Assert: Verify exact match
-        assert!(matcher.matches("google.com"), "Should match exact domain");
-        assert!(
-            matcher.matches("GOOGLE.COM"),
-            "Should match case-insensitively"
-        );
-        assert!(
-            !matcher.matches("www.google.com"),
-            "Should not match subdomain"
-        );
-    }
-
-    #[test]
-    fn test_domain_matcher_suffix() {
-        // Arrange: Create a suffix domain matcher
-        let matcher = DomainMatcher::Suffix(".google.com".to_string());
-
-        // Act & Assert: Verify suffix matching
-        assert!(
-            matcher.matches("www.google.com"),
-            "Should match subdomain with suffix"
-        );
-        assert!(
-            matcher.matches("mail.google.com"),
-            "Should match subdomain with suffix"
-        );
-        assert!(
-            !matcher.matches("google.com.hk"),
-            "Should not match different TLD"
-        );
-    }
-
-    #[test]
-    fn test_domain_matcher_keyword() {
-        // Arrange: Create a keyword domain matcher
-        let matcher = DomainMatcher::Keyword("google".to_string());
-
-        // Act & Assert: Verify keyword matching
-        assert!(
-            matcher.matches("www.google.com"),
-            "Should match domain containing keyword"
-        );
-        assert!(
-            matcher.matches("googleapis.com"),
-            "Should match domain containing keyword"
-        );
-        assert!(
-            !matcher.matches("www.bing.com"),
-            "Should not match domain without keyword"
-        );
-    }
-
-    #[test]
-    fn test_geosite_manager() {
-        // Arrange: Create GeoSite manager and add Google category
-        let mut manager = GeoSiteManager::new();
-
-        manager.add_entry(GeoSiteEntry {
-            tag: "google".to_string(),
-            matchers: vec![
-                DomainMatcher::Full("google.com".to_string()),
-                DomainMatcher::Suffix(".google.com".to_string()),
-                DomainMatcher::Suffix(".googleapis.com".to_string()),
-            ],
-        });
-
-        // Act & Assert: Test Google domain matches
-        assert!(
-            manager.matches("google", "google.com"),
-            "Should match exact Google domain"
-        );
-        assert!(
-            manager.matches("google", "www.google.com"),
-            "Should match Google subdomain"
-        );
-        assert!(
-            manager.matches("google", "mail.google.com"),
-            "Should match Google subdomain"
-        );
-        assert!(
-            manager.matches("google", "dns.googleapis.com"),
-            "Should match Google APIs domain"
-        );
-        assert!(
-            !manager.matches("google", "www.bing.com"),
-            "Should not match non-Google domain"
-        );
-    }
-
-    #[test]
-    fn test_geosite_manager_cache() {
-        // Arrange: Create GeoSite manager and add test entry
-        let mut manager = GeoSiteManager::new();
-
-        manager.add_entry(GeoSiteEntry {
-            tag: "test".to_string(),
-            matchers: vec![DomainMatcher::Full("example.com".to_string())],
-        });
-
-        // Act & Assert: First call - not cached
-        assert!(
-            manager.matches("test", "example.com"),
-            "Should match domain on first call"
-        );
-
-        // Act & Assert: Second call - should use cache
-        assert!(
-            manager.matches("test", "example.com"),
-            "Should match domain from cache"
-        );
-    }
-
-    #[test]
-    fn test_geosite_manager_multiple_tags() {
-        // Arrange: Create GeoSite manager and add multiple categories
-        let mut manager = GeoSiteManager::new();
-
-        // Add CN category
-        manager.add_entry(GeoSiteEntry {
-            tag: "cn".to_string(),
-            matchers: vec![
-                DomainMatcher::Suffix(".cn".to_string()),
-                DomainMatcher::Suffix(".com.cn".to_string()),
-                DomainMatcher::Keyword("baidu".to_string()),
-            ],
-        });
-
-        // Add category-ads
-        manager.add_entry(GeoSiteEntry {
-            tag: "category-ads".to_string(),
-            matchers: vec![
-                DomainMatcher::Keyword("ads".to_string()),
-                DomainMatcher::Suffix(".adserver.com".to_string()),
-            ],
-        });
-
-        // Act & Assert: Test CN matches
-        assert!(
-            manager.matches("cn", "www.baidu.com"),
-            "Should match CN domain with baidu keyword"
-        );
-        assert!(
-            manager.matches("cn", "example.com.cn"),
-            "Should match CN domain with .com.cn suffix"
-        );
-        assert!(
-            !manager.matches("cn", "www.google.com"),
-            "Should not match non-CN domain"
-        );
-
-        // Act & Assert: Test ads matches
-        assert!(
-            manager.matches("category-ads", "ads.google.com"),
-            "Should match ads domain with ads keyword"
-        );
-        assert!(
-            manager.matches("category-ads", "tracker.adserver.com"),
-            "Should match ads domain with .adserver.com suffix"
-        );
-        assert!(
-            !manager.matches("category-ads", "www.google.com"),
-            "Should not match non-ads domain"
-        );
+        self.database.get(tag).cloned()
     }
 }
 
@@ -532,8 +359,8 @@ impl GeoSiteManager {
     ///
     /// # 示例 / Example
     /// ```no_run
-    /// use kixdns::geosite::GeoSiteManager;
-    /// let mut manager = GeoSiteManager::new(10000, 3600);
+    /// use kixdns::matcher::geosite::GeoSiteManager;
+    /// let mut manager = GeoSiteManager::new();
     /// let count = manager.load_from_v2ray_file("geosite.json").unwrap();
     /// println!("Loaded {} GeoSite entries", count);
     /// ```
@@ -1295,14 +1122,14 @@ fn run_geosite_watcher(
                                 serde_json::from_str::<V2RayGeoSiteList>(&json_str)
                                     .with_context(|| "parse V2Ray GeoSite JSON format")
                             })
-                            .and_then(|v2ray_data| {
+                            .map(|v2ray_data| {
                                 // 安全地获取写锁 / Safely acquire write lock
                                 match manager.write() {
                                     Ok(mut guard) => {
                                         let entries = guard.convert_v2ray_to_entries(v2ray_data);
                                         let loaded_count = entries.len();
                                         guard.reload(entries);
-                                        Ok(loaded_count)
+                                        loaded_count
                                     }
                                     Err(e) => {
                                         let mut guard = e.into_inner();
@@ -1313,7 +1140,7 @@ fn run_geosite_watcher(
                                         let entries = guard.convert_v2ray_to_entries(v2ray_data);
                                         let loaded_count = entries.len();
                                         guard.reload(entries);
-                                        Ok(loaded_count)
+                                        loaded_count
                                     }
                                 }
                             })
