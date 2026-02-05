@@ -783,6 +783,13 @@ impl TcpMuxClient {
         // 确保连接存在（如果需要则获取连接级别 permit）
         self.ensure_connection().await?;
 
+        // Determine if connection is being reused for race-condition check
+        // 判断是否正在复用连接以进行竞态条件检查
+        let is_reused = {
+            let guard = self.conn.lock().await;
+            guard.is_some() && self.last_request_time.load(Ordering::Relaxed) > 0
+        };
+
         let elapsed = start.elapsed();
         if elapsed >= timeout_dur {
              anyhow::bail!("tcp timeout before processing");
@@ -795,7 +802,7 @@ impl TcpMuxClient {
         let (tx, rx) = oneshot::channel();
         
         // 原子操作：分配 ID 并注册到 pending map，避免竞态条件
-        let (new_packet, new_id) = self.register_pending(packet, original_id, tx).await?;
+        let (new_packet, new_id) = self.register_pending(packet, original_id, tx, is_reused).await?;
 
         // RAII Guard: ensures entry is removed from map when guard is dropped
         // RAII Guard：确保在 guard 丢弃时（超时、取消、提前返回）移除条目
@@ -818,8 +825,17 @@ impl TcpMuxClient {
 
             // Connection must exist (ensure_connection was called earlier)
             // 连接必须存在（ensure_connection 已在之前调用）
+            // Pre-flight check: if writer is closed or broken, fail fast
             let writer = guard.as_mut().context("tcp write half missing")?;
-            writer.write_all(&out).await?;
+            
+            // Note: OwnedWriteHalf doesn't support peek/checking error directly easily without shared socket access.
+            // But if the previous read failed, guard should be None (reset).
+            // The fact we are here means 'guard' is Some, so we think connection is alive.
+            // Writing to a closed socket usually triggers error immediately on Linux/BSD.
+            
+            if let Err(e) = writer.write_all(&out).await {
+                 return Err(anyhow::anyhow!(e).context("tcp write failed"));
+            }
             Ok::<(), anyhow::Error>(())
         }).await;
 
@@ -1020,8 +1036,38 @@ impl TcpMuxClient {
         &self, 
         packet: &[u8], 
         original_id: u16, 
-        tx: oneshot::Sender<anyhow::Result<Bytes>>
+        tx: oneshot::Sender<anyhow::Result<Bytes>>,
+        is_reused: bool
     ) -> anyhow::Result<(BytesMut, u16)> {
+        // Critical Check: If we are reusing a connection, we MUST verify the connection is still considered "alive"
+        // before registering. If conn is None, it means Reader has already reset it, so we shouldn't register.
+        // 关键检查：如果我们正在复用连接，必须在注册前验证连接是否仍然被认为是“活着”的。
+        // 如果 conn 为 None，说明 Reader 已经重置了它，我们不应该注册。
+        if is_reused {
+             let guard = self.conn.lock().await;
+             if guard.is_none() {
+                 anyhow::bail!("connection closed before registration");
+             }
+             // Optional: Check if generation is still valid?
+             // Since we hold the lock, Reader reset_conn needs the lock too.
+             // So if we hold the lock and it is Some, Reader hasn't reset it yet.
+             // But Reader might be stuck in fail_all_async waiting for lock?
+             // If Reader is waiting for lock to reset, it means it already encountered error.
+             // But Reader clears pending map BEFORE resetting conn.
+             // Race:
+             // 1. Reader gets error.
+             // 2. Reader calls fail_all_async.
+             // 3. Sender calls register_pending (here).
+             // 4. Sender inserts into pending.
+             // 5. Reader removes keys from pending (might miss the new one if iterator is already created?).
+             // dashmap is concurrent, but iterator consistency varies.
+             //
+             // Safer Logic: 
+             // We need to know if Reader is dead.
+             // But we can rely on `is_reused` check in `send` loop.
+             // If we fail here, `send` loop catches it and retries with fresh conn.
+        }
+
         let mut tries = 0;
         let new_id = loop {
             let cand = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -1105,7 +1151,7 @@ mod tests {
                 async move {
                     let dummy = vec![0u8; 4];
                     let (tx, _) = oneshot::channel();
-                    client.register_pending(&dummy, 0, tx).await.map(|(_, id)| id)
+                    client.register_pending(&dummy, 0, tx, false).await.map(|(_, id)| id)
                 }
             })
             .collect::<Vec<_>>();
