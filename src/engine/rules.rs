@@ -243,10 +243,19 @@ pub(crate) async fn apply_response_actions(
             }
             Action::Allow => {
                 if let Some(resp_ctx) = ctx.ctx_opt {
-                    // Get manager references for GeoIP/GeoSite matching
-                    // 获取 manager 引用以用于 GeoIP/GeoSite 匹配
-                    let geoip_manager = ctx.engine.geoip_manager.try_read();
-                    let geosite_manager = ctx.engine.geosite_manager.try_read();
+                    // Try to acquire read locks non-blockingly (fast path for concurrent reads)
+                    // 尝试非阻塞获取读锁（并发读的快速路径）
+                    let mut geoip_manager = ctx.engine.geoip_manager.try_read();
+                    let mut geosite_manager = ctx.engine.geosite_manager.try_read();
+
+                    // Fallback to blocking read if try_read fails (rare write operation in progress)
+                    // 如果 try_read 失败则回退到阻塞读取（罕见的写操作进行中）
+                    if geoip_manager.is_none() || geosite_manager.is_none() {
+                        tracing::debug!("GeoIP/GeoSite lock contention, falling back to blocking read");
+                        geoip_manager = Some(ctx.engine.geoip_manager.read());
+                        geosite_manager = Some(ctx.engine.geosite_manager.read());
+                    }
+
                     let geoip_manager_ref = geoip_manager.as_deref();
                     let geosite_manager_ref = geosite_manager.as_deref();
 
@@ -384,10 +393,19 @@ pub(crate) async fn apply_response_actions(
     }
 
     if let Some(resp_ctx) = ctx.ctx_opt {
-        // Get manager references for GeoIP/GeoSite matching
-        // 获取 manager 引用以用于 GeoIP/GeoSite 匹配
-        let geoip_manager = ctx.engine.geoip_manager.try_read();
-        let geosite_manager = ctx.engine.geosite_manager.try_read();
+        // Try to acquire read locks non-blockingly (fast path for concurrent reads)
+        // 尝试非阻塞获取读锁（并发读的快速路径）
+        let mut geoip_manager = ctx.engine.geoip_manager.try_read();
+        let mut geosite_manager = ctx.engine.geosite_manager.try_read();
+
+        // Fallback to blocking read if try_read fails (rare write operation in progress)
+        // 如果 try_read 失败则回退到阻塞读取（罕见的写操作进行中）
+        if geoip_manager.is_none() || geosite_manager.is_none() {
+            tracing::debug!("GeoIP/GeoSite lock contention, falling back to blocking read");
+            geoip_manager = Some(ctx.engine.geoip_manager.read());
+            geosite_manager = Some(ctx.engine.geosite_manager.read());
+        }
+
         let geoip_manager_ref = geoip_manager.as_deref();
         let geosite_manager_ref = geosite_manager.as_deref();
 
@@ -690,11 +708,23 @@ pub(crate) async fn process_response_jump(
                         let effective_ttl = Duration::from_secs(ttl_secs_cache.max(min_ttl.as_secs()));
 
                         // Get manager references for GeoIP/GeoSite matching in response matchers
+                        // Try to acquire read locks non-blockingly (fast path for concurrent reads)
+                        // Use scope to ensure locks are released immediately after use
                         // 获取 manager 引用以用于响应匹配器中的 GeoIP/GeoSite 匹配
-                        // Use scope to ensure locks are released immediately after use / 使用作用域确保锁在使用后立即释放
+                        // 尝试非阻塞获取读锁（并发读的快速路径）
+                        // 使用作用域确保锁在使用后立即释放
                         let resp_match_ok = {
-                            let geoip_manager = engine.geoip_manager.try_read();
-                            let geosite_manager = engine.geosite_manager.try_read();
+                            let mut geoip_manager = engine.geoip_manager.try_read();
+                            let mut geosite_manager = engine.geosite_manager.try_read();
+
+                            // Fallback to blocking read if try_read fails (rare write operation in progress)
+                            // 如果 try_read 失败则回退到阻塞读取（罕见的写操作进行中）
+                            if geoip_manager.is_none() || geosite_manager.is_none() {
+                                tracing::debug!("GeoIP/GeoSite lock contention, falling back to blocking read");
+                                geoip_manager = Some(engine.geoip_manager.read());
+                                geosite_manager = Some(engine.geosite_manager.read());
+                            }
+
                             let geoip_manager_ref = geoip_manager.as_deref();
                             let geosite_manager_ref = geosite_manager.as_deref();
 

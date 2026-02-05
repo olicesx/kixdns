@@ -321,9 +321,20 @@ pub async fn handle_forward_decision(
 
             let effective_ttl = Duration::from_secs(ttl_secs.max(min_ttl.as_secs()));
 
+            // Try to acquire read locks non-blockingly (fast path for concurrent reads)
+            // 尝试非阻塞获取读锁（并发读的快速路径）
             let (resp_match_ok, msg) = {
-                let geoip_manager = engine.geoip_manager.try_read();
-                let geosite_manager = engine.geosite_manager.try_read();
+                let mut geoip_manager = engine.geoip_manager.try_read();
+                let mut geosite_manager = engine.geosite_manager.try_read();
+
+                // Fallback to blocking read if try_read fails (rare write operation in progress)
+                // 如果 try_read 失败则回退到阻塞读取（罕见的写操作进行中）
+                if geoip_manager.is_none() || geosite_manager.is_none() {
+                    tracing::debug!("GeoIP/GeoSite lock contention, falling back to blocking read");
+                    geoip_manager = Some(engine.geoip_manager.read());
+                    geosite_manager = Some(engine.geosite_manager.read());
+                }
+
                 let geoip_manager_ref = geoip_manager.as_deref();
                 let geosite_manager_ref = geosite_manager.as_deref();
 
