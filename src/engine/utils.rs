@@ -100,6 +100,49 @@ pub fn clear_refreshing(bitmap: &AtomicU64, cache_hash: u64) {
     bitmap.fetch_and(!mask, Ordering::Relaxed);
 }
 
+/// RAII Guard for auto-clearing the refreshing bitmap
+/// RAII Guard 用于自动清除刷新位图标记
+pub struct RefreshingGuard {
+    bitmap: Option<Arc<AtomicU64>>,
+    cache_hash: Option<u64>,
+}
+
+impl RefreshingGuard {
+    /// Create a new guard that will clear the refresh mark on drop
+    /// 创建一个在 drop 时清除刷新标记的 guard
+    pub fn new(bitmap: &Arc<AtomicU64>, cache_hash: u64) -> Self {
+        mark_refreshing(bitmap, cache_hash);
+        Self {
+            bitmap: Some(Arc::clone(bitmap)),
+            cache_hash: Some(cache_hash),
+        }
+    }
+
+    /// Defuse the guard so it won't clear the mark on drop
+    /// 让 guard 失效，drop 时不会清除标记
+    pub fn defuse(&mut self) {
+        self.bitmap = None;
+        self.cache_hash = None;
+    }
+
+    /// Manually clear the refresh mark early
+    /// 手动提前清除刷新标记
+    pub fn clear(&mut self) {
+        if let (Some(bitmap), Some(hash)) = (&self.bitmap, self.cache_hash) {
+            clear_refreshing(bitmap, hash);
+        }
+        self.defuse();
+    }
+}
+
+impl Drop for RefreshingGuard {
+    fn drop(&mut self) {
+        if let (Some(bitmap), Some(hash)) = (&self.bitmap, self.cache_hash) {
+            clear_refreshing(bitmap, hash);
+        }
+    }
+}
+
 /// 提取配置中使用的 GeoSite tags / Extract GeoSite tags used in configuration
 ///
 /// 扫描配置以查找所有在匹配器中实际使用的GeoSite标签，这样可以只从数据文件中加载这些标签 / Scans the configuration to find all GeoSite tags actually used in matchers, so we can load only those tags from the data file.

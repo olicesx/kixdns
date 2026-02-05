@@ -301,7 +301,7 @@ impl Engine {
                         // OPTIMIZATION: Zero-lock check using bitmap / 优化：使用位图进行零锁检查
                         let is_refreshing = is_refreshing(&self.refreshing_bitmap, cache_hash);
 
-                        tracing::info!(
+                        tracing::warn!(
                             original_ttl = hit.original_ttl,
                             elapsed_secs = elapsed_secs,
                             remaining_ttl = remaining_ttl,
@@ -318,10 +318,10 @@ impl Engine {
                         if !is_refreshing && remaining_ttl as u64 <= threshold {
                             // Trigger background refresh (async, don't block current request)
                             // 触发后台刷新（异步，不阻塞当前请求）
-                            // Note: RefreshingGuard inside spawn_background_refresh will handle insertion
-                            // 注意：spawn_background_refresh 内部的 RefreshingGuard 将处理插入
+                            // Note: RefreshingGuard inside spawn_background_refresh will handle cleanup
+                            // 注意：spawn_background_refresh 内部的 RefreshingGuard 将处理清理
                             let qname_str = q.qname_str_unchecked();  // Zero-allocation / 零分配
-                            tracing::debug!(
+                            tracing::warn!(
                                 qname = %qname_str,
                                 original_ttl = hit.original_ttl,
                                 remaining_ttl = remaining_ttl,
