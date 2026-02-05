@@ -449,6 +449,9 @@ pub struct TcpMuxClient {
     /// Per-upstream permit manager for TCP connection-level control
     /// TCP 连接级别并发控制的 per-upstream permit manager
     pub permit_manager: Arc<PermitManager>,
+    /// Generation counter to detect stale readers
+    /// 代数计数器，用于检测过期的 reader (Wrapped in Arc for sharing with spawned tasks)
+    generation: Arc<AtomicU64>,
     /// Connection-level permit (acquired when connection is established, held for connection lifetime)
     /// 连接级别 permit（连接建立时获取，连接生命周期内持有）
     conn_permit: Arc<Mutex<Option<PermitGuard>>>,
@@ -493,6 +496,7 @@ impl TcpMuxClient {
             pending: Arc::new(dashmap::DashMap::with_hasher(FxBuildHasher)),
             next_id: AtomicU16::new(1),
             permit_manager,
+            generation: Arc::new(AtomicU64::new(0)),
             conn_permit: Arc::new(Mutex::new(None)),
             // 初始化健康检查字段（默认值，实际值会在 TcpMultiplexer 中设置）
             consecutive_errors: AtomicUsize::new(0),
@@ -513,16 +517,24 @@ impl TcpMuxClient {
         self.idle_timeout_ms.store(idle_timeout_secs * 1000, Ordering::Release);
     }
 
-    async fn spawn_reader(&self, mut reader: OwnedReadHalf) {
+    async fn spawn_reader(&self, mut reader: OwnedReadHalf, my_generation: u64, global_generation: Arc<AtomicU64>) {
         let pending = Arc::clone(&self.pending);
         let upstream = self.upstream.clone();
         let conn = Arc::clone(&self.conn);
         let conn_permit = Arc::clone(&self.conn_permit);  // Clone conn_permit
+        
         tokio::spawn(async move {
             // Pre-allocate a reusable buffer for TCP reads
             // DNS TCP max is 65535 bytes, but typical responses are much smaller
             let mut reusable_buf = BytesMut::with_capacity(4096);
             loop {
+                // Check if this reader is still valid (Zombie Check)
+                // 检查此 reader 是否仍然有效（僵尸检测）
+                if global_generation.load(Ordering::Relaxed) != my_generation {
+                    debug!(target = "tcp_mux", upstream = %upstream, gen = my_generation, "TCP reader detected older generation, exiting silently");
+                    return;
+                }
+
                 // Ensure buffer has enough space for length prefix
                 // 确保缓冲区有足够空间读取长度前缀
                 if reusable_buf.capacity() < 2 {
@@ -531,9 +543,13 @@ impl TcpMuxClient {
 
                 let mut len_buf = [0u8; 2];
                 if let Err(err) = reader.read_exact(&mut len_buf).await {
-                    debug!(target = "tcp_mux", upstream = %upstream, error = %err, "tcp read len failed");
-                    Self::fail_all_async(&pending, anyhow::anyhow!("tcp read len failed"), &conn, &conn_permit)
-                        .await;
+                    // Check generation again before resetting anything
+                    if global_generation.load(Ordering::Relaxed) == my_generation {
+                        debug!(target = "tcp_mux", upstream = %upstream, error = %err, "tcp read len failed");
+                        Self::fail_all_async(&pending, anyhow::anyhow!("tcp read len failed"), &conn, &conn_permit).await;
+                    } else {
+                        debug!(target = "tcp_mux", upstream = %upstream, gen = my_generation, "TCP reader failed but generation changed, ignoring");
+                    }
                     break;
                 }
                 let resp_len = u16::from_be_bytes(len_buf) as usize;
@@ -546,9 +562,11 @@ impl TcpMuxClient {
                 reusable_buf.resize(resp_len, 0);
 
                 if let Err(err) = reader.read_exact(&mut reusable_buf[..resp_len]).await {
-                    debug!(target = "tcp_mux", upstream = %upstream, error = %err, "tcp read body failed");
-                    Self::fail_all_async(&pending, anyhow::anyhow!("tcp read body failed"), &conn, &conn_permit)
-                        .await;
+                    // Check generation again
+                    if global_generation.load(Ordering::Relaxed) == my_generation {
+                        debug!(target = "tcp_mux", upstream = %upstream, error = %err, "tcp read body failed");
+                        Self::fail_all_async(&pending, anyhow::anyhow!("tcp read body failed"), &conn, &conn_permit).await;
+                    }
                     break;
                 }
 
@@ -588,6 +606,7 @@ impl TcpMuxClient {
             }
         });
     }
+
 
     // ========== Health check methods / 健康检查方法 ==========
 
@@ -942,22 +961,31 @@ impl TcpMuxClient {
             // 配置 socket 选项以增强健壮性
             let _ = stream.set_nodelay(true);
 
-            // Set Check to 15s to detect dead connections faster
+            // Set Check to 5s to detect dead connections faster (Aggressive Keepalive)
             let sock = SockRef::from(&stream);
             let mut ka = TcpKeepalive::new();
-            ka = ka.with_time(Duration::from_secs(15));
-            ka = ka.with_interval(Duration::from_secs(5));
+            ka = ka.with_time(Duration::from_secs(5));
+            ka = ka.with_interval(Duration::from_secs(2));
+
+            // Explicitly enable SO_KEEPALIVE (Essential for Windows/Linux)
+            if let Err(e) = sock.set_keepalive(true) {
+                 warn!(upstream = %self.upstream, error = %e, "Failed to enable SO_KEEPALIVE");
+            }
             if let Err(e) = sock.set_tcp_keepalive(&ka) {
-                warn!(upstream = %self.upstream, error = %e, "Failed to set TCP keepalive");
+                warn!(upstream = %self.upstream, error = %e, "Failed to set TCP keepalive params");
             }
 
             let (read_half, write_half) = stream.into_split();
 
             *guard = Some(write_half);
+            
+            // Increment generation for new connection
+            // 为新连接增加代数
+            let new_gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
 
             // Spawn reader while holding the lock to prevent races
             // 持有锁时启动 reader 以防止竞争
-            self.spawn_reader(read_half).await;
+            self.spawn_reader(read_half, new_gen, self.generation.clone()).await;
 
             // Store permit in connection (held for connection lifetime)
             // 将 permit 保存在连接中（连接生命周期内持有）
