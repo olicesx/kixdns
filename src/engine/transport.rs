@@ -98,12 +98,23 @@ impl UdpClient {
 
                                         // 零拷贝优化：使用 split_to 复用已有容量，避免分配新内存
                                         let response = buf.split_to(len).freeze();
+                                        let resp_len = response.len();
 
                                         if tx.send(Ok(response)).is_err() {
                                             tracing::debug!(
                                                 socket_idx = idx,
+                                                original_id = original_id,
                                                 response_id = id,
+                                                response_len = resp_len,
                                                 "Failed to send UDP response, channel already closed"
+                                            );
+                                        } else {
+                                            tracing::trace!(
+                                                socket_idx = idx,
+                                                original_id = original_id,
+                                                response_id = id,
+                                                response_len = resp_len,
+                                                "UDP response sent successfully"
                                             );
                                         }
                                     } else {
@@ -514,10 +525,31 @@ impl TcpMuxClient {
                 }
                 let resp_id = u16::from_be_bytes([reusable_buf[0], reusable_buf[1]]);
                 if let Some((_, p)) = pending.remove(&resp_id) {
+                    let orig = p.original_id;
                     reusable_buf[0..2].copy_from_slice(&p.original_id.to_be_bytes());
                     // Split off the used portion to send, keeping capacity for reuse
                     let response = reusable_buf.split_to(resp_len).freeze();
-                    let _ = p.tx.send(Ok(response));
+                    match p.tx.send(Ok(response)) {
+                        Ok(()) => {
+                            tracing::trace!(
+                                target = "tcp_mux",
+                                upstream = %upstream,
+                                resp_id,
+                                original_id = orig,
+                                response_len = resp_len,
+                                "TCP mux response sent successfully"
+                            );
+                        }
+                        Err(_) => {
+                            tracing::debug!(
+                                target = "tcp_mux",
+                                upstream = %upstream,
+                                resp_id,
+                                original_id = orig,
+                                "TCP mux response send failed, channel already closed"
+                            );
+                        }
+                    }
                 } else {
                     debug!(target = "tcp_mux", upstream = %upstream, resp_id, "response with unknown id");
                 }
