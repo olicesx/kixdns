@@ -527,10 +527,14 @@ impl Engine {
             }
         }
 
-        let qname = qname_cow.into_owned();
+        // 优化：保持 Cow<str> 以延迟分配，避免不必要的 String 分配
+        // Optimization: Keep Cow<str> to defer allocation, avoid unnecessary String allocation
+        // 大部分情况下 qname_cow 是 Borrowed（零拷贝），只有快速解析失败时才是 Owned
+        // In most cases qname_cow is Borrowed (zero-copy), only Owned when quick parse fails
+        let qname = qname_cow;
         let mut skip_rules: HashSet<Arc<str>> = HashSet::new();
         let mut current_pipeline_id = pipeline_id.clone();
-        // Convert qname String to bytes for hash calculation / 将 qname String 转换为 bytes 进行哈希计算
+        // Convert qname to bytes for hash calculation / 将 qname 转换为 bytes 进行哈希计算
         let qname_bytes = qname.as_bytes();
         let mut dedupe_hash = Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, qname_bytes, qtype, qclass);
         let mut reused_response: Option<ResponseContext> = None;

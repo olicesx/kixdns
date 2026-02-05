@@ -153,6 +153,33 @@ pub fn fast_hash_str(s: &str) -> u64 {
     h.finish()
 }
 
+/// 辅助函数：获取 GeoIP 和 GeoSite 锁（带非阻塞快速路径）
+/// Helper function: Acquire GeoIP and GeoSite locks (with non-blocking fast path)
+/// 
+/// 优化：消除重复的锁获取逻辑 / Optimization: Eliminate duplicate lock acquisition logic
+#[inline]
+fn acquire_geo_locks<'a>(
+    engine: &'a Engine,
+) -> (
+    Option<crate::lock::RwLockReadGuard<'a, crate::matcher::geoip::GeoIpManager>>,
+    Option<crate::lock::RwLockReadGuard<'a, crate::matcher::geosite::GeoSiteManager>>,
+) {
+    // Try to acquire read locks non-blockingly (fast path for concurrent reads)
+    // 尝试非阻塞获取读锁（并发读的快速路径）
+    let mut geoip_manager = engine.geoip_manager.try_read();
+    let mut geosite_manager = engine.geosite_manager.try_read();
+
+    // Fallback to blocking read if try_read fails (rare write operation in progress)
+    // 如果 try_read 失败则回退到阻塞读取（罕见的写操作进行中）
+    if geoip_manager.is_none() || geosite_manager.is_none() {
+        tracing::debug!("GeoIP/GeoSite lock contention, falling back to blocking read");
+        geoip_manager = Some(engine.geoip_manager.read());
+        geosite_manager = Some(engine.geosite_manager.read());
+    }
+
+    (geoip_manager, geosite_manager)
+}
+
 #[inline]
 pub fn contains_continue(actions: &[Action]) -> bool {
     actions.iter().any(|action| matches!(action, Action::Continue))
@@ -243,19 +270,9 @@ pub(crate) async fn apply_response_actions(
             }
             Action::Allow => {
                 if let Some(resp_ctx) = ctx.ctx_opt {
-                    // Try to acquire read locks non-blockingly (fast path for concurrent reads)
-                    // 尝试非阻塞获取读锁（并发读的快速路径）
-                    let mut geoip_manager = ctx.engine.geoip_manager.try_read();
-                    let mut geosite_manager = ctx.engine.geosite_manager.try_read();
-
-                    // Fallback to blocking read if try_read fails (rare write operation in progress)
-                    // 如果 try_read 失败则回退到阻塞读取（罕见的写操作进行中）
-                    if geoip_manager.is_none() || geosite_manager.is_none() {
-                        tracing::debug!("GeoIP/GeoSite lock contention, falling back to blocking read");
-                        geoip_manager = Some(ctx.engine.geoip_manager.read());
-                        geosite_manager = Some(ctx.engine.geosite_manager.read());
-                    }
-
+                    // 优化：使用辅助函数获取锁，消除重复代码
+                    // Optimization: Use helper function to acquire locks, eliminate duplicate code
+                    let (geoip_manager, geosite_manager) = acquire_geo_locks(ctx.engine);
                     let geoip_manager_ref = geoip_manager.as_deref();
                     let geosite_manager_ref = geosite_manager.as_deref();
 
@@ -393,19 +410,9 @@ pub(crate) async fn apply_response_actions(
     }
 
     if let Some(resp_ctx) = ctx.ctx_opt {
-        // Try to acquire read locks non-blockingly (fast path for concurrent reads)
-        // 尝试非阻塞获取读锁（并发读的快速路径）
-        let mut geoip_manager = ctx.engine.geoip_manager.try_read();
-        let mut geosite_manager = ctx.engine.geosite_manager.try_read();
-
-        // Fallback to blocking read if try_read fails (rare write operation in progress)
-        // 如果 try_read 失败则回退到阻塞读取（罕见的写操作进行中）
-        if geoip_manager.is_none() || geosite_manager.is_none() {
-            tracing::debug!("GeoIP/GeoSite lock contention, falling back to blocking read");
-            geoip_manager = Some(ctx.engine.geoip_manager.read());
-            geosite_manager = Some(ctx.engine.geosite_manager.read());
-        }
-
+        // 优化：使用辅助函数获取锁，消除重复代码
+        // Optimization: Use helper function to acquire locks, eliminate duplicate code
+        let (geoip_manager, geosite_manager) = acquire_geo_locks(ctx.engine);
         let geoip_manager_ref = geoip_manager.as_deref();
         let geosite_manager_ref = geosite_manager.as_deref();
 
