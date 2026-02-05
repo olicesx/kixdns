@@ -172,6 +172,9 @@ pub struct GlobalSettings {
     /// GeoSite 数据文件路径列表（V2Ray 格式，支持多个文件） / GeoSite data file paths (V2Ray format, supports multiple files)
     #[serde(default)]
     pub geosite_data_paths: Vec<String>,
+    /// UDP 失败时是否自动 fallback 到 TCP（默认 true）。 / UDP failure automatically fallbacks to TCP (default true)
+    #[serde(default = "default_enable_tcp_fallback")]
+    pub enable_tcp_fallback: bool,
 }
 
 impl Default for GlobalSettings {
@@ -207,6 +210,7 @@ impl Default for GlobalSettings {
             geoip_auto_convert: false,
             geoip_filter_countries: Vec::new(),
             geosite_data_paths: Vec::new(),
+            enable_tcp_fallback: default_enable_tcp_fallback(),
         }
     }
 }
@@ -732,4 +736,9 @@ where
         TxtTextInput::String(s) => Ok(vec![s]),
         TxtTextInput::Array(arr) => Ok(arr),
     }
+}
+
+
+fn default_enable_tcp_fallback() -> bool {
+    true
 }

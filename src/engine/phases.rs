@@ -307,7 +307,9 @@ pub async fn handle_forward_decision(
                 (msg.response_code(), ttl, Some(msg), tc)
             };
 
-            if truncated && transport == Some(Transport::Udp) {
+            // 检查 TCP fallback 配置 / Check TCP fallback configuration
+            let enable_tcp_fallback = engine.state.load().pipeline.settings.enable_tcp_fallback;
+            if truncated && transport == Some(Transport::Udp) && enable_tcp_fallback {
                 tracing::debug!(event = "tc_flag_retry", upstream = %upstream, "response truncated, retrying with tcp");
                 drop(cleanup_guard);
                 let (tcp_resp, _) = crate::engine::upstream::forward_upstream(engine, packet, upstream, upstream_timeout, Some(Transport::Tcp), pre_split_upstreams).await?;

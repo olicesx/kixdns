@@ -110,6 +110,14 @@
                                 <input type="number" class="form-control" v-model.number="config.settings.tcp_connection_idle_timeout_seconds" placeholder="60">
                                 <div class="form-text small">无请求超过此时间重置连接（0=禁用，默认 60）</div>
                             </div>
+                            <div class="col-md-6">
+                                <label class="form-label">启用 TCP Fallback</label>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" v-model="config.settings.enable_tcp_fallback">
+                                    <label class="form-check-label">UDP 失败自动切换到 TCP</label>
+                                </div>
+                                <div class="form-text small">UDP 失败时自动 fallback 到 TCP（默认 true）</div>
+                            </div>
                                 <div class="col-md-3">
                                     <label class="form-label">缓存容量 (entries)</label>
                                     <input type="number" class="form-control" v-model.number="config.settings.cache_capacity" placeholder="10000">
@@ -138,37 +146,50 @@
                                 </div>
                                 <div class="form-text small">当TTL即将过期时异步刷新缓存条目</div>
                             </div>
-                            <div class="col-md-6">
+                            <div class="col-md-4" v-show="config.settings.cache_background_refresh">
                                 <label class="form-label">刷新阈值 (%)</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.cache_refresh_threshold_percent" placeholder="10" min="1" max="90">
                                 <div class="form-text small">当剩余TTL低于此百分比时触发刷新（1-90，默认10）</div>
+                            </div>
+                            <div class="col-md-4" v-show="config.settings.cache_background_refresh">
+                                <label class="form-label">刷新最小 TTL (秒)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.cache_refresh_min_ttl" placeholder="5" min="0">
+                                <div class="form-text small">防止TTL过短导致无限循环刷新（默认 5）</div>
                             </div>
                         </div>
 
                         <hr>
                         <h6 class="fw-bold mb-2 text-success">自适应流量控制配置 (Flow Control)</h6>
                         <div class="row g-3">
-                            <div class="col-md-6">
+                            <div class="col-md-12">
+                                <label class="form-label">启用流控</label>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" v-model="config.settings.flow_control_enabled">
+                                    <label class="form-check-label">启用自适应流控</label>
+                                </div>
+                                <div class="form-text small">推荐禁用以获得更好的性能和更简单的行为（rustdns风格）。禁用后不限制并发，依赖 tokio runtime 调度和超时保护。</div>
+                            </div>
+                            <div class="col-md-6" v-show="config.settings.flow_control_enabled">
                                 <label class="form-label">初始许可数 (Initial Permits)</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.flow_control_initial_permits" placeholder="500">
                                 <div class="form-text small">初始并发任务数</div>
                             </div>
-                            <div class="col-md-6">
+                            <div class="col-md-6" v-show="config.settings.flow_control_enabled">
                                 <label class="form-label">最小许可数 (Min Permits)</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.flow_control_min_permits" placeholder="100">
                                 <div class="form-text small">并发下限</div>
                             </div>
-                            <div class="col-md-6">
+                            <div class="col-md-6" v-show="config.settings.flow_control_enabled">
                                 <label class="form-label">最大许可数 (Max Permits)</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.flow_control_max_permits" placeholder="800">
                                 <div class="form-text small">并发上限</div>
                             </div>
-                            <div class="col-md-6">
+                            <div class="col-md-6" v-show="config.settings.flow_control_enabled">
                                 <label class="form-label">延迟阈值 (ms)</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.flow_control_latency_threshold_ms" placeholder="100">
                                 <div class="form-text small">压力判断的延迟阈值</div>
                             </div>
-                            <div class="col-md-6">
+                            <div class="col-md-6" v-show="config.settings.flow_control_enabled">
                                 <label class="form-label">调整间隔 (seconds)</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.flow_control_adjustment_interval_secs" placeholder="5">
                                 <div class="form-text small">流控参数检查频率</div>
@@ -188,7 +209,7 @@
                                 <input type="text" class="form-control" v-model="config.settings.geoip_dat_path" placeholder="留空则不使用 .dat 文件">
                                 <div class="form-text small">V2Ray .dat 或 JSON 格式的 GeoIP 数据文件路径，支持热重载。缓存大小会根据实际加载的条目自动设置。</div>
                             </div>
-                            <div class="col-md-4">
+                            <div class="col-md-4" v-show="config.settings.geoip_dat_path || config.settings.geoip_db_path">
                                 <label class="form-label">自动转换 .dat 为 MMDB</label>
                                 <div class="form-check form-switch">
                                     <input class="form-check-input" type="checkbox" v-model="config.settings.geoip_auto_convert">
@@ -196,7 +217,7 @@
                                 </div>
                                 <div class="form-text small">当 MMDB 不存在但 .dat 文件存在时，自动转换并缓存 MMDB</div>
                             </div>
-                            <div class="col-md-8">
+                            <div class="col-md-8" v-show="config.settings.geoip_dat_path || config.settings.geoip_db_path">
                                 <label class="form-label">转换时过滤国家代码</label>
                                 <input type="text" class="form-control" v-model="geoipFilterCountriesString" placeholder="CN,US,JP 或留空表示全部">
                                 <div class="form-text small">只转换指定国家的数据，逗号分隔（如 CN,US,JP），留空则转换全部国家</div>
@@ -207,6 +228,14 @@
                         <h6 class="fw-bold mb-2 text-primary">GeoSite 配置 (GeoSite Data)</h6>
                         <div class="row g-3">
                             <div class="col-md-12">
+                                <label class="form-label">启用 GeoSite</label>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" v-model="geositeEnabled">
+                                    <label class="form-check-label">启用 GeoSite 匹配</label>
+                                </div>
+                                <div class="form-text small">启用后可以加载 V2Ray GeoSite 数据文件进行域名分类匹配</div>
+                            </div>
+                            <div class="col-md-12" v-show="geositeEnabled">
                                 <label class="form-label">数据文件路径（支持多个）</label>
                                 <div class="input-group mb-2" v-for="(path, idx) in geositePaths" :key="idx">
                                     <input type="text" class="form-control" v-model="geositePaths[idx]" placeholder="geosite.dat 或 v2ray.dat">
@@ -681,15 +710,22 @@
                         cache_capacity: 10000,
                         cache_max_ttl: 86400,
                         dashmap_shards: 0,
-                        cache_rule_include_client_ip: false,
                         cache_background_refresh: false,
                         cache_refresh_threshold_percent: 10,
                         cache_refresh_min_ttl: 5,
+                        flow_control_enabled: false,
+                        flow_control_initial_permits: 500,
+                        flow_control_min_permits: 100,
+                        flow_control_max_permits: 800,
+                        flow_control_latency_threshold_ms: 100,
+                        flow_control_adjustment_interval_secs: 5,
                         geoip_db_path: "",
                         geoip_dat_path: "",
                         geoip_auto_convert: false,
                         geoip_filter_countries: [],
-                        geosite_data_paths: []
+                        geosite_data_paths: [],
+                        enable_tcp_fallback: true,
+                        geosite_enabled: false
                     },
                     pipeline_select: [],
                     pipelines: []
@@ -697,9 +733,22 @@
 
                 // GeoSite paths array for UI management
                 const geositePaths = ref([]);
-
+ 
                 // GeoIP filter countries string for UI management
                 const geoipFilterCountriesString = ref('');
+ 
+                // Computed property for GeoSite enable status
+                const geositeEnabled = Vue.computed({
+                    get: () => config.value.settings.geosite_enabled || false,
+                    set: (val) => {
+                        config.value.settings.geosite_enabled = val;
+                        // When disabled, clear the paths array
+                        if (!val) {
+                            geositePaths.value = [];
+                            config.value.settings.geosite_data_paths = [];
+                        }
+                    }
+                });
 
                 const rawJson = ref('');
                 const manualJsonEdit = ref(false);
@@ -1178,9 +1227,12 @@
                 if (Array.isArray(config.value.settings.geoip_filter_countries)) {
                     geoipFilterCountriesString.value = config.value.settings.geoip_filter_countries.join(',');
                 }
+ 
+                // Initialize geositeEnabled from config
+                geositeEnabled.value = config.value.settings.geosite_enabled || false;
 
                 return {
-                    config, rawJson, manualJsonEdit, geositePaths, geoipFilterCountriesString,
+                    config, rawJson, manualJsonEdit, geositePaths, geoipFilterCountriesString, geositeEnabled,
                     selectorMatcherTypes, requestMatcherTypes, responseMatcherTypes,
                     loadJson, handleFileUpload, downloadJson,
                     addPipelineSelect, removePipelineSelect,

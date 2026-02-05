@@ -27,7 +27,7 @@ bytes = "1"
 regex = "1"
 num_cpus = "1.16"
 moka = { version = "0.12.12", features = ["sync"] }
-socket2 = "0.5"
+socket2 = "0.6"
 libc = "0.2"
 rustc-hash = "2.1.1"
 smallvec = "1.13"
@@ -39,7 +39,7 @@ criterion = "0.5"
 
 [profile.release]
 opt-level = 3
-lto = "fat"
+lto = true
 codegen-units = 1
 panic = "abort"
 strip = true

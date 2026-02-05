@@ -160,6 +160,10 @@ async fn forward_udp_smart(
     upstream: &str,
     timeout_dur: Duration,
 ) -> anyhow::Result<Bytes> {
+    // 获取 TCP fallback 配置（Copy bool 值，避免持有 Guard 跨 await）
+    // Get TCP fallback config (Copy bool value to avoid holding Guard across await)
+    let enable_tcp_fallback = engine.state.load().pipeline.settings.enable_tcp_fallback;
+
     // Split timeout: first attempt uses 1/N budget (leaving room for TCP fallback)
     // 分割超时：第一次尝试使用 1/N 时间（为 TCP fallback 留出空间）
     let hedge_timeout = timeout_dur
@@ -172,7 +176,7 @@ async fn forward_udp_smart(
             Ok(bytes) => {
                 // RFC 1035: Check TC (Truncated) flag using quick parse - 使用快速解析检查 TC 标志
                 if let Some(qr) = crate::proto_utils::parse_response_quick(&bytes) {
-                    if qr.truncated {
+                    if qr.truncated && enable_tcp_fallback {
                         debug!(event = "tc_flag_fallback", upstream = %upstream, "udp response truncated, retrying with tcp");
                         return engine.tcp_mux.send(packet, upstream, timeout_dur).await;
                     }
@@ -189,14 +193,18 @@ async fn forward_udp_smart(
                     "udp forward attempt failed",
                 );
                 if idx + 1 == attempts.len() {
-                    // Last UDP attempt, try TCP fallback before failing.
-                    debug!(event = "udp_forward_fallback_tcp", upstream = %upstream, "falling back to tcp");
-                    return engine.tcp_mux.send(packet, upstream, timeout_dur).await;
+                    if enable_tcp_fallback {
+                        // Last UDP attempt, try TCP fallback before failing.
+                        debug!(event = "udp_forward_fallback_tcp", upstream = %upstream, "falling back to tcp");
+                        return engine.tcp_mux.send(packet, upstream, timeout_dur).await;
+                    }
                 }
             }
         }
     }
 
     // Should never reach here because we either return on success or fallback.
-    anyhow::bail!("udp forward failed")
+    // However, if TCP fallback is disabled, we might reach here if all UDP attempts fail.
+    // 如果 TCP fallback 被禁用，若所有 UDP 尝试均失败，可能会到达此处。
+    anyhow::bail!("all udp attempts failed and tcp fallback disabled")
 }
