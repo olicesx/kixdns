@@ -22,6 +22,7 @@ use crate::engine::response::{make_static_ip_answer, make_static_txt_answer, ext
 use crate::engine::matcher_adapter::log_match;
 use crate::matcher::eval_match_chain;
 use crate::cache::CacheEntry;
+use crate::engine::upstream::UpstreamFailure;
 
 #[derive(Debug, Clone)]
 pub enum Decision {
@@ -423,6 +424,9 @@ pub(crate) async fn apply_response_actions(
                             error = %err,
                             "response action forward failed"
                         );
+                        if err.downcast_ref::<UpstreamFailure>().is_none() {
+                            return Err(err);
+                        }
                         let bytes = engine_helpers::build_servfail_response(ctx.req)?;
                         return Ok(ResponseActionResult::Static {
                             bytes,
@@ -878,7 +882,10 @@ pub(crate) async fn process_response_jump(
                             }
                         }
                     }
-                    Err(_err) => {
+                    Err(err) => {
+                        if err.downcast_ref::<UpstreamFailure>().is_none() {
+                            return Err(err);
+                        }
                         let resp_bytes = engine_helpers::build_servfail_response(req)?;
                         for g in &mut cleanup_guards { g.defuse(); }
                         for h in &inflight_hashes { engine.notify_inflight_waiters(*h, &resp_bytes).await; }

@@ -12,6 +12,31 @@ use futures::future::select;
 use crate::config::Transport;
 use super::Engine;
 
+/// Error indicating that all upstream attempts have been exhausted.
+/// 表示所有 upstream 尝试均已耗尽的错误。
+#[derive(Debug)]
+pub struct UpstreamFailure {
+    source: anyhow::Error,
+}
+
+impl UpstreamFailure {
+    pub fn new(source: anyhow::Error) -> Self {
+        Self { source }
+    }
+}
+
+impl std::fmt::Display for UpstreamFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "all upstreams failed")
+    }
+}
+
+impl std::error::Error for UpstreamFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Parse upstream address with optional protocol prefix.
 /// 解析带有可选协议前缀的 upstream 地址。
 ///
@@ -256,7 +281,8 @@ pub async fn forward_upstream(
 
         let upstream_with_proto = format!("{}:{}", proto, addr);
 
-        if let Ok(ref bytes) = res {
+        match res {
+            Ok(ref bytes) => {
              // 记录成功指标 / Record success metrics
              // Increment upstream metrics - 原子操作
              engine.metrics_upstream_calls.fetch_add(1, Ordering::Relaxed);
@@ -268,10 +294,12 @@ pub async fn forward_upstream(
                 tracing::debug!(upstream=%up, upstream_ns = dur.as_nanos() as u64, rcode = %qr.rcode, "upstream call succeeded");
              }
              return Ok((bytes.clone(), upstream_with_proto));
-        } else {
-             // 失败时不构造 prefix，只 warn
-             tracing::warn!(upstream=%up, error=%res.as_ref().unwrap_err(), elapsed_ns = dur.as_nanos() as u64, "single upstream call failed");
-             return res.map(|b| (b, upstream_with_proto));
+            }
+            Err(err) => {
+                // 失败时不构造 prefix，只 warn
+                tracing::warn!(upstream=%up, error=%err, elapsed_ns = dur.as_nanos() as u64, "single upstream call failed");
+                return Err(anyhow::Error::new(UpstreamFailure::new(err)));
+            }
         }
     }
 
@@ -279,6 +307,7 @@ pub async fn forward_upstream(
     // 多个上游：使用 JoinSet 进行并发
     let mut tasks = JoinSet::new();
     let packet_owned = packet.to_vec();
+    let mut last_err: Option<anyhow::Error> = None;
 
     for up in upstreams {
         // 解析地址中的协议前缀 / Parse protocol prefix from address
@@ -321,11 +350,11 @@ pub async fn forward_upstream(
     while let Some(result) = tasks.join_next().await {
         match result {
             Ok((up_proto, res, dur)) => {
-                if res.is_ok() {
-                    let bytes = res.as_ref().unwrap();
+                match res {
+                    Ok(bytes) => {
 
                     // 快速解析响应码 / Quick parse response code
-                    let should_accept = if let Some(qr) = crate::proto_utils::parse_response_quick(bytes) {
+                    let should_accept = if let Some(qr) = crate::proto_utils::parse_response_quick(&bytes) {
                          match qr.rcode {
                             ResponseCode::NoError => true,
                             ResponseCode::ServFail | ResponseCode::Refused => false,
@@ -345,20 +374,25 @@ pub async fn forward_upstream(
                             tasks.abort_all();
                         }
 
-                        return res.map(|b| (b, up_proto));
+                        return Ok((bytes, up_proto));
                     }
-                } else {
-                    tracing::warn!(upstream=%up_proto, error=%res.as_ref().unwrap_err(), elapsed_ns = dur.as_nanos() as u64, "upstream call failed, waiting for others");
+                }
+                    Err(err) => {
+                        tracing::warn!(upstream=%up_proto, error=%err, elapsed_ns = dur.as_nanos() as u64, "upstream call failed, waiting for others");
+                        last_err = Some(err);
+                    }
                 }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "upstream task join error, waiting for others");
+                last_err = Some(anyhow::anyhow!(e));
             }
         }
     }
 
     // 所有上游都失败 / All upstreams failed
-    anyhow::bail!("all upstreams failed")
+    let err = last_err.unwrap_or_else(|| anyhow::anyhow!("all upstreams failed"));
+    Err(anyhow::Error::new(UpstreamFailure::new(err)))
 }
 
 

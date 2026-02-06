@@ -10,6 +10,7 @@ use crate::proto_utils;
 use crate::cache::CacheEntry;
 use crate::engine::utils::engine_helpers::build_response;
 use crate::engine::utils::InflightCleanupGuard;
+use crate::engine::upstream::UpstreamFailure;
 use crate::matcher::{eval_match_chain, RuntimeResponseMatcherWithOp};
 use crate::config::{MatchOperator, Action, Transport};
 use crate::engine::rules::{self, ResponseContext, ResponseActionResult};
@@ -506,6 +507,11 @@ pub async fn handle_forward_decision(
         }
         Err(e) => {
              if response_actions_on_miss.is_empty() {
+                 // Only send SERVFAIL when upstream attempts are fully exhausted.
+                 // 仅在所有上游尝试都耗尽时发送 SERVFAIL。
+                 if e.downcast_ref::<UpstreamFailure>().is_none() {
+                     return Err(e);
+                 }
                  let rcode = ResponseCode::ServFail;
                  warn!(
                     event = "dns_response",
