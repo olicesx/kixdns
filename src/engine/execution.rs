@@ -421,7 +421,14 @@ impl Engine {
             // Optimization: only include IP in hash when rule uses client_ip matcher or config requires it
             // 优化：仅当规则使用client_ip匹配器或配置要求时才包含IP在哈希中
             let include_ip_in_hash = p.uses_client_ip || self.cache_background_refresh;
-            let rule_hash = calculate_rule_hash(&pipeline_id, qname_str, peer.ip(), include_ip_in_hash);
+            let rule_hash = calculate_rule_hash(
+                &pipeline_id,
+                qname_str,
+                qtype,
+                qclass,
+                peer.ip(),
+                include_ip_in_hash,
+            );
             if let Some(entry) = self.rule_cache.get(&rule_hash) {
                 // Check if entry is valid before using
                 // 在使用前检查条目是否有效
@@ -429,7 +436,14 @@ impl Engine {
                     // Remove expired entry
                     // 删除过期条目
                     self.rule_cache.remove(&rule_hash);
-                } else if entry.matches(&pipeline_id, qname_str, peer.ip(), include_ip_in_hash) {
+                } else if entry.matches(
+                    &pipeline_id,
+                    qname_str,
+                    qtype,
+                    qclass,
+                    peer.ip(),
+                    include_ip_in_hash,
+                ) {
                     if let Decision::Static { rcode, answers } = entry.decision.as_ref() {
                         let resp = build_fast_static_response(
                             q.tx_id,
@@ -1449,17 +1463,19 @@ mod tests {
         // Arrange: Define test data with different IPs
         let pipeline_id = "test_p";
         let qname = "example.com";
+        let qtype = RecordType::A;
+        let qclass = DNSClass::IN;
         let ip1 = "1.2.3.4".parse::<IpAddr>().unwrap();
         let ip2 = "5.6.7.8".parse::<IpAddr>().unwrap();
 
         // Act & Assert: When uses_client_ip is false, both IPs should result in the same hash
-        let h1_no_ip = calculate_rule_hash(pipeline_id, qname, ip1, false);
-        let h2_no_ip = calculate_rule_hash(pipeline_id, qname, ip2, false);
+        let h1_no_ip = calculate_rule_hash(pipeline_id, qname, qtype, qclass, ip1, false);
+        let h2_no_ip = calculate_rule_hash(pipeline_id, qname, qtype, qclass, ip2, false);
         assert_eq!(h1_no_ip, h2_no_ip, "Hashes should match when IP is ignored");
 
         // Act & Assert: When uses_client_ip is true, different IPs should result in different hashes
-        let h1_with_ip = calculate_rule_hash(pipeline_id, qname, ip1, true);
-        let h2_with_ip = calculate_rule_hash(pipeline_id, qname, ip2, true);
+        let h1_with_ip = calculate_rule_hash(pipeline_id, qname, qtype, qclass, ip1, true);
+        let h2_with_ip = calculate_rule_hash(pipeline_id, qname, qtype, qclass, ip2, true);
         assert_ne!(h1_with_ip, h2_with_ip, "Hashes should differ when IP is included");
         
         // Assert: Hash with IP should differ from hash without IP
@@ -1511,6 +1527,8 @@ mod tests {
         // Arrange: Define test data with different IPs
         let pipeline_id: Arc<str> = Arc::from("test_p");
         let qname = "example.com";
+        let qtype = RecordType::A;
+        let qclass = DNSClass::IN;
         let ip1 = "1.2.3.4".parse::<IpAddr>().unwrap();
         let ip2 = "5.6.7.8".parse::<IpAddr>().unwrap();
         let decision = Arc::new(Decision::Static { rcode: ResponseCode::NoError, answers: vec![] });
@@ -1519,33 +1537,55 @@ mod tests {
         let entry_no_ip = RuleCacheEntry {
             pipeline_id: pipeline_id.clone(),
             qname_hash: fast_hash_str(qname),
+            qtype: u16::from(qtype),
+            qclass: u16::from(qclass),
             client_ip: None,
             decision: decision.clone(),
             expires_at: None,
         };
 
         // Act & Assert: Should match any IP if we don't care about it
-        assert!(entry_no_ip.matches("test_p", qname, ip1, false), "Entry without IP should match any IP when uses_client_ip is false");
-        assert!(entry_no_ip.matches("test_p", qname, ip2, false), "Entry without IP should match any IP when uses_client_ip is false");
+        assert!(
+            entry_no_ip.matches("test_p", qname, qtype, qclass, ip1, false),
+            "Entry without IP should match any IP when uses_client_ip is false"
+        );
+        assert!(
+            entry_no_ip.matches("test_p", qname, qtype, qclass, ip2, false),
+            "Entry without IP should match any IP when uses_client_ip is false"
+        );
         
         // Act & Assert: Should NOT match if we now care about IP (since entry doesn't have it)
-        assert!(!entry_no_ip.matches("test_p", qname, ip1, true), "Entry without IP should not match when uses_client_ip is true");
+        assert!(
+            !entry_no_ip.matches("test_p", qname, qtype, qclass, ip1, true),
+            "Entry without IP should not match when uses_client_ip is true"
+        );
 
         // Arrange: Entry created WITH IP
         let entry_with_ip = RuleCacheEntry {
             pipeline_id: pipeline_id.clone(),
             qname_hash: fast_hash_str(qname),
+            qtype: u16::from(qtype),
+            qclass: u16::from(qclass),
             client_ip: Some(ip1),
             decision,
             expires_at: None,
         };
 
         // Act & Assert: Should match same IP if we care
-        assert!(entry_with_ip.matches("test_p", qname, ip1, true), "Entry with IP should match same IP when uses_client_ip is true");
+        assert!(
+            entry_with_ip.matches("test_p", qname, qtype, qclass, ip1, true),
+            "Entry with IP should match same IP when uses_client_ip is true"
+        );
         // Act & Assert: Should NOT match different IP if we care
-        assert!(!entry_with_ip.matches("test_p", qname, ip2, true), "Entry with IP should not match different IP when uses_client_ip is true");
+        assert!(
+            !entry_with_ip.matches("test_p", qname, qtype, qclass, ip2, true),
+            "Entry with IP should not match different IP when uses_client_ip is true"
+        );
         // Act & Assert: Should NOT match even same IP if we don't care now (safety check)
-        assert!(!entry_with_ip.matches("test_p", qname, ip1, false), "Entry with IP should not match when uses_client_ip is false");
+        assert!(
+            !entry_with_ip.matches("test_p", qname, qtype, qclass, ip1, false),
+            "Entry with IP should not match when uses_client_ip is false"
+        );
     }
 
     #[test]
@@ -1553,6 +1593,8 @@ mod tests {
         // Arrange: Define test data
         let pipeline_id: Arc<str> = Arc::from("test_p");
         let qname = "expire.com";
+        let qtype = RecordType::A;
+        let qclass = DNSClass::IN;
         let ip = "1.2.3.4".parse::<IpAddr>().unwrap();
         let decision = Arc::new(Decision::Static { rcode: ResponseCode::NoError, answers: vec![] });
 
@@ -1560,25 +1602,35 @@ mod tests {
         let entry_expired = RuleCacheEntry {
             pipeline_id: pipeline_id.clone(),
             qname_hash: fast_hash_str(qname),
+            qtype: u16::from(qtype),
+            qclass: u16::from(qclass),
             client_ip: None,
             decision: decision.clone(),
             expires_at: Some(Instant::now() - Duration::from_secs(1)),
         };
         
         // Act & Assert: Expired entry should not match
-        assert!(!entry_expired.matches("test_p", qname, ip, false), "Expired entry should not match");
+        assert!(
+            !entry_expired.matches("test_p", qname, qtype, qclass, ip, false),
+            "Expired entry should not match"
+        );
 
         // Arrange: Fresh entry
         let entry_fresh = RuleCacheEntry {
             pipeline_id: pipeline_id.clone(),
             qname_hash: fast_hash_str(qname),
+            qtype: u16::from(qtype),
+            qclass: u16::from(qclass),
             client_ip: None,
             decision,
             expires_at: Some(Instant::now() + Duration::from_secs(60)),
         };
         
         // Act & Assert: Fresh entry should match
-        assert!(entry_fresh.matches("test_p", qname, ip, false), "Fresh entry should match");
+        assert!(
+            entry_fresh.matches("test_p", qname, qtype, qclass, ip, false),
+            "Fresh entry should match"
+        );
     }
 
     /// 测试 DNS 响应缓存键包含 QCLASS

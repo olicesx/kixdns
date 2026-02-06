@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use tokio::task::JoinSet;
+use tokio::time::timeout;
 use tracing::{debug};
 use hickory_proto::op::ResponseCode;
 use futures::future::select;
@@ -44,6 +45,56 @@ const HEDGE_TIMEOUT_DIVISOR: u32 = 3;
 ///
 /// Returns (response_bytes, protocol_name).
 /// 返回 (响应字节, 协议名称)。
+async fn fallback_after_primary_failure(
+    other_task: tokio::task::JoinHandle<anyhow::Result<Bytes>>,
+    remaining: Duration,
+    primary_label: &'static str,
+    primary_err: anyhow::Error,
+    primary_is_task_error: bool,
+    other_label: &'static str,
+) -> anyhow::Result<(Bytes, &'static str)> {
+    if remaining.is_zero() {
+        other_task.abort();
+        if primary_is_task_error {
+            return Err(anyhow::anyhow!("{} task error: {}", primary_label, primary_err));
+        }
+        return Err(anyhow::anyhow!(
+            "{} failed and no time left for {}: {}",
+            primary_label,
+            other_label,
+            primary_err
+        ));
+    }
+
+    let prefix = if primary_is_task_error { "task error" } else { "failed" };
+    match timeout(remaining, other_task).await {
+        Ok(Ok(Ok(bytes))) => Ok((bytes, other_label)),
+        Ok(Ok(Err(other_err))) => Err(anyhow::anyhow!(
+            "{} {}: {}; {} failed: {}",
+            primary_label,
+            prefix,
+            primary_err,
+            other_label,
+            other_err
+        )),
+        Ok(Err(join_err)) => Err(anyhow::anyhow!(
+            "{} {}: {}; {} task error: {}",
+            primary_label,
+            prefix,
+            primary_err,
+            other_label,
+            join_err
+        )),
+        Err(_) => Err(anyhow::anyhow!(
+            "{} {}: {}; {} timed out",
+            primary_label,
+            prefix,
+            primary_err,
+            other_label
+        )),
+    }
+}
+
 async fn forward_tcp_udp_dual(
     engine: &Engine,
     packet: &[u8],
@@ -65,19 +116,81 @@ async fn forward_tcp_udp_dual(
         engine_tcp.tcp_mux.send(&packet_tcp, &addr_tcp, timeout_dur).await
     });
 
+    let start = std::time::Instant::now();
+
     // Wait for first successful response / 等待第一个成功响应
-    match select(Box::pin(udp_task), Box::pin(tcp_task)).await {
+    match select(udp_task, tcp_task).await {
         futures::future::Either::Left((result, tcp_task)) => {
-            tcp_task.abort();
-            let proto = "udp";
-            // result: Result<Result<Bytes, Error>, JoinError>
-            // First unwrap JoinError, then map Ok(Bytes) to (Bytes, proto)
-            result.map_err(|e| anyhow::anyhow!("udp task error: {}", e))?.map(|r| (r, proto))
+            match result {
+                Ok(Ok(bytes)) => {
+                    tcp_task.abort();
+                    Ok((bytes, "udp"))
+                }
+                Ok(Err(err)) => {
+                    let remaining = timeout_dur
+                        .checked_sub(start.elapsed())
+                        .unwrap_or_else(|| Duration::from_millis(0));
+                    fallback_after_primary_failure(
+                        tcp_task,
+                        remaining,
+                        "udp",
+                        err,
+                        false,
+                        "tcp",
+                    )
+                    .await
+                }
+                Err(join_err) => {
+                    let remaining = timeout_dur
+                        .checked_sub(start.elapsed())
+                        .unwrap_or_else(|| Duration::from_millis(0));
+                    fallback_after_primary_failure(
+                        tcp_task,
+                        remaining,
+                        "udp",
+                        anyhow::anyhow!(join_err),
+                        true,
+                        "tcp",
+                    )
+                    .await
+                }
+            }
         }
         futures::future::Either::Right((result, udp_task)) => {
-            udp_task.abort();
-            let proto = "tcp";
-            result.map_err(|e| anyhow::anyhow!("tcp task error: {}", e))?.map(|r| (r, proto))
+            match result {
+                Ok(Ok(bytes)) => {
+                    udp_task.abort();
+                    Ok((bytes, "tcp"))
+                }
+                Ok(Err(err)) => {
+                    let remaining = timeout_dur
+                        .checked_sub(start.elapsed())
+                        .unwrap_or_else(|| Duration::from_millis(0));
+                    fallback_after_primary_failure(
+                        udp_task,
+                        remaining,
+                        "tcp",
+                        err,
+                        false,
+                        "udp",
+                    )
+                    .await
+                }
+                Err(join_err) => {
+                    let remaining = timeout_dur
+                        .checked_sub(start.elapsed())
+                        .unwrap_or_else(|| Duration::from_millis(0));
+                    fallback_after_primary_failure(
+                        udp_task,
+                        remaining,
+                        "tcp",
+                        anyhow::anyhow!(join_err),
+                        true,
+                        "udp",
+                    )
+                    .await
+                }
+            }
         }
     }
 }
@@ -176,6 +289,7 @@ pub async fn forward_upstream(
         let addr_owned = addr.to_string();
 
         tasks.spawn(async move {
+            let start = std::time::Instant::now();
             let (proto, res) = match transport_for_task {
                 Transport::Udp => {
                     let r = forward_udp_smart(&engine, &packet, &addr_owned, timeout_dur).await;
@@ -195,7 +309,6 @@ pub async fn forward_upstream(
                 }
             };
 
-            let start = std::time::Instant::now();
             // Note: for TcpUdp, timing includes both tasks' spawn/abort overhead
             // 注意：对于 TcpUdp，计时包含两个任务的 spawn/abort 开销
             let upstream_with_proto = format!("{}:{}", proto, addr_owned);

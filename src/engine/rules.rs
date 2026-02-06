@@ -80,10 +80,19 @@ pub enum ResponseActionResult {
 }
 
 #[inline]
-pub fn calculate_rule_hash(pipeline_id: &str, qname: &str, client_ip: IpAddr, uses_client_ip: bool) -> u64 {
+pub fn calculate_rule_hash(
+    pipeline_id: &str,
+    qname: &str,
+    qtype: RecordType,
+    qclass: DNSClass,
+    client_ip: IpAddr,
+    uses_client_ip: bool,
+) -> u64 {
     let mut hasher = FxHasher::default();
     pipeline_id.hash(&mut hasher);
     qname.hash(&mut hasher);
+    u16::from(qtype).hash(&mut hasher);
+    u16::from(qclass).hash(&mut hasher);
     if uses_client_ip {
         client_ip.hash(&mut hasher);
     }
@@ -94,6 +103,8 @@ pub fn calculate_rule_hash(pipeline_id: &str, qname: &str, client_ip: IpAddr, us
 pub struct RuleCacheEntry {
     pub pipeline_id: Arc<str>,
     pub qname_hash: u64,
+    pub qtype: u16,
+    pub qclass: u16,
     pub client_ip: Option<IpAddr>,
     pub decision: Arc<Decision>,
     /// Expiration time based on DNS TTL / 基于 DNS TTL 的过期时间
@@ -101,10 +112,20 @@ pub struct RuleCacheEntry {
 }
 
 impl RuleCacheEntry {
-    pub fn new(pipeline_id: Arc<str>, qname: &str, client_ip: IpAddr, decision: Decision, uses_client_ip: bool) -> Self {
+    pub fn new(
+        pipeline_id: Arc<str>,
+        qname: &str,
+        qtype: RecordType,
+        qclass: DNSClass,
+        client_ip: IpAddr,
+        decision: Decision,
+        uses_client_ip: bool,
+    ) -> Self {
         Self {
             pipeline_id,
             qname_hash: fast_hash_str(qname),
+            qtype: u16::from(qtype),
+            qclass: u16::from(qclass),
             client_ip: if uses_client_ip { Some(client_ip) } else { None },
             decision: Arc::new(decision),
             expires_at: None,
@@ -112,12 +133,24 @@ impl RuleCacheEntry {
     }
 
     #[inline]
-    pub fn matches(&self, pipeline_id: &str, qname: &str, client_ip: IpAddr, uses_client_ip: bool) -> bool {
+    pub fn matches(
+        &self,
+        pipeline_id: &str,
+        qname: &str,
+        qtype: RecordType,
+        qclass: DNSClass,
+        client_ip: IpAddr,
+        uses_client_ip: bool,
+    ) -> bool {
         // Check expiration first / 首先检查过期
         if let Some(expires) = self.expires_at {
             if Instant::now() > expires {
                 return false;
             }
+        }
+
+        if self.qtype != u16::from(qtype) || self.qclass != u16::from(qclass) {
+            return false;
         }
 
         if uses_client_ip {

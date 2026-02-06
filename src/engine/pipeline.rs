@@ -77,7 +77,17 @@ impl Engine {
             .find(|p| p.id.as_ref() == pipeline_id)
     }
 
-    pub fn insert_rule_cache(&self, hash: u64, pipeline_id: Arc<str>, qname: &str, client_ip: IpAddr, decision: Decision, uses_client_ip: bool) {
+    pub fn insert_rule_cache(
+        &self,
+        hash: u64,
+        pipeline_id: Arc<str>,
+        qname: &str,
+        qtype: RecordType,
+        qclass: DNSClass,
+        client_ip: IpAddr,
+        decision: Decision,
+        include_ip: bool,
+    ) {
         let state = self.state.load();
         let ttl = match &decision {
             Decision::Static { answers, .. } => {
@@ -119,13 +129,13 @@ impl Engine {
 
         // 优化：根据配置决定是否包含client_ip
         // Optimization: only include client_ip in cache entry when configured or required by rule
-        let include_ip = uses_client_ip || self.cache_background_refresh;
-
         self.rule_cache.insert(
             hash,
             RuleCacheEntry {
                 pipeline_id,
                 qname_hash: fast_hash_str(qname),
+                qtype: u16::from(qtype),
+                qclass: u16::from(qclass),
                 client_ip: if include_ip { Some(client_ip) } else { None },
                 decision: Arc::new(decision),
                 expires_at,
@@ -147,7 +157,8 @@ impl Engine {
     ) -> Decision {
         // 1. Check Rule Cache
         // Use hash for lookup to avoid cloning String for key on every lookup
-        let rule_hash = calculate_rule_hash(&pipeline.id, qname, client_ip, pipeline.uses_client_ip);
+        let include_ip = pipeline.uses_client_ip || self.cache_background_refresh;
+        let rule_hash = calculate_rule_hash(&pipeline.id, qname, qtype, qclass, client_ip, include_ip);
         let allow_rule_cache_lookup = !skip_cache && skip_rules.is_none_or(|set| set.is_empty());
         
         if allow_rule_cache_lookup {
@@ -156,7 +167,7 @@ impl Engine {
                 // 检查有效性，如果过期则清理
                 if !entry.is_valid() {
                     self.rule_cache.remove(&rule_hash);
-                } else if entry.matches(&pipeline.id, qname, client_ip, pipeline.uses_client_ip) {
+                } else if entry.matches(&pipeline.id, qname, qtype, qclass, client_ip, include_ip) {
                     return (*entry.decision).clone();
                 }
             }
@@ -331,7 +342,16 @@ impl Engine {
                         continue_on_miss: false,
                         allow_reuse: false,
                     };
-                    self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
+                    self.insert_rule_cache(
+                        rule_hash,
+                        pipeline.id.clone(),
+                        qname,
+                        qtype,
+                        qclass,
+                        client_ip,
+                        d.clone(),
+                        include_ip,
+                    );
                     return d;
                 }
 
@@ -344,7 +364,16 @@ impl Engine {
                                 rcode: code,
                                 answers: Vec::new(),
                             };
-                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
+                            self.insert_rule_cache(
+                                rule_hash,
+                                pipeline.id.clone(),
+                                qname,
+                                qtype,
+                                qclass,
+                                client_ip,
+                                d.clone(),
+                                include_ip,
+                            );
                             return d;
                         }
                         Action::StaticIpResponse { ip } => {
@@ -359,7 +388,16 @@ impl Engine {
                                         rcode: ResponseCode::NoError,
                                         answers: vec![record],
                                     };
-                                    self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
+                                    self.insert_rule_cache(
+                                        rule_hash,
+                                        pipeline.id.clone(),
+                                        qname,
+                                        qtype,
+                                        qclass,
+                                        client_ip,
+                                        d.clone(),
+                                        include_ip,
+                                    );
                                     return d;
                                 }
                             }
@@ -367,14 +405,32 @@ impl Engine {
                                 rcode: ResponseCode::ServFail,
                                 answers: Vec::new(),
                             };
-                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
+                            self.insert_rule_cache(
+                                rule_hash,
+                                pipeline.id.clone(),
+                                qname,
+                                qtype,
+                                qclass,
+                                client_ip,
+                                d.clone(),
+                                include_ip,
+                            );
                             return d;
                         }
                         Action::JumpToPipeline { pipeline: target } => {
                             let d = Decision::Jump {
                                 pipeline: Arc::from(target.as_str()),
                             };
-                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
+                            self.insert_rule_cache(
+                                rule_hash,
+                                pipeline.id.clone(),
+                                qname,
+                                qtype,
+                                qclass,
+                                client_ip,
+                                d.clone(),
+                                include_ip,
+                            );
                             return d;
                         }
                         Action::Allow => {
@@ -391,7 +447,16 @@ impl Engine {
                                 continue_on_miss: false,
                                 allow_reuse: true,
                             };
-                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
+                            self.insert_rule_cache(
+                                rule_hash,
+                                pipeline.id.clone(),
+                                qname,
+                                qtype,
+                                qclass,
+                                client_ip,
+                                d.clone(),
+                                include_ip,
+                            );
                             return d;
                         }
                         Action::Deny => {
@@ -399,7 +464,16 @@ impl Engine {
                                 rcode: ResponseCode::Refused,
                                 answers: Vec::new(),
                             };
-                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
+                            self.insert_rule_cache(
+                                rule_hash,
+                                pipeline.id.clone(),
+                                qname,
+                                qtype,
+                                qclass,
+                                client_ip,
+                                d.clone(),
+                                include_ip,
+                            );
                             return d;
                         }
                         Action::Forward {
@@ -426,7 +500,16 @@ impl Engine {
                                 continue_on_miss,
                                 allow_reuse: false,
                             };
-                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
+                            self.insert_rule_cache(
+                                rule_hash,
+                                pipeline.id.clone(),
+                                qname,
+                                qtype,
+                                qclass,
+                                client_ip,
+                                d.clone(),
+                                include_ip,
+                            );
                             return d;
                         }
                         Action::Log { level } => {
@@ -441,14 +524,32 @@ impl Engine {
                                     rcode: ResponseCode::NoError,
                                     answers: vec![record],
                                 };
-                                self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
+                                self.insert_rule_cache(
+                                    rule_hash,
+                                    pipeline.id.clone(),
+                                    qname,
+                                    qtype,
+                                    qclass,
+                                    client_ip,
+                                    d.clone(),
+                                    include_ip,
+                                );
                                 return d;
                             }
                             let d = Decision::Static {
                                 rcode: ResponseCode::ServFail,
                                 answers: Vec::new(),
                             };
-                            self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
+                            self.insert_rule_cache(
+                                rule_hash,
+                                pipeline.id.clone(),
+                                qname,
+                                qtype,
+                                qclass,
+                                client_ip,
+                                d.clone(),
+                                include_ip,
+                            );
                             return d;
                         }
                         Action::ReplaceTxtResponse { .. } => {
@@ -475,7 +576,16 @@ impl Engine {
             continue_on_miss: false,
             allow_reuse: false,
         };
-        self.insert_rule_cache(rule_hash, pipeline.id.clone(), qname, client_ip, d.clone(), pipeline.uses_client_ip);
+        self.insert_rule_cache(
+            rule_hash,
+            pipeline.id.clone(),
+            qname,
+            qtype,
+            qclass,
+            client_ip,
+            d.clone(),
+            include_ip,
+        );
         d
     }
 }
