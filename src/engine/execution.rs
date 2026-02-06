@@ -232,6 +232,7 @@ impl Engine {
         pipeline_id: Arc<str>,
         qtype: hickory_proto::rr::RecordType,
         original_ttl: u32,
+        refresh_ttl: u32,
     ) {
         let entry = CacheEntry {
             bytes,
@@ -243,6 +244,7 @@ impl Engine {
             qtype: u16::from(qtype),
             inserted_at: Instant::now(),
             original_ttl,
+            refresh_ttl,
         };
         self.cache.insert(cache_hash, Arc::new(entry));
     }
@@ -327,18 +329,19 @@ impl Engine {
                     // 只有来自 upstream 的缓存条目才进行预取刷新
                     if self.cache_background_refresh
                         && hit.upstream.is_some()
-                        && hit.original_ttl >= self.cache_refresh_min_ttl
+                        && hit.refresh_ttl >= self.cache_refresh_min_ttl
                     {
                         // Calculate remaining TTL and refresh threshold
                         // 计算剩余 TTL 和刷新阈值
-                        let remaining_ttl = hit.original_ttl.saturating_sub(elapsed_secs);
-                        let threshold = (hit.original_ttl as u64 * self.cache_refresh_threshold_percent as u64) / 100;
+                        let remaining_ttl = hit.refresh_ttl.saturating_sub(elapsed_secs);
+                        let threshold = (hit.refresh_ttl as u64 * self.cache_refresh_threshold_percent as u64) / 100;
 
                         // OPTIMIZATION: Zero-lock check using bitmap / 优化：使用位图进行零锁检查
                         let is_refreshing = is_refreshing(&self.refreshing_bitmap, cache_hash);
 
                         tracing::warn!(
                             original_ttl = hit.original_ttl,
+                            refresh_ttl = hit.refresh_ttl,
                             elapsed_secs = elapsed_secs,
                             remaining_ttl = remaining_ttl,
                             threshold_percent = self.cache_refresh_threshold_percent,
@@ -360,6 +363,7 @@ impl Engine {
                             tracing::warn!(
                                 qname = %qname_str,
                                 original_ttl = hit.original_ttl,
+                                refresh_ttl = hit.refresh_ttl,
                                 remaining_ttl = remaining_ttl,
                                 "triggering background cache refresh"
                             );
@@ -849,7 +853,7 @@ impl Engine {
     ///
     /// 防止无限循环的保护措施：
     /// Protection against infinite loops:
-    /// 1. 检查 original_ttl >= cache_refresh_min_ttl（默认5秒）
+    /// 1. 检查 refresh_ttl >= cache_refresh_min_ttl（默认5秒）
     /// 2. 使用与正常请求相同的 Singleflight 机制（inflight map）
     /// 3. 刷新失败不会删除现有缓存条目
     pub(crate) fn spawn_background_refresh(
@@ -1503,6 +1507,7 @@ mod tests {
             qtype: u16::from(qtype),
             inserted_at: Instant::now() - Duration::from_secs(10),
             original_ttl: 5, // Expired 5 seconds ago
+            refresh_ttl: 5,
         };
         engine.cache.insert(dedupe_hash, Arc::new(entry));
 

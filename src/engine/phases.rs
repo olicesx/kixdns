@@ -8,7 +8,7 @@ use tracing::{debug, info, warn};
 use super::Engine;
 use crate::proto_utils;
 use crate::cache::CacheEntry;
-use crate::engine::utils::engine_helpers::build_response;
+use crate::engine::utils::engine_helpers::{build_response, build_servfail_response_fast};
 use crate::engine::utils::InflightCleanupGuard;
 use crate::engine::upstream::UpstreamFailure;
 use crate::matcher::{eval_match_chain, RuntimeResponseMatcherWithOp};
@@ -74,14 +74,14 @@ pub fn check_cache(
                 // ========== NEW: Trigger background refresh before returning cached response ==========
                 let cfg = &engine.state.load().pipeline;
                 
-                let remaining_ttl = hit.original_ttl.saturating_sub(elapsed);
+                let remaining_ttl = hit.refresh_ttl.saturating_sub(elapsed);
                 
                 // Check if we should trigger background refresh
                 let should_refresh = if cfg.settings.cache_background_refresh
                     && hit.upstream.is_some()
-                    && hit.original_ttl >= cfg.settings.cache_refresh_min_ttl
+                    && hit.refresh_ttl >= cfg.settings.cache_refresh_min_ttl
                 {
-                    let threshold = (hit.original_ttl as u64 * cfg.settings.cache_refresh_threshold_percent as u64) / 100;
+                    let threshold = (hit.refresh_ttl as u64 * cfg.settings.cache_refresh_threshold_percent as u64) / 100;
                     remaining_ttl as u64 <= threshold
                 } else {
                     false
@@ -95,6 +95,7 @@ pub fn check_cache(
                         qtype = ?qtype,
                         remaining_ttl = remaining_ttl,
                         original_ttl = hit.original_ttl,
+                        refresh_ttl = hit.refresh_ttl,
                         "Triggering background refresh for cached entry"
                     );
                     
@@ -115,6 +116,7 @@ pub fn check_cache(
                     qtype = ?qtype,
                     rcode = ?hit.rcode,
                     original_ttl = hit.original_ttl,
+                    refresh_ttl = hit.refresh_ttl,
                     elapsed_secs = elapsed,
                     latency_ms = latency.as_millis() as u64,
                     client_ip = %peer.ip(),
@@ -162,6 +164,7 @@ pub fn handle_static_decision(
             qtype: u16::from(qtype),
             inserted_at: Instant::now(),
             original_ttl: min_ttl.as_secs() as u32,
+            refresh_ttl: min_ttl.as_secs() as u32,
         };
         engine.cache.insert(dedupe_hash, Arc::new(entry));
     }
@@ -292,20 +295,22 @@ pub async fn handle_forward_decision(
 
     match resp {
         Ok((raw, actual_upstream)) => {
-            let (rcode, ttl_secs, msg_opt, truncated) = if response_matchers.is_empty() && response_actions_on_match.is_empty() && response_actions_on_miss.is_empty() {
+            let (rcode, ttl_secs_cache, ttl_secs_refresh, msg_opt, truncated) = if response_matchers.is_empty() && response_actions_on_match.is_empty() && response_actions_on_miss.is_empty() {
                 if let Some(qr) = proto_utils::parse_response_quick(&raw) {
-                    (qr.rcode, qr.max_ttl as u64, None, qr.truncated)
+                    (qr.rcode, qr.min_ttl as u64, qr.max_ttl as u64, None, qr.truncated)
                 } else {
                     let msg = Message::from_bytes(&raw).context("parse upstream response")?;
-                    let ttl = extract_ttl_for_refresh(&msg);
+                    let ttl_cache = extract_ttl(&msg);
+                    let ttl_refresh = extract_ttl_for_refresh(&msg);
                     let tc = raw.len() >= 3 && (raw[2] & 0x02) != 0;
-                    (msg.response_code(), ttl, Some(msg), tc)
+                    (msg.response_code(), ttl_cache, ttl_refresh, Some(msg), tc)
                 }
             } else {
                 let msg = Message::from_bytes(&raw).context("parse upstream response")?;
-                let ttl = extract_ttl_for_refresh(&msg);
+                let ttl_cache = extract_ttl(&msg);
+                let ttl_refresh = extract_ttl_for_refresh(&msg);
                 let tc = raw.len() >= 3 && (raw[2] & 0x02) != 0;
-                (msg.response_code(), ttl, Some(msg), tc)
+                (msg.response_code(), ttl_cache, ttl_refresh, Some(msg), tc)
             };
 
             // 检查 TCP fallback 配置 / Check TCP fallback configuration
@@ -320,7 +325,7 @@ pub async fn handle_forward_decision(
                 return Ok(ForwardResult::Success(tcp_resp));
             }
 
-            let effective_ttl = Duration::from_secs(ttl_secs.max(min_ttl.as_secs()));
+            let effective_ttl = Duration::from_secs(ttl_secs_cache.max(min_ttl.as_secs()));
 
             // Try to acquire read locks non-blockingly (fast path for concurrent reads)
             // 尝试非阻塞获取读锁（并发读的快速路径）
@@ -379,7 +384,8 @@ pub async fn handle_forward_decision(
                         qname,
                         Arc::from(pipeline_id),
                         qtype,
-                        ttl_secs as u32,
+                        ttl_secs_cache as u32,
+                        ttl_secs_refresh as u32,
                     );
                 }
                 if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
@@ -438,8 +444,9 @@ pub async fn handle_forward_decision(
 
             match action_result {
                 ResponseActionResult::Upstream { ctx, resp_match: _ } => {
-                    let ttl_secs = extract_ttl(&ctx.msg); 
-                    let effective_ttl = Duration::from_secs(ttl_secs.max(min_ttl.as_secs()));
+                    let ttl_secs_cache = extract_ttl(&ctx.msg); 
+                    let ttl_secs_refresh = extract_ttl_for_refresh(&ctx.msg);
+                    let effective_ttl = Duration::from_secs(ttl_secs_cache.max(min_ttl.as_secs()));
                      if effective_ttl > Duration::from_secs(0) {
                         engine.insert_dns_cache_entry(
                             dedupe_hash,
@@ -450,7 +457,8 @@ pub async fn handle_forward_decision(
                             qname,
                             Arc::from(pipeline_id),
                             qtype,
-                            ttl_secs as u32,
+                            ttl_secs_cache as u32,
+                            ttl_secs_refresh as u32,
                         );
                     }
                     if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
@@ -468,6 +476,7 @@ pub async fn handle_forward_decision(
                             qname,
                             Arc::from(pipeline_id),
                             qtype,
+                            min_ttl.as_secs() as u32,
                             min_ttl.as_secs() as u32,
                         );
                     }
@@ -525,12 +534,25 @@ pub async fn handle_forward_decision(
                     transport = ?transport,
                     "upstream failed"
                  );
-                 // Try to build response from packet, if fails return original error
-                 let req = match Message::from_bytes(packet) {
-                     Ok(r) => r,
-                     Err(_) => return Err(e),
+                 // Fast build SERVFAIL without full request parse
+                 let rd = packet.get(2).map(|b| b & 0x01 != 0).unwrap_or(false);
+                 let resp_bytes = match build_servfail_response_fast(
+                     tx_id,
+                     qname,
+                     u16::from(qtype),
+                     u16::from(qclass),
+                     rd,
+                 ) {
+                     Ok(bytes) => bytes,
+                     Err(_) => {
+                         // Fallback to full parse if fast build fails
+                         let req = match Message::from_bytes(packet) {
+                             Ok(r) => r,
+                             Err(_) => return Err(e),
+                         };
+                         build_response(&req, rcode, Vec::new()).unwrap_or_default()
+                     }
                  };
-                 let resp_bytes = build_response(&req, rcode, Vec::new()).unwrap_or_default(); // Fallback to empty if fails? Result<Bytes> from build_response
 
                  if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
                  engine.notify_inflight_waiters(dedupe_hash, &resp_bytes).await;
@@ -566,8 +588,9 @@ pub async fn handle_forward_decision(
 
                 match action_result {
                     ResponseActionResult::Upstream { ctx, resp_match: _ } => {
-                        let ttl_secs = extract_ttl(&ctx.msg); 
-                        let effective_ttl = Duration::from_secs(ttl_secs.max(min_ttl.as_secs()));
+                        let ttl_secs_cache = extract_ttl(&ctx.msg); 
+                        let ttl_secs_refresh = extract_ttl_for_refresh(&ctx.msg);
+                        let effective_ttl = Duration::from_secs(ttl_secs_cache.max(min_ttl.as_secs()));
                         if effective_ttl > Duration::from_secs(0) {
                             engine.insert_dns_cache_entry(
                                 dedupe_hash,
@@ -578,7 +601,8 @@ pub async fn handle_forward_decision(
                                 qname,
                                 Arc::from(pipeline_id),
                                 qtype,
-                                ttl_secs as u32,
+                                ttl_secs_cache as u32,
+                                ttl_secs_refresh as u32,
                             );
                         }
                         if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
@@ -596,6 +620,7 @@ pub async fn handle_forward_decision(
                                 qname,
                                 Arc::from(pipeline_id),
                                 qtype,
+                                min_ttl.as_secs() as u32,
                                 min_ttl.as_secs() as u32,
                             );
                         }

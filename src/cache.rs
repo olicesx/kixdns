@@ -19,7 +19,11 @@ pub struct CacheEntry {
     /// RFC 1035 §5.2: Record insertion time for TTL decrement / RFC 1035 §5.2：记录插入时间用于TTL递减
     pub inserted_at: Instant,
     /// Original minimum TTL from upstream response / 上游响应的原始最小TTL
+    /// Used for cache expiration and TTL patching / 用于缓存过期与 TTL 修正
     pub original_ttl: u32,
+    /// Original maximum TTL from upstream response / 上游响应的原始最大TTL
+    /// Used for background refresh decisions / 用于后台刷新决策
+    pub refresh_ttl: u32,
 }
 
 /// Use u64 hash as key to avoid allocation during lookup / 使用 u64 哈希作为键以避免查找时的内存分配

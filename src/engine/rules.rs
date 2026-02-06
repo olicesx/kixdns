@@ -600,6 +600,7 @@ pub(crate) async fn process_response_jump(
                     qtype: u16::from(qtype),
                     inserted_at: Instant::now(),
                     original_ttl: min_ttl.as_secs() as u32,
+                    refresh_ttl: min_ttl.as_secs() as u32,
                 };
                 engine.cache.insert(dedupe_hash, Arc::new(entry));
                 for g in &mut cleanup_guards { g.defuse(); }
@@ -802,7 +803,8 @@ pub(crate) async fn process_response_jump(
                                     pipeline_id: pipeline_id.clone(),
                                     qtype: u16::from(qtype),
                                     inserted_at: Instant::now(),
-                                    original_ttl: ttl_secs_refresh as u32,  // Use max TTL for refresh timing / 使用最大 TTL 作为刷新时机
+                                    original_ttl: ttl_secs_cache as u32,  // Use min TTL for cache expiration / 使用最小 TTL 作为缓存过期
+                                    refresh_ttl: ttl_secs_refresh as u32,   // Use max TTL for refresh timing / 使用最大 TTL 作为刷新时机
                                 };
                                 engine.cache.insert(dedupe_hash, Arc::new(entry));
                             }
@@ -857,7 +859,8 @@ pub(crate) async fn process_response_jump(
                                         pipeline_id: pipeline_id.clone(),
                                         qtype: u16::from(qtype),
                                         inserted_at: Instant::now(),
-                                        original_ttl: ttl_secs_refresh as u32,  // Use max TTL for refresh timing / 使用最大 TTL 作为刷新时机
+                                        original_ttl: ttl_secs_cache as u32,  // Use min TTL for cache expiration / 使用最小 TTL 作为缓存过期
+                                        refresh_ttl: ttl_secs_refresh as u32,  // Use max TTL for refresh timing / 使用最大 TTL 作为刷新时机
                                     };
                                     engine.cache.insert(dedupe_hash, Arc::new(entry));
                                 }

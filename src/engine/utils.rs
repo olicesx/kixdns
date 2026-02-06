@@ -1,6 +1,8 @@
 use std::collections::HashSet;
+use std::str::FromStr;
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
-use hickory_proto::op::{Message, ResponseCode};
+use hickory_proto::op::{Message, ResponseCode, MessageType, OpCode, Query};
+use hickory_proto::rr::{DNSClass, RecordType, Name};
 use bytes::Bytes;
 use crate::matcher::RuntimePipelineConfig;
 use hickory_proto::serialize::binary::{BinEncoder, BinEncodable};
@@ -62,6 +64,37 @@ pub mod engine_helpers {
     #[inline]
     pub fn build_servfail_response(req: &Message) -> anyhow::Result<Bytes> {
         build_response(req, ResponseCode::ServFail, Vec::new())
+    }
+
+    /// 快速构建错误响应（ServFail），避免解析完整请求
+    /// Fast build ServFail response without parsing full request
+    #[inline]
+    pub fn build_servfail_response_fast(
+        tx_id: u16,
+        qname: &str,
+        qtype: u16,
+        qclass: u16,
+        rd: bool,
+    ) -> anyhow::Result<Bytes> {
+        let mut msg = Message::new();
+        msg.set_id(tx_id);
+        msg.set_message_type(MessageType::Response);
+        msg.set_op_code(OpCode::Query);
+        msg.set_response_code(ResponseCode::ServFail);
+        msg.set_recursion_desired(rd);
+        msg.set_recursion_available(true);
+
+        let name = Name::from_str(qname)?;
+        let mut query = Query::new();
+        query.set_name(name);
+        query.set_query_type(RecordType::from(qtype));
+        query.set_query_class(DNSClass::from(qclass));
+        msg.add_query(query);
+
+        let mut buf = Vec::with_capacity(128);
+        let mut encoder = BinEncoder::new(&mut buf);
+        msg.emit(&mut encoder)?;
+        Ok(Bytes::from(buf))
     }
 
     /// 构建拒绝响应（Refused）
