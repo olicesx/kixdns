@@ -427,6 +427,8 @@ async fn run_udp_worker(
     // 使用 BytesMut 避免 Bytes::copy_from_slice 的内存分配 / Use BytesMut to avoid memory allocation in Bytes::copy_from_slice
     use bytes::BytesMut;
     let mut buf = BytesMut::with_capacity(4096);
+    // 复用发送缓冲区：用于缓存命中时 patch TXID，避免每包堆分配 / Reuse send buffer to patch TXID on cache hits, avoiding per-packet heap allocation
+    let mut send_buf = BytesMut::with_capacity(512);
 
     // 自适应流控：每 100 个请求检查一次是否需要调整 permits
     // Adaptive flow control: check if adjustment needed every 100 requests
@@ -467,7 +469,10 @@ async fn run_udp_worker(
                     }
                     Ok(Some(FastPathResponse::CacheHit { cached, tx_id, inserted_at })) => {
                         // 复用 send_buf：copy + patch TXID / Reuse send_buf: copy + patch TXID
-                        let mut send_buf = bytes::BytesMut::with_capacity(cached.len());
+                        send_buf.clear();
+                        if send_buf.capacity() < cached.len() {
+                            send_buf.reserve(cached.len() - send_buf.capacity());
+                        }
                         send_buf.extend_from_slice(&cached);
 
                         // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
@@ -486,67 +491,85 @@ async fn run_udp_worker(
                     Ok(Some(FastPathResponse::AsyncNeeded { qname, qtype, qclass, tx_id, edns_present, pipeline_id })) => {
                         // 缓存未命中，使用预解析的数据避免重复解析
                         // Cache miss, use pre-parsed data to avoid re-parsing
-                        // ✅ 优化：直接同步处理，避免 tokio::spawn 开销
-                        // ✅ Optimization: Process synchronously to avoid tokio::spawn overhead
+                        let permit_mgr = Arc::clone(&engine.permit_manager);
                         let timeout_ms = engine.get_request_timeout_ms();
                         let timeout_dur = Duration::from_millis(timeout_ms);
 
-                        // ✅ 传递预解析数据给 handle_packet_internal，避免重复解析
-                        // ✅ Pass pre-parsed data to handle_packet_internal to avoid re-parsing
-                        match tokio::time::timeout(
-                            timeout_dur,
-                            engine.handle_packet_internal_with_pre_parsed(
-                                &packet_bytes,
-                                peer,
-                                false,
-                                qname,
-                                qtype,
-                                qclass,
-                                tx_id,
-                                edns_present,
-                                pipeline_id,
-                            )
-                        ).await {
-                            Ok(Ok(resp)) => {
-                                let _ = socket.send_to(&resp, peer).await;
-                            }
-                            Ok(Err(e)) => {
-                                debug!(error = %e, "handle_packet error");
-                                send_servfail_response(&socket, &packet_bytes, peer).await;
-                            }
-                            Err(_) => {
-                                warn!(
-                                    timeout_ms,
-                                    upstream_timeout_ms = engine.get_upstream_timeout_ms(),
-                                    "request timeout after hedge and fallback exhausted"
-                                );
-                                send_servfail_response(&socket, &packet_bytes, peer).await;
-                            }
+                        // 非阻塞式 try_acquire，避免在接收循环中 await / Non-blocking try_acquire to avoid await in receive loop
+                        if let Some(permit) = permit_mgr.try_acquire() {
+                            let engine = engine.clone();
+                            let socket = Arc::clone(&socket);
+                            let packet_bytes = packet_bytes.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit; // 自动释放 / Auto-release on drop
+
+                                // ✅ 传递预解析数据给 handle_packet_internal，避免重复解析
+                                // ✅ Pass pre-parsed data to handle_packet_internal to avoid re-parsing
+                                match tokio::time::timeout(
+                                    timeout_dur,
+                                    engine.handle_packet_internal_with_pre_parsed(
+                                        &packet_bytes,
+                                        peer,
+                                        false,
+                                        qname,
+                                        qtype,
+                                        qclass,
+                                        tx_id,
+                                        edns_present,
+                                        pipeline_id,
+                                    )
+                                ).await {
+                                    Ok(Ok(resp)) => {
+                                        let _ = socket.send_to(&resp, peer).await;
+                                    }
+                                    Ok(Err(e)) => {
+                                        debug!(error = %e, "handle_packet error");
+                                        send_servfail_response(&socket, &packet_bytes, peer).await;
+                                    }
+                                    Err(_) => {
+                                        warn!(
+                                            timeout_ms,
+                                            upstream_timeout_ms = engine.get_upstream_timeout_ms(),
+                                            "request timeout after hedge and fallback exhausted"
+                                        );
+                                        send_servfail_response(&socket, &packet_bytes, peer).await;
+                                    }
+                                }
+                            });
                         }
                     }
                     Ok(None) => {
                         // 快速解析失败，回退到完整处理
                         // Fast parse failed, fallback to full processing
-                        // ✅ 优化：直接同步处理，避免 tokio::spawn 开销
-                        // ✅ Optimization: Process synchronously to avoid tokio::spawn overhead
+                        let permit_mgr = Arc::clone(&engine.permit_manager);
                         let timeout_ms = engine.get_request_timeout_ms();
                         let timeout_dur = Duration::from_millis(timeout_ms);
-                        match tokio::time::timeout(timeout_dur, engine.handle_packet(&packet_bytes, peer)).await {
-                            Ok(Ok(resp)) => {
-                                let _ = socket.send_to(&resp, peer).await;
-                            }
-                            Ok(Err(e)) => {
-                                debug!(error = %e, "handle_packet error");
-                                send_servfail_response(&socket, &packet_bytes, peer).await;
-                            }
-                            Err(_) => {
-                                warn!(
-                                    timeout_ms,
-                                    upstream_timeout_ms = engine.get_upstream_timeout_ms(),
-                                    "request timeout"
-                                );
-                                send_servfail_response(&socket, &packet_bytes, peer).await;
-                            }
+
+                        // 非阻塞式 try_acquire，避免在接收循环中 await / Non-blocking try_acquire to avoid await in receive loop
+                        if let Some(permit) = permit_mgr.try_acquire() {
+                            let engine = engine.clone();
+                            let socket = Arc::clone(&socket);
+                            let packet_bytes = packet_bytes.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit; // 自动释放 / Auto-release on drop
+                                match tokio::time::timeout(timeout_dur, engine.handle_packet(&packet_bytes, peer)).await {
+                                    Ok(Ok(resp)) => {
+                                        let _ = socket.send_to(&resp, peer).await;
+                                    }
+                                    Ok(Err(e)) => {
+                                        debug!(error = %e, "handle_packet error");
+                                        send_servfail_response(&socket, &packet_bytes, peer).await;
+                                    }
+                                    Err(_) => {
+                                        warn!(
+                                            timeout_ms,
+                                            upstream_timeout_ms = engine.get_upstream_timeout_ms(),
+                                            "request timeout"
+                                        );
+                                        send_servfail_response(&socket, &packet_bytes, peer).await;
+                                    }
+                                }
+                            });
                         }
                     }
                     Err(_) => {
