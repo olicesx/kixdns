@@ -262,6 +262,9 @@ impl Engine {
 
                     let mut tcp_upstreams: HashSet<String> = HashSet::new();
                     let mut udp_upstreams: HashSet<String> = HashSet::new();
+                    let mut doh_upstreams: HashSet<String> = HashSet::new();
+                    let mut dot_upstreams: HashSet<String> = HashSet::new();
+                    let mut doq_upstreams: HashSet<String> = HashSet::new();
 
                     // 收集并按 transport 分组，同时去重
                     for (upstream_opt, transport_opt, _pre_split) in forward_actions.iter() {
@@ -277,6 +280,15 @@ impl Engine {
                                         tcp_upstreams.insert(addr.to_string());
                                     } else if addr.starts_with("udp://") {
                                         udp_upstreams.insert(addr.to_string());
+                                    } else if addr.starts_with("tcp+udp://") || addr.starts_with("udp+tcp://") {
+                                        tcp_upstreams.insert(addr.to_string());
+                                        udp_upstreams.insert(addr.to_string());
+                                    } else if addr.starts_with("doh://") || addr.starts_with("https://") {
+                                        doh_upstreams.insert(addr.to_string());
+                                    } else if addr.starts_with("dot://") || addr.starts_with("tls://") {
+                                        dot_upstreams.insert(addr.to_string());
+                                    } else if addr.starts_with("doq://") || addr.starts_with("quic://") {
+                                        doq_upstreams.insert(addr.to_string());
                                     }
                                 } else {
                                     // 添加协议前缀
@@ -292,6 +304,15 @@ impl Engine {
                                             tcp_upstreams.insert(format!("tcp://{}", addr));
                                             udp_upstreams.insert(format!("udp://{}", addr));
                                         }
+                                        Transport::Doh => {
+                                            doh_upstreams.insert(format!("doh://{}", addr));
+                                        }
+                                        Transport::Dot => {
+                                            dot_upstreams.insert(format!("dot://{}", addr));
+                                        }
+                                        Transport::Doq => {
+                                            doq_upstreams.insert(format!("doq://{}", addr));
+                                        }
                                     }
                                 }
                             }
@@ -302,6 +323,9 @@ impl Engine {
                     let mut all_upstreams: Vec<std::sync::Arc<str>> = Vec::new();
                     all_upstreams.extend(tcp_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
                     all_upstreams.extend(udp_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
+                    all_upstreams.extend(doh_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
+                    all_upstreams.extend(dot_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
+                    all_upstreams.extend(doq_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
 
                     if all_upstreams.is_empty() {
                         // 所有 upstream 都为空，使用默认
@@ -316,9 +340,15 @@ impl Engine {
                             count = forward_actions.len(),
                             tcp_count = tcp_upstreams.len(),
                             udp_count = udp_upstreams.len(),
+                            doh_count = doh_upstreams.len(),
+                            dot_count = dot_upstreams.len(),
+                            doq_count = doq_upstreams.len(),
                             total_upstreams = all_upstreams.len(),
                             tcp_upstreams = ?tcp_upstreams,
                             udp_upstreams = ?udp_upstreams,
+                            doh_upstreams = ?doh_upstreams,
+                            dot_upstreams = ?dot_upstreams,
+                            doq_upstreams = ?doq_upstreams,
                             "merged multiple forward actions with transport-specific deduplication"
                         );
                     }

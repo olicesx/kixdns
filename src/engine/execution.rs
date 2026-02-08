@@ -321,7 +321,11 @@ impl Engine {
                 // Check if expired / 检查是否已过期
                 let elapsed_secs = hit.inserted_at.elapsed().as_secs() as u32;
                 if elapsed_secs >= hit.original_ttl {
-                    self.cache.invalidate(&cache_hash);
+                    // RFC 8767: When serve_stale is enabled, keep stale entries for fallback
+                    // RFC 8767: 当 serve_stale 启用时，保留过期条目以便 fallback
+                    if !self.serve_stale {
+                        self.cache.invalidate(&cache_hash);
+                    }
                 } else {
                     // Cache background refresh: trigger async refresh when TTL < threshold percentage
                     // 缓存后台刷新：当TTL < 阈值百分比时，触发异步刷新

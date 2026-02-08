@@ -8,6 +8,15 @@ use dashmap::DashMap;
 use dashmap::mapref::entry;
 use rustc_hash::FxBuildHasher;
 use socket2::{Domain, Protocol, Socket, Type, SockRef, TcpKeepalive};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HOST};
+use reqwest::Client as DohHttpClient;
+use rustls::{ClientConfig, RootCertStore};
+use rustls::pki_types::ServerName;
+use quinn::crypto::rustls::QuicClientConfig;
+use tokio_rustls::TlsConnector;
+use webpki_roots::TLS_SERVER_ROOTS;
+use url::Url;
+use quinn::{Endpoint as QuicEndpoint, Connection as QuicConnection, TransportConfig as QuicTransportConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, tcp::{OwnedReadHalf, OwnedWriteHalf}};
 use tokio::sync::{Mutex, oneshot};
@@ -1120,6 +1129,980 @@ impl TcpMuxClient {
         let mut permit_guard = conn_permit.lock().await;
         *permit_guard = None;
     }
+}
+
+// ===================== DoH (DNS over HTTPS) =====================
+
+pub struct DohClient {
+    client: DohHttpClient,
+}
+
+impl DohClient {
+    pub fn new(pool_max_idle_per_host: usize) -> anyhow::Result<Self> {
+        let client = DohHttpClient::builder()
+            .http2_adaptive_window(true)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(pool_max_idle_per_host.max(1))
+            .build()
+            .context("build doh http client")?;
+        Ok(Self { client })
+    }
+
+    pub async fn send(
+        &self,
+        packet: &[u8],
+        upstream: &str,
+        timeout_dur: Duration,
+    ) -> anyhow::Result<Bytes> {
+        let (url, host_override) = build_doh_url(upstream)?;
+
+        let mut req = self.client
+            .post(url)
+            .header(ACCEPT, "application/dns-message")
+            .header(CONTENT_TYPE, "application/dns-message")
+            .body(packet.to_vec());
+
+        if let Some(host) = host_override {
+            req = req.header(HOST, host);
+        }
+
+        // Wrap entire operation (send + read body) in a single timeout
+        // to prevent hanging if server sends headers but delays body.
+        // 将整个操作（发送 + 读取响应体）包裹在单个超时中，
+        // 防止服务器发送头信息但延迟响应体时挂起。
+        let bytes = timeout(timeout_dur, async {
+            let resp = req.send().await.context("doh request send failed")?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(anyhow::anyhow!("doh http status {status}"));
+            }
+
+            resp.bytes().await.context("read doh response body")
+        }).await
+            .context("doh request timeout")??;
+
+        Ok(Bytes::from(bytes))
+    }
+}
+
+fn build_doh_url(upstream: &str) -> anyhow::Result<(Url, Option<String>)> {
+    let url_str = if upstream.starts_with("http://") || upstream.starts_with("https://") {
+        upstream.to_string()
+    } else if upstream.starts_with("doh://") {
+        format!("https://{}", &upstream[6..])
+    } else {
+        format!("https://{}", upstream)
+    };
+
+    let mut url = Url::parse(&url_str).context("invalid doh url")?;
+
+    // Default path for DoH if not provided
+    if url.path().is_empty() || url.path() == "/" {
+        url.set_path("/dns-query");
+    }
+
+    let mut host_override: Option<String> = None;
+    if url.query().is_some() {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        for (k, v) in url.query_pairs() {
+            if k.eq_ignore_ascii_case("host") {
+                if !v.is_empty() {
+                    host_override = Some(v.to_string());
+                }
+            } else {
+                serializer.append_pair(&k, &v);
+            }
+        }
+        let new_query = serializer.finish();
+        if new_query.is_empty() {
+            url.set_query(None);
+        } else {
+            url.set_query(Some(&new_query));
+        }
+    }
+
+    Ok((url, host_override))
+}
+
+// ===================== DoT (DNS over TLS) =====================
+
+type DotTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
+type DotReadHalf = tokio::io::ReadHalf<DotTlsStream>;
+type DotWriteHalf = tokio::io::WriteHalf<DotTlsStream>;
+
+#[derive(Clone)]
+struct DotTarget {
+    connect_addr: Arc<str>,
+    sni: Arc<str>,
+}
+
+pub struct DotMultiplexer {
+    pools: dashmap::DashMap<Arc<str>, Arc<DotConnectionPool>, FxBuildHasher>,
+    pool_size: usize,
+    tls_config: Arc<ClientConfig>,
+    health_error_threshold: usize,
+    max_age_secs: u64,
+    idle_timeout_secs: u64,
+}
+
+pub struct DotConnectionPool {
+    clients: Vec<Arc<DotMuxClient>>,
+    next_idx: AtomicUsize,
+}
+
+pub struct DotMuxClient {
+    pub upstream: Arc<str>,
+    target: Mutex<Option<DotTarget>>,
+    tls_config: Arc<ClientConfig>,
+    conn: Arc<Mutex<Option<DotWriteHalf>>>,
+    pending: Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
+    next_id: AtomicU16,
+    pub permit_manager: Arc<PermitManager>,
+    generation: Arc<AtomicU64>,
+    conn_permit: Arc<Mutex<Option<PermitGuard>>>,
+    consecutive_errors: AtomicUsize,
+    health_threshold: AtomicUsize,
+    conn_create_time: AtomicU64,
+    max_age_ms: AtomicU64,
+    last_request_time: AtomicU64,
+    idle_timeout_ms: AtomicU64,
+    last_health_check_time: AtomicU64,
+}
+
+impl DotMultiplexer {
+    pub fn new(
+        pool_size: usize,
+        health_error_threshold: usize,
+        max_age_secs: u64,
+        idle_timeout_secs: u64,
+    ) -> anyhow::Result<Self> {
+        let tls_config = build_tls_client_config()?;
+        Ok(Self {
+            pools: dashmap::DashMap::with_hasher(FxBuildHasher),
+            pool_size,
+            tls_config: Arc::new(tls_config),
+            health_error_threshold,
+            max_age_secs,
+            idle_timeout_secs,
+        })
+    }
+
+    #[inline]
+    pub async fn send(
+        &self,
+        packet: &[u8],
+        upstream: &str,
+        timeout_dur: Duration,
+    ) -> anyhow::Result<Bytes> {
+        let upstream_key: Arc<str> = Arc::from(upstream);
+        let pool = self
+            .pools
+            .entry(upstream_key.clone())
+            .or_insert_with(|| {
+                let mut clients = Vec::with_capacity(self.pool_size.max(1));
+                let size = if self.pool_size == 0 { 1 } else { self.pool_size };
+                let permit_mgr = Arc::new(PermitManager::new(size));
+                for _ in 0..size {
+                    let client = Arc::new(DotMuxClient::new(
+                        upstream_key.clone(),
+                        Arc::clone(&self.tls_config),
+                        Arc::clone(&permit_mgr),
+                    ));
+                    client.set_health_check_config(
+                        self.health_error_threshold,
+                        self.max_age_secs,
+                        self.idle_timeout_secs,
+                    );
+                    clients.push(client);
+                }
+                Arc::new(DotConnectionPool {
+                    clients,
+                    next_idx: AtomicUsize::new(0),
+                })
+            })
+            .clone();
+
+        let idx = pool.next_idx.fetch_add(1, Ordering::Relaxed) % pool.clients.len();
+        pool.clients[idx].send(packet, timeout_dur).await
+    }
+}
+
+impl DotMuxClient {
+    fn new(upstream: Arc<str>, tls_config: Arc<ClientConfig>, permit_manager: Arc<PermitManager>) -> Self {
+        Self {
+            upstream,
+            target: Mutex::new(None),
+            tls_config,
+            conn: Arc::new(Mutex::new(None)),
+            pending: Arc::new(dashmap::DashMap::with_hasher(FxBuildHasher)),
+            next_id: AtomicU16::new(1),
+            permit_manager,
+            generation: Arc::new(AtomicU64::new(0)),
+            conn_permit: Arc::new(Mutex::new(None)),
+            consecutive_errors: AtomicUsize::new(0),
+            health_threshold: AtomicUsize::new(3),
+            conn_create_time: AtomicU64::new(0),
+            max_age_ms: AtomicU64::new(300_000),
+            last_request_time: AtomicU64::new(0),
+            idle_timeout_ms: AtomicU64::new(60_000),
+            last_health_check_time: AtomicU64::new(0),
+        }
+    }
+
+    fn set_health_check_config(&self, error_threshold: usize, max_age_secs: u64, idle_timeout_secs: u64) {
+        self.health_threshold.store(error_threshold, Ordering::Release);
+        self.max_age_ms.store(max_age_secs * 1000, Ordering::Release);
+        self.idle_timeout_ms.store(idle_timeout_secs * 1000, Ordering::Release);
+    }
+
+    async fn spawn_reader(&self, mut reader: DotReadHalf, my_generation: u64, global_generation: Arc<AtomicU64>) {
+        let pending = Arc::clone(&self.pending);
+        let upstream = self.upstream.clone();
+        let conn = Arc::clone(&self.conn);
+        let conn_permit = Arc::clone(&self.conn_permit);
+
+        tokio::spawn(async move {
+            let mut reusable_buf = BytesMut::with_capacity(4096);
+            loop {
+                if global_generation.load(Ordering::Relaxed) != my_generation {
+                    debug!(target = "dot_mux", upstream = %upstream, gen = my_generation, "DoT reader older generation, exiting");
+                    return;
+                }
+
+                let mut len_buf = [0u8; 2];
+                if let Err(err) = reader.read_exact(&mut len_buf).await {
+                    if global_generation.load(Ordering::Relaxed) == my_generation {
+                        debug!(target = "dot_mux", upstream = %upstream, error = %err, "dot read len failed");
+                        Self::fail_all_async(&pending, anyhow::anyhow!("dot read len failed"), &conn, &conn_permit).await;
+                    }
+                    break;
+                }
+                let resp_len = u16::from_be_bytes(len_buf) as usize;
+                if reusable_buf.capacity() < resp_len {
+                    reusable_buf.reserve(resp_len.max(4096));
+                }
+                reusable_buf.resize(resp_len, 0);
+
+                if let Err(err) = reader.read_exact(&mut reusable_buf[..resp_len]).await {
+                    if global_generation.load(Ordering::Relaxed) == my_generation {
+                        debug!(target = "dot_mux", upstream = %upstream, error = %err, "dot read body failed");
+                        Self::fail_all_async(&pending, anyhow::anyhow!("dot read body failed"), &conn, &conn_permit).await;
+                    }
+                    break;
+                }
+
+                if resp_len < 2 {
+                    continue;
+                }
+                let resp_id = u16::from_be_bytes([reusable_buf[0], reusable_buf[1]]);
+                if let Some((_, p)) = pending.remove(&resp_id) {
+                    let orig = p.original_id;
+                    reusable_buf[0..2].copy_from_slice(&p.original_id.to_be_bytes());
+                    let response = reusable_buf.split_to(resp_len).freeze();
+                    let _ = p.tx.send(Ok(response));
+                    tracing::trace!(
+                        target = "dot_mux",
+                        upstream = %upstream,
+                        resp_id,
+                        original_id = orig,
+                        response_len = resp_len,
+                        "DoT response sent"
+                    );
+                } else {
+                    debug!(target = "dot_mux", upstream = %upstream, resp_id, "dot response with unknown id");
+                }
+            }
+        });
+    }
+
+    async fn record_error(&self) -> bool {
+        let errors = self.consecutive_errors.fetch_add(1, Ordering::Release) + 1;
+        let threshold = self.health_threshold.load(Ordering::Acquire);
+
+        if errors >= threshold {
+            warn!(
+                upstream = %self.upstream,
+                consecutive_errors = errors,
+                threshold = threshold,
+                "DoT connection error threshold exceeded, resetting"
+            );
+            Self::reset_conn(&self.conn, &self.conn_permit).await;
+            self.consecutive_errors.store(0, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn record_success(&self) {
+        self.consecutive_errors.store(0, Ordering::Release);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("SystemTime should be after UNIX_EPOCH")
+            .as_millis() as u64;
+        self.last_request_time.store(now, Ordering::Release);
+    }
+
+    async fn check_connection_health(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("SystemTime should be after UNIX_EPOCH")
+            .as_millis() as u64;
+
+        let create_time = self.conn_create_time.load(Ordering::Acquire);
+        let max_age = self.max_age_ms.load(Ordering::Acquire);
+        if create_time > 0 && max_age > 0 {
+            let age_ms = now.saturating_sub(create_time);
+            if age_ms > max_age {
+                info!(
+                    upstream = %self.upstream,
+                    age_ms = age_ms,
+                    max_age_ms = max_age,
+                    "DoT connection too old, resetting"
+                );
+                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                self.consecutive_errors.store(0, Ordering::Release);
+                return true;
+            }
+        }
+
+        let last_req = self.last_request_time.load(Ordering::Acquire);
+        let idle_timeout = self.idle_timeout_ms.load(Ordering::Acquire);
+        if last_req > 0 && idle_timeout > 0 {
+            let idle_ms = now.saturating_sub(last_req);
+            if idle_ms > idle_timeout {
+                info!(
+                    upstream = %self.upstream,
+                    idle_ms = idle_ms,
+                    idle_timeout_ms = idle_timeout,
+                    "DoT connection idle timeout, resetting"
+                );
+                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                self.consecutive_errors.store(0, Ordering::Release);
+                return true;
+            }
+        }
+
+        false
+    }
+
+    async fn send(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes> {
+        let start = tokio::time::Instant::now();
+        if packet.len() < 2 {
+            anyhow::bail!("dns packet too short for dot");
+        }
+
+        let is_reused = {
+            let guard = self.conn.lock().await;
+            guard.is_some()
+        };
+
+        match self.send_attempt(packet, timeout_dur).await {
+            Ok(res) => Ok(res),
+            Err(err) => {
+                if is_reused {
+                    let elapsed = start.elapsed();
+                    let remaining = if timeout_dur > elapsed {
+                        timeout_dur - elapsed
+                    } else {
+                        Duration::from_millis(0)
+                    };
+                    let retry_timeout = if remaining.as_millis() < 1000 {
+                        Duration::from_millis(1500)
+                    } else {
+                        remaining
+                    };
+                    tracing::warn!(
+                        upstream = %self.upstream,
+                        error = %err,
+                        retry_timeout_ms = retry_timeout.as_millis(),
+                        "DoT reuse failed, retrying with fresh connection"
+                    );
+                    return self.send_attempt(packet, retry_timeout).await;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    async fn send_attempt(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes> {
+        let start = tokio::time::Instant::now();
+
+        const HEALTH_CHECK_INTERVAL_MS: u64 = 30_000;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("SystemTime should be after UNIX_EPOCH")
+            .as_millis() as u64;
+        let last_check = self.last_health_check_time.load(Ordering::Relaxed);
+        if last_check == 0 || now.saturating_sub(last_check) >= HEALTH_CHECK_INTERVAL_MS {
+            self.check_connection_health().await;
+            self.last_health_check_time.store(now, Ordering::Relaxed);
+        }
+
+        self.ensure_connection().await?;
+
+        let is_reused = {
+            let guard = self.conn.lock().await;
+            guard.is_some() && self.last_request_time.load(Ordering::Relaxed) > 0
+        };
+
+        let elapsed = start.elapsed();
+        if elapsed >= timeout_dur {
+            anyhow::bail!("dot timeout before processing");
+        }
+        let remaining = timeout_dur - elapsed;
+
+        let original_id = u16::from_be_bytes([packet[0], packet[1]]);
+        let (tx, rx) = oneshot::channel();
+        let (new_packet, new_id) = self.register_pending(packet, original_id, tx, is_reused).await?;
+
+        let _guard = TcpPendingGuard {
+            pending: self.pending.clone(),
+            id: new_id,
+        };
+
+        let write_res = timeout(remaining, async {
+            let mut out = BytesMut::with_capacity(2 + new_packet.len());
+            out.extend_from_slice(&(new_packet.len() as u16).to_be_bytes());
+            out.extend_from_slice(&new_packet);
+
+            let mut guard = self.conn.lock().await;
+            let writer = guard.as_mut().context("dot write half missing")?;
+            if let Err(e) = writer.write_all(&out).await {
+                return Err(anyhow::anyhow!(e).context("dot write failed"));
+            }
+            Ok::<(), anyhow::Error>(())
+        }).await;
+
+        match write_res {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                self.record_error().await;
+                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                self.consecutive_errors.store(0, Ordering::Release);
+
+                return Err(err).context(format!(
+                    "DoT write/connect failed for upstream {upstream}",
+                    upstream = self.upstream
+                ));
+            }
+            Err(_) => {
+                self.record_error().await;
+                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                self.consecutive_errors.store(0, Ordering::Release);
+
+                return Err(anyhow::anyhow!(
+                    "DoT write/connect timeout for upstream {upstream} (timeout: {timeout_ms}ms)",
+                    upstream = self.upstream,
+                    timeout_ms = remaining.as_millis()
+                ));
+            }
+        }
+
+        let elapsed_after_write = start.elapsed();
+        if elapsed_after_write >= timeout_dur {
+            self.record_error().await;
+            Self::reset_conn(&self.conn, &self.conn_permit).await;
+            self.consecutive_errors.store(0, Ordering::Release);
+
+            return Err(anyhow::anyhow!(
+                "DoT timeout before waiting for response from upstream {upstream} (elapsed: {elapsed_ms}ms, timeout: {timeout_ms}ms)",
+                upstream = self.upstream,
+                elapsed_ms = elapsed_after_write.as_millis(),
+                timeout_ms = timeout_dur.as_millis()
+            ));
+        }
+        let final_remaining = timeout_dur - elapsed_after_write;
+
+        let resp = match timeout(final_remaining, rx).await {
+            Ok(Ok(r)) => {
+                self.record_success();
+                r?
+            }
+            Ok(Err(_canceled)) => {
+                self.record_error().await;
+                return Err(anyhow::anyhow!(
+                    "DoT response canceled for upstream {upstream}",
+                    upstream = self.upstream
+                ));
+            }
+            Err(_) => {
+                self.record_error().await;
+                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                self.consecutive_errors.store(0, Ordering::Release);
+
+                return Err(anyhow::anyhow!(
+                    "DoT response timeout from upstream {upstream} (remaining: {timeout_ms}ms)",
+                    upstream = self.upstream,
+                    timeout_ms = final_remaining.as_millis()
+                ));
+            }
+        };
+        Ok(resp)
+    }
+
+    async fn ensure_connection(&self) -> anyhow::Result<()> {
+        let errors = self.consecutive_errors.load(Ordering::Acquire);
+        let needs_reset = errors > 0;
+
+        if needs_reset {
+            debug!(
+                upstream = %self.upstream,
+                consecutive_errors = errors,
+                "DoT connection has errors, resetting before ensure"
+            );
+            Self::reset_conn(&self.conn, &self.conn_permit).await;
+        }
+
+        let mut guard = self.conn.lock().await;
+        if guard.is_none() {
+            let permit = self.permit_manager.try_acquire()
+                .ok_or_else(|| anyhow::anyhow!("dot connection limit exceeded"))?;
+
+            let target = {
+                let mut guard = self.target.lock().await;
+                if guard.is_none() {
+                    *guard = Some(parse_dot_target(&self.upstream)?);
+                }
+                guard.as_ref().expect("dot target must be initialized").clone()
+            };
+
+            let stream = TcpStream::connect(&*target.connect_addr).await
+                .map_err(|e| anyhow::anyhow!("dot connect failed: {}", e))?;
+
+            let _ = stream.set_nodelay(true);
+            let sock = SockRef::from(&stream);
+            let mut ka = TcpKeepalive::new();
+            ka = ka.with_time(Duration::from_secs(5));
+            ka = ka.with_interval(Duration::from_secs(2));
+            let _ = sock.set_keepalive(true);
+            let _ = sock.set_tcp_keepalive(&ka);
+
+            let tls_connector = TlsConnector::from(self.tls_config.clone());
+            let server_name = build_server_name(&target.sni)?;
+            let tls_stream = tls_connector.connect(server_name, stream).await
+                .context("dot tls handshake failed")?;
+
+            let (read_half, write_half) = tokio::io::split(tls_stream);
+            *guard = Some(write_half);
+
+            let new_gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+            self.spawn_reader(read_half, new_gen, self.generation.clone()).await;
+
+            let mut conn_permit_guard = self.conn_permit.lock().await;
+            *conn_permit_guard = Some(permit);
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("SystemTime should be after UNIX_EPOCH")
+                .as_millis() as u64;
+            self.conn_create_time.store(now, Ordering::Release);
+            self.last_request_time.store(now, Ordering::Release);
+            self.consecutive_errors.store(0, Ordering::Release);
+
+            info!(upstream = %self.upstream, "DoT connection established");
+        }
+
+        Ok(())
+    }
+
+    async fn register_pending(
+        &self,
+        packet: &[u8],
+        original_id: u16,
+        tx: oneshot::Sender<anyhow::Result<Bytes>>,
+        is_reused: bool,
+    ) -> anyhow::Result<(BytesMut, u16)> {
+        if is_reused {
+            let guard = self.conn.lock().await;
+            if guard.is_none() {
+                anyhow::bail!("connection closed before registration");
+            }
+        }
+
+        let mut tries = 0;
+        let new_id = loop {
+            let cand = self.next_id.fetch_add(1, Ordering::Relaxed);
+            tries += 1;
+            if let entry::Entry::Vacant(e) = self.pending.entry(cand) {
+                e.insert(Pending { original_id, tx });
+                break cand;
+            }
+            if tries > u16::MAX as usize {
+                anyhow::bail!("no available dns ids for dot mux");
+            }
+        };
+        let mut buf = BytesMut::with_capacity(packet.len());
+        buf.extend_from_slice(packet);
+        buf[0..2].copy_from_slice(&new_id.to_be_bytes());
+        Ok((buf, new_id))
+    }
+
+    async fn fail_all_async(
+        pending: &Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
+        err: anyhow::Error,
+        conn: &Arc<Mutex<Option<DotWriteHalf>>>,
+        conn_permit: &Arc<Mutex<Option<PermitGuard>>>,
+    ) {
+        let err_msg = err.to_string();
+        let keys: Vec<u16> = pending.iter().map(|item| *item.key()).collect();
+        for key in keys {
+            if let Some((_, p)) = pending.remove(&key) {
+                let _ = p.tx.send(Err(anyhow::anyhow!(err_msg.clone())));
+            }
+        }
+        Self::reset_conn(conn, conn_permit).await;
+    }
+
+    async fn reset_conn(
+        conn: &Arc<Mutex<Option<DotWriteHalf>>>,
+        conn_permit: &Arc<Mutex<Option<PermitGuard>>>,
+    ) {
+        let mut cg = conn.lock().await;
+        *cg = None;
+        let mut permit_guard = conn_permit.lock().await;
+        *permit_guard = None;
+    }
+}
+
+fn build_tls_client_config() -> anyhow::Result<ClientConfig> {
+    let mut root_store = RootCertStore::empty();
+    root_store.extend(TLS_SERVER_ROOTS.iter().cloned());
+    let config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    Ok(config)
+}
+
+fn build_server_name(name: &str) -> anyhow::Result<ServerName<'static>> {
+    if let Ok(ip) = name.parse::<std::net::IpAddr>() {
+        let ip = rustls::pki_types::IpAddr::from(ip);
+        Ok(ServerName::IpAddress(ip))
+    } else {
+        ServerName::try_from(name.to_string())
+            .context("invalid tls server name")
+    }
+}
+
+fn parse_dot_target(upstream: &str) -> anyhow::Result<DotTarget> {
+    let url = if upstream.contains("://") {
+        Url::parse(upstream)
+    } else {
+        Url::parse(&format!("dot://{}", upstream))
+    }
+    .context("invalid dot upstream url")?;
+
+    let host = url.host_str().context("dot upstream missing host")?;
+    let port = url.port().unwrap_or(853);
+
+    if !url.path().is_empty() && url.path() != "/" {
+        anyhow::bail!("dot upstream should not contain path");
+    }
+
+    let mut sni: Option<String> = None;
+    if url.query().is_some() {
+        for (k, v) in url.query_pairs() {
+            if k.eq_ignore_ascii_case("sni") || k.eq_ignore_ascii_case("servername") {
+                if !v.is_empty() {
+                    sni = Some(v.to_string());
+                }
+            }
+        }
+    }
+
+    let connect_addr = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+
+    let sni_value = sni.unwrap_or_else(|| host.to_string());
+
+    Ok(DotTarget {
+        connect_addr: Arc::from(connect_addr.as_str()),
+        sni: Arc::from(sni_value.as_str()),
+    })
+}
+
+// ===================== DoQ (DNS over QUIC) =====================
+
+const MAX_DNS_MESSAGE_SIZE: usize = 65_535;
+
+#[derive(Clone)]
+struct DoqTarget {
+    host: Arc<str>,
+    port: u16,
+    sni: Arc<str>,
+}
+
+struct DoqRuntime {
+    endpoint_v4: QuicEndpoint,
+    endpoint_v6: QuicEndpoint,
+    enable_0rtt: bool,
+}
+
+pub struct DoqConnectionPool {
+    clients: Vec<Arc<DoqMuxClient>>,
+    next_idx: AtomicUsize,
+}
+
+pub struct DoqClient {
+    pools: DashMap<Arc<str>, Arc<DoqConnectionPool>, FxBuildHasher>,
+    pool_size: usize,
+    runtime: Arc<DoqRuntime>,
+}
+
+pub struct DoqMuxClient {
+    upstream: Arc<str>,
+    target: Mutex<Option<DoqTarget>>,
+    connection: Mutex<Option<QuicConnection>>,
+    runtime: Arc<DoqRuntime>,
+}
+
+impl DoqClient {
+    pub fn new(
+        pool_size: usize,
+        idle_timeout_secs: u64,
+        keepalive_interval_ms: u64,
+        enable_0rtt: bool,
+    ) -> anyhow::Result<Self> {
+        let mut root_store = RootCertStore::empty();
+        root_store.extend(TLS_SERVER_ROOTS.iter().cloned());
+        let mut tls = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"doq".to_vec()];
+        tls.enable_early_data = enable_0rtt;
+
+        let quic_crypto = QuicClientConfig::try_from(tls)
+            .context("build quic client config")?;
+        let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
+
+        let mut transport_config = QuicTransportConfig::default();
+        if keepalive_interval_ms > 0 {
+            transport_config.keep_alive_interval(Some(Duration::from_millis(keepalive_interval_ms)));
+        }
+        if idle_timeout_secs > 0 {
+            let idle_timeout = Duration::from_secs(idle_timeout_secs)
+                .try_into()
+                .context("invalid doq idle timeout")?;
+            transport_config.max_idle_timeout(Some(idle_timeout));
+        }
+        client_config.transport_config(Arc::new(transport_config));
+
+        let mut endpoint_v4 = QuicEndpoint::client("0.0.0.0:0".parse()?)?;
+        endpoint_v4.set_default_client_config(client_config.clone());
+
+        let endpoint_v6 = match QuicEndpoint::client("[::]:0".parse()?) {
+            Ok(mut ep) => {
+                ep.set_default_client_config(client_config);
+                ep
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to bind IPv6 QUIC endpoint, falling back to IPv4 only");
+                endpoint_v4.clone()
+            }
+        };
+
+        let runtime = Arc::new(DoqRuntime {
+            endpoint_v4,
+            endpoint_v6,
+            enable_0rtt,
+        });
+
+        Ok(Self {
+            pools: DashMap::with_hasher(FxBuildHasher),
+            pool_size: if pool_size == 0 { 1 } else { pool_size },
+            runtime,
+        })
+    }
+
+    pub async fn send(
+        &self,
+        packet: &[u8],
+        upstream: &str,
+        timeout_dur: Duration,
+    ) -> anyhow::Result<Bytes> {
+        let upstream_key: Arc<str> = Arc::from(upstream);
+        let pool = self
+            .pools
+            .entry(upstream_key.clone())
+            .or_insert_with(|| {
+                let mut clients = Vec::with_capacity(self.pool_size);
+                for _ in 0..self.pool_size {
+                    clients.push(Arc::new(DoqMuxClient::new(
+                        upstream_key.clone(),
+                        Arc::clone(&self.runtime),
+                    )));
+                }
+                Arc::new(DoqConnectionPool {
+                    clients,
+                    next_idx: AtomicUsize::new(0),
+                })
+            })
+            .clone();
+
+        let idx = pool.next_idx.fetch_add(1, Ordering::Relaxed) % pool.clients.len();
+        pool.clients[idx].send(packet, timeout_dur).await
+    }
+}
+
+impl DoqMuxClient {
+    fn new(upstream: Arc<str>, runtime: Arc<DoqRuntime>) -> Self {
+        Self {
+            upstream,
+            target: Mutex::new(None),
+            connection: Mutex::new(None),
+            runtime,
+        }
+    }
+
+    pub async fn send(
+        &self,
+        packet: &[u8],
+        timeout_dur: Duration,
+    ) -> anyhow::Result<Bytes> {
+        let target = {
+            let mut guard = self.target.lock().await;
+            if guard.is_none() {
+                *guard = Some(parse_doq_target(&self.upstream)?);
+            }
+            guard.as_ref().expect("doq target must be initialized").clone()
+        };
+
+        if target.host.is_empty() {
+            anyhow::bail!("invalid doq upstream: {}", self.upstream);
+        }
+
+        let conn = self.get_or_connect(&target, timeout_dur).await?;
+
+        // RFC 9250 §4.2: DNS messages sent over QUIC streams MUST NOT be
+        // prefixed with a 2-octet length field. Each query uses a separate
+        // bidirectional stream; the message boundary is signalled by FIN.
+        // RFC 9250 §4.2: QUIC 流上的 DNS 消息不得使用长度前缀。
+        // 每个查询使用单独的双向流；消息边界由 FIN 信号标识。
+        let resp = timeout(timeout_dur, async {
+            let (mut send, mut recv) = conn.open_bi().await
+                .context("doq open stream failed")?;
+
+            // Send DNS message directly without length prefix (RFC 9250 §4.2)
+            // 直接发送 DNS 消息，不带长度前缀（RFC 9250 §4.2）
+            send.write_all(packet).await.context("doq send body failed")?;
+            let _ = send.finish();
+
+            // Read until stream FIN (no length prefix per RFC 9250)
+            // 读取直到流 FIN（RFC 9250 无长度前缀）
+            let buf = recv.read_to_end(MAX_DNS_MESSAGE_SIZE)
+                .await
+                .context("doq read response failed")?;
+            if buf.is_empty() {
+                anyhow::bail!("doq received empty response");
+            }
+            Ok::<Bytes, anyhow::Error>(Bytes::from(buf))
+        }).await;
+
+        match resp {
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(err)) => {
+                self.reset_connection().await;
+                Err(err)
+            }
+            Err(_) => {
+                self.reset_connection().await;
+                Err(anyhow::anyhow!("doq timeout"))
+            }
+        }
+    }
+
+    async fn get_or_connect(
+        &self,
+        target: &DoqTarget,
+        timeout_dur: Duration,
+    ) -> anyhow::Result<QuicConnection> {
+        {
+            let guard = self.connection.lock().await;
+            if let Some(conn) = guard.as_ref() {
+                return Ok(conn.clone());
+            }
+        }
+
+        let mut guard = self.connection.lock().await;
+        if let Some(conn) = guard.as_ref() {
+            return Ok(conn.clone());
+        }
+
+        let conn = self.connect_new(target, timeout_dur).await?;
+        *guard = Some(conn.clone());
+        Ok(conn)
+    }
+
+    async fn connect_new(&self, target: &DoqTarget, timeout_dur: Duration) -> anyhow::Result<QuicConnection> {
+        let addr_str = format!("{}:{}", target.host, target.port);
+        let mut addrs = tokio::net::lookup_host(&addr_str).await
+            .context("doq resolve failed")?;
+        let addr = addrs.next().context("doq resolve returned no addresses")?;
+
+        let endpoint = if addr.is_ipv6() { &self.runtime.endpoint_v6 } else { &self.runtime.endpoint_v4 };
+        let connecting = endpoint.connect(addr, target.sni.as_ref())
+            .context("doq connect failed")?;
+
+        if self.runtime.enable_0rtt {
+            match connecting.into_0rtt() {
+                Ok((conn, _)) => return Ok(conn),
+                Err(connecting) => {
+                    let connection = timeout(timeout_dur, connecting).await
+                        .context("doq connect timeout")??;
+                    return Ok(connection);
+                }
+            }
+        }
+
+        let connection = timeout(timeout_dur, connecting).await
+            .context("doq connect timeout")??;
+
+        Ok(connection)
+    }
+
+    async fn reset_connection(&self) {
+        let mut guard = self.connection.lock().await;
+        *guard = None;
+    }
+}
+
+fn parse_doq_target(upstream: &str) -> anyhow::Result<DoqTarget> {
+    let url = if upstream.contains("://") {
+        Url::parse(upstream)
+    } else {
+        Url::parse(&format!("doq://{}", upstream))
+    }
+    .context("invalid doq upstream url")?;
+
+    let host = url.host_str().context("doq upstream missing host")?;
+    let port = url.port().unwrap_or(853);
+
+    if !url.path().is_empty() && url.path() != "/" {
+        anyhow::bail!("doq upstream should not contain path");
+    }
+
+    let mut sni: Option<String> = None;
+    if url.query().is_some() {
+        for (k, v) in url.query_pairs() {
+            if k.eq_ignore_ascii_case("sni") || k.eq_ignore_ascii_case("servername") {
+                if !v.is_empty() {
+                    sni = Some(v.to_string());
+                }
+            }
+        }
+    }
+
+    let sni_value = sni.unwrap_or_else(|| host.to_string());
+
+    Ok(DoqTarget {
+        host: Arc::from(host),
+        port,
+        sni: Arc::from(sni_value.as_str()),
+    })
 }
 
 #[cfg(test)]

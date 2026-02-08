@@ -46,6 +46,10 @@ impl std::error::Error for UpstreamFailure {
 /// Examples:
 /// - "tcp://1.1.1.1:53" -> ("1.1.1.1:53", Transport::Tcp)
 /// - "udp://1.1.1.1:53" -> ("1.1.1.1:53", Transport::Udp)
+/// - "dot://1.1.1.1:853" -> ("1.1.1.1:853", Transport::Dot)
+/// - "doq://dns.example.com:853" -> ("dns.example.com:853", Transport::Doq)
+/// - "doh://dns.example.com/dns-query" -> ("dns.example.com/dns-query", Transport::Doh)
+/// - "https://dns.example.com/dns-query" -> ("dns.example.com/dns-query", Transport::Doh)
 /// - "1.1.1.1:53" -> ("1.1.1.1:53", default_transport)
 fn parse_upstream_addr(addr: &str, default_transport: Transport) -> (&str, Transport) {
     if let Some(idx) = addr.find("://") {
@@ -54,6 +58,10 @@ fn parse_upstream_addr(addr: &str, default_transport: Transport) -> (&str, Trans
         let transport = match protocol.to_lowercase().as_str() {
             "tcp" => Transport::Tcp,
             "udp" => Transport::Udp,
+            "tcp+udp" | "udp+tcp" => Transport::TcpUdp,
+            "doh" | "https" => Transport::Doh,
+            "dot" | "tls" => Transport::Dot,
+            "doq" | "quic" => Transport::Doq,
             _ => default_transport,
         };
         (address, transport)
@@ -276,6 +284,18 @@ pub async fn forward_upstream(
                     .map(|(bytes, proto)| (Ok(bytes), proto))
                     .unwrap_or_else(|e| (Err(e), "udp"))
             }
+            Transport::Doh => {
+                let r = engine.doh_client.send(packet, addr, timeout_dur).await;
+                (r, "doh")
+            }
+            Transport::Dot => {
+                let r = engine.dot_mux.send(packet, addr, timeout_dur).await;
+                (r, "dot")
+            }
+            Transport::Doq => {
+                let r = engine.doq_client.send(packet, addr, timeout_dur).await;
+                (r, "doq")
+            }
         };
         let dur = start.elapsed();
 
@@ -335,6 +355,18 @@ pub async fn forward_upstream(
                         Ok((bytes, proto)) => (proto, Ok(bytes)),
                         Err(e) => ("udp", Err(e)),
                     }
+                }
+                Transport::Doh => {
+                    let r = engine.doh_client.send(&packet, &addr_owned, timeout_dur).await;
+                    ("doh", r)
+                }
+                Transport::Dot => {
+                    let r = engine.dot_mux.send(&packet, &addr_owned, timeout_dur).await;
+                    ("dot", r)
+                }
+                Transport::Doq => {
+                    let r = engine.doq_client.send(&packet, &addr_owned, timeout_dur).await;
+                    ("doq", r)
                 }
             };
 

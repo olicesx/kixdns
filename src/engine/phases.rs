@@ -47,7 +47,13 @@ pub fn check_cache(
             
             // Check manual expiration (in case moka hasn't evicted it yet or for strict TTL compliance)
             if elapsed_secs >= hit.original_ttl as u64 {
-                engine.cache.invalidate(&dedupe_hash);
+                // RFC 8767: When serve_stale is enabled, do NOT invalidate expired entries.
+                // Keep them in moka cache for potential stale serving on upstream failure.
+                // RFC 8767: 当 serve_stale 启用时，不删除过期条目。
+                // 保留在 moka 缓存中，以便上游失败时提供过期数据。
+                if !engine.serve_stale {
+                    engine.cache.invalidate(&dedupe_hash);
+                }
                 return None;
             } else {
                 // Cache hit is valid
@@ -126,6 +132,92 @@ pub fn check_cache(
                 );
 
                 return Some(resp_bytes);
+            }
+        }
+    }
+    None
+}
+
+/// RFC 8767: Check if a stale (expired but still in moka) cache entry exists.
+/// Returns the stale response bytes with TTL set to serve_stale_ttl.
+/// RFC 8767: 检查是否存在过期但仍在 moka 中的缓存条目。
+/// 返回 TTL 设置为 serve_stale_ttl 的过期响应字节。
+pub fn check_stale_cache(
+    engine: &Engine,
+    qname_ref: &str,
+    qtype: RecordType,
+    qclass: DNSClass,
+    pipeline_id: &str,
+    dedupe_hash: u64,
+    tx_id: u16,
+    peer: &std::net::SocketAddr,
+) -> Option<Bytes> {
+    if !engine.serve_stale {
+        return None;
+    }
+
+    if let Some(hit) = engine.cache.get(&dedupe_hash) {
+        if hit.qtype == u16::from(qtype)
+            && hit.pipeline_id.as_ref() == pipeline_id
+            && hit.qname.as_ref() == qname_ref
+        {
+            let elapsed_secs = hit.inserted_at.elapsed().as_secs();
+
+            // Only serve stale when TTL has actually expired
+            // 仅当 TTL 已过期时才提供 stale 数据
+            if elapsed_secs >= hit.original_ttl as u64 {
+                // Don't serve SERVFAIL/REFUSED as stale / 不提供 SERVFAIL/REFUSED 作为 stale
+                if hit.rcode == ResponseCode::ServFail || hit.rcode == ResponseCode::Refused {
+                    return None;
+                }
+
+                let stale_ttl = engine.serve_stale_ttl;
+
+                let mut resp_bytes = BytesMut::with_capacity(hit.bytes.len());
+                resp_bytes.extend_from_slice(&hit.bytes);
+
+                // RFC 8767 §4: Patch all TTLs in the stale response to serve_stale_ttl
+                // 将 stale 响应中所有 TTL 设置为 serve_stale_ttl
+                let elapsed = elapsed_secs as u32;
+                // First subtract elapsed, then we'll override to stale_ttl
+                // We need to set TTL = stale_ttl directly. Since original TTL - elapsed would be negative,
+                // use patch to set to 0 first then we just rewrite TTLs directly via set_all_ttls.
+                crate::proto_utils::set_all_ttls(&mut resp_bytes, stale_ttl);
+
+                // Rewrite Transaction ID
+                if resp_bytes.len() >= 2 {
+                    let id_bytes = tx_id.to_be_bytes();
+                    resp_bytes[0] = id_bytes[0];
+                    resp_bytes[1] = id_bytes[1];
+                }
+
+                debug!(
+                    event = "serve_stale",
+                    qname = %qname_ref,
+                    qtype = ?qtype,
+                    rcode = ?hit.rcode,
+                    original_ttl = hit.original_ttl,
+                    elapsed_secs = elapsed,
+                    stale_ttl = stale_ttl,
+                    client_ip = %peer.ip(),
+                    pipeline = %pipeline_id,
+                    "RFC 8767: serving stale cache entry"
+                );
+
+                // Also trigger background refresh to try to get fresh data
+                // 同时触发后台刷新以尝试获取新数据
+                if let Some(upstream_ref) = hit.upstream.as_deref() {
+                    engine.spawn_background_refresh(
+                        dedupe_hash,
+                        pipeline_id,
+                        qname_ref,
+                        qtype,
+                        qclass,
+                        Some(upstream_ref),
+                    );
+                }
+
+                return Some(resp_bytes.freeze());
             }
         }
     }
@@ -521,6 +613,34 @@ pub async fn handle_forward_decision(
                  if e.downcast_ref::<UpstreamFailure>().is_none() {
                      return Err(e);
                  }
+
+                 // RFC 8767: Try to serve stale cache entry before returning SERVFAIL
+                 // RFC 8767: 在返回 SERVFAIL 之前尝试提供过期缓存
+                 if let Some(stale_bytes) = check_stale_cache(
+                     engine,
+                     qname,
+                     qtype,
+                     qclass,
+                     pipeline_id,
+                     dedupe_hash,
+                     tx_id,
+                     peer,
+                 ) {
+                     warn!(
+                         event = "serve_stale_on_upstream_failure",
+                         upstream = %upstream,
+                         qname = %qname,
+                         qtype = ?qtype,
+                         client_ip = %peer.ip(),
+                         pipeline = %pipeline_id,
+                         error = %e,
+                         "RFC 8767: upstream failed, serving stale cache"
+                     );
+                     if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
+                     engine.notify_inflight_waiters(dedupe_hash, &stale_bytes).await;
+                     return Ok(ForwardResult::Success(stale_bytes));
+                 }
+
                  let rcode = ResponseCode::ServFail;
                  warn!(
                     event = "dns_response",

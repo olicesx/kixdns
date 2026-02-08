@@ -35,6 +35,12 @@ maxminddb = "0.24"
 maxminddb-writer = "0.1"
 futures = "0.3"
 parking_lot = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+webpki-roots = "0.26"
+url = "2"
+quinn = { version = "0.11", features = ["runtime-tokio", "rustls"] }
 [dev-dependencies]
 criterion = "0.5"
 

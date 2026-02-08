@@ -114,6 +114,15 @@ pub struct GlobalSettings {
     /// TCP 上游连接池大小。 / TCP upstream connection pool size
     #[serde(default = "default_tcp_pool_size")]
     pub tcp_pool_size: usize,
+    /// DoH 上游连接池大小（每个 upstream 的最大空闲连接数）。 / DoH upstream pool size (max idle per host)
+    #[serde(default = "default_doh_pool_size")]
+    pub doh_pool_size: usize,
+    /// DoT 上游连接池大小。 / DoT upstream connection pool size
+    #[serde(default = "default_dot_pool_size")]
+    pub dot_pool_size: usize,
+    /// DoQ 上游连接池大小。 / DoQ upstream connection pool size
+    #[serde(default = "default_doq_pool_size")]
+    pub doq_pool_size: usize,
     /// TCP 健康检查错误阈值（连续失败多少次后重置连接） / TCP health check error threshold (reset connection after N consecutive failures)
     /// 默认 3 次，0 表示禁用健康检查 / Default 3, 0 means disable health check
     #[serde(default = "default_tcp_health_check_error_threshold")]
@@ -126,6 +135,15 @@ pub struct GlobalSettings {
     /// 0 表示禁用空闲超时检查 / 0 means disable idle timeout check
     #[serde(default = "default_tcp_connection_idle_timeout_seconds")]
     pub tcp_connection_idle_timeout_seconds: u64,
+    /// DoQ 连接空闲超时（秒）。 / DoQ connection idle timeout (seconds)
+    #[serde(default = "default_doq_idle_timeout_seconds")]
+    pub doq_connection_idle_timeout_seconds: u64,
+    /// DoQ keepalive 间隔（毫秒）。0 表示禁用。 / DoQ keepalive interval (ms). 0 disables.
+    #[serde(default = "default_doq_keepalive_interval_ms")]
+    pub doq_keepalive_interval_ms: u64,
+    /// 是否启用 DoQ 0-RTT（默认 true）。 / Enable DoQ 0-RTT (default true)
+    #[serde(default = "default_doq_enable_0rtt")]
+    pub doq_enable_0rtt: bool,
     /// 是否启用自适应流控（默认false，推荐禁用以获得更好的性能和更简单的行为）
     /// Enable adaptive flow control (default false, recommended disabled for better performance and simpler behavior)
     /// 
@@ -148,6 +166,12 @@ pub struct GlobalSettings {
     /// 流控调整间隔（秒，仅在flow_control_enabled=true时有效） / Flow control adjustment interval (seconds, only effective when flow_control_enabled=true)
     #[serde(default = "default_flow_control_adjustment_interval_secs")]
     pub flow_control_adjustment_interval_secs: u64,
+    /// RFC 8767: 上游不可用时返回过期缓存（默认 false）/ RFC 8767: Serve stale cached data when upstream is unavailable (default false)
+    #[serde(default = "default_serve_stale")]
+    pub serve_stale: bool,
+    /// RFC 8767: 过期缓存响应的 TTL（秒，默认 30）/ RFC 8767: TTL for stale responses (seconds, default 30)
+    #[serde(default = "default_serve_stale_ttl")]
+    pub serve_stale_ttl: u32,
     /// 缓存后台刷新是否启用（默认false） / Enable cache background refresh (default false)
     #[serde(default = "default_cache_background_refresh")]
     pub cache_background_refresh: bool,
@@ -190,9 +214,15 @@ impl Default for GlobalSettings {
             response_jump_limit: default_response_jump_limit(),
             udp_pool_size: default_udp_pool_size(),
             tcp_pool_size: default_tcp_pool_size(),
+            doh_pool_size: default_doh_pool_size(),
+            dot_pool_size: default_dot_pool_size(),
+            doq_pool_size: default_doq_pool_size(),
             tcp_health_check_error_threshold: default_tcp_health_check_error_threshold(),
             tcp_connection_max_age_seconds: default_tcp_connection_max_age_seconds(),
             tcp_connection_idle_timeout_seconds: default_tcp_connection_idle_timeout_seconds(),
+            doq_connection_idle_timeout_seconds: default_doq_idle_timeout_seconds(),
+            doq_keepalive_interval_ms: default_doq_keepalive_interval_ms(),
+            doq_enable_0rtt: default_doq_enable_0rtt(),
             flow_control_enabled: default_flow_control_enabled(),
             flow_control_initial_permits: default_flow_control_initial_permits(),
             flow_control_min_permits: default_flow_control_min_permits(),
@@ -202,6 +232,8 @@ impl Default for GlobalSettings {
             cache_capacity: default_cache_capacity(),
             cache_max_ttl: default_cache_max_ttl(),
             dashmap_shards: default_dashmap_shards(),
+            serve_stale: default_serve_stale(),
+            serve_stale_ttl: default_serve_stale_ttl(),
             cache_background_refresh: default_cache_background_refresh(),
             cache_refresh_threshold_percent: default_cache_refresh_threshold_percent(),
             cache_refresh_min_ttl: default_cache_refresh_min_ttl(),
@@ -426,7 +458,8 @@ pub enum Action {
     Allow,
     /// 终止并丢弃（返回 REFUSED）。 / Terminate and drop (return REFUSED)
     Deny,
-    /// 透传上游；upstream为空则使用全局默认；支持逗号分隔或数组格式的多个上游（并发请求取最快结果）；transport缺省udp。 / Forward to upstream; use global default if upstream is empty; supports comma-separated or array format for multiple upstreams (concurrent requests, take fastest result); transport defaults to udp
+    /// 透传上游；upstream为空则使用全局默认；支持逗号分隔或数组格式的多个上游（并发请求取最快结果）；transport缺省udp。
+    /// 支持 udp/tcp/tcp_udp/doh/dot/doq。/ Forward to upstream; use global default if upstream is empty; supports comma-separated or array format for multiple upstreams (concurrent requests, take fastest result); transport defaults to udp; supports udp/tcp/tcp_udp/doh/dot/doq.
     Forward {
         #[serde(deserialize_with = "deserialize_upstream")]
         upstream: Option<String>,
@@ -526,6 +559,15 @@ pub enum Transport {
     /// Send both TCP and UDP concurrently, use first response (hedged request)
     /// 同时发送 TCP 和 UDP，使用第一个响应（对冲请求）
     TcpUdp,
+    /// DNS over HTTPS (DoH)
+    /// DNS over HTTPS（DoH）
+    Doh,
+    /// DNS over TLS (DoT)
+    /// DNS over TLS（DoT）
+    Dot,
+    /// DNS over QUIC (DoQ)
+    /// DNS over QUIC（DoQ）
+    Doq,
 }
 
 #[derive(Debug, Clone, Deserialize, Copy, PartialEq, Eq)]
@@ -641,6 +683,18 @@ fn default_tcp_pool_size() -> usize {
     64
 }
 
+fn default_doh_pool_size() -> usize {
+    8
+}
+
+fn default_dot_pool_size() -> usize {
+    64
+}
+
+fn default_doq_pool_size() -> usize {
+    16
+}
+
 fn default_tcp_health_check_error_threshold() -> usize {
     3 // 连续 3 次失败后重置连接 / Reset connection after 3 consecutive failures
 }
@@ -651,6 +705,18 @@ fn default_tcp_connection_max_age_seconds() -> u64 {
 
 fn default_tcp_connection_idle_timeout_seconds() -> u64 {
     60 // 1 分钟 / 1 minute
+}
+
+fn default_doq_idle_timeout_seconds() -> u64 {
+    60 // 1 分钟 / 1 minute
+}
+
+fn default_doq_keepalive_interval_ms() -> u64 {
+    15_000
+}
+
+fn default_doq_enable_0rtt() -> bool {
+    true
 }
 
 fn default_flow_control_enabled() -> bool {
@@ -675,6 +741,14 @@ fn default_flow_control_latency_threshold_ms() -> u64 {
 
 fn default_flow_control_adjustment_interval_secs() -> u64 {
     5
+}
+
+fn default_serve_stale() -> bool {
+    false
+}
+
+fn default_serve_stale_ttl() -> u32 {
+    30
 }
 
 fn default_cache_background_refresh() -> bool {

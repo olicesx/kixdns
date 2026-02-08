@@ -19,7 +19,7 @@ use super::utils::{extract_geosite_tags_from_config, uses_geoip_matchers};
 use super::concurrency::{PermitManager, FlowControlState};
 use super::types::{EngineInner, InflightMap};
 use super::rules::RuleCacheEntry;
-use super::transport::{UdpClient, TcpMultiplexer};
+use super::transport::{UdpClient, TcpMultiplexer, DohClient, DotMultiplexer, DoqClient};
 
 #[derive(Clone)]
 pub struct Engine {
@@ -27,6 +27,9 @@ pub struct Engine {
     pub(crate) cache: DnsCache,
     pub(crate) udp_client: Arc<UdpClient>,
     pub(crate) tcp_mux: Arc<TcpMultiplexer>,
+    pub(crate) doh_client: Arc<DohClient>,
+    pub(crate) dot_mux: Arc<DotMultiplexer>,
+    pub(crate) doq_client: Arc<DoqClient>,
     pub listener_label: Arc<str>,
     // Rule execution result cache: Hash -> (Key, Decision) / 规则执行结果缓存：哈希 -> (键, 决策)
     // Key is stored to verify collisions / 存储键以验证冲突
@@ -69,6 +72,9 @@ pub struct Engine {
     pub(crate) cache_background_refresh: bool,
     pub(crate) cache_refresh_threshold_percent: u8,
     pub(crate) cache_refresh_min_ttl: u32,
+    // RFC 8767: Serve stale cache on upstream failure / RFC 8767: 上游失败时提供过期缓存
+    pub(crate) serve_stale: bool,
+    pub(crate) serve_stale_ttl: u32,
     // GeoIP manager for geographic IP-based routing / GeoIP 管理器用于基于地理位置的 IP 路由
     pub geoip_manager: Arc<RwLock<GeoIpManager>>,
     // GeoSite manager for domain category-based routing / GeoSite 管理器用于域名分类路由
@@ -101,6 +107,12 @@ impl Engine {
         // Extract flow control settings before moving cfg / 在 move cfg 之前提取流控设置
         let udp_pool_size = cfg.settings.udp_pool_size;
         let tcp_pool_size = cfg.settings.tcp_pool_size;
+        let doh_pool_size = cfg.settings.doh_pool_size;
+        let dot_pool_size = cfg.settings.dot_pool_size;
+        let doq_pool_size = cfg.settings.doq_pool_size;
+        let doq_idle_timeout_secs = cfg.settings.doq_connection_idle_timeout_seconds;
+        let doq_keepalive_interval_ms = cfg.settings.doq_keepalive_interval_ms;
+        let doq_enable_0rtt = cfg.settings.doq_enable_0rtt;
         let flow_control_enabled = cfg.settings.flow_control_enabled;
         let flow_control_initial_permits = cfg.settings.flow_control_initial_permits;
         let flow_control_min_permits = cfg.settings.flow_control_min_permits;
@@ -111,6 +123,8 @@ impl Engine {
         let cache_background_refresh = cfg.settings.cache_background_refresh;
         let cache_refresh_threshold_percent = cfg.settings.cache_refresh_threshold_percent;
         let cache_refresh_min_ttl = cfg.settings.cache_refresh_min_ttl;
+        let serve_stale = cfg.settings.serve_stale;
+        let serve_stale_ttl = cfg.settings.serve_stale_ttl;
 
         // Extract TCP health check settings / 提取 TCP 健康检查配置
         let tcp_health_error_threshold = cfg.settings.tcp_health_check_error_threshold;
@@ -300,6 +314,21 @@ impl Engine {
             tcp_idle_timeout_secs,
         ));
 
+        let dot_mux = Arc::new(DotMultiplexer::new(
+            dot_pool_size,
+            tcp_health_error_threshold,
+            tcp_max_age_secs,
+            tcp_idle_timeout_secs,
+        ).expect("initialize DoT multiplexer"));
+
+        let doh_client = Arc::new(DohClient::new(doh_pool_size).expect("initialize DoH client"));
+        let doq_client = Arc::new(DoqClient::new(
+            doq_pool_size,
+            doq_idle_timeout_secs,
+            doq_keepalive_interval_ms,
+            doq_enable_0rtt,
+        ).expect("initialize DoQ client"));
+
         // Warm up TCP connection pools (create 1 connection per upstream)
         // 预热 TCP 连接池（每个 upstream 创建 1 个连接）
         tcp_mux.warm_up_pools(&tcp_upstreams);
@@ -309,6 +338,9 @@ impl Engine {
             cache,
             udp_client: Arc::new(UdpClient::new(udp_pool_size)),
             tcp_mux,
+            doh_client,
+            dot_mux,
+            doq_client,
             listener_label: Arc::from(listener_label),
             rule_cache,
             metrics_inflight: Arc::new(AtomicUsize::new(0)),
@@ -341,6 +373,9 @@ impl Engine {
             cache_background_refresh,
             cache_refresh_threshold_percent,
             cache_refresh_min_ttl,
+            // RFC 8767: Serve stale cache settings / RFC 8767: 过期缓存设置
+            serve_stale,
+            serve_stale_ttl,
             // GeoIP manager / GeoIP 管理器
             geoip_manager,
             // GeoSite manager / GeoSite 管理器

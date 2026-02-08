@@ -550,23 +550,91 @@ pub fn patch_all_ttls(packet: &mut [u8], decrement: u32) {
         }
 
         // Type(2) Class(2) TTL(4) RDLen(2)
-        let ttl_offset = pos + 4;
-        let old_ttl = u32::from_be_bytes([
-            packet[ttl_offset],
-            packet[ttl_offset + 1],
-            packet[ttl_offset + 2],
-            packet[ttl_offset + 3],
-        ]);
+        let rtype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
 
-        // RFC 1035: Decrement TTL, floor at 0
-        let new_ttl = old_ttl.saturating_sub(decrement);
-        let ttl_bytes = new_ttl.to_be_bytes();
-        packet[ttl_offset..ttl_offset + 4].copy_from_slice(&ttl_bytes);
+        // Skip OPT (type 41) pseudo-records: their TTL field contains EDNS extended
+        // RCODE and flags (including the DO bit), NOT an actual TTL value.
+        // 跳过 OPT（类型 41）伪记录：其 TTL 字段包含 EDNS 扩展 RCODE 和标志（包括 DO 位），不是真正的 TTL。
+        if rtype != 41 {
+            let ttl_offset = pos + 4;
+            let old_ttl = u32::from_be_bytes([
+                packet[ttl_offset],
+                packet[ttl_offset + 1],
+                packet[ttl_offset + 2],
+                packet[ttl_offset + 3],
+            ]);
+
+            // RFC 1035: Decrement TTL, floor at 0
+            let new_ttl = old_ttl.saturating_sub(decrement);
+            let ttl_bytes = new_ttl.to_be_bytes();
+            packet[ttl_offset..ttl_offset + 4].copy_from_slice(&ttl_bytes);
+        }
 
         let rd_len = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
 
         // Ensure the entire record (10 bytes header + RData) fits within remaining packet
         // and handle potential overflow for the next iteration's position
+        let record_total_len = 10usize.saturating_add(rd_len);
+        if pos.saturating_add(record_total_len) > packet_len {
+            return;
+        }
+
+        pos += record_total_len;
+    }
+}
+
+/// Set all record TTLs in a DNS packet to an absolute value.
+/// Used by RFC 8767 stale serving to set TTL to serve_stale_ttl.
+/// 将 DNS 报文中所有记录的 TTL 设为绝对值。
+/// 用于 RFC 8767 stale 服务，将 TTL 设置为 serve_stale_ttl。
+pub fn set_all_ttls(packet: &mut [u8], new_ttl: u32) {
+    if packet.len() < 12 {
+        return;
+    }
+
+    let qd_count = u16::from_be_bytes([packet[4], packet[5]]);
+    let an_count = u16::from_be_bytes([packet[6], packet[7]]);
+    let ns_count = u16::from_be_bytes([packet[8], packet[9]]);
+    let ar_count = u16::from_be_bytes([packet[10], packet[11]]);
+
+    let mut pos = 12;
+    let packet_len = packet.len();
+
+    // 1. Skip Questions
+    for _ in 0..qd_count {
+        if let Some(next) = skip_name(packet, pos) {
+            pos = next + 4;
+        } else {
+            return;
+        }
+    }
+
+    // 2. Set TTL for Answer, Authority, and Additional sections
+    let total_records = an_count as usize + ns_count as usize + ar_count as usize;
+    let ttl_bytes = new_ttl.to_be_bytes();
+    for _ in 0..total_records {
+        if let Some(next) = skip_name(packet, pos) {
+            pos = next;
+        } else {
+            return;
+        }
+
+        if pos + 10 > packet_len {
+            return;
+        }
+
+        // Type(2) Class(2) TTL(4) RDLen(2)
+        let rtype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
+
+        // Skip OPT (type 41) pseudo-records: their TTL field contains EDNS extended
+        // RCODE and flags (including the DO bit), NOT an actual TTL value.
+        // 跳过 OPT（类型 41）伪记录：其 TTL 字段包含 EDNS 扩展 RCODE 和标志（包括 DO 位），不是真正的 TTL。
+        if rtype != 41 {
+            let ttl_offset = pos + 4;
+            packet[ttl_offset..ttl_offset + 4].copy_from_slice(&ttl_bytes);
+        }
+
+        let rd_len = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
         let record_total_len = 10usize.saturating_add(rd_len);
         if pos.saturating_add(record_total_len) > packet_len {
             return;

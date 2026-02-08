@@ -96,6 +96,19 @@
                                 <input type="number" class="form-control" v-model.number="config.settings.tcp_pool_size" placeholder="64">
                             </div>
                             <div class="col-md-3">
+                                <label class="form-label">DoH 连接池大小</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.doh_pool_size" placeholder="8">
+                                <div class="form-text small">每个上游最大空闲连接数（默认 8）</div>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">DoT 连接池大小</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.dot_pool_size" placeholder="64">
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">DoQ 连接池大小</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.doq_pool_size" placeholder="16">
+                            </div>
+                            <div class="col-md-3">
                                 <label class="form-label">TCP 健康检查错误阈值</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.tcp_health_check_error_threshold" placeholder="3">
                                 <div class="form-text small">连续失败多少次后重置连接（0=禁用，默认 3）</div>
@@ -109,6 +122,24 @@
                                 <label class="form-label">TCP 连接空闲超时 (秒)</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.tcp_connection_idle_timeout_seconds" placeholder="60">
                                 <div class="form-text small">无请求超过此时间重置连接（0=禁用，默认 60）</div>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">DoQ 连接空闲超时 (秒)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.doq_connection_idle_timeout_seconds" placeholder="60">
+                                <div class="form-text small">QUIC 连接空闲超时（0=禁用，默认 60）</div>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">DoQ Keepalive (ms)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.doq_keepalive_interval_ms" placeholder="15000">
+                                <div class="form-text small">0=禁用，默认 15000</div>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">启用 DoQ 0-RTT</label>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" v-model="config.settings.doq_enable_0rtt">
+                                    <label class="form-check-label">允许 0-RTT</label>
+                                </div>
+                                <div class="form-text small">可能存在重放风险，默认启用</div>
                             </div>
                             <div class="col-md-6">
                                 <label class="form-label">启用 TCP Fallback</label>
@@ -155,6 +186,24 @@
                                 <label class="form-label">刷新最小 TTL (秒)</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.cache_refresh_min_ttl" placeholder="5" min="0">
                                 <div class="form-text small">防止TTL过短导致无限循环刷新（默认 5）</div>
+                            </div>
+                        </div>
+
+                        <hr>
+                        <h6 class="fw-bold mb-2 text-danger">RFC 8767 过期缓存 (Serve Stale)</h6>
+                        <div class="row g-3">
+                            <div class="col-md-4">
+                                <label class="form-label">启用过期缓存</label>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" v-model="config.settings.serve_stale">
+                                    <label class="form-check-label">启用 RFC 8767 Serve Stale</label>
+                                </div>
+                                <div class="form-text small">上游不可用时返回过期缓存而非 SERVFAIL</div>
+                            </div>
+                            <div class="col-md-4" v-show="config.settings.serve_stale">
+                                <label class="form-label">Stale TTL (秒)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.serve_stale_ttl" placeholder="30" min="1">
+                                <div class="form-text small">过期缓存响应的 TTL（默认 30秒）</div>
                             </div>
                         </div>
 
@@ -448,12 +497,16 @@
 
                 <!-- Forward -->
                 <template v-if="a.type === 'forward'">
-                    <input type="text" class="form-control" v-model="a.upstream" placeholder="8.8.8.8:53 或 tcp://8.8.4.4:53,udp://8.8.4.4:53">
-                    <select class="form-select" style="max-width: 80px;" v-model="a.transport">
+                    <input type="text" class="form-control" v-model="a.upstream" placeholder="8.8.8.8:53 或 tcp://8.8.4.4:53,doh://dns.google/dns-query,dot://1.1.1.1:853,doq://dns.quad9.net:853">
+                    <select class="form-select" style="max-width: 110px;" v-model="a.transport">
                         <option value="udp">UDP</option>
                         <option value="tcp">TCP</option>
+                        <option value="tcp_udp">TCP+UDP</option>
+                        <option value="doh">DoH</option>
+                        <option value="dot">DoT</option>
+                        <option value="doq">DoQ</option>
                     </select>
-                    <div class="form-text small" style="font-size: 11px;">支持协议前缀 (tcp://, udp://) 和逗号分隔的多个上游</div>
+                    <div class="form-text small" style="font-size: 11px;">支持协议前缀 (tcp://, udp://, doh://, dot://, doq://, https://, tls://, quic://) 以及逗号分隔的多个上游</div>
                 </template>
 
                 <!-- Static TXT -->
@@ -699,9 +752,15 @@
                         response_jump_limit: 10,
                         udp_pool_size: 64,
                         tcp_pool_size: 64,
+                        doh_pool_size: 8,
+                        dot_pool_size: 64,
+                        doq_pool_size: 16,
                         tcp_health_check_error_threshold: 3,
                         tcp_connection_max_age_seconds: 300,
                         tcp_connection_idle_timeout_seconds: 60,
+                        doq_connection_idle_timeout_seconds: 60,
+                        doq_keepalive_interval_ms: 15000,
+                        doq_enable_0rtt: true,
                         flow_control_initial_permits: 500,
                         flow_control_min_permits: 100,
                         flow_control_max_permits: 800,
@@ -713,6 +772,8 @@
                         cache_background_refresh: false,
                         cache_refresh_threshold_percent: 10,
                         cache_refresh_min_ttl: 5,
+                        serve_stale: false,
+                        serve_stale_ttl: 30,
                         flow_control_enabled: false,
                         flow_control_initial_permits: 500,
                         flow_control_min_permits: 100,
