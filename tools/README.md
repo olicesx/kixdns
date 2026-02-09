@@ -216,6 +216,25 @@ kixdns --config /path/to/pipeline.json
 4. 上游查询失败（无论 client_timeout 设置）时，返回过期缓存而非 SERVFAIL
 5. `serve_stale_ttl_reset=true` 时，每次返回 stale 数据都会重置过期计时器，确保频繁访问的域名不会因 `serve_stale_expire_ttl` 超时
 
+### 缓存后台刷新 (Background Refresh)
+
+启用后台刷新可以在缓存 TTL 即将过期时自动刷新，减少缓存未命中。
+
+- `cache_background_refresh`：是否启用缓存后台刷新（默认 false）
+- `cache_refresh_threshold_percent`：后台刷新阈值（百分比，默认 10）。当剩余 TTL 低于此百分比时触发后台刷新
+- `cache_refresh_min_ttl`：后台刷新最小 TTL（秒，默认 5）。防止 TTL 过短导致无限循环刷新
+
+**工作原理**：
+- 当剩余 TTL 低于原始 TTL 的指定百分比时触发后台刷新
+- 后台刷新使用 `skip_cache=true` 避免返回过期数据
+- 刷新失败不影响现有缓存条目
+- 防止 TTL 过短导致无限循环刷新
+
+**与 Serve Stale 配合使用**：
+- `cache_background_refresh`：在 TTL 即将过期时主动刷新（预防性）
+- `serve_stale`：在 TTL 已过期或上游失败时返回过期数据（补救性）
+- 两者可以同时启用，提供完整的缓存管理策略
+
 ## 配置示例
 
 ### 示例 1：国内网站分流

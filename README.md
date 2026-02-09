@@ -84,21 +84,36 @@ OPTIONS:
 | bind_udp | string | 0.0.0.0:5353 | UDP 监听地址 |
 | bind_tcp | string | 0.0.0.0:5353 | TCP 监听地址 |
 | cache_capacity | uint | 10000 | 缓存最大条目数 |
+| cache_max_ttl | uint | 86400 | 缓存最大生存时间 (秒) |
 | dashmap_shards | uint | 0 | DashMap 分片数 (0=自动) |
 | default_upstream | string | 1.1.1.1:53 | 默认上游 DNS |
 | upstream_timeout_ms | uint | 2000 | 上游超时 (毫秒) |
 | response_jump_limit | uint | 10 | 响应 Pipeline 跳转上限 |
 | udp_pool_size | uint | 64 | UDP 上游连接池大小 |
 | tcp_pool_size | uint | 64 | TCP 上游连接池大小 |
+| doh_pool_size | uint | 8 | DoH 每个上游最大空闲连接数 |
+| dot_pool_size | uint | 64 | DoT 连接池大小 |
+| doq_pool_size | uint | 16 | DoQ 连接池大小 |
+| doq_connection_idle_timeout_seconds | uint | 60 | DoQ 空闲超时 (秒) |
+| doq_keepalive_interval_ms | uint | 15000 | DoQ keepalive 间隔 (毫秒) |
+| doq_enable_0rtt | bool | true | 启用 DoQ 0-RTT (自动检测并回退) |
 | flow_control_initial_permits | uint | 500 | 流控初始 permits |
 | flow_control_min_permits | uint | 100 | 流控最小 permits |
 | flow_control_max_permits | uint | 800 | 流控最大 permits |
 | flow_control_latency_threshold_ms | uint | 100 | 延迟告急阈值 (毫秒) |
 | flow_control_adjustment_interval_secs | uint | 5 | 流控调整间隔 (秒) |
+| cache_background_refresh | bool | false | 启用缓存后台刷新 |
+| cache_refresh_threshold_percent | uint | 10 | 后台刷新阈值 (剩余 TTL 百分比) |
+| cache_refresh_min_ttl | uint | 5 | 后台刷新最小 TTL (秒) |
+| **serve_stale** | bool | false | 启用 RFC 8767 过期缓存 |
+| **serve_stale_ttl** | uint | 30 | 过期缓存响应的 TTL (秒) |
+| **serve_stale_expire_ttl** | uint | 86400 | 过期缓存最大时间窗口 (秒，0=无限制) |
+| **serve_stale_ttl_reset** | bool | true | 每次返回过期数据时重置过期计时器 |
+| **serve_stale_client_timeout_ms** | uint | 0 | 返回过期数据前尝试上游查询的时间 (毫秒) |
 | **geoip_db_path** | string | null | GeoIP 数据库文件路径（MMDB 格式） |
 | **geoip_cache_capacity** | uint | 10000 | GeoIP 查询结果缓存容量 |
 | **geoip_cache_ttl** | uint | 3600 | GeoIP 查询结果缓存 TTL（秒） |
-| **geosite_data_paths** | array | [] | GeoSite 数据文件路径列表（V2Ray 格式） |
+| **geosite_data_paths** | array | [] | GeoSite 数据文件路径列表（V2Ray 格式) |
 
 ### Pipeline 选择匹配器类型
 
@@ -237,6 +252,143 @@ OPTIONS:
   ]
 }
 ```
+
+## 缓存与过期处理
+
+### RFC 8767 过期缓存 (Serve Stale)
+
+当上游 DNS 服务器不可用时，RFC 8767 允许返回已过期的缓存记录而不是 SERVFAIL，从而提升 DNS 弹性。设置对齐 Unbound 的 Serve Expired 配置。
+
+**配置项**：
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| serve_stale | bool | false | 启用过期缓存 |
+| serve_stale_ttl | uint | 30 | 过期缓存响应的 TTL (秒) |
+| serve_stale_expire_ttl | uint | 86400 | 过期缓存最大时间窗口 (秒，0=无限制) |
+| serve_stale_ttl_reset | bool | true | 每次返回过期数据时重置过期计时器 |
+| serve_stale_client_timeout_ms | uint | 0 | 返回过期数据前尝试上游查询的时间 (毫秒) |
+
+**工作模式**：
+
+1. **乐观模式** (`client_timeout_ms=0`)：
+   - TTL 过期后立即返回过期数据
+   - 同时触发后台异步刷新
+   - 适用于对延迟敏感的场景
+
+2. **等待模式** (`client_timeout_ms>0`)：
+   - TTL 过期后先尝试上游查询 N 毫秒
+   - 如果在超时内获得新鲜数据则返回新鲜数据
+   - 否则返回过期数据
+   - 适用于对数据新鲜度敏感的场景
+
+**示例配置**：
+
+```json
+{
+  "settings": {
+    "serve_stale": true,
+    "serve_stale_ttl": 30,
+    "serve_stale_expire_ttl": 86400,
+    "serve_stale_ttl_reset": true,
+    "serve_stale_client_timeout_ms": 0
+  }
+}
+```
+
+### 缓存后台刷新
+
+启用后台刷新可以在缓存 TTL 即将过期时自动刷新，减少缓存未命中。
+
+**配置项**：
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| cache_background_refresh | bool | false | 启用缓存后台刷新 |
+| cache_refresh_threshold_percent | uint | 10 | 后台刷新阈值 (剩余 TTL 百分比) |
+| cache_refresh_min_ttl | uint | 5 | 后台刷新最小 TTL (秒) |
+
+**工作原理**：
+
+- 当剩余 TTL 低于原始 TTL 的指定百分比时触发后台刷新
+- 后台刷新使用 `skip_cache=true` 避免返回过期数据
+- 刷新失败不影响现有缓存条目
+- 防止 TTL 过短导致无限循环刷新
+
+**示例配置**：
+
+```json
+{
+  "settings": {
+    "cache_background_refresh": true,
+    "cache_refresh_threshold_percent": 10,
+    "cache_refresh_min_ttl": 5
+  }
+}
+```
+
+### DoQ 传输协议
+
+DoQ (DNS-over-QUIC) 是基于 QUIC 协议的 DNS 传输方式，提供更好的性能和安全性。
+
+#### 0-RTT 自动检测
+
+KixDNS 实现了智能的 0-RTT (Zero Round Trip Time) 自动检测机制：
+
+- **默认启用**：`doq_enable_0rtt` 默认为 `true`
+- **自动降级**：当服务器拒绝 0-RTT 连接时，自动禁用并缓存结果
+- **零开销**：使用 `AtomicBool` 实现零分配的缓存机制
+- **配置热加载**：配置重载时保留检测结果（连接池不会重建）
+
+**工作原理**：
+
+1. 首次连接尝试使用 0-RTT 加速
+2. 如果服务器拒绝（返回 0-RTT rejected），自动禁用该上游的 0-RTT
+3. 后续连接自动使用 1-RTT，避免请求丢失
+4. 检测结果缓存在内存中，无需重复检测
+
+**配置选项**：
+
+```json
+{
+  "settings": {
+    "doq_enable_0rtt": true,
+    "doq_pool_size": 8
+  }
+}
+```
+
+**上游级别配置**：
+
+可以通过 URL 查询参数为特定上游配置 0-RTT：
+
+```json
+{
+  "actions": [
+    {
+      "type": "Forward",
+      "upstream": "doq://223.5.5.5:853?0rtt=false"
+    }
+  ]
+}
+```
+
+**支持的查询参数**：
+
+- `0rtt=true` - 强制启用 0-RTT
+- `0rtt=false` - 强制禁用 0-RTT
+- 未指定时使用全局 `doq_enable_0rtt` 设置
+
+**传输协议前缀**：
+
+支持以下协议前缀（可省略 `transport` 字段）：
+
+- `udp://` - UDP
+- `tcp://` - TCP
+- `tcp+udp://` - TCP + UDP
+- `doh://` 或 `https://` - DNS-over-HTTPS
+- `dot://` 或 `tls://` - DNS-over-TLS
+- `doq://` 或 `quic://` - DNS-over-QUIC
 
 ### GeoSite 域名分类路由
 
