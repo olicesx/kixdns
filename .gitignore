@@ -8,7 +8,10 @@ diff_review.txt
 # Local AI coding agent instructions (not for repository)
 .github/copilot-instructions.md
 /docs
+# Exclude most .md files but allow README
 *.md
+!README.md
+!tools/README.md
 # Data files
 /data/
 /meta-rules-dat/
