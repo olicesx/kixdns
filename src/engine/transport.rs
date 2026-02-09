@@ -1863,6 +1863,11 @@ pub struct DoqMuxClient {
     target: Mutex<Option<DoqTarget>>,
     connection: Mutex<Option<QuicConnection>>,
     runtime: Arc<DoqRuntime>,
+    /// Track whether 0-RTT has been rejected by the server for auto-fallback
+    /// 跟踪服务器是否拒绝了 0-RTT，用于自动回退
+    /// Once rejected, 0-RTT will be skipped for subsequent connections
+    /// 一旦被拒绝，后续连接将跳过 0-RTT
+    zero_rtt_rejected: std::sync::atomic::AtomicBool,
 }
 
 impl DoqClient {
@@ -1960,6 +1965,7 @@ impl DoqMuxClient {
             target: Mutex::new(None),
             connection: Mutex::new(None),
             runtime,
+            zero_rtt_rejected: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2014,6 +2020,20 @@ impl DoqMuxClient {
                 Err(err)
             }
             Err(_) => {
+                // Timeout occurred - check if this was a 0-RTT connection
+                // 超时发生 - 检查是否是 0-RTT 连接
+                let was_rejected = self.zero_rtt_rejected.load(std::sync::atomic::Ordering::Relaxed);
+                if !was_rejected {
+                    // Mark 0-RTT as rejected for this upstream (cached until restart)
+                    // 标记此上游的 0-RTT 为被拒绝（缓存直到重启）
+                    self.zero_rtt_rejected.store(true, std::sync::atomic::Ordering::Relaxed);
+                    warn!(
+                        upstream = %self.upstream,
+                        "DoQ 0-RTT timeout detected, automatically disabling 0-RTT for this upstream. \
+                        Future connections will use normal handshake. This status is cached until restart. \
+                        To re-enable 0-RTT, restart the server or use ?0rtt=true in the upstream URL."
+                    );
+                }
                 self.reset_connection().await;
                 Err(anyhow::anyhow!("doq timeout"))
             }
@@ -2058,15 +2078,20 @@ impl DoqMuxClient {
         // 优先级：上游设置 > 全局设置
         let enable_0rtt = target.enable_0rtt.unwrap_or(self.runtime.enable_0rtt);
 
-        if enable_0rtt {
+        // Auto-fallback: if 0-RTT was previously rejected, skip it for this connection
+        // 自动回退：如果 0-RTT 之前被拒绝，跳过本次连接的 0-RTT
+        let was_rejected = self.zero_rtt_rejected.load(std::sync::atomic::Ordering::Relaxed);
+        let should_try_0rtt = enable_0rtt && !was_rejected;
+
+        if should_try_0rtt {
             match connecting.into_0rtt() {
                 Ok((conn, _zero_rtt_accepted)) => {
                     // 0-RTT connection established
                     // Note: Some DoQ servers (e.g., Alibaba DNS) may reject 0-RTT data
-                    // If you see timeouts, try adding ?0rtt=false to the upstream URL
+                    // If you see timeouts, the system will automatically disable 0-RTT for this upstream
                     // 0-RTT 连接已建立
                     // 注意：某些 DoQ 服务器（如阿里 DNS）可能拒绝 0-RTT 数据
-                    // 如果遇到超时，请尝试在上游 URL 中添加 ?0rtt=false
+                    // 如果遇到超时，系统将自动为此上游禁用 0-RTT
                     debug!(
                         upstream = %self.upstream,
                         "DoQ 0-RTT connection established"

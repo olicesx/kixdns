@@ -575,4 +575,30 @@ mod tests {
         assert_eq!(addr, "dns.google/dns-query");
         assert_eq!(transport, Transport::Doh, "URL prefix should override default transport");
     }
+
+    #[test]
+    fn test_doq_url_with_0rtt_parameter() {
+        // Test that DoQ URLs with 0rtt parameter are parsed correctly
+        // 测试带 0rtt 参数的 DoQ URL 是否正确解析
+
+        // DoQ with 0rtt=false
+        let (addr, transport) = parse_upstream_addr("doq://223.5.5.5:853?0rtt=false", Transport::Udp);
+        assert_eq!(addr, "223.5.5.5:853?0rtt=false");
+        assert_eq!(transport, Transport::Doq);
+
+        // DoQ with 0rtt=true
+        let (addr, transport) = parse_upstream_addr("doq://dns.google:853?0rtt=true", Transport::Udp);
+        assert_eq!(addr, "dns.google:853?0rtt=true");
+        assert_eq!(transport, Transport::Doq);
+
+        // DoQ with SNI parameter
+        let (addr, transport) = parse_upstream_addr("doq://dns.example.com:853?sni=dns.example.com", Transport::Udp);
+        assert_eq!(addr, "dns.example.com:853?sni=dns.example.com");
+        assert_eq!(transport, Transport::Doq);
+
+        // DoQ with both 0rtt and SNI
+        let (addr, transport) = parse_upstream_addr("doq://dns.example.com:853?0rtt=false&sni=dns.example.com", Transport::Udp);
+        assert_eq!(addr, "dns.example.com:853?0rtt=false&sni=dns.example.com");
+        assert_eq!(transport, Transport::Doq);
+    }
 }
