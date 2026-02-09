@@ -483,3 +483,96 @@ async fn forward_udp_smart(
     // 如果 TCP fallback 被禁用，若所有 UDP 尝试均失败，可能会到达此处。
     anyhow::bail!("all udp attempts failed and tcp fallback disabled")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_upstream_addr_with_protocol_prefix() {
+        // Test that protocol prefixes are correctly extracted
+        // 测试协议前缀是否正确提取
+
+        // DoQ with prefix
+        let (addr, transport) = parse_upstream_addr("doq://223.5.5.5:853", Transport::Udp);
+        assert_eq!(addr, "223.5.5.5:853");
+        assert_eq!(transport, Transport::Doq);
+
+        // DoH with prefix
+        let (addr, transport) = parse_upstream_addr("doh://dns.google/dns-query", Transport::Udp);
+        assert_eq!(addr, "dns.google/dns-query");
+        assert_eq!(transport, Transport::Doh);
+
+        // HTTPS (alias for DoH)
+        let (addr, transport) = parse_upstream_addr("https://dns.example.com/dns-query", Transport::Udp);
+        assert_eq!(addr, "dns.example.com/dns-query");
+        assert_eq!(transport, Transport::Doh);
+
+        // DoT with prefix
+        let (addr, transport) = parse_upstream_addr("dot://1.1.1.1:853", Transport::Udp);
+        assert_eq!(addr, "1.1.1.1:853");
+        assert_eq!(transport, Transport::Dot);
+
+        // TLS (alias for DoT)
+        let (addr, transport) = parse_upstream_addr("tls://dns.example.com:853", Transport::Udp);
+        assert_eq!(addr, "dns.example.com:853");
+        assert_eq!(transport, Transport::Dot);
+
+        // TCP with prefix
+        let (addr, transport) = parse_upstream_addr("tcp://8.8.8.8:53", Transport::Udp);
+        assert_eq!(addr, "8.8.8.8:53");
+        assert_eq!(transport, Transport::Tcp);
+
+        // UDP with prefix
+        let (addr, transport) = parse_upstream_addr("udp://1.1.1.1:53", Transport::Tcp);
+        assert_eq!(addr, "1.1.1.1:53");
+        assert_eq!(transport, Transport::Udp);
+
+        // TCP+UDP with prefix
+        let (addr, transport) = parse_upstream_addr("tcp+udp://8.8.8.8:53", Transport::Udp);
+        assert_eq!(addr, "8.8.8.8:53");
+        assert_eq!(transport, Transport::TcpUdp);
+
+        // No prefix - use default
+        let (addr, transport) = parse_upstream_addr("8.8.8.8:53", Transport::Udp);
+        assert_eq!(addr, "8.8.8.8:53");
+        assert_eq!(transport, Transport::Udp);
+
+        // No prefix with different default
+        let (addr, transport) = parse_upstream_addr("1.1.1.1:53", Transport::Tcp);
+        assert_eq!(addr, "1.1.1.1:53");
+        assert_eq!(transport, Transport::Tcp);
+
+        // Case insensitive protocol
+        let (addr, transport) = parse_upstream_addr("DOQ://223.5.5.5:853", Transport::Udp);
+        assert_eq!(addr, "223.5.5.5:853");
+        assert_eq!(transport, Transport::Doq);
+
+        // QUIC (alias for DoQ)
+        let (addr, transport) = parse_upstream_addr("quic://dns.example.com:853", Transport::Udp);
+        assert_eq!(addr, "dns.example.com:853");
+        assert_eq!(transport, Transport::Doq);
+    }
+
+    #[test]
+    fn test_transport_field_can_be_omitted_with_url_prefix() {
+        // This test verifies that when upstream URL contains a protocol prefix,
+        // the transport field can be omitted in configuration.
+        // 这个测试验证当 upstream URL 包含协议前缀时，
+        // 配置中可以省略 transport 字段。
+
+        // Simulate: { "upstream": "doq://223.5.5.5:853" } (no transport field)
+        // transport field would be None, which becomes Transport::Udp as default
+        let default_transport = Transport::Udp;
+
+        // parse_upstream_addr should extract DoQ from the URL prefix
+        let (addr, transport) = parse_upstream_addr("doq://223.5.5.5:853", default_transport);
+        assert_eq!(addr, "223.5.5.5:853");
+        assert_eq!(transport, Transport::Doq, "URL prefix should override default transport");
+
+        // Simulate: { "upstream": "doh://dns.google/dns-query" } (no transport field)
+        let (addr, transport) = parse_upstream_addr("doh://dns.google/dns-query", default_transport);
+        assert_eq!(addr, "dns.google/dns-query");
+        assert_eq!(transport, Transport::Doh, "URL prefix should override default transport");
+    }
+}

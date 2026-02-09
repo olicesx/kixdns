@@ -1834,6 +1834,11 @@ struct DoqTarget {
     host: Arc<str>,
     port: u16,
     sni: Arc<str>,
+    /// Enable 0-RTT for this specific upstream (overrides global setting)
+    /// 为此特定上游启用 0-RTT（覆盖全局设置）
+    /// None = use global setting, Some(true) = force enable, Some(false) = force disable
+    /// None = 使用全局设置，Some(true) = 强制启用，Some(false) = 强制禁用
+    enable_0rtt: Option<bool>,
 }
 
 struct DoqRuntime {
@@ -2047,10 +2052,30 @@ impl DoqMuxClient {
         let connecting = endpoint.connect(addr, target.sni.as_ref())
             .context("doq connect failed")?;
 
-        if self.runtime.enable_0rtt {
+        // Determine whether to enable 0-RTT for this specific upstream
+        // 决定是否为此特定上游启用 0-RTT
+        // Priority: target setting > global setting
+        // 优先级：上游设置 > 全局设置
+        let enable_0rtt = target.enable_0rtt.unwrap_or(self.runtime.enable_0rtt);
+
+        if enable_0rtt {
             match connecting.into_0rtt() {
-                Ok((conn, _)) => return Ok(conn),
+                Ok((conn, _zero_rtt_accepted)) => {
+                    // 0-RTT connection established
+                    // Note: Some DoQ servers (e.g., Alibaba DNS) may reject 0-RTT data
+                    // If you see timeouts, try adding ?0rtt=false to the upstream URL
+                    // 0-RTT 连接已建立
+                    // 注意：某些 DoQ 服务器（如阿里 DNS）可能拒绝 0-RTT 数据
+                    // 如果遇到超时，请尝试在上游 URL 中添加 ?0rtt=false
+                    debug!(
+                        upstream = %self.upstream,
+                        "DoQ 0-RTT connection established"
+                    );
+                    return Ok(conn);
+                }
                 Err(connecting) => {
+                    // 0-RTT not available (no previous session), fall back to normal connect
+                    // 0-RTT 不可用（无先前会话），回退到正常连接
                     let connection = timeout(timeout_dur, connecting).await
                         .context("doq connect timeout")??;
                     return Ok(connection);
@@ -2086,12 +2111,24 @@ fn parse_doq_target(upstream: &str) -> anyhow::Result<DoqTarget> {
     }
 
     let mut sni: Option<String> = None;
+    let mut enable_0rtt: Option<bool> = None;
     if url.query().is_some() {
         for (k, v) in url.query_pairs() {
             if k.eq_ignore_ascii_case("sni") || k.eq_ignore_ascii_case("servername") {
                 if !v.is_empty() {
                     sni = Some(v.to_string());
                 }
+            } else if k.eq_ignore_ascii_case("0rtt") || k.eq_ignore_ascii_case("enable_0rtt") {
+                // Parse 0rtt parameter: true/false/1/0
+                // 解析 0rtt 参数：true/false/1/0
+                enable_0rtt = match v.to_lowercase().as_str() {
+                    "true" | "1" | "yes" | "on" => Some(true),
+                    "false" | "0" | "no" | "off" => Some(false),
+                    _ => {
+                        warn!("invalid doq 0rtt value: {}, ignoring", v);
+                        None
+                    }
+                };
             }
         }
     }
@@ -2102,6 +2139,7 @@ fn parse_doq_target(upstream: &str) -> anyhow::Result<DoqTarget> {
         host: Arc::from(host),
         port,
         sni: Arc::from(sni_value.as_str()),
+        enable_0rtt,
     })
 }
 

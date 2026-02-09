@@ -741,7 +741,8 @@ fn default_doq_keepalive_interval_ms() -> u64 {
 }
 
 fn default_doq_enable_0rtt() -> bool {
-    true
+    false  // 默认禁用 0-RTT，部分 DoQ 服务器（如阿里 DNS）拒绝 0-RTT 数据
+    // Disabled by default - some DoQ servers (e.g., Alibaba DNS) reject 0-RTT data
 }
 
 fn default_flow_control_enabled() -> bool {

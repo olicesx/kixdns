@@ -159,8 +159,21 @@ OPTIONS:
 | jump_to_pipeline | pipeline | 跳转到指定 Pipeline |
 | allow | - | 终止匹配，使用默认上游/当前响应 |
 | deny | - | 终止并返回 REFUSED |
-| forward | upstream, transport | 转发到上游 (transport: udp/tcp/tcp_udp/doh/dot/doq) |
+| forward | upstream, transport | 转发到上游 (transport: udp/tcp/tcp_udp/doh/dot/doq，可省略) |
 | continue | - | 继续匹配后续规则 |
+
+**Transport 字段省略规则**：
+
+- 当 `upstream` 包含协议前缀时，`transport` 字段可省略
+- 支持的 URL 前缀：`udp://`、`tcp://`、`doh://`、`https://`、`dot://`、`tls://`、`doq://`、`quic://`
+- 优先级：URL 协议前缀 > `transport` 字段 > 默认值 (udp)
+
+示例：
+```json
+{ "type": "forward", "upstream": "doq://223.5.5.5:853?0rtt=false" }
+{ "type": "forward", "upstream": "doh://dns.google/dns-query" }
+{ "type": "forward", "upstream": "8.8.8.8:53", "transport": "tcp" }
+```
 
 ### 匹配器运算符
 
