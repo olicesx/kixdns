@@ -99,10 +99,18 @@ async fn run_dns_server(
     debug: bool,
     udp_workers_count: usize,
 ) -> anyhow::Result<()> {
-            // Run DNS server
-            init_tracing(debug);
+    // Run DNS server
+    init_tracing(debug);
 
-            let cfg = load_config(&config).context("load initial config")?;
+    // Install default CryptoProvider for rustls
+    // 安装 rustls 的默认 CryptoProvider
+    // This is required for rustls 0.23+ when multiple crypto backends are available
+    // 当有多个加密后端可用时，rustls 0.23+ 需要此调用
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
+    let cfg = load_config(&config).context("load initial config")?;
             let cfg = RuntimePipelineConfig::from_config(cfg).context("compile matchers")?;
             let bind_addr: SocketAddr = cfg.settings.bind_udp.parse().context("parse bind addr")?;
             let bind_tcp: SocketAddr = cfg

@@ -643,6 +643,78 @@ impl Engine {
             }
         }
 
+        // RFC 8767 Client Timeout: When serve_stale is enabled with client_timeout > 0,
+        // try upstream for client_timeout_ms before falling back to stale data.
+        // RFC 8767 客户端超时：当 serve_stale 启用且 client_timeout > 0 时，
+        // 先尝试上游查询 client_timeout_ms 毫秒，超时后返回过期数据。
+        // Corresponds to Unbound serve-expired-client-timeout
+        //
+        // Design: check_cache() already triggers spawn_background_refresh() for expired entries
+        // when client_timeout > 0. Here we poll the cache with 5ms intervals to detect
+        // when the background refresh completes. If client_timeout expires, serve stale.
+        // 设计：check_cache() 在 client_timeout > 0 且缓存过期时已触发 spawn_background_refresh。
+        // 这里以 5ms 间隔轮询缓存，检测后台刷新是否完成。超时则返回过期数据。
+        if !skip_cache && self.serve_stale && self.serve_stale_client_timeout_ms > 0 {
+            let has_stale = self.cache.get(&dedupe_hash)
+                .filter(|h| {
+                    h.qtype == u16::from(qtype)
+                    && h.pipeline_id.as_ref() == pipeline_id.as_ref()
+                    && h.qname.as_ref() == qname_ref
+                    && h.inserted_at.elapsed().as_secs() >= h.original_ttl as u64
+                    && h.rcode != ResponseCode::ServFail
+                    && h.rcode != ResponseCode::Refused
+                })
+                .is_some();
+
+            if has_stale {
+                let client_timeout = std::time::Duration::from_millis(self.serve_stale_client_timeout_ms);
+                let poll_interval = std::time::Duration::from_millis(5);
+                let wait_start = Instant::now();
+
+                // Poll cache for fresh data from background refresh
+                // 轮询缓存等待后台刷新带来的新鲜数据
+                while wait_start.elapsed() < client_timeout {
+                    tokio::time::sleep(poll_interval).await;
+                    // Check if background refresh put fresh data in cache
+                    if let Some(fresh_hit) = self.cache.get(&dedupe_hash) {
+                        if fresh_hit.inserted_at.elapsed().as_secs() < fresh_hit.original_ttl as u64 {
+                            // Fresh data available! Serve it.
+                            if let Some(fresh_bytes) = phases::check_cache(
+                                self, qname_ref, qtype, qclass, &pipeline_id,
+                                dedupe_hash, tx_id, start, &peer,
+                            ) {
+                                tracing::debug!(
+                                    event = "serve_fresh_after_client_wait",
+                                    qname = %qname_ref,
+                                    wait_ms = wait_start.elapsed().as_millis() as u64,
+                                    "background refresh completed within client_timeout"
+                                );
+                                return Ok(fresh_bytes);
+                            }
+                        }
+                    }
+                }
+
+                // Client timeout expired - serve stale response
+                // 客户端超时 - 返回过期缓存响应
+                if let Some(stale_bytes) = phases::check_stale_cache(
+                    self, qname_ref, qtype, qclass, &pipeline_id, dedupe_hash, tx_id, &peer,
+                ) {
+                    tracing::debug!(
+                        event = "serve_stale_on_client_timeout",
+                        qname = %qname_ref,
+                        qtype = ?qtype,
+                        timeout_ms = self.serve_stale_client_timeout_ms,
+                        client_ip = %peer.ip(),
+                        pipeline = %pipeline_id,
+                        "RFC 8767: client timeout expired, serving stale"
+                    );
+                    return Ok(stale_bytes);
+                }
+                // Stale entry evicted by moka - fall through to normal processing
+            }
+        }
+
         // 优化：保持 Cow<str> 以延迟分配，避免不必要的 String 分配
         // Optimization: Keep Cow<str> to defer allocation, avoid unnecessary String allocation
         // 大部分情况下 qname_cow 是 Borrowed（零拷贝），只有快速解析失败时才是 Owned

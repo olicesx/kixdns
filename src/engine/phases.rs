@@ -47,14 +47,119 @@ pub fn check_cache(
             
             // Check manual expiration (in case moka hasn't evicted it yet or for strict TTL compliance)
             if elapsed_secs >= hit.original_ttl as u64 {
-                // RFC 8767: When serve_stale is enabled, do NOT invalidate expired entries.
-                // Keep them in moka cache for potential stale serving on upstream failure.
-                // RFC 8767: 当 serve_stale 启用时，不删除过期条目。
-                // 保留在 moka 缓存中，以便上游失败时提供过期数据。
+                // serve_stale disabled → invalidate and miss
                 if !engine.serve_stale {
                     engine.cache.invalidate(&dedupe_hash);
+                    return None;
                 }
-                return None;
+                // Don't serve SERVFAIL/REFUSED as stale
+                if hit.rcode == ResponseCode::ServFail || hit.rcode == ResponseCode::Refused {
+                    engine.cache.invalidate(&dedupe_hash);
+                    return None;
+                }
+                
+                // Check serve_stale_expire_ttl: how long past original TTL has this been stale?
+                // 检查 serve_stale_expire_ttl：此条目已过期多长时间？
+                let stale_age = elapsed_secs - hit.original_ttl as u64;
+                if engine.serve_stale_expire_ttl > 0 && stale_age > engine.serve_stale_expire_ttl {
+                    // Stale entry has exceeded the maximum stale window
+                    // 过期条目已超过最大过期窗口
+                    engine.cache.invalidate(&dedupe_hash);
+                    debug!(
+                        event = "serve_stale_expired",
+                        qname = %qname_ref,
+                        qtype = ?qtype,
+                        stale_age = stale_age,
+                        serve_stale_expire_ttl = engine.serve_stale_expire_ttl,
+                        "stale entry exceeded serve_stale_expire_ttl, invalidating"
+                    );
+                    return None;
+                }
+                
+                // serve_stale_client_timeout_ms > 0: don't serve stale here, let the caller
+                // try upstream first with a short timeout (handled in handle_packet_internal).
+                // serve_stale_client_timeout_ms > 0: 不在此处返回 stale，
+                // 让调用者先尝试上游查询（在 handle_packet_internal 中处理）。
+                if engine.serve_stale_client_timeout_ms > 0 {
+                    // Don't invalidate - we still need the stale entry for the client_timeout path.
+                    // Spawn background refresh proactively.
+                    if let Some(upstream_ref) = hit.upstream.as_deref() {
+                        engine.spawn_background_refresh(
+                            dedupe_hash,
+                            pipeline_id,
+                            qname_ref,
+                            qtype,
+                            qclass,
+                            Some(upstream_ref),
+                        );
+                    }
+                    return None;
+                }
+
+                // serve_stale_client_timeout_ms == 0: Serve stale immediately (optimistic mode)
+                // RFC 8767: 立即返回 stale 数据 + 后台刷新
+                let stale_ttl = engine.serve_stale_ttl;
+                let mut resp_bytes = BytesMut::with_capacity(hit.bytes.len());
+                resp_bytes.extend_from_slice(&hit.bytes);
+                
+                // Set all TTLs to serve_stale_ttl
+                crate::proto_utils::set_all_ttls(&mut resp_bytes, stale_ttl);
+                
+                // Rewrite Transaction ID
+                if resp_bytes.len() >= 2 {
+                    let id_bytes = tx_id.to_be_bytes();
+                    resp_bytes[0] = id_bytes[0];
+                    resp_bytes[1] = id_bytes[1];
+                }
+                
+                // serve_stale_ttl_reset: reset stale expiry timer by re-inserting with shifted inserted_at
+                // 重置过期计时器：通过重新插入条目并将 inserted_at 设置为"刚过期"的时间点
+                if engine.serve_stale_ttl_reset {
+                    let new_entry = crate::cache::CacheEntry {
+                        bytes: hit.bytes.clone(),
+                        rcode: hit.rcode,
+                        source: hit.source.clone(),
+                        upstream: hit.upstream.clone(),
+                        qname: hit.qname.clone(),
+                        pipeline_id: hit.pipeline_id.clone(),
+                        qtype: hit.qtype,
+                        // Reset inserted_at so that stale_age starts from 0 again
+                        // 重置 inserted_at 使 stale_age 从 0 重新开始
+                        inserted_at: Instant::now() - Duration::from_secs(hit.original_ttl as u64),
+                        original_ttl: hit.original_ttl,
+                        refresh_ttl: hit.refresh_ttl,
+                    };
+                    engine.cache.insert(dedupe_hash, std::sync::Arc::new(new_entry));
+                }
+
+                // Trigger background refresh to get fresh data
+                if let Some(upstream_ref) = hit.upstream.as_deref() {
+                    engine.spawn_background_refresh(
+                        dedupe_hash,
+                        pipeline_id,
+                        qname_ref,
+                        qtype,
+                        qclass,
+                        Some(upstream_ref),
+                    );
+                }
+                
+                debug!(
+                    event = "serve_stale_on_ttl_expiry",
+                    qname = %qname_ref,
+                    qtype = ?qtype,
+                    rcode = ?hit.rcode,
+                    original_ttl = hit.original_ttl,
+                    elapsed_secs = elapsed_secs,
+                    stale_ttl = stale_ttl,
+                    stale_age = stale_age,
+                    ttl_reset = engine.serve_stale_ttl_reset,
+                    client_ip = %peer.ip(),
+                    pipeline = %pipeline_id,
+                    "RFC 8767: serving stale cache entry on TTL expiry"
+                );
+                
+                return Some(resp_bytes.freeze());
             } else {
                 // Cache hit is valid
                 let latency = start.elapsed();
@@ -171,17 +276,19 @@ pub fn check_stale_cache(
                     return None;
                 }
 
+                // Check serve_stale_expire_ttl: max stale age window
+                // 检查 serve_stale_expire_ttl：过期数据的最大可用窗口
+                let stale_age = elapsed_secs - hit.original_ttl as u64;
+                if engine.serve_stale_expire_ttl > 0 && stale_age > engine.serve_stale_expire_ttl {
+                    return None;
+                }
+
                 let stale_ttl = engine.serve_stale_ttl;
 
                 let mut resp_bytes = BytesMut::with_capacity(hit.bytes.len());
                 resp_bytes.extend_from_slice(&hit.bytes);
 
-                // RFC 8767 §4: Patch all TTLs in the stale response to serve_stale_ttl
-                // 将 stale 响应中所有 TTL 设置为 serve_stale_ttl
-                let elapsed = elapsed_secs as u32;
-                // First subtract elapsed, then we'll override to stale_ttl
-                // We need to set TTL = stale_ttl directly. Since original TTL - elapsed would be negative,
-                // use patch to set to 0 first then we just rewrite TTLs directly via set_all_ttls.
+                // RFC 8767 §4: Set all TTLs to serve_stale_ttl
                 crate::proto_utils::set_all_ttls(&mut resp_bytes, stale_ttl);
 
                 // Rewrite Transaction ID
@@ -191,17 +298,36 @@ pub fn check_stale_cache(
                     resp_bytes[1] = id_bytes[1];
                 }
 
+                // serve_stale_ttl_reset: reset stale expiry timer
+                // 重置过期计时器
+                if engine.serve_stale_ttl_reset {
+                    let new_entry = crate::cache::CacheEntry {
+                        bytes: hit.bytes.clone(),
+                        rcode: hit.rcode,
+                        source: hit.source.clone(),
+                        upstream: hit.upstream.clone(),
+                        qname: hit.qname.clone(),
+                        pipeline_id: hit.pipeline_id.clone(),
+                        qtype: hit.qtype,
+                        inserted_at: Instant::now() - Duration::from_secs(hit.original_ttl as u64),
+                        original_ttl: hit.original_ttl,
+                        refresh_ttl: hit.refresh_ttl,
+                    };
+                    engine.cache.insert(dedupe_hash, std::sync::Arc::new(new_entry));
+                }
+
                 debug!(
                     event = "serve_stale",
                     qname = %qname_ref,
                     qtype = ?qtype,
                     rcode = ?hit.rcode,
                     original_ttl = hit.original_ttl,
-                    elapsed_secs = elapsed,
+                    elapsed_secs = elapsed_secs,
+                    stale_age = stale_age,
                     stale_ttl = stale_ttl,
                     client_ip = %peer.ip(),
                     pipeline = %pipeline_id,
-                    "RFC 8767: serving stale cache entry"
+                    "RFC 8767: serving stale cache entry on upstream failure"
                 );
 
                 // Also trigger background refresh to try to get fresh data

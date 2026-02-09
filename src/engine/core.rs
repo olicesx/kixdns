@@ -75,6 +75,9 @@ pub struct Engine {
     // RFC 8767: Serve stale cache on upstream failure / RFC 8767: 上游失败时提供过期缓存
     pub(crate) serve_stale: bool,
     pub(crate) serve_stale_ttl: u32,
+    pub(crate) serve_stale_expire_ttl: u64,
+    pub(crate) serve_stale_ttl_reset: bool,
+    pub(crate) serve_stale_client_timeout_ms: u64,
     // GeoIP manager for geographic IP-based routing / GeoIP 管理器用于基于地理位置的 IP 路由
     pub geoip_manager: Arc<RwLock<GeoIpManager>>,
     // GeoSite manager for domain category-based routing / GeoSite 管理器用于域名分类路由
@@ -125,6 +128,9 @@ impl Engine {
         let cache_refresh_min_ttl = cfg.settings.cache_refresh_min_ttl;
         let serve_stale = cfg.settings.serve_stale;
         let serve_stale_ttl = cfg.settings.serve_stale_ttl;
+        let serve_stale_expire_ttl = cfg.settings.serve_stale_expire_ttl;
+        let serve_stale_ttl_reset = cfg.settings.serve_stale_ttl_reset;
+        let serve_stale_client_timeout_ms = cfg.settings.serve_stale_client_timeout_ms;
 
         // Extract TCP health check settings / 提取 TCP 健康检查配置
         let tcp_health_error_threshold = cfg.settings.tcp_health_check_error_threshold;
@@ -376,6 +382,9 @@ impl Engine {
             // RFC 8767: Serve stale cache settings / RFC 8767: 过期缓存设置
             serve_stale,
             serve_stale_ttl,
+            serve_stale_expire_ttl,
+            serve_stale_ttl_reset,
+            serve_stale_client_timeout_ms,
             // GeoIP manager / GeoIP 管理器
             geoip_manager,
             // GeoSite manager / GeoSite 管理器

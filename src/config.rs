@@ -170,8 +170,30 @@ pub struct GlobalSettings {
     #[serde(default = "default_serve_stale")]
     pub serve_stale: bool,
     /// RFC 8767: 过期缓存响应的 TTL（秒，默认 30）/ RFC 8767: TTL for stale responses (seconds, default 30)
+    /// 对应 Unbound serve-expired-reply-ttl / Corresponds to Unbound serve-expired-reply-ttl
     #[serde(default = "default_serve_stale_ttl")]
     pub serve_stale_ttl: u32,
+    /// RFC 8767: 过期缓存可被服务的最大时间窗口（秒，默认 86400）
+    /// 当缓存过期超过此时间后不再返回 stale 数据。0 表示无限制。
+    /// RFC 8767: Maximum time window for serving stale cache (seconds, default 86400)
+    /// Don't serve stale data after the entry has been expired for longer than this. 0 means no limit.
+    /// 对应 Unbound serve-expired-ttl / Corresponds to Unbound serve-expired-ttl
+    #[serde(default = "default_serve_stale_expire_ttl")]
+    pub serve_stale_expire_ttl: u64,
+    /// RFC 8767: 提供过期缓存后重置过期计时器（默认 true）
+    /// 启用后，每次返回 stale 数据时重置过期时间窗口，确保频繁访问的域名不会因 serve_stale_expire_ttl 超时。
+    /// RFC 8767: Reset the stale expiry timer after serving stale (default true)
+    /// When enabled, resets the stale age counter each time stale data is served.
+    /// 对应 Unbound serve-expired-ttl-reset / Corresponds to Unbound serve-expired-ttl-reset
+    #[serde(default = "default_serve_stale_ttl_reset")]
+    pub serve_stale_ttl_reset: bool,
+    /// RFC 8767: 返回过期缓存前尝试上游查询的超时（毫秒，默认 0）
+    /// 0 = 立即返回过期缓存（乐观模式）。 > 0 = 先尝试上游查询，超时后返回过期缓存。
+    /// RFC 8767: Client timeout before serving stale (ms, default 0)
+    /// 0 = serve stale immediately (optimistic mode). > 0 = try upstream first, serve stale on timeout.
+    /// 对应 Unbound serve-expired-client-timeout / Corresponds to Unbound serve-expired-client-timeout
+    #[serde(default = "default_serve_stale_client_timeout_ms")]
+    pub serve_stale_client_timeout_ms: u64,
     /// 缓存后台刷新是否启用（默认false） / Enable cache background refresh (default false)
     #[serde(default = "default_cache_background_refresh")]
     pub cache_background_refresh: bool,
@@ -234,6 +256,9 @@ impl Default for GlobalSettings {
             dashmap_shards: default_dashmap_shards(),
             serve_stale: default_serve_stale(),
             serve_stale_ttl: default_serve_stale_ttl(),
+            serve_stale_expire_ttl: default_serve_stale_expire_ttl(),
+            serve_stale_ttl_reset: default_serve_stale_ttl_reset(),
+            serve_stale_client_timeout_ms: default_serve_stale_client_timeout_ms(),
             cache_background_refresh: default_cache_background_refresh(),
             cache_refresh_threshold_percent: default_cache_refresh_threshold_percent(),
             cache_refresh_min_ttl: default_cache_refresh_min_ttl(),
@@ -749,6 +774,18 @@ fn default_serve_stale() -> bool {
 
 fn default_serve_stale_ttl() -> u32 {
     30
+}
+
+fn default_serve_stale_expire_ttl() -> u64 {
+    86400
+}
+
+fn default_serve_stale_ttl_reset() -> bool {
+    true
+}
+
+fn default_serve_stale_client_timeout_ms() -> u64 {
+    0
 }
 
 fn default_cache_background_refresh() -> bool {

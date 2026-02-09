@@ -193,7 +193,7 @@
                         <h6 class="fw-bold mb-2 text-danger">RFC 8767 过期缓存 (Serve Stale)</h6>
                         <div class="row g-3">
                             <div class="col-md-4">
-                                <label class="form-label">启用过期缓存</label>
+                                <label class="form-label">服务过期响应</label>
                                 <div class="form-check form-switch">
                                     <input class="form-check-input" type="checkbox" v-model="config.settings.serve_stale">
                                     <label class="form-check-label">启用 RFC 8767 Serve Stale</label>
@@ -201,9 +201,29 @@
                                 <div class="form-text small">上游不可用时返回过期缓存而非 SERVFAIL</div>
                             </div>
                             <div class="col-md-4" v-show="config.settings.serve_stale">
-                                <label class="form-label">Stale TTL (秒)</label>
+                                <label class="form-label">过期记录回复TTL值 (秒)</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.serve_stale_ttl" placeholder="30" min="1">
-                                <div class="form-text small">过期缓存响应的 TTL（默认 30秒）</div>
+                                <div class="form-text small">返回过期数据时使用的 TTL（对应 Unbound serve-expired-reply-ttl，默认 30秒）</div>
+                            </div>
+                            <div class="col-md-4" v-show="config.settings.serve_stale">
+                                <label class="form-label">过期响应的 TTL (秒)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.serve_stale_expire_ttl" placeholder="86400" min="0">
+                                <div class="form-text small">缓存过期后可服务的最大时间窗口，0=无限制（对应 Unbound serve-expired-ttl，默认 86400秒）</div>
+                            </div>
+                        </div>
+                        <div class="row g-3 mt-1" v-show="config.settings.serve_stale">
+                            <div class="col-md-4">
+                                <label class="form-label">重置过期记录 TTL</label>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" v-model="config.settings.serve_stale_ttl_reset">
+                                    <label class="form-check-label">启用 TTL 重置</label>
+                                </div>
+                                <div class="form-text small">每次返回过期数据时重置过期时间窗口（对应 Unbound serve-expired-ttl-reset）</div>
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label">客户端响应超时 (ms)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.serve_stale_client_timeout_ms" placeholder="0" min="0">
+                                <div class="form-text small">0=立即返回过期数据，>0=先尝试上游查询此时间后再返回过期数据（对应 Unbound serve-expired-client-timeout，默认 0）</div>
                             </div>
                         </div>
 
@@ -774,6 +794,9 @@
                         cache_refresh_min_ttl: 5,
                         serve_stale: false,
                         serve_stale_ttl: 30,
+                        serve_stale_expire_ttl: 86400,
+                        serve_stale_ttl_reset: true,
+                        serve_stale_client_timeout_ms: 0,
                         flow_control_enabled: false,
                         flow_control_initial_permits: 500,
                         flow_control_min_permits: 100,
