@@ -1890,6 +1890,18 @@ impl DoqClient {
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
 
         let mut transport_config = QuicTransportConfig::default();
+        
+        // Set initial RTT to 100ms (idoq best practice)
+        // This helps QUIC estimate initial round-trip time for better congestion control
+        // 设置初始 RTT 为 100ms（idoq 最佳实践）
+        // 这有助于 QUIC 估算初始往返时间，以实现更好的拥塞控制
+        transport_config.initial_rtt(Duration::from_millis(100));
+        
+        // Set max concurrent streams (idoq best practice)
+        // 设置最大并发流数（idoq 最佳实践）
+        transport_config.max_concurrent_bidi_streams(100u32.into());
+        transport_config.max_concurrent_uni_streams(100u32.into());
+        
         if keepalive_interval_ms > 0 {
             transport_config.keep_alive_interval(Some(Duration::from_millis(keepalive_interval_ms)));
         }
@@ -1988,29 +2000,69 @@ impl DoqMuxClient {
 
         let conn = self.get_or_connect(&target, timeout_dur).await?;
 
-        // RFC 9250 §4.2: DNS messages sent over QUIC streams MUST NOT be
-        // prefixed with a 2-octet length field. Each query uses a separate
-        // bidirectional stream; the message boundary is signalled by FIN.
-        // RFC 9250 §4.2: QUIC 流上的 DNS 消息不得使用长度前缀。
-        // 每个查询使用单独的双向流；消息边界由 FIN 信号标识。
+        // RFC 9250 §4.2: DNS messages sent over QUIC streams MUST be prefixed
+        // with a 2-octet length field, followed by the DNS message content.
+        // Each query uses a separate bidirectional stream; the message boundary
+        // is signalled by FIN.
+        // RFC 9250 §4.2: QUIC 流上的 DNS 消息必须使用 2 字节长度前缀，
+        // 后跟 DNS 消息内容。每个查询使用单独的双向流；消息边界由 FIN 信号标识。
         let resp = timeout(timeout_dur, async {
             let (mut send, mut recv) = conn.open_bi().await
                 .context("doq open stream failed")?;
 
-            // Send DNS message directly without length prefix (RFC 9250 §4.2)
-            // 直接发送 DNS 消息，不带长度前缀（RFC 9250 §4.2）
-            send.write_all(packet).await.context("doq send body failed")?;
+            // RFC 9250 §4.2: The DNS query MUST be sent in a SINGLE send operation
+            // The DNS message MUST be prefixed with a 2-octet length field
+            // RFC 9250 §4.2: DNS 查询必须在单次发送操作中发送
+            // DNS 消息必须使用 2 字节长度前缀
+            let mut buffer = Vec::with_capacity(2 + packet.len());
+            buffer.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+            buffer.extend_from_slice(packet);
+            send.write_all(&buffer).await.context("doq send query failed")?;
             let _ = send.finish();
 
-            // Read until stream FIN (no length prefix per RFC 9250)
-            // 读取直到流 FIN（RFC 9250 无长度前缀）
-            let buf = recv.read_to_end(MAX_DNS_MESSAGE_SIZE)
-                .await
-                .context("doq read response failed")?;
-            if buf.is_empty() {
-                anyhow::bail!("doq received empty response");
+            // Read response: 2-byte length prefix followed by DNS message
+            // 读取响应：2 字节长度前缀，后跟 DNS 消息
+            // Note: The server sends the response and closes the stream with FIN
+            // We need to read all data until FIN, then parse the length prefix
+            // 注意：服务器发送响应后用 FIN 关闭流
+            // 我们需要读取所有数据直到 FIN，然后解析长度前缀
+            let all_data = match recv.read_to_end(MAX_DNS_MESSAGE_SIZE + 2).await {
+                Ok(data) => data,
+                Err(e) => {
+                    // Check if this is a connection closed error
+                    // 检查是否是连接关闭错误
+                    if e.to_string().contains("closed by peer") || e.to_string().contains("connection lost") {
+                        anyhow::bail!("doq connection closed by server (possible protocol error or server does not support DoQ)");
+                    }
+                    return Err(e).context("doq read response failed");
+                }
+            };
+
+            if all_data.is_empty() {
+                anyhow::bail!("doq received empty response (server closed stream without sending data)");
             }
-            Ok::<Bytes, anyhow::Error>(Bytes::from(buf))
+
+            if all_data.len() < 2 {
+                anyhow::bail!("doq response too short: {} bytes", all_data.len());
+            }
+
+            let msg_len = u16::from_be_bytes([all_data[0], all_data[1]]) as usize;
+            
+            // idoq-style length validation: response length must match length prefix
+            // idoq 风格的长度验证：响应长度必须匹配长度前缀
+            if all_data.len() != 2 + msg_len {
+                anyhow::bail!(
+                    "doq length mismatch: expected {} bytes (2 + {}), got {} bytes. \
+                    This may indicate data corruption or server protocol violation.",
+                    2 + msg_len, msg_len, all_data.len()
+                );
+            }
+
+            let buf = &all_data[2..2 + msg_len];
+            if buf.is_empty() {
+                anyhow::bail!("doq received empty DNS message");
+            }
+            Ok::<Bytes, anyhow::Error>(Bytes::copy_from_slice(buf))
         }).await;
 
         match resp {
@@ -2064,9 +2116,21 @@ impl DoqMuxClient {
 
     async fn connect_new(&self, target: &DoqTarget, timeout_dur: Duration) -> anyhow::Result<QuicConnection> {
         let addr_str = format!("{}:{}", target.host, target.port);
-        let mut addrs = tokio::net::lookup_host(&addr_str).await
+        let addrs = tokio::net::lookup_host(&addr_str).await
             .context("doq resolve failed")?;
-        let addr = addrs.next().context("doq resolve returned no addresses")?;
+
+        // 优先使用 IPv4 地址，避免 IPv6 连接问题
+        // Prefer IPv4 addresses to avoid IPv6 connection issues
+        // 某些网络的 IPv6 连接不稳定或 MTU 限制导致 QUIC Initial 数据包发送失败
+        // Some networks have unstable IPv6 or MTU limits causing QUIC Initial packet send failures
+        let addrs_vec: Vec<_> = addrs.collect();
+        let addr = addrs_vec
+            .iter()
+            .find(|a| a.is_ipv4())
+            .or_else(|| addrs_vec.first())
+            .context("doq resolve returned no addresses")?;
+
+        let addr = *addr;
 
         let endpoint = if addr.is_ipv6() { &self.runtime.endpoint_v6 } else { &self.runtime.endpoint_v4 };
         let connecting = endpoint.connect(addr, target.sni.as_ref())
@@ -2158,6 +2222,13 @@ fn parse_doq_target(upstream: &str) -> anyhow::Result<DoqTarget> {
         }
     }
 
+    let is_ip = host.parse::<std::net::IpAddr>().is_ok();
+    if sni.is_none() && is_ip {
+        anyhow::bail!(
+            "doq upstream with IP address requires explicit sni (e.g. doq://223.5.5.5:853?sni=alidns.com)"
+        );
+    }
+
     let sni_value = sni.unwrap_or_else(|| host.to_string());
 
     Ok(DoqTarget {
@@ -2174,6 +2245,13 @@ mod tests {
     use std::time::Duration;
     use tokio::time::timeout;
     use futures::future::join_all;
+
+    #[test]
+    fn doq_target_requires_sni_for_ip() {
+        assert!(parse_doq_target("doq://223.5.5.5:853").is_err());
+        assert!(parse_doq_target("doq://223.5.5.5:853?sni=alidns.com").is_ok());
+        assert!(parse_doq_target("doq://dns.alidns.com:853").is_ok());
+    }
 
     #[tokio::test]
     async fn tcp_mux_rewrite_id_no_deadlock_under_contention() {

@@ -43,6 +43,7 @@ url = "2"
 quinn = { version = "0.11", features = ["runtime-tokio", "rustls"] }
 [dev-dependencies]
 criterion = "0.5"
+ctor = "0.2"
 
 [profile.release]
 opt-level = 3

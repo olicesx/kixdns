@@ -693,7 +693,11 @@ fn default_upstream() -> String {
 }
 
 fn default_upstream_timeout_ms() -> u64 {
-    2000
+    // Increased from 2000ms to 9000ms to align with idoq library best practices
+    // DoQ servers (especially Alibaba DNS) may require longer response times
+    // 从 2000ms 增加到 9000ms，以对齐 idoq 库的最佳实践
+    // DoQ 服务器（特别是阿里 DNS）可能需要更长的响应时间
+    9000
 }
 
 fn default_response_jump_limit() -> u32 {
