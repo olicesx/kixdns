@@ -142,7 +142,8 @@ async fn forward_tcp_udp_dual(
     let addr_tcp = addr.to_string();
 
     let udp_task = tokio::spawn(async move {
-        forward_udp_smart(&engine_udp, &packet_udp, &addr_udp, timeout_dur).await
+        // Disable TCP fallback here to avoid duplicate TCP sends when dual-send is enabled.
+        forward_udp_smart(&engine_udp, &packet_udp, &addr_udp, timeout_dur, false).await
     });
 
     let tcp_task = tokio::spawn(async move {
@@ -269,7 +270,7 @@ pub async fn forward_upstream(
         let start = std::time::Instant::now();
         let (res, proto): (anyhow::Result<Bytes>, &str) = match transport_for_addr {
             Transport::Udp => {
-                let r = forward_udp_smart(engine, packet, addr, timeout_dur).await;
+                let r = forward_udp_smart(engine, packet, addr, timeout_dur, true).await;
                 (r, "udp")
             }
             Transport::Tcp => {
@@ -329,6 +330,13 @@ pub async fn forward_upstream(
     let packet_owned = packet.to_vec();
     let mut last_err: Option<anyhow::Error> = None;
 
+    // If any TCP/TCP+UDP upstream is present, avoid UDP->TCP fallback to prevent duplicate TCP sends
+    // 如果同一批次已有 TCP/TCP+UDP 上游，禁用 UDP->TCP fallback，避免重复 TCP 发送
+    let has_tcp_task = upstreams.iter().any(|up| {
+        let (_, t) = parse_upstream_addr(up, default_transport);
+        matches!(t, Transport::Tcp | Transport::TcpUdp)
+    });
+
     for up in upstreams {
         // 解析地址中的协议前缀 / Parse protocol prefix from address
         let (addr, transport_for_task) = parse_upstream_addr(&up, default_transport);
@@ -341,7 +349,7 @@ pub async fn forward_upstream(
             let start = std::time::Instant::now();
             let (proto, res) = match transport_for_task {
                 Transport::Udp => {
-                    let r = forward_udp_smart(&engine, &packet, &addr_owned, timeout_dur).await;
+                    let r = forward_udp_smart(&engine, &packet, &addr_owned, timeout_dur, !has_tcp_task).await;
                     ("udp", r)
                 }
                 Transport::Tcp => {
@@ -434,10 +442,12 @@ async fn forward_udp_smart(
     packet: &[u8],
     upstream: &str,
     timeout_dur: Duration,
+    allow_tcp_fallback: bool,
 ) -> anyhow::Result<Bytes> {
     // 获取 TCP fallback 配置（Copy bool 值，避免持有 Guard 跨 await）
     // Get TCP fallback config (Copy bool value to avoid holding Guard across await)
-    let enable_tcp_fallback = engine.state.load().pipeline.settings.enable_tcp_fallback;
+    let enable_tcp_fallback = allow_tcp_fallback
+        && engine.state.load().pipeline.settings.enable_tcp_fallback;
 
     // Split timeout: first attempt uses 1/N budget (leaving room for TCP fallback)
     // 分割超时：第一次尝试使用 1/N 时间（为 TCP fallback 留出空间）
