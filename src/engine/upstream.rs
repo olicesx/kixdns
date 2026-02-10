@@ -497,6 +497,16 @@ async fn forward_udp_smart(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GlobalSettings;
+    use crate::matcher::RuntimePipelineConfig;
+    use hickory_proto::op::{Message, MessageType, Query};
+    use hickory_proto::rr::{Name, RecordType};
+    use rustls::crypto::ring;
+    use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn test_parse_upstream_addr_with_protocol_prefix() {
@@ -610,5 +620,104 @@ mod tests {
         let (addr, transport) = parse_upstream_addr("doq://dns.example.com:853?0rtt=false&sni=dns.example.com", Transport::Udp);
         assert_eq!(addr, "dns.example.com:853?0rtt=false&sni=dns.example.com");
         assert_eq!(transport, Transport::Doq);
+    }
+
+    fn build_test_engine(enable_tcp_fallback: bool) -> Engine {
+        let mut settings = GlobalSettings::default();
+        settings.default_upstream = "127.0.0.1:0".to_string();
+        settings.enable_tcp_fallback = enable_tcp_fallback;
+        settings.udp_pool_size = 1;
+        settings.tcp_pool_size = 1;
+        let runtime = RuntimePipelineConfig {
+            settings,
+            pipeline_select: Vec::new(),
+            pipelines: Vec::new(),
+        };
+        Engine::new(runtime, "test".to_string())
+    }
+
+    fn build_dns_query_packet(qname: &str) -> Vec<u8> {
+        let mut msg = Message::new();
+        msg.set_id(0x1234);
+        msg.set_message_type(MessageType::Query);
+        msg.set_recursion_desired(true);
+        let name = Name::from_str(qname).expect("qname");
+        msg.add_query(Query::query(name, RecordType::A));
+        msg.to_vec().expect("encode dns query")
+    }
+
+    #[tokio::test]
+    async fn udp_truncated_response_does_not_fallback_to_tcp_when_disallowed() {
+        let _ = ring::default_provider().install_default();
+
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind tcp");
+        let tcp_addr = tcp_listener.local_addr().expect("tcp addr");
+
+        let udp_socket = tokio::net::UdpSocket::bind(tcp_addr)
+            .await
+            .expect("bind udp");
+        let upstream_addr = udp_socket.local_addr().expect("udp addr");
+
+        let tcp_hits = Arc::new(AtomicUsize::new(0));
+        let tcp_hits_clone = Arc::clone(&tcp_hits);
+        let tcp_task = tokio::spawn(async move {
+            if let Ok(Ok((mut stream, _))) = tokio::time::timeout(
+                Duration::from_millis(500),
+                tcp_listener.accept(),
+            )
+            .await
+            {
+                tcp_hits_clone.fetch_add(1, Ordering::SeqCst);
+                let mut len_buf = [0u8; 2];
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(200),
+                    stream.read_exact(&mut len_buf),
+                )
+                .await;
+            }
+        });
+
+        let udp_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, peer) = udp_socket.recv_from(&mut buf).await.expect("udp recv");
+            let mut resp = buf[..len].to_vec();
+            if resp.len() >= 4 {
+                resp[2] = 0x82; // QR=1, TC=1
+                resp[3] = 0x00;
+            }
+            let _ = udp_socket.send_to(&resp, peer).await;
+            resp
+        });
+
+        let engine = build_test_engine(true);
+        let packet = build_dns_query_packet("example.com");
+
+        let resp = forward_udp_smart(
+            &engine,
+            &packet,
+            &upstream_addr.to_string(),
+            Duration::from_millis(500),
+            false,
+        )
+        .await
+        .expect("udp response");
+
+        let udp_resp = udp_task.await.expect("udp task");
+        assert_eq!(resp[2], 0x82, "tc flag should be set in udp response");
+        assert_eq!(resp[3], 0x00, "response flags should match truncated reply");
+        assert_eq!(
+            resp.as_ref()[2..],
+            udp_resp.as_slice()[2..],
+            "should return udp response without tcp fallback (ignoring txid rewrite)"
+        );
+
+        let _ = tcp_task.await;
+        assert_eq!(
+            tcp_hits.load(Ordering::SeqCst),
+            0,
+            "tcp fallback should be disabled in dual-send udp path"
+        );
     }
 }
