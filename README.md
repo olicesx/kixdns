@@ -185,7 +185,7 @@ OPTIONS:
 
 示例：
 ```json
-{ "type": "forward", "upstream": "doq://223.5.5.5:853?0rtt=false" }
+{ "type": "forward", "upstream": "doq://223.5.5.5:853?sni=dns.alidns.com&0rtt=false" }
 { "type": "forward", "upstream": "doh://dns.google/dns-query" }
 { "type": "forward", "upstream": "8.8.8.8:53", "transport": "tcp" }
 ```
@@ -366,12 +366,15 @@ KixDNS 实现了智能的 0-RTT (Zero Round Trip Time) 自动检测机制：
 {
   "actions": [
     {
-      "type": "Forward",
-      "upstream": "doq://223.5.5.5:853?0rtt=false"
+      "type": "forward",
+      "upstream": "doq://223.5.5.5:853?sni=dns.alidns.com&0rtt=false"
     }
   ]
 }
 ```
+
+当 DoQ 上游使用 IP（例如 `223.5.5.5`）时，必须显式设置 `sni` 参数；
+否则会因为无法确定 TLS Server Name 而被拒绝。
 
 **支持的查询参数**：
 

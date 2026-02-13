@@ -1847,6 +1847,11 @@ struct DoqRuntime {
     enable_0rtt: bool,
 }
 
+struct DoqConnectionInfo {
+    conn: QuicConnection,
+    used_0rtt: bool,
+}
+
 pub struct DoqConnectionPool {
     clients: Vec<Arc<DoqMuxClient>>,
     next_idx: AtomicUsize,
@@ -1998,123 +2003,221 @@ impl DoqMuxClient {
             anyhow::bail!("invalid doq upstream: {}", self.upstream);
         }
 
-        let conn = self.get_or_connect(&target, timeout_dur).await?;
+        self.send_with_retry(&target, packet, timeout_dur, true).await
+    }
 
-        // RFC 9250 §4.2: DNS messages sent over QUIC streams MUST be prefixed
-        // with a 2-octet length field, followed by the DNS message content.
-        // Each query uses a separate bidirectional stream; the message boundary
-        // is signalled by FIN.
-        // RFC 9250 §4.2: QUIC 流上的 DNS 消息必须使用 2 字节长度前缀，
-        // 后跟 DNS 消息内容。每个查询使用单独的双向流；消息边界由 FIN 信号标识。
-        let resp = timeout(timeout_dur, async {
-            let (mut send, mut recv) = conn.open_bi().await
-                .context("doq open stream failed")?;
+    async fn send_with_retry(
+        &self,
+        target: &DoqTarget,
+        packet: &[u8],
+        timeout_dur: Duration,
+        allow_retry: bool,
+    ) -> anyhow::Result<Bytes> {
+        // RFC 9250 §4.2.1: DNS Message ID over DoQ MUST be set to 0.
+        // We preserve original ID for local correlation and restore it in the final response.
+        // RFC 9250 §4.2.1：DoQ 上的 DNS Message ID 必须为 0。
+        // 我们保留原始 ID 用于本地关联，并在最终响应中恢复。
+        if packet.len() < 2 {
+            anyhow::bail!("dns packet too short for doq");
+        }
+        let original_id = u16::from_be_bytes([packet[0], packet[1]]);
 
-            // RFC 9250 §4.2: The DNS query MUST be sent in a SINGLE send operation
-            // The DNS message MUST be prefixed with a 2-octet length field
-            // RFC 9250 §4.2: DNS 查询必须在单次发送操作中发送
-            // DNS 消息必须使用 2 字节长度前缀
-            let mut buffer = Vec::with_capacity(2 + packet.len());
-            buffer.extend_from_slice(&(packet.len() as u16).to_be_bytes());
-            buffer.extend_from_slice(packet);
-            send.write_all(&buffer).await.context("doq send query failed")?;
-            let _ = send.finish();
+        let mut allow_retry = allow_retry;
+        let mut timeout_dur = timeout_dur;
 
-            // Read response: 2-byte length prefix followed by DNS message
-            // 读取响应：2 字节长度前缀，后跟 DNS 消息
-            // Note: The server sends the response and closes the stream with FIN
-            // We need to read all data until FIN, then parse the length prefix
-            // 注意：服务器发送响应后用 FIN 关闭流
-            // 我们需要读取所有数据直到 FIN，然后解析长度前缀
-            let all_data = match recv.read_to_end(MAX_DNS_MESSAGE_SIZE + 2).await {
-                Ok(data) => data,
-                Err(e) => {
-                    // Check if this is a connection closed error
-                    // 检查是否是连接关闭错误
-                    if e.to_string().contains("closed by peer") || e.to_string().contains("connection lost") {
-                        anyhow::bail!("doq connection closed by server (possible protocol error or server does not support DoQ)");
+        loop {
+            let start = tokio::time::Instant::now();
+            let info = self.get_or_connect(target, timeout_dur).await?;
+            let conn = info.conn;
+            let used_0rtt = info.used_0rtt;
+
+            // RFC 9250 §4.2: DNS messages sent over QUIC streams MUST be prefixed
+            // with a 2-octet length field, followed by the DNS message content.
+            // Each query uses a separate bidirectional stream; the message boundary
+            // is signalled by FIN.
+            // RFC 9250 §4.2: QUIC 流上的 DNS 消息必须使用 2 字节长度前缀，
+            // 后跟 DNS 消息内容。每个查询使用单独的双向流；消息边界由 FIN 信号标识。
+            let resp = timeout(timeout_dur, async {
+                let (mut send, mut recv) = conn.open_bi().await
+                    .context("doq open stream failed")?;
+
+                // RFC 9250 §4.2: The DNS query MUST be sent in a SINGLE send operation
+                // The DNS message MUST be prefixed with a 2-octet length field
+                // RFC 9250 §4.2: DNS 查询必须在单次发送操作中发送
+                // DNS 消息必须使用 2 字节长度前缀
+                // RFC 9250 §4.2.1: Rewrite DNS Message ID to 0 before sending over DoQ.
+                // RFC 9250 §4.2.1：在 DoQ 上传输前，将 DNS Message ID 重写为 0。
+                let doq_query = build_doq_query_packet(packet)?;
+
+                let mut buffer = Vec::with_capacity(2 + doq_query.len());
+                buffer.extend_from_slice(&(doq_query.len() as u16).to_be_bytes());
+                buffer.extend_from_slice(&doq_query);
+                send.write_all(&buffer).await.context("doq send query failed")?;
+                let _ = send.finish();
+
+                // Read response: 2-byte length prefix followed by DNS message
+                // 读取响应：2 字节长度前缀，后跟 DNS 消息
+                // Note: The server sends the response and closes the stream with FIN
+                // We need to read all data until FIN, then parse the length prefix
+                // 注意：服务器发送响应后用 FIN 关闭流
+                // 我们需要读取所有数据直到 FIN，然后解析长度前缀
+                let all_data = match recv.read_to_end(MAX_DNS_MESSAGE_SIZE + 2).await {
+                    Ok(data) => data,
+                    Err(e) => {
+                        // Check if this is a connection closed error
+                        // 检查是否是连接关闭错误
+                        if e.to_string().contains("closed by peer") || e.to_string().contains("connection lost") {
+                            anyhow::bail!("doq connection closed by server (possible protocol error or server does not support DoQ)");
+                        }
+                        return Err(e).context("doq read response failed");
                     }
-                    return Err(e).context("doq read response failed");
+                };
+
+                if all_data.is_empty() {
+                    anyhow::bail!("doq received empty response (server closed stream without sending data)");
                 }
-            };
 
-            if all_data.is_empty() {
-                anyhow::bail!("doq received empty response (server closed stream without sending data)");
-            }
+                if all_data.len() < 2 {
+                    anyhow::bail!("doq response too short: {} bytes", all_data.len());
+                }
 
-            if all_data.len() < 2 {
-                anyhow::bail!("doq response too short: {} bytes", all_data.len());
-            }
-
-            let msg_len = u16::from_be_bytes([all_data[0], all_data[1]]) as usize;
-            
-            // idoq-style length validation: response length must match length prefix
-            // idoq 风格的长度验证：响应长度必须匹配长度前缀
-            if all_data.len() != 2 + msg_len {
-                anyhow::bail!(
-                    "doq length mismatch: expected {} bytes (2 + {}), got {} bytes. \
-                    This may indicate data corruption or server protocol violation.",
-                    2 + msg_len, msg_len, all_data.len()
-                );
-            }
-
-            let buf = &all_data[2..2 + msg_len];
-            if buf.is_empty() {
-                anyhow::bail!("doq received empty DNS message");
-            }
-            Ok::<Bytes, anyhow::Error>(Bytes::copy_from_slice(buf))
-        }).await;
-
-        match resp {
-            Ok(Ok(bytes)) => Ok(bytes),
-            Ok(Err(err)) => {
-                self.reset_connection().await;
-                Err(err)
-            }
-            Err(_) => {
-                // Timeout occurred - check if this was a 0-RTT connection
-                // 超时发生 - 检查是否是 0-RTT 连接
-                let was_rejected = self.zero_rtt_rejected.load(std::sync::atomic::Ordering::Relaxed);
-                if !was_rejected {
-                    // Mark 0-RTT as rejected for this upstream (cached until restart)
-                    // 标记此上游的 0-RTT 为被拒绝（缓存直到重启）
-                    self.zero_rtt_rejected.store(true, std::sync::atomic::Ordering::Relaxed);
-                    warn!(
-                        upstream = %self.upstream,
-                        "DoQ 0-RTT timeout detected, automatically disabling 0-RTT for this upstream. \
-                        Future connections will use normal handshake. This status is cached until restart. \
-                        To re-enable 0-RTT, restart the server or use ?0rtt=true in the upstream URL."
+                let msg_len = u16::from_be_bytes([all_data[0], all_data[1]]) as usize;
+                
+                // idoq-style length validation: response length must match length prefix
+                // idoq 风格的长度验证：响应长度必须匹配长度前缀
+                if all_data.len() != 2 + msg_len {
+                    anyhow::bail!(
+                        "doq length mismatch: expected {} bytes (2 + {}), got {} bytes. \
+                        This may indicate data corruption or server protocol violation.",
+                        2 + msg_len, msg_len, all_data.len()
                     );
                 }
-                self.reset_connection().await;
-                Err(anyhow::anyhow!("doq timeout"))
+
+                let buf = &all_data[2..2 + msg_len];
+                if buf.is_empty() {
+                    anyhow::bail!("doq received empty DNS message");
+                }
+                // Restore original DNS Message ID before returning to caller.
+                // 返回调用方前恢复原始 DNS Message ID。
+                Ok::<Bytes, anyhow::Error>(restore_doq_response_id(buf, original_id)?)
+            }).await;
+
+            match resp {
+                Ok(Ok(bytes)) => return Ok(bytes),
+                Ok(Err(err)) => {
+                    let err_str = err.to_string();
+                    self.reset_connection().await;
+                    if allow_retry && used_0rtt && self.should_retry_without_0rtt(target, &err_str) {
+                        self.disable_zero_rtt();
+                        let remaining = timeout_dur.saturating_sub(start.elapsed());
+                        if remaining.is_zero() {
+                            return Err(err);
+                        }
+                        warn!(
+                            upstream = %self.upstream,
+                            error = %err,
+                            "DoQ 0-RTT likely rejected (connection closed/stream error), retrying without 0-RTT"
+                        );
+                        allow_retry = false;
+                        timeout_dur = remaining;
+                        continue;
+                    }
+                    return Err(err);
+                }
+                Err(_) => {
+                    if allow_retry && used_0rtt {
+                        self.disable_zero_rtt();
+                        let remaining = timeout_dur.saturating_sub(start.elapsed());
+                        if remaining.is_zero() {
+                            self.reset_connection().await;
+                            return Err(anyhow::anyhow!("doq timeout"));
+                        }
+                        warn!(
+                            upstream = %self.upstream,
+                            "DoQ 0-RTT timeout detected, retrying without 0-RTT"
+                        );
+                        self.reset_connection().await;
+                        allow_retry = false;
+                        timeout_dur = remaining;
+                        continue;
+                    }
+
+                    // Timeout occurred - check if this was a 0-RTT connection
+                    // 超时发生 - 检查是否是 0-RTT 连接
+                    let was_rejected = self.zero_rtt_rejected.load(std::sync::atomic::Ordering::Relaxed);
+                    if !was_rejected {
+                        // Mark 0-RTT as rejected for this upstream (cached until restart)
+                        // 标记此上游的 0-RTT 为被拒绝（缓存直到重启）
+                        self.zero_rtt_rejected.store(true, std::sync::atomic::Ordering::Relaxed);
+                        warn!(
+                            upstream = %self.upstream,
+                            "DoQ 0-RTT timeout detected, automatically disabling 0-RTT for this upstream. \
+                            Future connections will use normal handshake. This status is cached until restart. \
+                            To re-enable 0-RTT, restart the server or use ?0rtt=true in the upstream URL."
+                        );
+                    }
+                    self.reset_connection().await;
+                    return Err(anyhow::anyhow!("doq timeout"));
+                }
             }
         }
     }
 
+    fn should_retry_without_0rtt(&self, target: &DoqTarget, err: &str) -> bool {
+        let enable_0rtt = target.enable_0rtt.unwrap_or(self.runtime.enable_0rtt);
+        if !enable_0rtt {
+            return false;
+        }
+        if self.zero_rtt_rejected.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        err.contains("doq connection closed by server")
+            || err.contains("closed by peer")
+            || err.contains("connection lost")
+            || err.contains("stream reset")
+            || err.contains("ConnectionClosed")
+            || err.contains("reset by peer")
+    }
+
+    fn disable_zero_rtt(&self) {
+        let was_rejected = self.zero_rtt_rejected.load(std::sync::atomic::Ordering::Relaxed);
+        if !was_rejected {
+            self.zero_rtt_rejected.store(true, std::sync::atomic::Ordering::Relaxed);
+            warn!(
+                upstream = %self.upstream,
+                "DoQ 0-RTT rejected or unstable, disabling 0-RTT for this upstream until restart"
+            );
+        }
+    }
     async fn get_or_connect(
         &self,
         target: &DoqTarget,
         timeout_dur: Duration,
-    ) -> anyhow::Result<QuicConnection> {
+    ) -> anyhow::Result<DoqConnectionInfo> {
         {
             let guard = self.connection.lock().await;
             if let Some(conn) = guard.as_ref() {
-                return Ok(conn.clone());
+                return Ok(DoqConnectionInfo {
+                    conn: conn.clone(),
+                    used_0rtt: false,
+                });
             }
         }
 
         let mut guard = self.connection.lock().await;
         if let Some(conn) = guard.as_ref() {
-            return Ok(conn.clone());
+            return Ok(DoqConnectionInfo {
+                conn: conn.clone(),
+                used_0rtt: false,
+            });
         }
 
-        let conn = self.connect_new(target, timeout_dur).await?;
+        let (conn, used_0rtt) = self.connect_new(target, timeout_dur).await?;
         *guard = Some(conn.clone());
-        Ok(conn)
+        Ok(DoqConnectionInfo { conn, used_0rtt })
     }
 
-    async fn connect_new(&self, target: &DoqTarget, timeout_dur: Duration) -> anyhow::Result<QuicConnection> {
+    async fn connect_new(&self, target: &DoqTarget, timeout_dur: Duration) -> anyhow::Result<(QuicConnection, bool)> {
         let addr_str = format!("{}:{}", target.host, target.port);
         let addrs = tokio::net::lookup_host(&addr_str).await
             .context("doq resolve failed")?;
@@ -2160,14 +2263,14 @@ impl DoqMuxClient {
                         upstream = %self.upstream,
                         "DoQ 0-RTT connection established"
                     );
-                    return Ok(conn);
+                    return Ok((conn, true));
                 }
                 Err(connecting) => {
                     // 0-RTT not available (no previous session), fall back to normal connect
                     // 0-RTT 不可用（无先前会话），回退到正常连接
                     let connection = timeout(timeout_dur, connecting).await
                         .context("doq connect timeout")??;
-                    return Ok(connection);
+                    return Ok((connection, false));
                 }
             }
         }
@@ -2175,13 +2278,34 @@ impl DoqMuxClient {
         let connection = timeout(timeout_dur, connecting).await
             .context("doq connect timeout")??;
 
-        Ok(connection)
+        Ok((connection, false))
     }
 
     async fn reset_connection(&self) {
         let mut guard = self.connection.lock().await;
         *guard = None;
     }
+}
+
+fn build_doq_query_packet(packet: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if packet.len() < 2 {
+        anyhow::bail!("dns packet too short for doq");
+    }
+    let mut doq_query = Vec::with_capacity(packet.len());
+    doq_query.extend_from_slice(packet);
+    doq_query[0] = 0;
+    doq_query[1] = 0;
+    Ok(doq_query)
+}
+
+fn restore_doq_response_id(response: &[u8], original_id: u16) -> anyhow::Result<Bytes> {
+    if response.len() < 2 {
+        anyhow::bail!("doq DNS message too short: {} bytes", response.len());
+    }
+    let mut restored = BytesMut::with_capacity(response.len());
+    restored.extend_from_slice(response);
+    restored[0..2].copy_from_slice(&original_id.to_be_bytes());
+    Ok(restored.freeze())
 }
 
 fn parse_doq_target(upstream: &str) -> anyhow::Result<DoqTarget> {
@@ -2245,6 +2369,26 @@ mod tests {
     use std::time::Duration;
     use tokio::time::timeout;
     use futures::future::join_all;
+
+    #[test]
+    fn doq_query_message_id_must_be_zero() {
+        let packet = [0x12, 0x34, 0x01, 0x00, 0xaa, 0xbb];
+        let doq_packet = build_doq_query_packet(&packet).expect("build doq query packet");
+
+        assert_eq!(doq_packet.len(), packet.len());
+        assert_eq!(&doq_packet[0..2], &[0x00, 0x00]);
+        assert_eq!(&doq_packet[2..], &packet[2..]);
+    }
+
+    #[test]
+    fn doq_response_restores_original_message_id() {
+        let response_from_upstream = [0x00, 0x00, 0x81, 0x80, 0xde, 0xad];
+        let restored = restore_doq_response_id(&response_from_upstream, 0x1234)
+            .expect("restore doq response id");
+
+        assert_eq!(&restored[0..2], &[0x12, 0x34]);
+        assert_eq!(&restored[2..], &response_from_upstream[2..]);
+    }
 
     #[test]
     fn doq_target_requires_sni_for_ip() {
