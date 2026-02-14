@@ -10,6 +10,8 @@ pub struct CacheEntry {
     pub bytes: Bytes,
     pub rcode: ResponseCode,
     pub source: Arc<str>,
+    /// Upstream that provided this response / 提供此响应的上游服务器
+    pub upstream: Option<Arc<str>>,
     // Store validation fields to handle hash collisions / 存储验证字段以处理哈希冲突
     pub qname: Arc<str>,
     pub pipeline_id: Arc<str>,
@@ -17,11 +19,17 @@ pub struct CacheEntry {
     /// RFC 1035 §5.2: Record insertion time for TTL decrement / RFC 1035 §5.2：记录插入时间用于TTL递减
     pub inserted_at: Instant,
     /// Original minimum TTL from upstream response / 上游响应的原始最小TTL
+    /// Used for cache expiration and TTL patching / 用于缓存过期与 TTL 修正
     pub original_ttl: u32,
+    /// Original maximum TTL from upstream response / 上游响应的原始最大TTL
+    /// Used for background refresh decisions / 用于后台刷新决策
+    pub refresh_ttl: u32,
 }
 
 /// Use u64 hash as key to avoid allocation during lookup / 使用 u64 哈希作为键以避免查找时的内存分配
-pub type DnsCache = Cache<u64, CacheEntry>;
+///  Performance: Wrap in Arc to reduce atomic operations from 5 to 1 per cache hit
+///  性能优化：使用 Arc 包裹，将缓存命中的原子操作从 5 次减少到 1 次
+pub type DnsCache = Cache<u64, Arc<CacheEntry>>;
 
 /// 创建带 TTL 的 DNS 缓存 / Create DNS cache with TTL
 #[inline]

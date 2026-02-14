@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>诊断工具</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+</head>
+<body>
+    <h1>config_editor.html 诊断</h1>
+    <div id="test1"></div>
+    <div id="test2"></div>
+    <div id="test3"></div>
+    <div id="test4"></div>
+
+    <script>
+        console.log('=== 开始诊断 ===');
+
+        // 测试1: Vue基本功能
+        try {
+            const app1 = Vue.createApp({
+                setup() {
+                    return { message: 'Vue 3工作正常' };
+                }
+            });
+            app1.mount('#test1');
+            document.getElementById('test1').innerHTML += ' ✅<br>';
+            console.log('✅ 测试1通过: Vue基本功能');
+        } catch (e) {
+            document.getElementById('test1').innerHTML = '❌ ' + e.message;
+            console.error('❌ 测试1失败:', e);
+        }
+
+        // 测试2: 响应式数据
+        try {
+            const app2 = Vue.createApp({
+                setup() {
+                    const config = Vue.ref({
+                        pipelines: [{
+                            id: 'test',
+                            rules: [{
+                                name: 'rule1',
+                                actions: []
+                            }]
+                        }]
+                    });
+                    return { config };
+                }
+            });
+            app2.mount('#test2');
+            document.getElementById('test2').innerHTML += ' ✅<br>';
+            console.log('✅ 测试2通过: 响应式数据');
+        } catch (e) {
+            document.getElementById('test2').innerHTML = '❌ ' + e.message;
+            console.error('❌ 测试2失败:', e);
+        }
+
+        // 测试3: TXT Action配置
+        try {
+            const app3 = Vue.createApp({
+                setup() {
+                    const actions = Vue.ref([]);
+                    const testAction = () => {
+                        actions.value.push({
+                            type: 'static_txt_response',
+                            text: ['test'],
+                            ttl: 300,
+                            _textSingle: 'test'
+                        });
+                        console.log('Action添加成功:', actions.value[0]);
+                    };
+                    return { actions, testAction };
+                }
+            });
+            app3.mount('#test3');
+            // 触发测试
+            setTimeout(() => {
+                try {
+                    app3.testAction();
+                    document.getElementById('test3').innerHTML += ' ✅<br>';
+                    console.log('✅ 测试3通过: TXT Action配置');
+                } catch (e) {
+                    document.getElementById('test3').innerHTML = '❌ ' + e.message;
+                    console.error('❌ 测试3失败:', e);
+                }
+            }, 100);
+        } catch (e) {
+            document.getElementById('test3').innerHTML = '❌ ' + e.message;
+            console.error('❌ 测试3失败:', e);
+        }
+
+        // 测试4: Matcher组件
+        try {
+            const app4 = Vue.createApp({
+                setup() {
+                    const matchers = Vue.ref([]);
+                    const matcherTypes = {
+                        'response_txt_content': 'TXT Content'
+                    };
+                    const addMatcher = () => {
+                        matchers.value.push({
+                            type: 'response_txt_content',
+                            mode: 'exact',
+                            value: 'test'
+                        });
+                        console.log('Matcher添加成功:', matchers.value[0]);
+                    };
+                    return { matchers, matcherTypes, addMatcher };
+                }
+            });
+            app4.mount('#test4');
+            // 触发测试
+            setTimeout(() => {
+                try {
+                    app4.addMatcher();
+                    document.getElementById('test4').innerHTML += ' ✅<br>';
+                    console.log('✅ 测试4通过: Matcher组件');
+                } catch (e) {
+                    document.getElementById('test4').innerHTML = '❌ ' + e.message;
+                    console.error('❌ 测试4失败:', e);
+                }
+            }, 100);
+        } catch (e) {
+            document.getElementById('test4').innerHTML = '❌ ' + e.message;
+            console.error('❌ 测试4失败:', e);
+        }
+
+        console.log('=== 诊断完成 ===');
+    </script>
+</body>
+</html>
+``</tool_call><tool_call>AskUserQuestion<arg_key>questions</arg_key><arg_value>[{"header": "问题现象", "multiSelect": true, "options": [{"description": "页面无法加载或显示空白", "label": "页面加载失败"}, {"description": "点击按钮没反应，或功能不工作", "label": "功能无法使用"}, {"description": "浏览器控制台显示JavaScript错误", "label": "控制台有JS错误"}, {"description": "配置无法保存或加载", "label": "配置保存/加载问题"}, {"description": "TXT相关的选项无法显示或配置", "label": "TXT选项不显示"}], "question": "请问web配置工具出现了什么错误？"}]

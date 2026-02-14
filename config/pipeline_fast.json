@@ -4,13 +4,11 @@
     "min_ttl": 30,
     "bind_udp": "0.0.0.0:5353",
     "bind_tcp": "0.0.0.0:5353",
-    "default_upstream": "1.1.1.1:53",
-    "upstream_timeout_ms": 2000,
+    "default_upstream": "223.5.5.5:53",
+    "upstream_timeout_ms": 500,
+    "cache_capacity": 10000,
     "geoip_dat_path": "data/geoip.dat",
-    "geosite_data_paths": ["data/geosite.dat"],
-    "cache_background_refresh": true,
-    "cache_refresh_threshold_percent": 15,
-    "cache_refresh_min_ttl": 6
+    "geosite_data_paths": ["data/geosite.dat"]
   },
   "pipeline_select": [
     {
@@ -63,7 +61,7 @@
           "matchers": [ { "type": "any" } ],
           "actions": [
             { "type": "log", "level": "info" },
-            { "type": "forward", "upstream": "8.8.8.8:53", "transport": "tcp" }
+            { "type": "forward", "upstream": "114.114.114.114:53", "transport": "tcp" }
           ],
           "response_matchers": [
             { "type": "response_rcode", "value": "NOERROR" }
@@ -80,7 +78,7 @@
             { "type": "edns_present", "expect": true }
           ],
           "actions": [
-            { "type": "forward", "upstream": "9.9.9.9:53", "transport": "udp" }
+            { "type": "forward", "upstream": "223.5.5.5:53", "transport": "udp" }
           ],
           "response_matchers": [
             { "type": "request_domain_regex", "value": "(?i)\\.video\\." },

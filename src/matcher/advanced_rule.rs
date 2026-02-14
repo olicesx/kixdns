@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -6,10 +5,11 @@ use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{DNSClass, RecordType};
 use ipnet::IpNet;
 use regex::Regex;
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::config::{Action, MatchOperator};
-use crate::engine::{Decision, make_static_ip_answer};
+use crate::engine::{make_static_ip_answer, Decision};
 use crate::matcher::eval_match_chain;
 use crate::matcher::{RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig, RuntimeRule};
 
@@ -40,10 +40,10 @@ pub struct CompiledMatcherWithOp {
 pub enum CompiledMatcher {
     #[allow(dead_code)]
     DomainExact {
-        domain: String,
+        domain: Arc<str>,
     },
     DomainSuffix {
-        suffix: String,
+        suffix: Arc<str>,
     },
     ClientIp {
         net: IpNet,
@@ -71,9 +71,9 @@ pub enum PrecomputedAction {
 
 #[derive(Debug, Clone, Default)]
 pub struct RuleIndex {
-    pub domain_exact: HashMap<String, Vec<usize>>,
-    pub domain_suffix: HashMap<String, Vec<usize>>,
-    pub query_type: HashMap<RecordType, Vec<usize>>,
+    pub domain_exact: FxHashMap<Arc<str>, Vec<usize>>,
+    pub domain_suffix: FxHashMap<Arc<str>, Vec<usize>>,
+    pub query_type: FxHashMap<RecordType, Vec<usize>>,
     pub always_check: Vec<usize>,
 }
 
@@ -129,7 +129,12 @@ impl RuleIndex {
 
     /// Get candidate rule indices into provided SmallVec to avoid allocation
     /// SmallVec<[usize; 32]> keeps up to 32 candidates on stack (typical case)
-    pub fn get_candidates_into(&self, qname: &str, qtype: RecordType, out: &mut SmallVec<[usize; 32]>) {
+    pub fn get_candidates_into(
+        &self,
+        qname: &str,
+        qtype: RecordType,
+        out: &mut SmallVec<[usize; 32]>,
+    ) {
         out.extend_from_slice(&self.always_check);
 
         if let Some(indices) = self.domain_exact.get(qname) {
@@ -164,7 +169,7 @@ impl RuleIndex {
 }
 
 pub fn compile_pipelines(cfg: &RuntimePipelineConfig) -> Vec<CompiledPipeline> {
-    cfg.pipelines.iter().map(|p| compile_pipeline(p)).collect()
+    cfg.pipelines.iter().map(compile_pipeline).collect()
 }
 
 fn compile_pipeline(p: &RuntimePipeline) -> CompiledPipeline {
@@ -207,19 +212,37 @@ fn compile_rule(rule: &RuntimeRule, rule_idx: usize) -> CompiledRule {
 fn compile_matcher(m: &RuntimeMatcher) -> CompiledMatcher {
     match m {
         RuntimeMatcher::Any => CompiledMatcher::DomainSuffix {
-            suffix: String::new(),
+            suffix: Arc::from(""),
+        },
+        RuntimeMatcher::DomainExact { value } => CompiledMatcher::DomainExact {
+            domain: value.clone(),
         },
         RuntimeMatcher::DomainSuffix { value } => CompiledMatcher::DomainSuffix {
             suffix: value.clone(),
         },
-        RuntimeMatcher::ClientIp { net } => CompiledMatcher::ClientIp { net: net.clone() },
+        RuntimeMatcher::ClientIp { net } => CompiledMatcher::ClientIp { net: *net },
         RuntimeMatcher::DomainRegex { regex } => CompiledMatcher::Regex {
             regex: regex.clone(),
+        },
+        RuntimeMatcher::GeoipCountry { country_codes } => CompiledMatcher::Complex {
+            matcher: RuntimeMatcher::GeoipCountry {
+                country_codes: country_codes.clone(),
+            },
+        },
+        RuntimeMatcher::GeoipPrivate { expect } => CompiledMatcher::Complex {
+            matcher: RuntimeMatcher::GeoipPrivate { expect: *expect },
         },
         RuntimeMatcher::Qclass { value } => CompiledMatcher::Qclass { qclass: *value },
         RuntimeMatcher::EdnsPresent { expect } => CompiledMatcher::Complex {
             matcher: RuntimeMatcher::EdnsPresent { expect: *expect },
         },
+        RuntimeMatcher::GeoSite { tag } => CompiledMatcher::Complex {
+            matcher: RuntimeMatcher::GeoSite { tag: tag.clone() },
+        },
+        RuntimeMatcher::GeoSiteNot { tag } => CompiledMatcher::Complex {
+            matcher: RuntimeMatcher::GeoSiteNot { tag: tag.clone() },
+        },
+        RuntimeMatcher::Qtype { value } => CompiledMatcher::QueryType { qtype: *value },
     }
 }
 
@@ -256,6 +279,8 @@ pub(crate) fn fast_static_match(
         if !matched {
             continue;
         }
+        // 找到第一个匹配的规则
+        // 如果它可预计算，使用快速路径；否则放弃快速路径以保持规则顺序
         if let Some(pre) = &rule.precomputed {
             match pre {
                 PrecomputedAction::Static { rcode } => {
@@ -269,6 +294,12 @@ pub(crate) fn fast_static_match(
                     return Some(Decision::Static { rcode, answers });
                 }
             }
+        } else {
+            // 第一个匹配的规则不可预计算（如 Forward、Jump 等）
+            // 放弃快速路径，让规则走正常路径以保持配置顺序
+            // 这确保了像 "domain_regex → forward" 这样的规则不会被
+            // 后面的 "domain_suffix → static_ip" 规则跳过
+            return None;
         }
     }
     None
@@ -288,7 +319,7 @@ fn compiled_matcher_matches(
             if suffix.is_empty() {
                 true
             } else {
-                qname.ends_with(suffix)
+                qname.ends_with(suffix.as_ref())
             }
         }
         CompiledMatcher::ClientIp { net } => net.contains(&client_ip),
@@ -297,15 +328,38 @@ fn compiled_matcher_matches(
         CompiledMatcher::Regex { regex } => regex.is_match(qname),
         CompiledMatcher::Complex { matcher } => match matcher {
             RuntimeMatcher::Any => true,
-            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value),
+            RuntimeMatcher::DomainExact { value } => qname.eq_ignore_ascii_case(value),
+            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value.as_ref()),
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
+            RuntimeMatcher::GeoipCountry { country_codes: _ } => {
+                // GeoIP matching requires GeoIpManager integration
+                // For now, return false (will be implemented in Engine integration)
+                false
+            }
+            RuntimeMatcher::GeoipPrivate { expect: _ } => {
+                // GeoIP private IP detection requires GeoIpManager integration
+                // For now, return false (will be implemented in Engine integration)
+                false
+            }
             RuntimeMatcher::Qclass { value } => *value == qclass,
             RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
+            RuntimeMatcher::GeoSite { tag: _ } => {
+                // GeoSite matching requires GeoSiteManager integration
+                // For now, return false (will be implemented in Engine integration)
+                false
+            }
+            RuntimeMatcher::GeoSiteNot { tag: _ } => {
+                // GeoSite negation matching requires GeoSiteManager integration
+                // For now, return false (will be implemented in Engine integration)
+                false
+            }
+            RuntimeMatcher::Qtype { value } => *value == qtype,
         },
     }
 }
 
+#[inline]
 fn parse_rcode(rcode: &str) -> Option<ResponseCode> {
     match rcode.to_ascii_uppercase().as_str() {
         "NOERROR" => Some(ResponseCode::NoError),

@@ -7,3 +7,37 @@ claude.md
 diff_review.txt
 # Local AI coding agent instructions (not for repository)
 .github/copilot-instructions.md
+/docs
+# Exclude most .md files but allow README
+*.md
+!README.md
+!tools/README.md
+# Data files
+/data/
+/meta-rules-dat/
+# Log files
+*.log
+# Test output and temporary files
+*_output.log
+*_stdout.log
+*_stderr.log
+test_output.log
+*.exe
+*.pdb
+# Python test scripts
+check_*.py
+test_*.py
+# Desktop temp files
+"C\Users\*\Desktop\*.txt"
+nul
+# Allow config JSON files
+!config/*.json
+!tests/config/*.json
+
+# Local development and testing files (keep locally, don't commit)
+/test/
+/benches/
+/tests/
+test_parse_response_quick.rs
+# Historical code comparison files (keep locally, don't commit)
+*_old.rs

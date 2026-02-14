@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>KixDNS 配置编辑器测试</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+</head>
+<body>
+    <div id="app">
+        <h1>{{ message }}</h1>
+        <button @click="testAction">测试TXT Action</button>
+        <div v-if="action">
+            <p>Type: {{ action.type }}</p>
+            <p>Text: {{ action.text }}</p>
+            <p>TTL: {{ action.ttl }}</p>
+        </div>
+    </div>
+
+    <script>
+        const { createApp, ref } = Vue;
+
+        createApp({
+            setup() {
+                const message = ref('TXT记录支持测试');
+                const action = ref(null);
+
+                const testAction = () => {
+                    action.value = {
+                        type: 'static_txt_response',
+                        text: ['v=spf1 ~all'],
+                        ttl: 300
+                    };
+                    console.log('Action created:', action.value);
+                };
+
+                return {
+                    message,
+                    action,
+                    testAction
+                };
+            }
+        }).mount('#app');
+
+        console.log('Vue app mounted successfully!');
+    </script>
+</body>
+</html>

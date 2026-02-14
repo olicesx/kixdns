@@ -2,30 +2,48 @@
 name = "kixdns"
 version = "0.1.0"
 edition = "2024"
+authors = ["KixDNS Contributors"]
+description = "High-performance, non-recursive DNS server with hot-reloadable pipeline configuration and advanced routing rules"
+license = "GPL-3.0"
+repository = "https://github.com/kixdns/kixdns"
+keywords = ["dns", "server", "async", "tokio", "dns-server", "routing"]
+categories = ["network-programming", "asynchronous"]
+readme = "README.md"
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal", "sync"] }
 hickory-proto = "0.24"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-arc-swap = "1.7"
+arc-swap = "1.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "json", "env-filter"] }
 notify = "6"
 clap = { version = "4.5", features = ["derive"] }
-dashmap = "5"
+dashmap = "6"
 ipnet = "2"
 anyhow = "1"
 bytes = "1"
 regex = "1"
 num_cpus = "1.16"
-moka = { version = "0.12", features = ["sync"] }
-socket2 = "0.5"
+moka = { version = "0.12.12", features = ["sync"] }
+socket2 = "0.6"
 libc = "0.2"
 rustc-hash = "2.1.1"
 smallvec = "1.13"
-[dev-dependencies]
+maxminddb = "0.24"
+maxminddb-writer = "0.1"
 futures = "0.3"
+parking_lot = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls"] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+webpki-roots = "0.26"
+url = "2"
+quinn = { version = "0.11", features = ["runtime-tokio", "rustls"] }
+[dev-dependencies]
+criterion = "0.5"
+ctor = "0.2"
 
 [profile.release]
 opt-level = 3
@@ -33,3 +51,50 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# ============================================================================
+# Cross-compilation Configuration
+# 交叉编译配置
+#
+# NOTE: GitHub Actions uses `cross` tool which auto-configures linkers,
+#       so these settings are primarily for local cross-compilation.
+#       GitHub Actions 使用 `cross` 工具自动配置 linker，
+#       所以这些配置主要用于本地交叉编译。
+# ============================================================================
+
+# Cross-compilation for Linux x86_64
+# Linux x86_64 交叉编译
+# [target.x86_64-unknown-linux-gnu]
+# linker = "x86_64-linux-gnu-gcc"
+
+# Cross-compilation for Linux ARM64 (aarch64)
+# Linux ARM64 交叉编译
+# [target.aarch64-unknown-linux-gnu]
+# linker = "aarch64-linux-gnu-gcc"
+
+# Cross-compilation for Linux musl (static binary)
+# Linux musl 交叉编译（静态二进制）
+# [target.x86_64-unknown-linux-musl]
+# linker = "x86_64-linux-musl-gcc"
+# strip = true
+
+# Cross-compilation for FreeBSD x86_64
+# FreeBSD x86_64 交叉编译
+# NOTE: Requires cross tool: https://github.com/cross-rs/cross
+#       Install: cargo install cross --git https://github.com/cross-rs/cross
+#       Build: cross build --target x86_64-unknown-freebsd --release
+# 注意：需要 cross 工具：https://github.com/cross-rs/cross
+#       安装：cargo install cross --git https://github.com/cross-rs/cross
+#       构建：cross build --target x86_64-unknown-freebsd --release
+# [target.x86_64-unknown-freebsd]
+# linker = "x86_64-unknown-freebsd12.0-gcc"
+
+# Cross-compilation for FreeBSD ARM64 (aarch64)
+# FreeBSD ARM64 交叉编译
+# NOTE: Requires nightly toolchain with -Z build-std=std,panic_abort
+#       See GitHub Actions workflow for details
+# 注意：需要 nightly 工具链和 -Z build-std=std,panic_abort
+#       详情请参考 GitHub Actions 工作流
+# [target.aarch64-unknown-freebsd]
+# linker = "aarch64-unknown-freebsd12.0-gcc"
+

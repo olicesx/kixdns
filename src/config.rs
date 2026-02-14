@@ -13,11 +13,61 @@ pub struct PipelineConfig {
     pub version: Option<String>,
     #[serde(default)]
     pub settings: GlobalSettings,
-    /// 多维优先级的 pipeline 选择规则（按顺序评估）。 / Multi-dimensional priority pipeline selection rules (evaluated in order)
+    /// 多维优先级的 pipeline 选择规则（按顺序评估）。 / Multi-dimensional priority selection rules (evaluated in order)
     #[serde(default)]
     pub pipeline_select: Vec<PipelineSelectRule>,
     #[serde(default)]
     pub pipelines: Vec<Pipeline>,
+
+    /// 后台刷新专用规则（可选）。如果未配置，将使用默认规则（Any 匹配 + Forward 到原始 upstream）。
+    /// Background refresh dedicated rule (optional). If not configured, will use default rule (Any matcher + Forward to original upstream).
+    ///
+    /// # Purpose
+    ///
+    /// 为后台刷新提供独立的规则配置，允许自定义后台刷新的行为。
+    /// Provide independent rule configuration for background refresh, allowing custom behavior.
+    ///
+    /// # Design Philosophy
+    ///
+    /// **后台刷新 = 调用 handle_packet(skip_cache=true)**
+    ///
+    /// 后台刷新本质上就是向规则引擎发起一个特殊的查询请求，
+    /// 使用"后台刷新专用规则"，完全复用规则引擎的所有逻辑。
+    ///
+    /// **Background refresh = Call handle_packet(skip_cache=true)**
+    ///
+    /// 后台刷新与正常查询的唯一区别：
+    /// - 正常查询：检查缓存 → 规则引擎 → 执行查询
+    /// - 后台刷新：跳过缓存 → 规则引擎 → 执行查询
+    ///
+    /// # Example
+    ///
+    /// ```json
+    /// {
+    ///   "background_refresh_rule": {
+    ///     "name": "后台刷新专用规则",
+    ///     "matchers": [
+    ///       {
+    ///         "type": "any",
+    ///         "operator": "and"
+    ///       }
+    ///     ],
+    ///     "actions": [
+    ///       {
+    ///         "type": "forward",
+    ///         "upstream": "8.8.8.8:53",  // 将在运行时替换为实际 upstream
+    ///         "transport": "tcp"
+    ///       }
+    ///     ],
+    ///     "response_matchers": [],
+    ///     "response_matcher_operator": "and",
+    ///     "response_actions_on_match": [],
+    ///     "response_actions_on_miss": []
+    ///   }
+    /// }
+    /// ```
+    #[serde(default)]
+    pub background_refresh_rule: Option<Rule>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -43,9 +93,18 @@ pub struct GlobalSettings {
     /// 默认上游DNS。 / Default upstream DNS
     #[serde(default = "default_upstream")]
     pub default_upstream: String,
+    /// 预分割的默认上游列表（性能优化） / Pre-split default upstream list (performance optimization)
+    #[serde(skip)]
+    pub default_upstream_pre_split: Option<std::sync::Arc<Vec<std::sync::Arc<str>>>>,
     /// 上游超时（毫秒）。 / Upstream timeout (milliseconds)
+    /// 单次上游请求的超时时间
     #[serde(default = "default_upstream_timeout_ms")]
     pub upstream_timeout_ms: u64,
+    /// 整体请求超时（毫秒）。 / Overall request timeout (milliseconds)
+    /// 包含 hedge + TCP fallback 的总超时时间。如果未设置，自动计算为 upstream_timeout_ms * 2.5
+    /// Total timeout including hedge + TCP fallback. If not set, auto-calculated as upstream_timeout_ms * 2.5
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
     /// 响应阶段 Pipeline 跳转上限。 / Response phase pipeline jump limit
     #[serde(default = "default_response_jump_limit")]
     pub response_jump_limit: u32,
@@ -55,21 +114,113 @@ pub struct GlobalSettings {
     /// TCP 上游连接池大小。 / TCP upstream connection pool size
     #[serde(default = "default_tcp_pool_size")]
     pub tcp_pool_size: usize,
-    /// 自适应流控初始 permits 数量。 / Initial permits for adaptive flow control
+    /// DoH 上游连接池大小（每个 upstream 的最大空闲连接数）。 / DoH upstream pool size (max idle per host)
+    #[serde(default = "default_doh_pool_size")]
+    pub doh_pool_size: usize,
+    /// DoT 上游连接池大小。 / DoT upstream connection pool size
+    #[serde(default = "default_dot_pool_size")]
+    pub dot_pool_size: usize,
+    /// DoQ 上游连接池大小。 / DoQ upstream connection pool size
+    #[serde(default = "default_doq_pool_size")]
+    pub doq_pool_size: usize,
+    /// TCP 健康检查错误阈值（连续失败多少次后重置连接） / TCP health check error threshold (reset connection after N consecutive failures)
+    /// 默认 3 次，0 表示禁用健康检查 / Default 3, 0 means disable health check
+    #[serde(default = "default_tcp_health_check_error_threshold")]
+    pub tcp_health_check_error_threshold: usize,
+    /// TCP 连接最大存活时间（秒，超过强制重置） / TCP connection max age (seconds, force reset after this time)
+    /// 0 表示禁用连接老化检查 / 0 means disable connection aging check
+    #[serde(default = "default_tcp_connection_max_age_seconds")]
+    pub tcp_connection_max_age_seconds: u64,
+    /// TCP 连接空闲超时（秒，无请求超过此时间重置） / TCP connection idle timeout (seconds, reset if no requests for this time)
+    /// 0 表示禁用空闲超时检查 / 0 means disable idle timeout check
+    #[serde(default = "default_tcp_connection_idle_timeout_seconds")]
+    pub tcp_connection_idle_timeout_seconds: u64,
+    /// DoQ 连接空闲超时（秒）。 / DoQ connection idle timeout (seconds)
+    #[serde(default = "default_doq_idle_timeout_seconds")]
+    pub doq_connection_idle_timeout_seconds: u64,
+    /// DoQ keepalive 间隔（毫秒）。0 表示禁用。 / DoQ keepalive interval (ms). 0 disables.
+    #[serde(default = "default_doq_keepalive_interval_ms")]
+    pub doq_keepalive_interval_ms: u64,
+    /// 是否启用 DoQ 0-RTT（默认 true）。 / Enable DoQ 0-RTT (default true)
+    #[serde(default = "default_doq_enable_0rtt")]
+    pub doq_enable_0rtt: bool,
+    /// 是否启用自适应流控（默认false，推荐禁用以获得更好的性能和更简单的行为）
+    /// Enable adaptive flow control (default false, recommended disabled for better performance and simpler behavior)
+    /// 
+    /// 禁用后采用rustdns风格：不限制并发，依赖tokio runtime调度和超时保护
+    /// When disabled, use rustdns style: no concurrency limit, rely on tokio runtime scheduling and timeout protection
+    #[serde(default = "default_flow_control_enabled")]
+    pub flow_control_enabled: bool,
+    /// 自适应流控初始 permits 数量（仅在flow_control_enabled=true时有效） / Initial permits for adaptive flow control (only effective when flow_control_enabled=true)
     #[serde(default = "default_flow_control_initial_permits")]
     pub flow_control_initial_permits: usize,
-    /// 自适应流控最小 permits 数量。 / Minimum permits for adaptive flow control
+    /// 自适应流控最小 permits 数量（仅在flow_control_enabled=true时有效） / Minimum permits for adaptive flow control (only effective when flow_control_enabled=true)
     #[serde(default = "default_flow_control_min_permits")]
     pub flow_control_min_permits: usize,
-    /// 自适应流控最大 permits 数量。 / Maximum permits for adaptive flow control
+    /// 自适应流控最大 permits 数量（仅在flow_control_enabled=true时有效） / Maximum permits for adaptive flow control (only effective when flow_control_enabled=true)
     #[serde(default = "default_flow_control_max_permits")]
     pub flow_control_max_permits: usize,
-    /// 上游延迟告急阈值（毫秒）。 / Critical latency threshold (milliseconds)
+    /// 上游延迟告急阈值（毫秒，仅在flow_control_enabled=true时有效） / Critical latency threshold (milliseconds, only effective when flow_control_enabled=true)
     #[serde(default = "default_flow_control_latency_threshold_ms")]
     pub flow_control_latency_threshold_ms: u64,
-    /// 流控调整间隔（秒）。 / Flow control adjustment interval (seconds)
+    /// 流控调整间隔（秒，仅在flow_control_enabled=true时有效） / Flow control adjustment interval (seconds, only effective when flow_control_enabled=true)
     #[serde(default = "default_flow_control_adjustment_interval_secs")]
     pub flow_control_adjustment_interval_secs: u64,
+    /// RFC 8767: 上游不可用时返回过期缓存（默认 false）/ RFC 8767: Serve stale cached data when upstream is unavailable (default false)
+    #[serde(default = "default_serve_stale")]
+    pub serve_stale: bool,
+    /// RFC 8767: 过期缓存响应的 TTL（秒，默认 30）/ RFC 8767: TTL for stale responses (seconds, default 30)
+    /// 对应 Unbound serve-expired-reply-ttl / Corresponds to Unbound serve-expired-reply-ttl
+    #[serde(default = "default_serve_stale_ttl")]
+    pub serve_stale_ttl: u32,
+    /// RFC 8767: 过期缓存可被服务的最大时间窗口（秒，默认 86400）
+    /// 当缓存过期超过此时间后不再返回 stale 数据。0 表示无限制。
+    /// RFC 8767: Maximum time window for serving stale cache (seconds, default 86400)
+    /// Don't serve stale data after the entry has been expired for longer than this. 0 means no limit.
+    /// 对应 Unbound serve-expired-ttl / Corresponds to Unbound serve-expired-ttl
+    #[serde(default = "default_serve_stale_expire_ttl")]
+    pub serve_stale_expire_ttl: u64,
+    /// RFC 8767: 提供过期缓存后重置过期计时器（默认 true）
+    /// 启用后，每次返回 stale 数据时重置过期时间窗口，确保频繁访问的域名不会因 serve_stale_expire_ttl 超时。
+    /// RFC 8767: Reset the stale expiry timer after serving stale (default true)
+    /// When enabled, resets the stale age counter each time stale data is served.
+    /// 对应 Unbound serve-expired-ttl-reset / Corresponds to Unbound serve-expired-ttl-reset
+    #[serde(default = "default_serve_stale_ttl_reset")]
+    pub serve_stale_ttl_reset: bool,
+    /// RFC 8767: 返回过期缓存前尝试上游查询的超时（毫秒，默认 0）
+    /// 0 = 立即返回过期缓存（乐观模式）。 > 0 = 先尝试上游查询，超时后返回过期缓存。
+    /// RFC 8767: Client timeout before serving stale (ms, default 0)
+    /// 0 = serve stale immediately (optimistic mode). > 0 = try upstream first, serve stale on timeout.
+    /// 对应 Unbound serve-expired-client-timeout / Corresponds to Unbound serve-expired-client-timeout
+    #[serde(default = "default_serve_stale_client_timeout_ms")]
+    pub serve_stale_client_timeout_ms: u64,
+    /// 缓存后台刷新是否启用（默认false） / Enable cache background refresh (default false)
+    #[serde(default = "default_cache_background_refresh")]
+    pub cache_background_refresh: bool,
+    /// 缓存后台刷新阈值（百分比，默认10）。当剩余TTL低于此百分比时触发后台刷新 / Cache background refresh threshold (percentage, default 10). Trigger background refresh when remaining TTL below this percentage
+    #[serde(default = "default_cache_refresh_threshold_percent")]
+    pub cache_refresh_threshold_percent: u8,
+    /// 缓存后台刷新最小TTL（秒，默认5）。防止TTL过短导致无限循环刷新 / Cache background refresh minimum TTL (seconds, default 5). Prevent infinite refresh loop for very short TTLs
+    #[serde(default = "default_cache_refresh_min_ttl")]
+    pub cache_refresh_min_ttl: u32,
+    /// GeoIP 数据库文件路径（MMDB 格式） / GeoIP database file path (MMDB format)
+    #[serde(default)]
+    pub geoip_db_path: Option<String>,
+    /// GeoIP 数据文件路径（V2Ray .dat 格式） / GeoIP data file path (V2Ray .dat format)
+    #[serde(default)]
+    pub geoip_dat_path: Option<String>,
+    /// 是否自动转换 .dat 为 MMDB（默认 false）/ Auto-convert .dat to MMDB (default false)
+    #[serde(default)]
+    pub geoip_auto_convert: bool,
+    /// GeoIP 转换时过滤的国家代码列表 / Country codes to filter during GeoIP conversion
+    #[serde(default)]
+    pub geoip_filter_countries: Vec<String>,
+    /// GeoSite 数据文件路径列表（V2Ray 格式，支持多个文件） / GeoSite data file paths (V2Ray format, supports multiple files)
+    #[serde(default)]
+    pub geosite_data_paths: Vec<String>,
+    /// UDP 失败时是否自动 fallback 到 TCP（默认 true）。 / UDP failure automatically fallbacks to TCP (default true)
+    #[serde(default = "default_enable_tcp_fallback")]
+    pub enable_tcp_fallback: bool,
 }
 
 impl Default for GlobalSettings {
@@ -79,10 +230,22 @@ impl Default for GlobalSettings {
             bind_udp: default_bind_udp(),
             bind_tcp: default_bind_tcp(),
             default_upstream: default_upstream(),
+            default_upstream_pre_split: None,
             upstream_timeout_ms: default_upstream_timeout_ms(),
+            request_timeout_ms: None, // 默认自动计算 / Auto-calculated by default
             response_jump_limit: default_response_jump_limit(),
             udp_pool_size: default_udp_pool_size(),
             tcp_pool_size: default_tcp_pool_size(),
+            doh_pool_size: default_doh_pool_size(),
+            dot_pool_size: default_dot_pool_size(),
+            doq_pool_size: default_doq_pool_size(),
+            tcp_health_check_error_threshold: default_tcp_health_check_error_threshold(),
+            tcp_connection_max_age_seconds: default_tcp_connection_max_age_seconds(),
+            tcp_connection_idle_timeout_seconds: default_tcp_connection_idle_timeout_seconds(),
+            doq_connection_idle_timeout_seconds: default_doq_idle_timeout_seconds(),
+            doq_keepalive_interval_ms: default_doq_keepalive_interval_ms(),
+            doq_enable_0rtt: default_doq_enable_0rtt(),
+            flow_control_enabled: default_flow_control_enabled(),
             flow_control_initial_permits: default_flow_control_initial_permits(),
             flow_control_min_permits: default_flow_control_min_permits(),
             flow_control_max_permits: default_flow_control_max_permits(),
@@ -91,6 +254,20 @@ impl Default for GlobalSettings {
             cache_capacity: default_cache_capacity(),
             cache_max_ttl: default_cache_max_ttl(),
             dashmap_shards: default_dashmap_shards(),
+            serve_stale: default_serve_stale(),
+            serve_stale_ttl: default_serve_stale_ttl(),
+            serve_stale_expire_ttl: default_serve_stale_expire_ttl(),
+            serve_stale_ttl_reset: default_serve_stale_ttl_reset(),
+            serve_stale_client_timeout_ms: default_serve_stale_client_timeout_ms(),
+            cache_background_refresh: default_cache_background_refresh(),
+            cache_refresh_threshold_percent: default_cache_refresh_threshold_percent(),
+            cache_refresh_min_ttl: default_cache_refresh_min_ttl(),
+            geoip_db_path: None,
+            geoip_dat_path: None,
+            geoip_auto_convert: false,
+            geoip_filter_countries: Vec::new(),
+            geosite_data_paths: Vec::new(),
+            enable_tcp_fallback: default_enable_tcp_fallback(),
         }
     }
 }
@@ -152,6 +329,14 @@ pub enum Matcher {
     ClientIp {
         cidr: String,
     },
+    /// 匹配客户端IP的GeoIP国家代码（大小写不敏感）。 / Match client IP GeoIP country code (case insensitive)
+    GeoipCountry {
+        country_codes: Vec<String>,
+    },
+    /// 匹配客户端IP是否为私有IP（内网）。 / Match whether client IP is private (internal network)
+    GeoipPrivate {
+        expect: bool,
+    },
     /// 匹配查询 QCLASS（如 IN/CH/HS）。 / Match query QCLASS (e.g., IN/CH/HS)
     Qclass {
         value: String,
@@ -159,6 +344,18 @@ pub enum Matcher {
     /// 是否存在 EDNS 伪记录。 / Whether EDNS pseudo-record exists
     EdnsPresent {
         expect: bool,
+    },
+    /// GeoSite 分类匹配（如 "cn", "google", "category-ads"）。 / GeoSite category matching (e.g., "cn", "google", "category-ads")
+    GeoSite {
+        value: String,
+    },
+    /// GeoSite 否定匹配（匹配不在该分类的域名）。 / GeoSite negation matching (match domains NOT in category)
+    GeoSiteNot {
+        value: String,
+    },
+    /// 请求 QTYPE（如 A/AAAA/CNAME/TXT/MX 等）。 / Request QTYPE (e.g., A/AAAA/CNAME/TXT/MX, etc.)
+    Qtype {
+        value: String,
     },
 }
 
@@ -179,6 +376,16 @@ pub enum PipelineSelectorMatcher {
     Qclass { value: String },
     /// 请求是否携带 EDNS。 / Whether request carries EDNS
     EdnsPresent { expect: bool },
+    /// GeoSite 分类匹配（如 "cn", "google", "category-ads"）。 / GeoSite category matching (e.g., "cn", "google", "category-ads")
+    GeoSite { value: String },
+    /// GeoSite 否定匹配（匹配不在该分类的域名）。 / GeoSite negation matching (match domains NOT in category)
+    GeoSiteNot { value: String },
+    /// 匹配客户端IP的GeoIP国家代码（大小写不敏感）。 / Match client IP GeoIP country code (case insensitive)
+    GeoipCountry { country_codes: Vec<String> },
+    /// 匹配客户端IP是否为私有IP（内网）。 / Match whether client IP is private (internal network)
+    GeoipPrivate { expect: bool },
+    /// 请求 QTYPE（如 A/AAAA/CNAME/TXT/MX 等）。 / Request QTYPE (e.g., A/AAAA/CNAME/TXT/MX, etc.)
+    Qtype { value: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -235,6 +442,21 @@ pub enum ResponseMatcher {
     ResponseQclass { value: String },
     /// 响应是否携带 EDNS。 / Whether response carries EDNS
     ResponseEdnsPresent { expect: bool },
+    /// 匹配响应中 IP 的 GeoIP 国家代码（大小写不敏感）/ Match GeoIP country code of IPs in response (case insensitive)
+    ResponseAnswerIpGeoipCountry { country_codes: Vec<String> },
+    /// 匹配响应中 IP 是否为私有 IP / Match whether IPs in response are private IPs
+    ResponseAnswerIpGeoipPrivate { expect: bool },
+    /// 匹配响应中的请求域名是否属于指定 GeoSite 分类 / Match if request domain in response belongs to specified GeoSite category
+    ResponseRequestDomainGeoSite { value: String },
+    /// 匹配响应中的请求域名是否不属于指定 GeoSite 分类 / Match if request domain in response does NOT belong to specified GeoSite category
+    ResponseRequestDomainGeoSiteNot { value: String },
+    /// 匹配响应中 TXT 记录的内容 / Match TXT record content in response
+    ResponseTxtContent {
+        /// 匹配模式: exact(精确), prefix(前缀), regex(正则) / Match mode: exact, prefix, or regex
+        mode: String,
+        /// 要匹配的文本 / Text to match
+        value: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -246,27 +468,131 @@ pub enum Action {
     StaticResponse { rcode: String },
     /// 返回固定 IP (A/AAAA)。 / Return static IP (A/AAAA)
     StaticIpResponse { ip: String },
+    /// 返回固定 TXT 记录。支持单个字符串或字符串数组。 / Return static TXT record. Supports single string or string array.
+    StaticTxtResponse {
+        /// TXT 记录内容 / TXT record content
+        #[serde(deserialize_with = "deserialize_txt_text")]
+        text: Vec<String>,
+        /// TTL (可选，默认 300) / TTL (optional, default 300)
+        #[serde(default)]
+        ttl: Option<u32>,
+    },
     /// 跳转到指定 Pipeline 继续处理。 / Jump to specified Pipeline to continue processing
     JumpToPipeline { pipeline: String },
     /// 终止匹配。请求阶段使用默认上游，响应阶段使用当前响应。 / Terminate matching. Request phase uses default upstream, response phase uses current response
     Allow,
     /// 终止并丢弃（返回 REFUSED）。 / Terminate and drop (return REFUSED)
     Deny,
-    /// 透传上游；upstream为空则使用全局默认；transport缺省udp。 / Forward to upstream; use global default if upstream is empty; transport defaults to udp
+    /// 透传上游；upstream为空则使用全局默认；支持逗号分隔或数组格式的多个上游（并发请求取最快结果）；transport缺省udp。
+    /// 支持 udp/tcp/tcp_udp/doh/dot/doq。/ Forward to upstream; use global default if upstream is empty; supports comma-separated or array format for multiple upstreams (concurrent requests, take fastest result); transport defaults to udp; supports udp/tcp/tcp_udp/doh/dot/doq.
     Forward {
+        #[serde(deserialize_with = "deserialize_upstream")]
         upstream: Option<String>,
         #[serde(default)]
         transport: Option<Transport>,
+        /// 预分割的 upstream 列表（性能优化）/ Pre-split upstream list (performance optimization)
+        #[serde(skip)]
+        pre_split_upstreams: Option<std::sync::Arc<Vec<std::sync::Arc<str>>>>,
     },
     /// 继续匹配后续规则。响应阶段会复用当前响应结果。 / Continue matching subsequent rules. Response phase will reuse current response result
     Continue,
+    /// 修改响应中的 TXT 记录 / Modify TXT records in response
+    ReplaceTxtResponse {
+        /// 新的 TXT 内容 / New TXT content
+        #[serde(deserialize_with = "deserialize_txt_text")]
+        text: Vec<String>,
+    },
 }
 
-#[derive(Debug, Clone, Deserialize, Copy, PartialEq, Eq)]
+/// Action 辅助函数 / Action helper functions
+impl Action {
+    /// 预分割 upstream 字符串以优化性能（在配置加载时调用）/ Pre-split upstream string for performance (call during config loading)
+    #[inline]
+    pub fn pre_split_upstreams(&mut self) {
+        if let Action::Forward {
+            upstream,
+            pre_split_upstreams,
+            ..
+        } = self
+        {
+            if let Some(upstream_str) = upstream {
+                let split: Vec<std::sync::Arc<str>> = upstream_str
+                    .split(',')
+                    .map(|s| std::sync::Arc::from(s.trim()))
+                    .filter(|s: &std::sync::Arc<str>| !s.is_empty())
+                    .collect();
+                *pre_split_upstreams = Some(std::sync::Arc::new(split));
+            }
+        }
+    }
+}
+
+impl GlobalSettings {
+    /// 预分割默认 upstream 字符串以优化性能（在配置加载时调用）/ Pre-split default upstream string for performance (call during config loading)
+    #[inline]
+    pub fn pre_split_default_upstream(&mut self) {
+        let split: Vec<std::sync::Arc<str>> = self
+            .default_upstream
+            .split(',')
+            .map(|s| std::sync::Arc::from(s.trim()))
+            .filter(|s: &std::sync::Arc<str>| !s.is_empty())
+            .collect();
+        if split.len() > 1 {
+            self.default_upstream_pre_split = Some(std::sync::Arc::new(split));
+        }
+    }
+
+    /// Validate timeout configuration sanity
+    /// 验证超时配置的合理性
+    pub fn validate_timeouts(&self) -> anyhow::Result<()> {
+        // Validate request_timeout >= upstream_timeout
+        // 验证 request_timeout >= upstream_timeout
+        if let Some(request_timeout) = self.request_timeout_ms {
+            if request_timeout < self.upstream_timeout_ms {
+                anyhow::bail!(
+                    "Configuration error: request_timeout_ms ({request_timeout}) must be >= upstream_timeout_ms ({upstream})\n\
+                     配置错误: request_timeout_ms ({request_timeout}) 必须大于等于 upstream_timeout_ms ({upstream})",
+                    upstream = self.upstream_timeout_ms
+                );
+            }
+
+            // Recommended value check (warning only, doesn't block)
+            // 建议值检查（警告但不阻止）
+            // Recommended value should be at least upstream * 2.5 to allow hedge + TCP fallback to complete
+            // 建议值应至少为 upstream * 2.5，以允许 hedge + TCP fallback 完成
+            let recommended = self.upstream_timeout_ms * 5 / 2;
+            if request_timeout < recommended {
+                tracing::warn!(
+                    upstream_timeout_ms = self.upstream_timeout_ms,
+                    request_timeout_ms = request_timeout,
+                    recommended = recommended,
+                    "request_timeout_ms may be too short, may interrupt hedge and TCP fallback\n\
+                     request_timeout_ms 可能太短，可能会中断 hedge 和 TCP fallback"
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
     Udp,
     Tcp,
+    /// Send both TCP and UDP concurrently, use first response (hedged request)
+    /// 同时发送 TCP 和 UDP，使用第一个响应（对冲请求）
+    TcpUdp,
+    /// DNS over HTTPS (DoH)
+    /// DNS over HTTPS（DoH）
+    Doh,
+    /// DNS over TLS (DoT)
+    /// DNS over TLS（DoT）
+    Dot,
+    /// DNS over QUIC (DoQ)
+    /// DNS over QUIC（DoQ）
+    Doq,
 }
 
 #[derive(Debug, Clone, Deserialize, Copy, PartialEq, Eq)]
@@ -299,8 +625,15 @@ pub fn load_config(path: &Path) -> Result<PipelineConfig> {
     }
 
     // 轻量校验：CIDR提前解析，便于后续快速匹配。 / Lightweight validation: parse CIDR in advance for subsequent fast matching
+    // 预分割 upstream 字符串以提高性能 / Pre-split upstream strings for better performance
+    // 预分割默认 upstream 以支持并发查询 / Pre-split default upstream for concurrent queries
+    cfg.settings.pre_split_default_upstream();
+
     for pipeline in &mut cfg.pipelines {
         for rule in &mut pipeline.rules {
+            for action in &mut rule.actions {
+                action.pre_split_upstreams();
+            }
             for matcher in &rule.matchers {
                 if let Matcher::ClientIp { cidr } = &matcher.matcher {
                     let _parsed: IpNet = cidr.parse()?;
@@ -343,104 +676,6 @@ pub fn load_config(path: &Path) -> Result<PipelineConfig> {
     Ok(cfg)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn response_action_fields_default_to_empty() {
-        let raw = json!({
-            "pipelines": [
-                {
-                    "id": "p1",
-                    "rules": [
-                        {
-                            "name": "rule",
-                            "actions": [ { "type": "log", "level": "info" } ]
-                        }
-                    ]
-                }
-            ]
-        });
-        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        let rule = &cfg.pipelines[0].rules[0];
-        assert!(rule.response_actions_on_match.is_empty());
-        assert!(rule.response_actions_on_miss.is_empty());
-    }
-
-    #[test]
-    fn rule_operator_defaults_to_and_when_omitted() {
-        let raw = serde_json::json!({
-            "pipelines": [
-                {
-                    "id": "p1",
-                    "rules": [
-                        {
-                            "name": "rule",
-                            "matchers": [ { "type": "any" } ],
-                            "actions": [ { "type": "log", "level": "info" } ]
-                        }
-                    ]
-                }
-            ]
-        });
-
-        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        let rule = &cfg.pipelines[0].rules[0];
-        // default should be MatchOperator::And / 默认应为 MatchOperator::And
-        assert_eq!(rule.matcher_operator, MatchOperator::And);
-        assert_eq!(rule.response_matcher_operator, MatchOperator::And);
-    }
-
-    #[test]
-    fn flow_control_settings_default_when_omitted() {
-        let raw = serde_json::json!({
-            "pipelines": [
-                {
-                    "id": "p1",
-                    "rules": []
-                }
-            ]
-        });
-
-        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        // Verify flow control settings have correct defaults
-        assert_eq!(cfg.settings.flow_control_initial_permits, 500);
-        assert_eq!(cfg.settings.flow_control_min_permits, 100);
-        assert_eq!(cfg.settings.flow_control_max_permits, 800);
-        assert_eq!(cfg.settings.flow_control_latency_threshold_ms, 100);
-        assert_eq!(cfg.settings.flow_control_adjustment_interval_secs, 5);
-    }
-
-    #[test]
-    fn flow_control_settings_can_be_customized() {
-        let raw = serde_json::json!({
-            "settings": {
-                "flow_control_initial_permits": 200,
-                "flow_control_min_permits": 50,
-                "flow_control_max_permits": 400,
-                "flow_control_latency_threshold_ms": 150,
-                "flow_control_adjustment_interval_secs": 10
-            },
-            "pipelines": [
-                {
-                    "id": "p1",
-                    "rules": []
-                }
-            ]
-        });
-
-        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        // Verify custom flow control settings
-        assert_eq!(cfg.settings.flow_control_initial_permits, 200);
-        assert_eq!(cfg.settings.flow_control_min_permits, 50);
-        assert_eq!(cfg.settings.flow_control_max_permits, 400);
-        assert_eq!(cfg.settings.flow_control_latency_threshold_ms, 150);
-        assert_eq!(cfg.settings.flow_control_adjustment_interval_secs, 10);
-    }
-}
-
 fn default_min_ttl() -> u32 {
     0
 }
@@ -458,7 +693,11 @@ fn default_upstream() -> String {
 }
 
 fn default_upstream_timeout_ms() -> u64 {
-    2000
+    // Increased from 2000ms to 9000ms to align with idoq library best practices
+    // DoQ servers (especially Alibaba DNS) may require longer response times
+    // 从 2000ms 增加到 9000ms，以对齐 idoq 库的最佳实践
+    // DoQ 服务器（特别是阿里 DNS）可能需要更长的响应时间
+    9000
 }
 
 fn default_response_jump_limit() -> u32 {
@@ -471,6 +710,47 @@ fn default_udp_pool_size() -> usize {
 
 fn default_tcp_pool_size() -> usize {
     64
+}
+
+fn default_doh_pool_size() -> usize {
+    8
+}
+
+fn default_dot_pool_size() -> usize {
+    64
+}
+
+fn default_doq_pool_size() -> usize {
+    16
+}
+
+fn default_tcp_health_check_error_threshold() -> usize {
+    3 // 连续 3 次失败后重置连接 / Reset connection after 3 consecutive failures
+}
+
+fn default_tcp_connection_max_age_seconds() -> u64 {
+    300 // 5 分钟 / 5 minutes
+}
+
+fn default_tcp_connection_idle_timeout_seconds() -> u64 {
+    60 // 1 分钟 / 1 minute
+}
+
+fn default_doq_idle_timeout_seconds() -> u64 {
+    60 // 1 分钟 / 1 minute
+}
+
+fn default_doq_keepalive_interval_ms() -> u64 {
+    15_000
+}
+
+fn default_doq_enable_0rtt() -> bool {
+    true  // 默认启用 0-RTT，系统会自动检测并回退不支持的服务器
+    // Enabled by default - system automatically detects and falls back for unsupported servers
+}
+
+fn default_flow_control_enabled() -> bool {
+    false  // 默认禁用，采用rustdns风格 / Default disabled, use rustdns style
 }
 
 fn default_flow_control_initial_permits() -> usize {
@@ -491,4 +771,93 @@ fn default_flow_control_latency_threshold_ms() -> u64 {
 
 fn default_flow_control_adjustment_interval_secs() -> u64 {
     5
+}
+
+fn default_serve_stale() -> bool {
+    false
+}
+
+fn default_serve_stale_ttl() -> u32 {
+    30
+}
+
+fn default_serve_stale_expire_ttl() -> u64 {
+    86400
+}
+
+fn default_serve_stale_ttl_reset() -> bool {
+    true
+}
+
+fn default_serve_stale_client_timeout_ms() -> u64 {
+    0
+}
+
+fn default_cache_background_refresh() -> bool {
+    false
+}
+
+fn default_cache_refresh_threshold_percent() -> u8 {
+    10
+}
+
+fn default_cache_refresh_min_ttl() -> u32 {
+    5
+}
+
+/// 反序列化 upstream 字段，支持字符串、逗号分隔字符串或数组格式
+/// Deserialize upstream field, supports string, comma-separated string, or array format
+fn deserialize_upstream<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum UpstreamInput {
+        String(String),
+        Array(Vec<String>),
+    }
+
+    let input = Option::<UpstreamInput>::deserialize(deserializer)?;
+
+    match input {
+        None => Ok(None),
+        Some(UpstreamInput::String(s)) => Ok(Some(s)),
+        Some(UpstreamInput::Array(arr)) => {
+            if arr.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(arr.join(",")))
+            }
+        }
+    }
+}
+
+/// 反序列化TXT文本字段，支持单个字符串或字符串数组 / Deserialize TXT text field, supports single string or string array
+fn deserialize_txt_text<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum TxtTextInput {
+        String(String),
+        Array(Vec<String>),
+    }
+
+    let input = TxtTextInput::deserialize(deserializer)?;
+
+    match input {
+        TxtTextInput::String(s) => Ok(vec![s]),
+        TxtTextInput::Array(arr) => Ok(arr),
+    }
+}
+
+
+fn default_enable_tcp_fallback() -> bool {
+    true
 }

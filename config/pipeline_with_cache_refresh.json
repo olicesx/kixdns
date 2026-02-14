@@ -1,0 +1,33 @@
+{
+  "version": "1.0",
+  "settings": {
+    "default_upstream": "8.8.8.8:53",
+    "cache_background_refresh": true,
+    "cache_refresh_threshold_percent": 80,
+    "cache_refresh_min_ttl": 5,
+    "cache_capacity": 10000,
+    "cache_max_ttl": 3600
+  },
+  "pipelines": [
+    {
+      "id": "pipeline",
+      "rules": [
+        {
+          "name": "gfw",
+          "matchers": [
+            {
+              "matcher": "geosite",
+              "tag": "gfw"
+            }
+          ],
+          "actions": [
+            {
+              "action": "forward",
+              "upstream": ["8.8.8.8:53", "1.1.1.1:53"]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

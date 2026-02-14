@@ -79,6 +79,11 @@
                                 <input type="number" class="form-control" v-model.number="config.settings.upstream_timeout_ms">
                             </div>
                             <div class="col-md-3">
+                                <label class="form-label">整体请求超时 (ms)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.request_timeout_ms" placeholder="留空自动计算">
+                                <div class="form-text small">包含 hedge + TCP fallback 的总超时，留空则自动计算为 upstream * 2.5</div>
+                            </div>
+                            <div class="col-md-3">
                                 <label class="form-label">响应跳转上限</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.response_jump_limit">
                             </div>
@@ -89,6 +94,60 @@
                             <div class="col-md-3">
                                 <label class="form-label">TCP 连接池大小</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.tcp_pool_size" placeholder="64">
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">DoH 连接池大小</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.doh_pool_size" placeholder="8">
+                                <div class="form-text small">每个上游最大空闲连接数（默认 8）</div>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">DoT 连接池大小</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.dot_pool_size" placeholder="64">
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">DoQ 连接池大小</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.doq_pool_size" placeholder="16">
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">TCP 健康检查错误阈值</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.tcp_health_check_error_threshold" placeholder="3">
+                                <div class="form-text small">连续失败多少次后重置连接（0=禁用，默认 3）</div>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">TCP 连接最大存活时间 (秒)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.tcp_connection_max_age_seconds" placeholder="300">
+                                <div class="form-text small">连接超过此时间强制重置（0=禁用，默认 300）</div>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">TCP 连接空闲超时 (秒)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.tcp_connection_idle_timeout_seconds" placeholder="60">
+                                <div class="form-text small">无请求超过此时间重置连接（0=禁用，默认 60）</div>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">DoQ 连接空闲超时 (秒)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.doq_connection_idle_timeout_seconds" placeholder="60">
+                                <div class="form-text small">QUIC 连接空闲超时（0=禁用，默认 60）</div>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">DoQ Keepalive (ms)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.doq_keepalive_interval_ms" placeholder="15000">
+                                <div class="form-text small">0=禁用，默认 15000</div>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">启用 DoQ 0-RTT</label>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" v-model="config.settings.doq_enable_0rtt">
+                                    <label class="form-check-label">允许 0-RTT</label>
+                                </div>
+                                <div class="form-text small">可能存在重放风险，默认启用</div>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label">启用 TCP Fallback</label>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" v-model="config.settings.enable_tcp_fallback">
+                                    <label class="form-check-label">UDP 失败自动切换到 TCP</label>
+                                </div>
+                                <div class="form-text small">UDP 失败时自动 fallback 到 TCP（默认 true）</div>
                             </div>
                                 <div class="col-md-3">
                                     <label class="form-label">缓存容量 (entries)</label>
@@ -108,32 +167,151 @@
                         </div>
 
                         <hr>
+                        <h6 class="fw-bold mb-2 text-warning">缓存后台刷新配置 (Cache Background Refresh)</h6>
+                        <div class="row g-3">
+                            <div class="col-md-4">
+                                <label class="form-label">启用后台刷新</label>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" v-model="config.settings.cache_background_refresh">
+                                    <label class="form-check-label">启用缓存后台刷新</label>
+                                </div>
+                                <div class="form-text small">当TTL即将过期时异步刷新缓存条目</div>
+                            </div>
+                            <div class="col-md-4" v-show="config.settings.cache_background_refresh">
+                                <label class="form-label">刷新阈值 (%)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.cache_refresh_threshold_percent" placeholder="10" min="1" max="90">
+                                <div class="form-text small">当剩余TTL低于此百分比时触发刷新（1-90，默认10）</div>
+                            </div>
+                            <div class="col-md-4" v-show="config.settings.cache_background_refresh">
+                                <label class="form-label">刷新最小 TTL (秒)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.cache_refresh_min_ttl" placeholder="5" min="0">
+                                <div class="form-text small">防止TTL过短导致无限循环刷新（默认 5）</div>
+                            </div>
+                        </div>
+
+                        <hr>
+                        <h6 class="fw-bold mb-2 text-danger">RFC 8767 过期缓存 (Serve Stale)</h6>
+                        <div class="row g-3">
+                            <div class="col-md-4">
+                                <label class="form-label">服务过期响应</label>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" v-model="config.settings.serve_stale">
+                                    <label class="form-check-label">启用 RFC 8767 Serve Stale</label>
+                                </div>
+                                <div class="form-text small">上游不可用时返回过期缓存而非 SERVFAIL</div>
+                            </div>
+                            <div class="col-md-4" v-show="config.settings.serve_stale">
+                                <label class="form-label">过期记录回复TTL值 (秒)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.serve_stale_ttl" placeholder="30" min="1">
+                                <div class="form-text small">返回过期数据时使用的 TTL（对应 Unbound serve-expired-reply-ttl，默认 30秒）</div>
+                            </div>
+                            <div class="col-md-4" v-show="config.settings.serve_stale">
+                                <label class="form-label">过期响应的 TTL (秒)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.serve_stale_expire_ttl" placeholder="86400" min="0">
+                                <div class="form-text small">缓存过期后可服务的最大时间窗口，0=无限制（对应 Unbound serve-expired-ttl，默认 86400秒）</div>
+                            </div>
+                        </div>
+                        <div class="row g-3 mt-1" v-show="config.settings.serve_stale">
+                            <div class="col-md-4">
+                                <label class="form-label">重置过期记录 TTL</label>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" v-model="config.settings.serve_stale_ttl_reset">
+                                    <label class="form-check-label">启用 TTL 重置</label>
+                                </div>
+                                <div class="form-text small">每次返回过期数据时重置过期时间窗口（对应 Unbound serve-expired-ttl-reset）</div>
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label">客户端响应超时 (ms)</label>
+                                <input type="number" class="form-control" v-model.number="config.settings.serve_stale_client_timeout_ms" placeholder="0" min="0">
+                                <div class="form-text small">0=立即返回过期数据，>0=先尝试上游查询此时间后再返回过期数据（对应 Unbound serve-expired-client-timeout，默认 0）</div>
+                            </div>
+                        </div>
+
+                        <hr>
                         <h6 class="fw-bold mb-2 text-success">自适应流量控制配置 (Flow Control)</h6>
                         <div class="row g-3">
-                            <div class="col-md-6">
+                            <div class="col-md-12">
+                                <label class="form-label">启用流控</label>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" v-model="config.settings.flow_control_enabled">
+                                    <label class="form-check-label">启用自适应流控</label>
+                                </div>
+                                <div class="form-text small">推荐禁用以获得更好的性能和更简单的行为（rustdns风格）。禁用后不限制并发，依赖 tokio runtime 调度和超时保护。</div>
+                            </div>
+                            <div class="col-md-6" v-show="config.settings.flow_control_enabled">
                                 <label class="form-label">初始许可数 (Initial Permits)</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.flow_control_initial_permits" placeholder="500">
                                 <div class="form-text small">初始并发任务数</div>
                             </div>
-                            <div class="col-md-6">
+                            <div class="col-md-6" v-show="config.settings.flow_control_enabled">
                                 <label class="form-label">最小许可数 (Min Permits)</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.flow_control_min_permits" placeholder="100">
                                 <div class="form-text small">并发下限</div>
                             </div>
-                            <div class="col-md-6">
+                            <div class="col-md-6" v-show="config.settings.flow_control_enabled">
                                 <label class="form-label">最大许可数 (Max Permits)</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.flow_control_max_permits" placeholder="800">
                                 <div class="form-text small">并发上限</div>
                             </div>
-                            <div class="col-md-6">
+                            <div class="col-md-6" v-show="config.settings.flow_control_enabled">
                                 <label class="form-label">延迟阈值 (ms)</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.flow_control_latency_threshold_ms" placeholder="100">
                                 <div class="form-text small">压力判断的延迟阈值</div>
                             </div>
-                            <div class="col-md-6">
+                            <div class="col-md-6" v-show="config.settings.flow_control_enabled">
                                 <label class="form-label">调整间隔 (seconds)</label>
                                 <input type="number" class="form-control" v-model.number="config.settings.flow_control_adjustment_interval_secs" placeholder="5">
                                 <div class="form-text small">流控参数检查频率</div>
+                            </div>
+                        </div>
+
+                        <hr>
+                        <h6 class="fw-bold mb-2 text-info">GeoIP 配置 (GeoIP Database)</h6>
+                        <div class="row g-3">
+                            <div class="col-md-12">
+                                <label class="form-label">MMDB 文件路径</label>
+                                <input type="text" class="form-control" v-model="config.settings.geoip_db_path" placeholder="留空则不使用 GeoIP">
+                                <div class="form-text small">MaxMind MMDB 文件路径（如 GeoLite2-Country.mmdb），留空则不加载 GeoIP 功能</div>
+                            </div>
+                            <div class="col-md-12">
+                                <label class="form-label">.dat 文件路径 (V2Ray 格式)</label>
+                                <input type="text" class="form-control" v-model="config.settings.geoip_dat_path" placeholder="留空则不使用 .dat 文件">
+                                <div class="form-text small">V2Ray .dat 或 JSON 格式的 GeoIP 数据文件路径，支持热重载。缓存大小会根据实际加载的条目自动设置。</div>
+                            </div>
+                            <div class="col-md-4" v-show="config.settings.geoip_dat_path || config.settings.geoip_db_path">
+                                <label class="form-label">自动转换 .dat 为 MMDB</label>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" v-model="config.settings.geoip_auto_convert">
+                                    <label class="form-check-label">启用自动转换</label>
+                                </div>
+                                <div class="form-text small">当 MMDB 不存在但 .dat 文件存在时，自动转换并缓存 MMDB</div>
+                            </div>
+                            <div class="col-md-8" v-show="config.settings.geoip_dat_path || config.settings.geoip_db_path">
+                                <label class="form-label">转换时过滤国家代码</label>
+                                <input type="text" class="form-control" v-model="geoipFilterCountriesString" placeholder="CN,US,JP 或留空表示全部">
+                                <div class="form-text small">只转换指定国家的数据，逗号分隔（如 CN,US,JP），留空则转换全部国家</div>
+                            </div>
+                        </div>
+
+                        <hr>
+                        <h6 class="fw-bold mb-2 text-primary">GeoSite 配置 (GeoSite Data)</h6>
+                        <div class="row g-3">
+                            <div class="col-md-12">
+                                <label class="form-label">启用 GeoSite</label>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" v-model="geositeEnabled">
+                                    <label class="form-check-label">启用 GeoSite 匹配</label>
+                                </div>
+                                <div class="form-text small">启用后可以加载 V2Ray GeoSite 数据文件进行域名分类匹配</div>
+                            </div>
+                            <div class="col-md-12" v-show="geositeEnabled">
+                                <label class="form-label">数据文件路径（支持多个）</label>
+                                <div class="input-group mb-2" v-for="(path, idx) in geositePaths" :key="idx">
+                                    <input type="text" class="form-control" v-model="geositePaths[idx]" placeholder="geosite.dat 或 v2ray.dat">
+                                    <button class="btn btn-outline-danger" @click="removeGeositePath(idx)">删除</button>
+                                </div>
+                                <button class="btn btn-sm btn-outline-primary" @click="addGeositePath">+ 添加文件</button>
+                                <div class="form-text small">V2Ray GeoSite 数据文件路径（.dat 或 .json 格式），支持多个文件。缓存大小会根据实际加载的条目自动设置。</div>
                             </div>
                         </div>
                     </div>
@@ -153,7 +331,7 @@
                                     <option disabled value="">选择 Pipeline</option>
                                     <option v-for="p in config.pipelines" :value="p.id">{{ p.id }}</option>
                                 </select>
-                                <button class="btn btn-sm btn-outline-danger ms-auto" @click="removePipelineSelect(idx)">删除</button>
+                                <button class="btn btn-sm btn-outline-danger ms-auto" @click.stop="removePipelineSelect(idx)">删除</button>
                             </div>
                             <div class="ps-3 border-start">
                                 <div class="text-muted small mb-1">匹配条件 (Matchers):</div>
@@ -257,11 +435,37 @@
                 </select>
                 
                 <!-- Dynamic Inputs based on type -->
-                <input v-if="hasField(m.type, 'value')" type="text" class="form-control" v-model="m.value" placeholder="Value">
+                <input v-if="hasField(m.type, 'value')" type="text" class="form-control" v-model="m.value"
+                    :placeholder="m.type === 'geo_site' || m.type === 'geo_site_not' || m.type === 'response_request_domain_geosite' || m.type === 'response_request_domain_geosite_not' ? 'cn 或 geosite:cn' : 'Value'">
                 <input v-if="hasField(m.type, 'cidr')" type="text" class="form-control" v-model="m.cidr" placeholder="CIDR 或逗号分隔列表 (e.g. 127.0.0.0/8,0.0.0.0/8)">
                 <div v-if="hasField(m.type, 'expect')" class="input-group-text bg-white">
                     <input type="checkbox" class="form-check-input mt-0" v-model="m.expect"> &nbsp;Expect
                 </div>
+                
+                <!-- GeoIP Country Codes -->
+                <input v-if="hasField(m.type, 'country_codes')" type="text" class="form-control" v-model="m.country_codes"
+                    placeholder="CN,US,JP 或 geoip:CN">
+
+                <!-- TXT Content Mode -->
+                <select v-if="hasField(m.type, 'mode') && m.type === 'response_txt_content'" class="form-select" v-model="m.mode">
+                    <option value="exact">Exact (精确匹配)</option>
+                    <option value="prefix">Prefix (前缀匹配)</option>
+                    <option value="regex">Regex (正则匹配)</option>
+                </select>
+
+                <!-- QType Dropdown -->
+                <select v-if="hasField(m.type, 'value') && m.type === 'qtype'" class="form-select" v-model="m.value">
+                    <option value="A">A</option>
+                    <option value="AAAA">AAAA</option>
+                    <option value="CNAME">CNAME</option>
+                    <option value="MX">MX</option>
+                    <option value="TXT">TXT</option>
+                    <option value="NS">NS</option>
+                    <option value="PTR">PTR</option>
+                    <option value="SOA">SOA</option>
+                    <option value="SRV">SRV</option>
+                    <option value="OPT">OPT</option>
+                </select>
 
                 <button class="btn btn-outline-danger" @click="matchers.splice(idx, 1)">×</button>
             </div>
@@ -272,10 +476,12 @@
     <script type="text/x-template" id="action-list-template">
         <div>
             <div v-for="(a, idx) in actions" :key="idx" class="input-group input-group-sm mb-1">
-                <select class="form-select" style="max-width: 140px;" v-model="a.type" @change="resetActionFields(a)">
+                <select class="form-select" style="max-width: 160px;" v-model="a.type" @change="resetActionFields(a)">
                     <option value="log">Log</option>
                     <option value="static_response">Static Response</option>
                     <option value="static_ip_response">Static IP</option>
+                    <option value="static_txt_response">Static TXT</option>
+                    <option value="replace_txt_response">Replace TXT</option>
                     <option value="jump_to_pipeline">Jump to Pipeline</option>
                     <option value="allow">Allow (Pass)</option>
                     <option value="deny">Deny (Drop)</option>
@@ -311,12 +517,34 @@
 
                 <!-- Forward -->
                 <template v-if="a.type === 'forward'">
-                    <input type="text" class="form-control" v-model="a.upstream" placeholder="Upstream (Optional)">
-                    <select class="form-select" style="max-width: 80px;" v-model="a.transport">
-                        <option :value="null">Auto</option>
+                    <input type="text" class="form-control" v-model="a.upstream" placeholder="8.8.8.8:53 或 tcp://8.8.4.4:53,doh://dns.google/dns-query,dot://1.1.1.1:853,doq://dns.quad9.net:853">
+                    <select class="form-select" style="max-width: 110px;" v-model="a.transport">
                         <option value="udp">UDP</option>
                         <option value="tcp">TCP</option>
+                        <option value="tcp_udp">TCP+UDP</option>
+                        <option value="doh">DoH</option>
+                        <option value="dot">DoT</option>
+                        <option value="doq">DoQ</option>
                     </select>
+                    <div class="form-text small" style="font-size: 11px;">支持协议前缀 (tcp://, udp://, doh://, dot://, doq://, https://, tls://, quic://) 以及逗号分隔的多个上游</div>
+                </template>
+
+                <!-- Static TXT -->
+                <template v-if="a.type === 'static_txt_response'">
+                    <input type="text" class="form-control" v-model="a._textSingle" placeholder="单个字符串或逗号分隔多个"
+                        @input="updateTxtText(a)">
+                    <button class="btn btn-outline-secondary" type="button" @click="a._showArray = !a._showArray">数组/TTL</button>
+                    <div v-if="a._showArray" class="input-group-text bg-white">
+                        TTL: <input type="number" class="form-control form-control-sm" style="max-width: 70px;" v-model.number="a.ttl" placeholder="300" min="1">
+                    </div>
+                    <div class="form-text small" style="font-size: 11px;">逗号分隔多段，或点击"数组/TTL"配置TTL</div>
+                </template>
+
+                <!-- Replace TXT -->
+                <template v-if="a.type === 'replace_txt_response'">
+                    <input type="text" class="form-control" v-model="a._textSingle" placeholder="替换为的TXT内容"
+                        @input="updateTxtText(a)">
+                    <div class="form-text small" style="font-size: 11px;">逗号分隔多段，或直接编辑JSON使用[]数组格式</div>
                 </template>
 
                 <button class="btn btn-outline-danger" @click="actions.splice(idx, 1)">×</button>
@@ -336,6 +564,11 @@
             'domain_regex': ['value'],
             'qclass': ['value'],
             'edns_present': ['expect'],
+            'geo_site': ['value'],
+            'geo_site_not': ['value'],
+            'geoip_country': ['country_codes'],
+            'geoip_private': ['expect'],
+            'qtype': ['value'],
             'upstream_equals': ['value'],
             'request_domain_suffix': ['value'],
             'request_domain_regex': ['value'],
@@ -345,7 +578,23 @@
             'response_edns_present': ['expect'],
             'response_upstream_ip': ['cidr'],
             'response_answer_ip': ['cidr'],
+            'response_answer_ip_geoip_country': ['country_codes'],
+            'response_answer_ip_geoip_private': ['expect'],
+            'response_request_domain_geosite': ['value'],
+            'response_request_domain_geosite_not': ['value'],
+            'response_txt_content': ['mode', 'value'],
             'any': []
+        };
+
+        // Parse call syntax like "geosite:cn" or "geoip:CN"
+        const parseCallSyntax = (value) => {
+            if (!value || typeof value !== 'string') return null;
+            const match = value.match(/^(\w+):(.+)$/);
+            if (match) {
+                const [, type, arg] = match;
+                return { type: type.toLowerCase(), arg: arg.trim() };
+            }
+            return null;
         };
 
         // Default logical operator for new matchers
@@ -373,11 +622,59 @@
                     // Keep type, clear others
                     const type = m.type;
                     for (const key in m) { if (key !== 'type' && key !== 'operator') delete m[key]; }
-                    if (hasField(type, 'value')) m.value = '';
+
+                    // Handle call syntax for GeoSite and GeoIP
+                    if (hasField(type, 'value')) {
+                        if (type === 'qtype') {
+                            m.value = 'A'; // Default QType
+                        } else {
+                            m.value = '';
+                        }
+                    }
                     if (hasField(type, 'cidr')) m.cidr = '';
                     if (hasField(type, 'expect')) m.expect = true;
+                    if (hasField(type, 'country_codes')) {
+                        m.country_codes = '';
+                        // Support call syntax: "geoip:CN" or "geoip:CN,US,JP"
+                        m._callSyntax = false; // Track if using call syntax
+                    }
+                    if (hasField(type, 'value') && (type === 'geo_site' || type === 'geo_site_not' ||
+                        type === 'response_request_domain_geosite' || type === 'response_request_domain_geosite_not')) {
+                        m._callSyntax = false; // Track if using call syntax
+                    }
                     if (!m.operator) m.operator = DEFAULT_MATCH_OPERATOR;
                 };
+
+                // Watch for call syntax in GeoSite and GeoIP matchers
+                const parseCallSyntaxForMatcher = (m) => {
+                    // Handle GeoSite matchers (request and response)
+                    if (m.type === 'geo_site' || m.type === 'geo_site_not' ||
+                        m.type === 'response_request_domain_geosite' || m.type === 'response_request_domain_geosite_not') {
+                        if (m.value && m.value.includes(':')) {
+                            const parsed = parseCallSyntax(m.value);
+                            if (parsed && parsed.type === 'geosite') {
+                                m.value = parsed.arg;
+                                m._callSyntax = true;
+                            }
+                        }
+                    }
+                    // Handle GeoIP Country matchers (request and response)
+                    if (m.type === 'geoip_country' || m.type === 'response_answer_ip_geoip_country') {
+                        if (m.country_codes && m.country_codes.includes(':')) {
+                            const parsed = parseCallSyntax(m.country_codes);
+                            if (parsed && parsed.type === 'geoip') {
+                                m.country_codes = parsed.arg;
+                                m._callSyntax = true;
+                            }
+                        }
+                    }
+                };
+
+                // Auto-parse call syntax when value changes
+                Vue.watch(() => props.matchers, (matchers) => {
+                    matchers.forEach(m => parseCallSyntaxForMatcher(m));
+                }, { deep: true });
+
                 return { addMatcher, hasField, resetMatcherFields };
             }
         };
@@ -386,7 +683,7 @@
             template: '#action-list-template',
             props: ['actions', 'pipelines', 'currentPipelineId'],
             setup(props) {
-                const pipelineOptions = computed(() => (props.pipelines || []).map(p => p.id));
+                const pipelineOptions = Vue.computed(() => (props.pipelines || []).map(p => p.id));
                 const addAction = () => {
                     props.actions.push({ type: 'log', level: 'info' });
                 };
@@ -396,13 +693,47 @@
                     if (type === 'log') a.level = 'info';
                     if (type === 'static_response') a.rcode = 'NXDOMAIN';
                     if (type === 'static_ip_response') a.ip = '127.0.0.1';
+                    if (type === 'static_txt_response') {
+                        a.text = ['v=spf1 ~all'];
+                        a._textSingle = 'v=spf1 ~all';
+                        a.ttl = 300;
+                        a._showArray = false;
+                    }
+                    if (type === 'replace_txt_response') {
+                        a.text = ['replaced'];
+                        a._textSingle = 'replaced';
+                        a._showArray = false;
+                    }
                     if (type === 'jump_to_pipeline') a.pipeline = '';
                     if (type === 'allow') { /* No fields */ }
                     if (type === 'deny') { /* No fields */ }
                     if (type === 'continue') { /* No fields */ }
-                    if (type === 'forward') { a.upstream = ''; a.transport = null; }
+                    if (type === 'forward') { a.upstream = ''; a.transport = 'udp'; }
                 };
-                return { addAction, resetActionFields, pipelineOptions };
+
+                const updateTxtText = (a) => {
+                    // 从单字符串输入更新到数组
+                    if (a._textSingle !== undefined) {
+                        a.text = a._textSingle.split(',').map(s => s.trim()).filter(s => s);
+                    }
+                };
+
+                // 使用Vue 3的watch监听actions，确保text字段正确同步
+                const stopWatch = Vue.watch(() => props.pipelines, (pipelines) => {
+                    (pipelines || []).forEach(pipe => {
+                        (pipe.rules || []).forEach(rule => {
+                            [rule.actions, rule.response_actions_on_match, rule.response_actions_on_miss].forEach(actions => {
+                                (actions || []).forEach(a => {
+                                    if ((a.type === 'static_txt_response' || a.type === 'replace_txt_response') && a._textSingle === undefined && Array.isArray(a.text)) {
+                                        a._textSingle = a.text.join(', ');
+                                    }
+                                });
+                            });
+                        });
+                    });
+                }, { deep: true });
+
+                return { addAction, resetActionFields, pipelineOptions, updateTxtText };
             }
         };
 
@@ -437,9 +768,19 @@
                         bind_tcp: "0.0.0.0:5353",
                         default_upstream: "1.1.1.1:53",
                         upstream_timeout_ms: 2000,
+                        request_timeout_ms: null,
                         response_jump_limit: 10,
                         udp_pool_size: 64,
                         tcp_pool_size: 64,
+                        doh_pool_size: 8,
+                        dot_pool_size: 64,
+                        doq_pool_size: 16,
+                        tcp_health_check_error_threshold: 3,
+                        tcp_connection_max_age_seconds: 300,
+                        tcp_connection_idle_timeout_seconds: 60,
+                        doq_connection_idle_timeout_seconds: 60,
+                        doq_keepalive_interval_ms: 15000,
+                        doq_enable_0rtt: true,
                         flow_control_initial_permits: 500,
                         flow_control_min_permits: 100,
                         flow_control_max_permits: 800,
@@ -447,10 +788,50 @@
                         flow_control_adjustment_interval_secs: 5,
                         cache_capacity: 10000,
                         cache_max_ttl: 86400,
-                        dashmap_shards: 0
+                        dashmap_shards: 0,
+                        cache_background_refresh: false,
+                        cache_refresh_threshold_percent: 10,
+                        cache_refresh_min_ttl: 5,
+                        serve_stale: false,
+                        serve_stale_ttl: 30,
+                        serve_stale_expire_ttl: 86400,
+                        serve_stale_ttl_reset: true,
+                        serve_stale_client_timeout_ms: 0,
+                        flow_control_enabled: false,
+                        flow_control_initial_permits: 500,
+                        flow_control_min_permits: 100,
+                        flow_control_max_permits: 800,
+                        flow_control_latency_threshold_ms: 100,
+                        flow_control_adjustment_interval_secs: 5,
+                        geoip_db_path: "",
+                        geoip_dat_path: "",
+                        geoip_auto_convert: false,
+                        geoip_filter_countries: [],
+                        geosite_data_paths: [],
+                        enable_tcp_fallback: true,
+                        geosite_enabled: false
                     },
                     pipeline_select: [],
                     pipelines: []
+                });
+
+                // GeoSite paths array for UI management
+                const geositePaths = ref([]);
+ 
+                // GeoIP filter countries string for UI management
+                const geoipFilterCountriesString = ref('');
+ 
+                // Computed property for GeoSite enable status
+                const geositeEnabled = Vue.computed({
+                    get: () => config.value.settings.geosite_enabled || false,
+                    set: (val) => {
+                        config.value.settings.geosite_enabled = val;
+                        // When disabled, clear the paths array
+                        if (!val) {
+                            geositePaths.value = [];
+                            config.value.settings.geosite_data_paths = [];
+                        }
+                    }
                 });
 
                 const rawJson = ref('');
@@ -464,7 +845,12 @@
                     'domain_regex': 'Domain Regex',
                     'any': 'Any',
                     'qclass': 'QClass',
-                    'edns_present': 'EDNS Present'
+                    'edns_present': 'EDNS Present',
+                    'geo_site': 'GeoSite',
+                    'geo_site_not': 'GeoSite Not',
+                    'geoip_country': 'GeoIP Country',
+                    'geoip_private': 'GeoIP Private',
+                    'qtype': 'QType'
                 };
                 const requestMatcherTypes = {
                     'any': 'Any',
@@ -472,7 +858,12 @@
                     'domain_regex': 'Domain Regex',
                     'client_ip': 'Client IP',
                     'qclass': 'QClass',
-                    'edns_present': 'EDNS Present'
+                    'edns_present': 'EDNS Present',
+                    'geo_site': 'GeoSite',
+                    'geo_site_not': 'GeoSite Not',
+                    'geoip_country': 'GeoIP Country',
+                    'geoip_private': 'GeoIP Private',
+                    'qtype': 'QType'
                 };
                 const responseMatcherTypes = {
                     'upstream_equals': 'Upstream Equals',
@@ -483,11 +874,20 @@
                     'response_qclass': 'Response QClass',
                     'response_edns_present': 'Response EDNS',
                     'response_upstream_ip': 'Upstream IP (CIDR)',
-                    'response_answer_ip': 'Answer IP (CIDR)'
+                    'response_answer_ip': 'Answer IP (CIDR)',
+                    'response_answer_ip_geoip_country': 'Answer IP GeoIP Country',
+                    'response_answer_ip_geoip_private': 'Answer IP GeoIP Private',
+                    'response_request_domain_geosite': 'Req Domain GeoSite',
+                    'response_request_domain_geosite_not': 'Req Domain GeoSite Not',
+                    'response_txt_content': 'TXT Content'
                 };
 
                 const toCleanJsonString = (cfgObj) => JSON.stringify(cfgObj, (key, value) => {
                     if (key && key.startsWith('_')) return undefined;
+                    // 过滤掉空的 geosite_data_paths 数组
+                    if (key === 'geosite_data_paths' && Array.isArray(value) && value.length === 0) {
+                        return undefined;
+                    }
                     return value;
                 }, 2);
 
@@ -495,6 +895,58 @@
                 watch(config, (newVal) => {
                     if (!manualJsonEdit.value) {
                         rawJson.value = toCleanJsonString(newVal);
+                    }
+                    // Sync geosite_data_paths to geositePaths array (单向同步，避免循环)
+                    if (Array.isArray(newVal.settings.geosite_data_paths)) {
+                        // 只有当真正不同时才更新，避免触发 watch
+                        const currentPaths = geositePaths.value.join(',');
+                        const newPaths = newVal.settings.geosite_data_paths.join(',');
+                        if (currentPaths !== newPaths) {
+                            // 使用 nextTick 避免同步触发其他 watch
+                            nextTick(() => {
+                                geositePaths.value = [...newVal.settings.geosite_data_paths];
+                            });
+                        }
+                    }
+                }, { deep: true });
+
+                // Sync geositePaths -> config.settings.geosite_data_paths (单向同步，避免循环)
+                watch(geositePaths, (newPaths) => {
+                    // 过滤掉空字符串，只保留有效的路径
+                    const filteredPaths = newPaths.filter(p => p && p.trim());
+                    // 只有当真正不同时才更新，避免触发 watch
+                    const currentConfigPaths = (config.value.settings.geosite_data_paths || []).join(',');
+                    const newConfigPaths = filteredPaths.join(',');
+                    if (currentConfigPaths !== newConfigPaths) {
+                        // 使用 nextTick 避免同步触发其他 watch
+                        nextTick(() => {
+                            config.value.settings.geosite_data_paths = filteredPaths;
+                        });
+                    }
+                }, { deep: true });
+
+                // Sync geoipFilterCountriesString -> config.settings.geoip_filter_countries (单向同步)
+                watch(geoipFilterCountriesString, (newStr) => {
+                    // 解析逗号分隔的字符串为数组
+                    const countries = newStr
+                        .split(',')
+                        .map(s => s.trim())
+                        .filter(s => s);
+                    // 只有当真正不同时才更新
+                    const currentCountries = (config.value.settings.geoip_filter_countries || []).join(',');
+                    const newCountries = countries.join(',');
+                    if (currentCountries !== newCountries) {
+                        config.value.settings.geoip_filter_countries = countries;
+                    }
+                });
+
+                // Sync config.settings.geoip_filter_countries -> geoipFilterCountriesString (单向同步)
+                watch(() => config.value.settings.geoip_filter_countries, (newCountries) => {
+                    const newStr = (newCountries || []).join(',');
+                    if (geoipFilterCountriesString.value !== newStr) {
+                        nextTick(() => {
+                            geoipFilterCountriesString.value = newStr;
+                        });
                     }
                 }, { deep: true });
 
@@ -550,7 +1002,9 @@
                 };
 
                 const downloadJson = () => {
-                    const blob = new Blob([rawJson.value], { type: 'application/json' });
+                    // 确保使用最新的配置生成 JSON
+                    const latestJson = toCleanJsonString(config.value);
+                    const blob = new Blob([latestJson], { type: 'application/json' });
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement('a');
                     a.href = url;
@@ -711,6 +1165,14 @@
                     return rule.actions.some(action => action.type === 'forward');
                 };
 
+                // GeoSite path management
+                const addGeositePath = () => {
+                    geositePaths.value.push('');
+                };
+                const removeGeositePath = (idx) => {
+                    geositePaths.value.splice(idx, 1);
+                };
+
                 const activePipelineIndex = ref(0);
                 const togglePipeline = (idx) => {
                     activePipelineIndex.value = activePipelineIndex.value === idx ? -1 : idx;
@@ -840,8 +1302,21 @@
                 // Initialize with default JSON
                 rawJson.value = toCleanJsonString(config.value);
 
+                // Initialize geositePaths from config
+                if (Array.isArray(config.value.settings.geosite_data_paths)) {
+                    geositePaths.value = [...config.value.settings.geosite_data_paths];
+                }
+
+                // Initialize geoipFilterCountriesString from config
+                if (Array.isArray(config.value.settings.geoip_filter_countries)) {
+                    geoipFilterCountriesString.value = config.value.settings.geoip_filter_countries.join(',');
+                }
+ 
+                // Initialize geositeEnabled from config
+                geositeEnabled.value = config.value.settings.geosite_enabled || false;
+
                 return {
-                    config, rawJson, manualJsonEdit,
+                    config, rawJson, manualJsonEdit, geositePaths, geoipFilterCountriesString, geositeEnabled,
                     selectorMatcherTypes, requestMatcherTypes, responseMatcherTypes,
                     loadJson, handleFileUpload, downloadJson,
                     addPipelineSelect, removePipelineSelect,
@@ -849,7 +1324,8 @@
                     addRule, removeRule,
                     ruleHasForwardAction,
                     activePipelineIndex, togglePipeline,
-                    currentTab, mermaidRef, renderFlowchart
+                    currentTab, mermaidRef, renderFlowchart,
+                    addGeositePath, removeGeositePath
                 };
             }
         }).mount('#app');
