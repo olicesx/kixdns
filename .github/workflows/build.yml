@@ -56,10 +56,17 @@ jobs:
         shell: msys2 {0}
         run: |
           cargo build --release --target ${{ matrix.target }}
-          strip target/${{ matrix.target }}/release/kixdns || true
-    
+          strip target/${{ matrix.target }}/release/kixdns.exe || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kixdns-windows-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/kixdns.exe
+          retention-days: 30
+
   build-linux:
-    name: Build Linux ${{ matrix.arch }}
+    name: Build Linux MUSL ${{ matrix.arch }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -69,6 +76,21 @@ jobs:
             arch: x86_64
           - target: aarch64-unknown-linux-gnu
             arch: arm64
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+            set -euo pipefail
+            sudo apt-get update
+            sudo apt-get install -y musl-tools
 
     steps:
       - name: Checkout code
