@@ -11,7 +11,7 @@ on:
 
 jobs:
   build-windows:
-    name: Build Windows ${{ matrix.arch }}
+    name: Build Windows ${{ matrix.arch }} gnullvm
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -66,7 +66,7 @@ jobs:
           retention-days: 30
 
   build-linux:
-    name: Build Linux MUSL ${{ matrix.arch }}
+    name: Build Linux ${{ matrix.arch }} ${{ matrix.toolset }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -74,27 +74,26 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             arch: x86_64
+            toolset: gnu
           - target: aarch64-unknown-linux-gnu
             arch: arm64
+            toolset: gnu
           - target: x86_64-unknown-linux-musl
             arch: x86_64
+            toolset: musl
           - target: aarch64-unknown-linux-musl
             arch: arm64
+            toolset: musl
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install musl toolchain
-        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'
+        if: matrix.toolset == 'musl'
         run: |
-            set -euo pipefail
-            sudo apt-get update
-            sudo apt-get install -y musl-tools
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+            sudo apt update
+            sudo apt install -y musl-tools
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -104,8 +103,8 @@ jobs:
       - name: Install cross-compilation dependencies
         if: matrix.arch == 'arm64'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt update
+          sudo apt install -y gcc-aarch64-linux-gnu
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
