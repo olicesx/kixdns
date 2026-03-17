@@ -10,6 +10,54 @@ on:
   workflow_dispatch:
 
 jobs:
+  build-windows:
+    name: Build Windows ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-gnullvm
+            arch: x86_64
+            runner: windows-latest
+          - target: aarch64-pc-windows-gnullvm
+            arch: arm64
+            runner: windows-11-arm
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install MSYS2 x86_64 toolchain
+        if: matrix.arch == 'x86_64'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-lld
+            mingw-w64-clang-x86_64-llvm
+            mingw-w64-clang-x86_64-rust
+
+      - name: Install MSYS2 aarch64 toolchain
+        if: matrix.arch == 'arm64'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANGARM64
+          update: true
+          install: >-
+            mingw-w64-clang-aarch64-clang
+            mingw-w64-clang-aarch64-lld
+            mingw-w64-clang-aarch64-llvm
+            mingw-w64-clang-aarch64-rust 
+ 
+      - name: build
+        shell: msys2 {0}
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          strip target/${{ matrix.target }}/release/kixdns || true
+    
   build-linux:
     name: Build Linux ${{ matrix.arch }}
     runs-on: ubuntu-latest
