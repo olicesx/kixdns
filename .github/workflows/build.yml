@@ -55,6 +55,7 @@ jobs:
       - name: build
         shell: msys2 {0}
         run: |
+          # Windows gnullvm targets need crt-static enabled via .cargo/config.toml.
           cargo build --release --target ${{ matrix.target }}
           strip target/${{ matrix.target }}/release/kixdns.exe || true
 
