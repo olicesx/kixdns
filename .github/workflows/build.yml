@@ -9,6 +9,9 @@ on:
     types: [ created ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     name: Build Windows ${{ matrix.arch }} gnullvm
@@ -50,21 +53,32 @@ jobs:
             mingw-w64-clang-aarch64-clang
             mingw-w64-clang-aarch64-lld
             mingw-w64-clang-aarch64-llvm
-            mingw-w64-clang-aarch64-rust 
- 
-      - name: build
+            mingw-w64-clang-aarch64-rust
+
+      - name: Build
         shell: msys2 {0}
         run: |
-          # Windows gnullvm targets need crt-static enabled via .cargo/config.toml.
           cargo build --release --target ${{ matrix.target }}
           strip target/${{ matrix.target }}/release/kixdns.exe || true
 
-      - name: Upload artifacts
+      - name: Package
+        shell: msys2 {0}
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/kixdns.exe dist/kixdns-windows-${{ matrix.arch }}.exe
+
+      - name: Upload CI artifact
         uses: actions/upload-artifact@v7
         with:
           name: kixdns-windows-${{ matrix.arch }}.exe
-          path: target/${{ matrix.target }}/release/kixdns.exe
+          path: dist/kixdns-windows-${{ matrix.arch }}.exe
           retention-days: 30
+
+      - name: Upload to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/kixdns-windows-${{ matrix.arch }}.exe
 
   build-linux:
     name: Build Linux ${{ matrix.arch }} ${{ matrix.toolset }}
@@ -97,8 +111,8 @@ jobs:
       - name: Install musl toolchain
         if: matrix.toolset == 'musl'
         run: |
-            sudo apt update
-            sudo apt install -y musl-tools musl-dev
+          sudo apt update
+          sudo apt install -y musl-tools musl-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -110,12 +124,23 @@ jobs:
           cargo build --release --target ${{ matrix.target }}
           strip target/${{ matrix.target }}/release/kixdns || true
 
-      - name: Upload artifacts
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/kixdns dist/kixdns-linux-${{ matrix.arch }}-${{ matrix.toolset }}
+
+      - name: Upload CI artifact
         uses: actions/upload-artifact@v7
         with:
           name: kixdns-linux-${{ matrix.arch }}-${{ matrix.toolset }}
-          path: target/${{ matrix.target }}/release/kixdns
+          path: dist/kixdns-linux-${{ matrix.arch }}-${{ matrix.toolset }}
           retention-days: 30
+
+      - name: Upload to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/kixdns-linux-${{ matrix.arch }}-${{ matrix.toolset }}
 
   build-freebsd:
     name: Build FreeBSD ${{ matrix.arch }} (cross)
@@ -157,7 +182,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-target-${{ matrix.target }}-
 
-      - name: Install toolchain and cross # cross 用于 FreeBSD 交叉构建（x86_64: stable；aarch64: nightly+build-std）
+      - name: Install toolchain and cross
         run: |
           if ! command -v cross >/dev/null 2>&1; then
             cargo install cross --git https://github.com/cross-rs/cross
@@ -176,10 +201,20 @@ jobs:
           fi
           strip target/${{ matrix.target }}/release/kixdns || true
 
-      - name: Upload artifacts
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/kixdns dist/kixdns-freebsd-${{ matrix.arch }}
+
+      - name: Upload CI artifact
         uses: actions/upload-artifact@v7
         with:
           name: kixdns-freebsd-${{ matrix.arch }}
-          path: target/${{ matrix.target }}/release/kixdns
+          path: dist/kixdns-freebsd-${{ matrix.arch }}
           retention-days: 30
 
+      - name: Upload to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/kixdns-freebsd-${{ matrix.arch }}
