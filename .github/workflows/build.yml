@@ -145,7 +145,7 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-${{ matrix.toolchain }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ matrix.toolchain }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.toolchain }}-
 
@@ -153,7 +153,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: target/${{ matrix.target }}
-          key: ${{ runner.os }}-target-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-target-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-target-${{ matrix.target }}-
 
