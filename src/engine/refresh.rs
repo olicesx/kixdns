@@ -22,9 +22,9 @@ pub fn spawn_background_refresh(
 ) {
     // FIX: Check if already refreshing to prevent duplicate refreshes
     // 修复：检查是否已在刷新，防止重复刷新
-    // OPTIMIZATION: Zero-lock check using bitmap
-    // 优化：使用位图进行零锁检查
-    if is_refreshing(&engine.refreshing_set, cache_hash) {
+    // OPTIMIZATION: Hybrid bloom filter + DashSet check
+    // 优化：混合布隆过滤器 + DashSet 检查
+    if is_refreshing(&engine.refreshing_bitmap, &engine.refreshing_set, cache_hash) {
         return;
     }
 
@@ -48,7 +48,7 @@ pub fn spawn_background_refresh(
     // 步骤 2：创建 RefreshingGuard 并生成后台任务
     // RefreshingGuard will auto-clear the bitmap on drop via RAII
     // RefreshingGuard 会在 drop 时通过 RAII 自动清除位图标记
-    let _guard = RefreshingGuard::new(&engine.refreshing_set, cache_hash);
+    let _guard = RefreshingGuard::new(&engine.refreshing_bitmap, &engine.refreshing_set, cache_hash);
     let engine = engine.clone();
     let qname_owned = qname.to_string();
     let pipeline_id_owned = pipeline_id.to_string();

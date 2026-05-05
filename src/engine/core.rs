@@ -53,11 +53,13 @@ pub struct Engine {
     /// Value: watch sender that will be notified when upstream query completes
     /// Note: Using Arc<anyhow::Error> to make the type Send + Clone
     pub inflight: Arc<InflightMap>,
-    // Background refresh tracking: bitmap for concurrent refresh deduplication
-    // 后台刷新跟踪：用于并发刷新去重
-    // Use DashSet for exact deduplication without hash collisions.
-    // DashSet is sharded internally, so concurrent access is nearly lock-free.
-    // 使用 DashSet 精确去重，无哈希冲突。内部分片，接近零锁。
+    // Background refresh tracking: hybrid bloom filter + DashSet for concurrent refresh deduplication
+    // 后台刷新跟踪：混合布隆过滤器 + DashSet 用于并发刷新去重
+    // AtomicU64 bloom filter provides O(1) fast-path (~1ns) for the common case (no refresh).
+    // DashSet provides exact deduplication when bloom filter indicates a possible hit.
+    // AtomicU64 布隆过滤器在常见情况（无刷新）下提供 O(1) 快速路径（~1ns）。
+    // DashSet 在布隆过滤器指示可能命中时提供精确去重。
+    pub refreshing_bitmap: Arc<AtomicU64>,
     pub refreshing_set: Arc<DashSet<u64>>,
     // Semaphore to limit concurrent handle_packet async tasks / 用于限制并发 handle_packet 异步任务数量
     pub permit_manager: Arc<PermitManager>,
@@ -369,6 +371,7 @@ impl Engine {
                     dashmap_shards,
                 ))
             },
+            refreshing_bitmap: Arc::new(AtomicU64::new(0)),
             refreshing_set: Arc::new(DashSet::new()),
             permit_manager,
             flow_control_state,

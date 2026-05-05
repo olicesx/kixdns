@@ -340,8 +340,8 @@ impl Engine {
                         let remaining_ttl = hit.refresh_ttl.saturating_sub(elapsed_secs);
                         let threshold = (hit.refresh_ttl as u64 * self.cache_refresh_threshold_percent as u64) / 100;
 
-                        // OPTIMIZATION: Zero-lock check using bitmap / 优化：使用位图进行零锁检查
-                        let is_refreshing = is_refreshing(&self.refreshing_set, cache_hash);
+                        // OPTIMIZATION: Hybrid bloom filter + DashSet check / 优化：混合布隆过滤器 + DashSet 检查
+                        let is_refreshing = is_refreshing(&self.refreshing_bitmap, &self.refreshing_set, cache_hash);
 
                         tracing::warn!(
                             original_ttl = hit.original_ttl,
