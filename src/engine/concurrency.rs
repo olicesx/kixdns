@@ -133,6 +133,10 @@ impl PermitManager {
     
     /// Try to acquire a permit without blocking / 非阻塞地尝试获取 permit
     /// Returns a guard that holds Arc<PermitManager> to ensure permit is released
+    ///
+    /// Uses a post-CAS validation to handle the TOCTOU window where max_permits
+    /// may shrink between the initial load and the successful CAS.
+    /// 使用 CAS 后验证来处理 max_permits 在初始读取和 CAS 成功之间缩小的 TOCTOU 窗口。
     pub fn try_acquire(self: &Arc<Self>) -> Option<PermitGuard> {
         loop {
             let active = self.active_permits.load(Ordering::Acquire);
@@ -163,7 +167,28 @@ impl PermitManager {
                 Ordering::Release,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(PermitGuard::new(Arc::clone(self))),
+                Ok(_) => {
+                    // Post-CAS validation: max_permits may have shrunk concurrently
+                    // via set_max_permits(). If we now exceed the new limit, roll back.
+                    // CAS后验证：max_permits 可能已通过 set_max_permits() 缩小，
+                    // 如果超出新限制则回滚。
+                    let current_max = self.max_permits.load(Ordering::Acquire);
+                    if active + 1 > current_max {
+                        // Exceeded new limit — return the permit and report exhaustion
+                        self.active_permits.fetch_sub(1, Ordering::Release);
+                        let dropped = self.dropped_requests.fetch_add(1, Ordering::Relaxed);
+                        if dropped % 1000 == 0 {
+                            tracing::warn!(
+                                active = active,
+                                new_max = current_max,
+                                dropped_total = dropped + 1,
+                                "Permit acquired but max shrunk concurrently, rolling back"
+                            );
+                        }
+                        return None;
+                    }
+                    return Some(PermitGuard::new(Arc::clone(self)));
+                }
                 Err(_) => continue, // Retry on CAS failure / CAS 失败时重试
             }
         }
@@ -298,15 +323,18 @@ impl PermitGuard {
     }
 
     /// Manually release the permit early / 提前手动释放permit
-    /// This is useful if you want to release the permit before the guard is dropped
-    /// 如果你想在guard被drop之前释放permit，这很有用
-    pub fn release(self: Arc<Self>) {
+    /// This is useful if you want to release the permit before the guard is dropped.
+    /// Consumes self to prevent double-release; Drop impl will see released=true and skip.
+    /// 如果你想在guard被drop之前释放permit，这很有用。
+    /// 消耗 self 防止双重释放；Drop 实现会看到 released=true 并跳过。
+    pub fn release(self) {
         // Mark as released and decrement / 标记为已释放并递减
         if self.released.compare_exchange(
             false, true, Ordering::AcqRel, Ordering::Relaxed
         ).is_ok() {
             self.manager.active_permits.fetch_sub(1, Ordering::Release);
         }
+        // self is dropped here; Drop::drop sees released=true → no double free
     }
 }
 

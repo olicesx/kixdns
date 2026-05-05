@@ -1905,6 +1905,21 @@ impl DoqClient {
         tls.alpn_protocols = vec![b"doq".to_vec()];
         tls.enable_early_data = enable_0rtt;
 
+        // Security warning: 0-RTT (early data) is vulnerable to replay attacks
+        // per RFC 8446 §8 and RFC 9001 §5.4. DNS queries are idempotent, so
+        // replay impact is limited to redundant lookups and potential cache
+        // timing side-channels. Only enable 0-RTT in trusted network environments.
+        // 安全警告：0-RTT（早期数据）容易受到重放攻击（RFC 8446 §8, RFC 9001 §5.4）。
+        // DNS 查询是幂等的，因此重放影响仅限于冗余查询和潜在的缓存时序侧信道。
+        // 仅在可信网络环境中启用 0-RTT。
+        if enable_0rtt {
+            tracing::warn!(
+                "DoQ 0-RTT enabled: vulnerable to replay attacks (RFC 8446 §8). \
+                 DNS queries are idempotent but an attacker can observe timing patterns. \
+                 Disable 0-RTT in untrusted environments."
+            );
+        }
+
         let quic_crypto = QuicClientConfig::try_from(tls)
             .context("build quic client config")?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));

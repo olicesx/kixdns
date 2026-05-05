@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::Context;
 use moka::sync::Cache as MokaCache;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHasher;
 use serde::Deserialize;
@@ -767,7 +767,11 @@ impl GeoSiteManager {
                 dat_format::TYPE_FULL => DomainMatcher::Full(domain),
                 dat_format::TYPE_SUBDOMAIN => DomainMatcher::Suffix(domain),
                 dat_format::TYPE_KEYWORD => DomainMatcher::Keyword(domain),
-                dat_format::TYPE_REGEX => match Regex::new(&domain) {
+                dat_format::TYPE_REGEX => match RegexBuilder::new(&domain)
+                    .size_limit(1_000_000)      // 1MB state space limit
+                    .dfa_size_limit(1_000_000)   // 1MB DFA limit
+                    .build()
+                {
                     Ok(re) => DomainMatcher::Regex(re),
                     Err(err) => {
                         warn!(target = "geosite", pattern = %domain, error = %err,
@@ -869,7 +873,11 @@ impl GeoSiteManager {
                         0 => DomainMatcher::Keyword(domain_value), // Plain
                         1 => {
                             // Regex
-                            match Regex::new(&domain_value) {
+                            match RegexBuilder::new(&domain_value)
+                                .size_limit(1_000_000)
+                                .dfa_size_limit(1_000_000)
+                                .build()
+                            {
                                 Ok(re) => DomainMatcher::Regex(re),
                                 Err(err) => {
                                     warn!(target = "geosite", pattern = %domain_value, error = %err,
@@ -994,7 +1002,11 @@ impl GeoSiteManager {
                             // 正则匹配器 / Regex matcher
                             let pattern = domain.trim_start_matches("regexp:");
                             DomainMatcher::Regex(
-                                Regex::new(pattern).unwrap_or_else(|_| Regex::new(r"^$").unwrap()),
+                                RegexBuilder::new(pattern)
+                                    .size_limit(1_000_000)
+                                    .dfa_size_limit(1_000_000)
+                                    .build()
+                                    .unwrap_or_else(|_| Regex::new(r"^$").unwrap()),
                             )
                         } else if domain.starts_with("domain:") {
                             // 完整域名匹配器 / Full domain matcher
@@ -1010,7 +1022,10 @@ impl GeoSiteManager {
                             if domain.contains('*') {
                                 let pattern = domain.replace('.', r"\.").replace('*', ".*");
                                 DomainMatcher::Regex(
-                                    Regex::new(&format!("^{}$", pattern))
+                                    RegexBuilder::new(&format!("^{}$", pattern))
+                                        .size_limit(1_000_000)
+                                        .dfa_size_limit(1_000_000)
+                                        .build()
                                         .unwrap_or_else(|_| Regex::new(r"^$").unwrap()),
                                 )
                             } else {

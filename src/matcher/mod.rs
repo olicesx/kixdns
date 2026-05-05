@@ -659,7 +659,10 @@ impl RuntimeMatcher {
             },
             config::Matcher::ClientIp { cidr } => RuntimeMatcher::ClientIp { net: cidr.parse()? },
             config::Matcher::DomainRegex { value } => RuntimeMatcher::DomainRegex {
-                regex: Regex::new(&value)?,
+                regex: RegexBuilder::new(&value)
+                    .size_limit(1_000_000)
+                    .dfa_size_limit(1_000_000)
+                    .build()?,
             },
             config::Matcher::GeoipCountry { country_codes } => RuntimeMatcher::GeoipCountry {
                 country_codes: country_codes.into_iter().map(Arc::from).collect(),
@@ -822,7 +825,10 @@ impl RuntimePipelineSelectorMatcher {
             }
             config::PipelineSelectorMatcher::DomainRegex { value } => {
                 RuntimePipelineSelectorMatcher::DomainRegex {
-                    regex: Regex::new(&value)?,
+                    regex: RegexBuilder::new(&value)
+                        .size_limit(1_000_000)
+                        .dfa_size_limit(1_000_000)
+                        .build()?,
                 }
             }
             config::PipelineSelectorMatcher::Any => RuntimePipelineSelectorMatcher::Any,
@@ -1083,7 +1089,10 @@ impl RuntimeResponseMatcher {
             }
             config::ResponseMatcher::RequestDomainRegex { value } => {
                 RuntimeResponseMatcher::RequestDomainRegex {
-                    regex: Regex::new(&value)?,
+                    regex: RegexBuilder::new(&value)
+                        .size_limit(1_000_000)
+                        .dfa_size_limit(1_000_000)
+                        .build()?,
                 }
             }
             config::ResponseMatcher::ResponseUpstreamIp { cidr } => {

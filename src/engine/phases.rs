@@ -900,6 +900,11 @@ pub async fn handle_forward_decision(
                         Ok(ForwardResult::Success(resp_bytes))
                     },
                     ResponseActionResult::Continue { ctx } => {
+                        // Defuse cleanup guard: we're returning Continue which re-enters
+                        // the decision loop. The inflight entry must survive for waiters.
+                        // If we don't defuse, Drop will remove the inflight entry without
+                        // notifying waiters, causing them to hang forever on rx.changed().
+                        if let Some(g) = cleanup_guard.as_mut() { g.defuse(); }
                         Ok(ForwardResult::Continue(Box::new(ctx)))
                     }
                 }
