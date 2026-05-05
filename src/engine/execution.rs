@@ -341,7 +341,7 @@ impl Engine {
                         let threshold = (hit.refresh_ttl as u64 * self.cache_refresh_threshold_percent as u64) / 100;
 
                         // OPTIMIZATION: Zero-lock check using bitmap / 优化：使用位图进行零锁检查
-                        let is_refreshing = is_refreshing(&self.refreshing_bitmap, cache_hash);
+                        let is_refreshing = is_refreshing(&self.refreshing_set, cache_hash);
 
                         tracing::warn!(
                             original_ttl = hit.original_ttl,
@@ -772,8 +772,12 @@ impl Engine {
         // This is a standard Rust RAII pattern that is safe and idiomatic.
         // 这是标准的 Rust RAII 模式，安全且符合惯用法。
 
+        // jump_count must live outside 'decision_loop so it is not reset
+        // when Forward returns Continue and we re-enter the outer loop.
+        // Without this, the response_jump_limit could be bypassed via:
+        //   Jump → Forward(Continue) → [jump_count reset to 0] → Jump → …
+        let mut jump_count = 0;
         'decision_loop: loop {
-            let mut jump_count = 0;
             loop {
                 if let Decision::Jump { pipeline } = &decision {
                     jump_count += 1;

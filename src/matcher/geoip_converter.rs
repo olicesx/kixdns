@@ -318,7 +318,7 @@ impl GeoIpConverter {
 
     /// 写入 MMDB 文件
     /// Write to MMDB file
-    pub fn write_mmdb(&self, output_path: &Path) -> Result<ConversionStats> {
+    pub fn write_mmdb(&self, source_path: &Path, output_path: &Path) -> Result<ConversionStats> {
         use maxminddb_writer::{Database, metadata::IpVersion, paths::IpAddrWithMask};
         use std::io::Write;
 
@@ -364,8 +364,7 @@ impl GeoIpConverter {
             .context("Failed to flush output")?;
 
         // Get file sizes
-        let source_size = std::fs::metadata(self.country_to_nets.keys().next()
-            .map(|_| "unknown").unwrap_or_default())
+        let source_size = std::fs::metadata(source_path)
             .map(|m| m.len())
             .unwrap_or(0);
         let output_size = std::fs::metadata(output_path)
@@ -585,7 +584,7 @@ pub fn convert_dat_to_mmdb(
     converter.merge_cidrs();
 
     // Write MMDB
-    let stats = converter.write_mmdb(mmdb_path)?;
+    let stats = converter.write_mmdb(dat_path, mmdb_path)?;
 
     info!("Conversion completed:\n{}", stats);
 

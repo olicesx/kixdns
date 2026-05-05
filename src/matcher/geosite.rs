@@ -1059,26 +1059,66 @@ fn run_geosite_watcher(
     manager: Arc<RwLock<GeoSiteManager>>,
     tags: Vec<String>,
 ) -> notify::Result<()> {
+    // Watch parent directories instead of individual files.
+    // Linux inotify watches inodes; atomic replacement (mv newfile oldfile)
+    // creates a new inode that would be missed when watching files directly.
+    // By watching parent directories, we capture IN_MOVED_TO/IN_CREATE events
+    // for the target filenames, properly detecting atomic replacements.
+
+    // Collect unique parent directories and their target filenames
+    let mut dir_watches: std::collections::HashMap<PathBuf, Vec<std::ffi::OsString>> =
+        std::collections::HashMap::new();
+    for p in &paths {
+        let parent = p.parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        let fname = p.file_name()
+            .map(|s| s.to_os_string())
+            .unwrap_or_default();
+        dir_watches.entry(parent).or_default().push(fname);
+    }
+
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher: RecommendedWatcher = Watcher::new(tx, Config::default())?;
 
-    // 监听所有 GeoSite 数据文件 / Watch all GeoSite data files
-    for path in &paths {
-        watcher.watch(path, RecursiveMode::NonRecursive)?;
-        info!(target = "geosite_watcher", path = %path.display(), "watching GeoSite file");
+    // Watch all unique parent directories
+    for (dir, file_names) in &dir_watches {
+        watcher.watch(dir, RecursiveMode::NonRecursive)?;
+        info!(target = "geosite_watcher", path = %dir.display(), filenames = ?file_names, "watching GeoSite file parent directory (atomic-replacement safe)");
     }
 
     info!(target = "geosite_watcher", "GeoSite watcher started");
 
+    // Build a set of target filenames for quick event matching
+    let target_filenames: std::collections::HashSet<std::ffi::OsString> = dir_watches
+        .values()
+        .flat_map(|v| v.iter().cloned())
+        .collect();
+
     for res in rx {
         match res {
             Ok(event) => {
+                // Check if the event is for any file we care about
+                let is_target_file = event.paths.iter().any(|p| {
+                    p.file_name().map_or(false, |fname| target_filenames.contains(fname))
+                });
+                if !is_target_file {
+                    continue;
+                }
+
                 // 仅在数据更改时重载 / Only reload on data changes
                 if !event.kind.is_modify() && !event.kind.is_create() {
                     continue;
                 }
 
-                let path = &event.paths[0];
+                // Find the matching original path for this event
+                let matching_path = event.paths.iter().find(|p| {
+                    p.file_name().map_or(false, |fname| target_filenames.contains(fname))
+                });
+                let path = match matching_path {
+                    Some(p) => p.clone(),
+                    None => continue,
+                };
 
                 // 检测文件格式 / Detect file format
                 let is_dat = path
@@ -1096,13 +1136,13 @@ fn run_geosite_watcher(
                         // 加载 .dat 格式 / Load .dat format
                         let mut guard = manager.write();
                         if tags.is_empty() {
-                            guard.load_from_dat_file(path)
+                            guard.load_from_dat_file(&path)
                         } else {
-                            guard.load_from_dat_file_selective(path, &tags)
+                            guard.load_from_dat_file_selective(&path, &tags)
                         }
                     } else {
                         // 加载 JSON 格式 / Load JSON format
-                        std::fs::read_to_string(path)
+                        std::fs::read_to_string(&path)
                             .with_context(|| format!("read GeoSite file: {}", path.display()))
                             .and_then(|json_str| {
                                 serde_json::from_str::<V2RayGeoSiteList>(&json_str)

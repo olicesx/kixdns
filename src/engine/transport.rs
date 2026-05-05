@@ -1873,6 +1873,21 @@ pub struct DoqMuxClient {
     /// Once rejected, 0-RTT will be skipped for subsequent connections
     /// 一旦被拒绝，后续连接将跳过 0-RTT
     zero_rtt_rejected: std::sync::atomic::AtomicBool,
+    /// 健康检查：连续错误计数 / Health check: consecutive error count
+    consecutive_errors: AtomicUsize,
+    /// 健康检查：错误阈值 / Health check: error threshold
+    health_threshold: AtomicUsize,
+    /// 连接老化：创建时间戳（毫秒）/ Connection aging: creation timestamp (ms)
+    conn_create_time: AtomicU64,
+    /// 连接老化：最大存活时间（毫秒）/ Connection aging: max age (ms)
+    max_age_ms: AtomicU64,
+    /// 空闲超时：最后请求时间（毫秒）/ Idle timeout: last request time (ms)
+    last_request_time: AtomicU64,
+    /// 空闲超时：空闲超时时间（毫秒）/ Idle timeout: idle timeout (ms)
+    idle_timeout_ms: AtomicU64,
+    /// 性能优化：上次健康检查时间（毫秒）/ Performance: last health check time (ms)
+    last_health_check_time: AtomicU64,
+
 }
 
 impl DoqClient {
@@ -1983,7 +1998,99 @@ impl DoqMuxClient {
             connection: Mutex::new(None),
             runtime,
             zero_rtt_rejected: std::sync::atomic::AtomicBool::new(false),
+            consecutive_errors: AtomicUsize::new(0),
+            health_threshold: AtomicUsize::new(3),
+            conn_create_time: AtomicU64::new(0),
+            max_age_ms: AtomicU64::new(30 * 60 * 1000), // 30 minutes default
+            last_request_time: AtomicU64::new(0),
+            idle_timeout_ms: AtomicU64::new(5 * 60 * 1000), // 5 minutes default
+            last_health_check_time: AtomicU64::new(0),
         }
+    }
+
+    /// Record an error and check if connection should be reset
+    /// 记录错误并检查是否需要重置连接
+    async fn record_error(&self) -> bool {
+        let errors = self.consecutive_errors.fetch_add(1, Ordering::Release) + 1;
+        let threshold = self.health_threshold.load(Ordering::Acquire);
+        if errors >= threshold {
+            warn!(
+                upstream = %self.upstream,
+                consecutive_errors = errors,
+                threshold = threshold,
+                "DoQ connection error threshold exceeded, resetting connection"
+            );
+            self.reset_connection().await;
+            self.consecutive_errors.store(0, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record success and clear error counter
+    /// 记录成功并清零错误计数
+    fn record_success(&self) {
+        self.consecutive_errors.store(0, Ordering::Release);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("SystemTime should be after UNIX_EPOCH")
+            .as_millis() as u64;
+        self.last_request_time.store(now, Ordering::Release);
+    }
+
+    /// Check if connection needs reset due to aging or idle timeout
+    /// 检查连接是否需要重置（老化或空闲超时）
+    async fn check_connection_health(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("SystemTime should be after UNIX_EPOCH")
+            .as_millis() as u64;
+
+        // Throttle health checks: only check once per second
+        let last_check = self.last_health_check_time.load(Ordering::Acquire);
+        if now.saturating_sub(last_check) < 1000 {
+            return false;
+        }
+        self.last_health_check_time.store(now, Ordering::Release);
+
+        // Check connection aging
+        let create_time = self.conn_create_time.load(Ordering::Acquire);
+        let max_age = self.max_age_ms.load(Ordering::Acquire);
+        if create_time > 0 && max_age > 0 {
+            let age_ms = now.saturating_sub(create_time);
+            if age_ms > max_age {
+                info!(
+                    upstream = %self.upstream,
+                    age_ms = age_ms,
+                    max_age_ms = max_age,
+                    "DoQ connection too old, resetting"
+                );
+                self.reset_connection().await;
+                self.consecutive_errors.store(0, Ordering::Release);
+                return true;
+            }
+        }
+
+        // Check idle timeout
+        let last_req = self.last_request_time.load(Ordering::Acquire);
+        let idle_timeout = self.idle_timeout_ms.load(Ordering::Acquire);
+        if last_req > 0 && idle_timeout > 0 {
+            let idle_ms = now.saturating_sub(last_req);
+            if idle_ms > idle_timeout {
+                info!(
+                    upstream = %self.upstream,
+                    idle_ms = idle_ms,
+                    idle_timeout_ms = idle_timeout,
+                    "DoQ connection idle too long, resetting"
+                );
+                self.reset_connection().await;
+                self.consecutive_errors.store(0, Ordering::Release);
+                return true;
+            }
+        }
+
+        false
     }
 
     pub async fn send(
@@ -2026,6 +2133,10 @@ impl DoqMuxClient {
         let mut timeout_dur = timeout_dur;
 
         loop {
+            // Check connection health (aging, idle timeout) before each attempt
+            // 每次尝试前检查连接健康状态（老化、空闲超时）
+            self.check_connection_health().await;
+
             let start = tokio::time::Instant::now();
             let info = self.get_or_connect(target, timeout_dur).await?;
             let conn = info.conn;
@@ -2103,10 +2214,17 @@ impl DoqMuxClient {
             }).await;
 
             match resp {
-                Ok(Ok(bytes)) => return Ok(bytes),
+                Ok(Ok(bytes)) => {
+                    self.record_success();
+                    return Ok(bytes);
+                }
                 Ok(Err(err)) => {
                     let err_str = err.to_string();
-                    self.reset_connection().await;
+                    let already_reset = self.record_error().await;
+                    if !already_reset {
+                        // Only reset if record_error() didn't already reset (below threshold)
+                        self.reset_connection().await;
+                    }
                     if allow_retry && used_0rtt && self.should_retry_without_0rtt(target, &err_str) {
                         self.disable_zero_rtt();
                         let remaining = timeout_dur.saturating_sub(start.elapsed());
@@ -2156,7 +2274,10 @@ impl DoqMuxClient {
                             To re-enable 0-RTT, restart the server or use ?0rtt=true in the upstream URL."
                         );
                     }
-                    self.reset_connection().await;
+                    let already_reset = self.record_error().await;
+                    if !already_reset {
+                        self.reset_connection().await;
+                    }
                     return Err(anyhow::anyhow!("doq timeout"));
                 }
             }
@@ -2194,16 +2315,11 @@ impl DoqMuxClient {
         target: &DoqTarget,
         timeout_dur: Duration,
     ) -> anyhow::Result<DoqConnectionInfo> {
-        {
-            let guard = self.connection.lock().await;
-            if let Some(conn) = guard.as_ref() {
-                return Ok(DoqConnectionInfo {
-                    conn: conn.clone(),
-                    used_0rtt: false,
-                });
-            }
-        }
-
+        // Single-lock pattern: acquire lock once, check + create in one critical section.
+        // This prevents the TOCTOU race where two coroutines both pass the first check,
+        // then both create connections, wasting one.
+        // 单锁模式：一次获取锁，检查+创建在一个临界区内完成。
+        // 防止两个协程同时通过第一次检查后都创建连接、浪费一个的竞态。
         let mut guard = self.connection.lock().await;
         if let Some(conn) = guard.as_ref() {
             return Ok(DoqConnectionInfo {
@@ -2214,6 +2330,16 @@ impl DoqMuxClient {
 
         let (conn, used_0rtt) = self.connect_new(target, timeout_dur).await?;
         *guard = Some(conn.clone());
+
+        // Record connection creation time for aging checks
+        // 记录连接创建时间用于老化检查
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("SystemTime should be after UNIX_EPOCH")
+            .as_millis() as u64;
+        self.conn_create_time.store(now, Ordering::Release);
+        self.last_request_time.store(now, Ordering::Release);
+
         Ok(DoqConnectionInfo { conn, used_0rtt })
     }
 
@@ -2284,6 +2410,8 @@ impl DoqMuxClient {
     async fn reset_connection(&self) {
         let mut guard = self.connection.lock().await;
         *guard = None;
+        // Reset connection creation time so aging checks start fresh on reconnect
+        self.conn_create_time.store(0, Ordering::Release);
     }
 }
 

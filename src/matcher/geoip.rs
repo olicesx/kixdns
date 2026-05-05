@@ -644,6 +644,12 @@ pub fn is_private_ip(ip: IpAddr) -> bool {
 ///
 /// 监听 .dat 文件变化并自动重新加载 GeoIP 数据
 /// Watches .dat file changes and automatically reloads GeoIP data
+///
+/// 注意：通过监控父目录而非直接监控文件本身来支持原子替换（mv）操作。
+/// Linux inotify 监控 inode，原子替换创建新 inode，直接监控文件会丢失事件。
+/// Note: Watches the parent directory instead of the file itself to support
+/// atomic replacement (mv). Linux inotify watches inodes; atomic replacement
+/// creates a new inode that would be missed when watching the file directly.
 pub fn spawn_geoip_watcher(
     dat_path: Option<PathBuf>,
     manager: Arc<RwLock<GeoIpManager>>,
@@ -667,28 +673,42 @@ fn run_geoip_watcher(
     path: PathBuf,
     manager: Arc<RwLock<GeoIpManager>>,
 ) -> notify::Result<()> {
+    // Watch the parent directory instead of the file itself,
+    // so that atomic replacement (mv newfile geoip.dat) is properly detected.
+    let parent_dir = path.parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let target_file_name = path.file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher: notify::RecommendedWatcher =
         notify::Watcher::new(tx, notify::Config::default())?;
 
-    // 监听 GeoIP .dat 文件 / Watch GeoIP .dat file
-    watcher.watch(&path, notify::RecursiveMode::NonRecursive)?;
-    tracing::info!(target = "geoip_watcher", path = %path.display(), "watching GeoIP file");
+    watcher.watch(&parent_dir, notify::RecursiveMode::NonRecursive)?;
+    tracing::info!(target = "geoip_watcher", path = %parent_dir.display(), filename = ?target_file_name, "watching GeoIP file parent directory (atomic-replacement safe)");
 
     tracing::info!(target = "geoip_watcher", "GeoIP watcher started");
 
     for res in rx {
         match res {
             Ok(event) => {
+                // Check if the event is for the file we care about
+                let is_target_file = event.paths.iter().any(|p| {
+                    p.file_name() == Some(&target_file_name)
+                });
+                if !is_target_file {
+                    continue;
+                }
+
                 // 仅在数据更改时重载 / Only reload on data changes
                 if !event.kind.is_modify() && !event.kind.is_create() {
                     continue;
                 }
 
-                let event_path = &event.paths[0];
-
                 // 检测文件格式 / Detect file format
-                let is_dat = event_path
+                let is_dat = path
                     .extension()
                     .and_then(|s| s.to_str())
                     .map(|s| s.eq_ignore_ascii_case("dat"))
@@ -700,16 +720,16 @@ fn run_geoip_watcher(
                     // parking_lot::RwLock::write() 返回 guard 直接，不会中毒
                     // parking_lot::RwLock does not have poison state
                     let load_result = if is_dat {
-                        manager.write().load_from_dat_file(event_path)
+                        manager.write().load_from_dat_file(&path)
                     } else {
-                        manager.write().load_from_v2ray_file(event_path)
+                        manager.write().load_from_v2ray_file(&path)
                     };
 
                     match load_result {
                         Ok(count) => {
                             tracing::info!(
                                 target = "geoip_watcher",
-                                path = %event_path.display(),
+                                path = %path.display(),
                                 loaded_count = count,
                                 "GeoIP data reloaded"
                             );
@@ -720,7 +740,7 @@ fn run_geoip_watcher(
                             if retries == 0 {
                                 tracing::warn!(
                                     target = "geoip_watcher",
-                                    path = %event_path.display(),
+                                    path = %path.display(),
                                     error = %err,
                                     "GeoIP reload failed after retries"
                                 );

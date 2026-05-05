@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::str::FromStr;
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::sync::Arc;
+use dashmap::DashSet;
 use hickory_proto::op::{Message, ResponseCode, MessageType, OpCode, Query};
 use hickory_proto::rr::{DNSClass, RecordType, Name};
 use bytes::Bytes;
@@ -109,44 +110,38 @@ pub mod engine_helpers {
 // Refreshing Bitmap Helpers / 刷新位图辅助函数
 // ============================================================================
 
-/// 检查缓存哈希是否正在刷新（零锁读取） / Check if a cache hash is currently being refreshed (zero-lock read)
+/// 检查缓存哈希是否正在刷新 / Check if a cache hash is currently being refreshed
 #[inline]
-pub fn is_refreshing(bitmap: &AtomicU64, cache_hash: u64) -> bool {
-    let bit_index = cache_hash % 64;
-    let mask = 1u64 << bit_index;
-    bitmap.load(Ordering::Relaxed) & mask != 0
+pub fn is_refreshing(set: &DashSet<u64>, cache_hash: u64) -> bool {
+    set.contains(&cache_hash)
 }
 
-/// 标记缓存哈希为正在刷新（零锁写入） / Mark a cache hash as being refreshed (zero-lock write)
+/// 标记缓存哈希为正在刷新 / Mark a cache hash as being refreshed
 #[inline]
-pub fn mark_refreshing(bitmap: &AtomicU64, cache_hash: u64) {
-    let bit_index = cache_hash % 64;
-    let mask = 1u64 << bit_index;
-    bitmap.fetch_or(mask, Ordering::Relaxed);
+pub fn mark_refreshing(set: &DashSet<u64>, cache_hash: u64) {
+    set.insert(cache_hash);
 }
 
-/// 清除缓存哈希的刷新标记（零锁写入） / Clear the refreshing mark for a cache hash (zero-lock write)
+/// 清除缓存哈希的刷新标记 / Clear the refreshing mark for a cache hash
 #[inline]
-pub fn clear_refreshing(bitmap: &AtomicU64, cache_hash: u64) {
-    let bit_index = cache_hash % 64;
-    let mask = 1u64 << bit_index;
-    bitmap.fetch_and(!mask, Ordering::Relaxed);
+pub fn clear_refreshing(set: &DashSet<u64>, cache_hash: u64) {
+    set.remove(&cache_hash);
 }
 
-/// RAII Guard for auto-clearing the refreshing bitmap
-/// RAII Guard 用于自动清除刷新位图标记
+/// RAII Guard for auto-clearing the refreshing set
+/// RAII Guard 用于自动清除刷新标记
 pub struct RefreshingGuard {
-    bitmap: Option<Arc<AtomicU64>>,
+    set: Option<Arc<DashSet<u64>>>,
     cache_hash: Option<u64>,
 }
 
 impl RefreshingGuard {
     /// Create a new guard that will clear the refresh mark on drop
     /// 创建一个在 drop 时清除刷新标记的 guard
-    pub fn new(bitmap: &Arc<AtomicU64>, cache_hash: u64) -> Self {
-        mark_refreshing(bitmap, cache_hash);
+    pub fn new(set: &Arc<DashSet<u64>>, cache_hash: u64) -> Self {
+        mark_refreshing(set, cache_hash);
         Self {
-            bitmap: Some(Arc::clone(bitmap)),
+            set: Some(Arc::clone(set)),
             cache_hash: Some(cache_hash),
         }
     }
@@ -154,15 +149,15 @@ impl RefreshingGuard {
     /// Defuse the guard so it won't clear the mark on drop
     /// 让 guard 失效，drop 时不会清除标记
     pub fn defuse(&mut self) {
-        self.bitmap = None;
+        self.set = None;
         self.cache_hash = None;
     }
 
     /// Manually clear the refresh mark early
     /// 手动提前清除刷新标记
     pub fn clear(&mut self) {
-        if let (Some(bitmap), Some(hash)) = (&self.bitmap, self.cache_hash) {
-            clear_refreshing(bitmap, hash);
+        if let (Some(set), Some(hash)) = (&self.set, self.cache_hash) {
+            clear_refreshing(set, hash);
         }
         self.defuse();
     }
@@ -170,8 +165,8 @@ impl RefreshingGuard {
 
 impl Drop for RefreshingGuard {
     fn drop(&mut self) {
-        if let (Some(bitmap), Some(hash)) = (&self.bitmap, self.cache_hash) {
-            clear_refreshing(bitmap, hash);
+        if let (Some(set), Some(hash)) = (&self.set, self.cache_hash) {
+            clear_refreshing(set, hash);
         }
     }
 }

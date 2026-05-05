@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::sync::atomic::{AtomicUsize, AtomicU64};
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use arc_swap::ArcSwap;
 use moka::sync::Cache;
 use rustc_hash::FxBuildHasher;
@@ -54,14 +54,11 @@ pub struct Engine {
     /// Note: Using Arc<anyhow::Error> to make the type Send + Clone
     pub inflight: Arc<InflightMap>,
     // Background refresh tracking: bitmap for concurrent refresh deduplication
-    // 后台刷新跟踪：用于并发刷新去重的位图
-    // OPTIMIZATION: Use AtomicU64 bitmap instead of DashMap for zero-lock overhead
-    // 优化：使用 AtomicU64 位图代替 DashMap，实现零锁开销
-    // Each bit represents whether a cache_hash (low 6 bits) is currently being refreshed
-    // 每个位表示一个 cache_hash（低 6 位）是否正在刷新
-    // Trade-off: Can track up to 64 concurrent refreshes (sufficient for background refresh)
-    // 权衡：最多跟踪 64 个并发刷新（对后台刷新足够）
-    pub refreshing_bitmap: Arc<AtomicU64>,
+    // 后台刷新跟踪：用于并发刷新去重
+    // Use DashSet for exact deduplication without hash collisions.
+    // DashSet is sharded internally, so concurrent access is nearly lock-free.
+    // 使用 DashSet 精确去重，无哈希冲突。内部分片，接近零锁。
+    pub refreshing_set: Arc<DashSet<u64>>,
     // Semaphore to limit concurrent handle_packet async tasks / 用于限制并发 handle_packet 异步任务数量
     pub permit_manager: Arc<PermitManager>,
     // Latest upstream latency for adaptive flow control / 用于自适应流控的最新上游延迟
@@ -372,7 +369,7 @@ impl Engine {
                     dashmap_shards,
                 ))
             },
-            refreshing_bitmap: Arc::new(AtomicU64::new(0)),
+            refreshing_set: Arc::new(DashSet::new()),
             permit_manager,
             flow_control_state,
             // Cache background refresh settings / 缓存后台刷新设置

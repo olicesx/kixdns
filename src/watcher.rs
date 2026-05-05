@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
@@ -18,15 +18,34 @@ pub fn spawn(path: PathBuf, engine: Engine) {
 }
 
 fn run_watcher(path: PathBuf, engine: Engine) -> notify::Result<()> {
+    // Watch the parent directory instead of the file itself,
+    // so that atomic replacement (mv newfile config.yml) is properly detected.
+    // Linux inotify watches inodes, not paths; watching the parent directory
+    // captures IN_MOVED_TO/IN_CREATE events for the target filename.
+    let parent_dir = path.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let target_file_name = path.file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher: RecommendedWatcher = Watcher::new(tx, Config::default())?;
-    watcher.watch(&path, RecursiveMode::NonRecursive)?;
+    watcher.watch(&parent_dir, RecursiveMode::NonRecursive)?;
 
-    info!(target = "watcher", path = %path.display(), "config watcher started");
+    info!(target = "watcher", path = %parent_dir.display(), filename = ?target_file_name, "config watcher started (watching parent directory for atomic replacement support)");
 
     for res in rx {
         match res {
             Ok(event) => {
+                // Check if the event is for the file we care about
+                let is_target_file = event.paths.iter().any(|p| {
+                    p.file_name() == Some(&target_file_name)
+                });
+                if !is_target_file {
+                    continue;
+                }
+
                 // Only reload on data changes / 仅在数据更改时重载
                 if !event.kind.is_modify() && !event.kind.is_create() {
                     continue;
