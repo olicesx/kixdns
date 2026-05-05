@@ -11,6 +11,7 @@ diff_review.txt
 # Exclude most .md files but allow README
 *.md
 !README.md
+!README.zh-CN.md
 !tools/README.md
 # Data files
 /data/
