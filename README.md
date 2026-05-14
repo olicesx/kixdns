@@ -90,32 +90,212 @@ OPTIONS:
   -V, --version                Show version
 ```
 
-### systemd Service
+### Service Management (Cross-Platform)
 
-Create `/etc/systemd/system/kixdns.service`:
+KixDNS includes built-in service management that supports all major init systems.
+The `service` subcommand works on Windows, Linux, and FreeBSD.
+
+#### Quick Commands
+
+```bash
+# Install as a system service (auto-detects init system)
+sudo ./target/release/kixdns service install
+
+# Install with custom config
+sudo ./target/release/kixdns service install \
+    --config /etc/kixdns/pipeline.json \
+    --listener-label edge-internal
+
+# Uninstall the service
+sudo ./target/release/kixdns service uninstall
+
+# Run as service (used by init system internally)
+kixdns service run
+```
+
+> **Note**: `service install` and `service uninstall` require root/Administrator
+> privileges. `service run` is called automatically by the init system.
+
+#### Auto-Detection Logic
+
+The init system is auto-detected in the following order:
+
+| Condition | Detected System |
+|-----------|----------------|
+| `#[cfg(target_os = "windows")]` | Windows SCM |
+| `/sbin/procd` exists | Procd (OpenWrt) |
+| `/usr/lib/systemd/systemd` or `/lib/systemd/systemd` exists | systemd |
+| `/sbin/openrc-run` exists | OpenRC |
+| `#[cfg(target_os = "freebsd")]` | BSD rc.d |
+| Nothing matched | Unknown (manual setup required) |
+
+#### Service Scripts
+
+<details>
+<summary><b>systemd</b> (Linux — most distributions)</summary>
+
+Installed to: `/etc/systemd/system/kixdns.service`
 
 ```ini
 [Unit]
-Description=KixDNS
+Description=KixDNS DNS Server
+Documentation=https://github.com/kixdns/kixdns
 After=network.target
+Wants=nss-lookup.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/kixdns --config /etc/kixdns/pipeline.json
+ExecStart=/usr/local/bin/kixdns run \
+    --config /etc/kixdns/pipeline.json \
+    --listener-label default
 Restart=on-failure
+RestartSec=5
+User=nobody
+Group=nogroup
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
 LimitNOFILE=65536
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
 ```
 
 ```bash
-sudo install -m 0755 target/release/kixdns /usr/local/bin/kixdns
-sudo mkdir -p /etc/kixdns
-sudo cp config/pipeline.json /etc/kixdns/
-sudo systemctl daemon-reload
-sudo systemctl enable --now kixdns
+# Manual commands
+systemctl daemon-reload
+systemctl enable --now kixdns
+systemctl status kixdns
+journalctl -u kixdns -f
 ```
+</details>
+
+<details>
+<summary><b>OpenRC</b> (Gentoo, Alpine Linux)</summary>
+
+Installed to: `/etc/init.d/kixdns`
+
+```sh
+#!/sbin/openrc-run
+
+name="KixDNS DNS Server"
+description="High-performance async DNS server"
+command="/usr/local/bin/kixdns"
+command_args="run --config /etc/kixdns/pipeline.json --listener-label default"
+command_user="nobody:nogroup"
+pidfile="/run/${RC_SVCNAME}.pid"
+command_background=false
+
+depend() {
+    need net
+    use dns logger
+}
+```
+
+```bash
+# Manual commands
+rc-update add kixdns default
+rc-service kixdns start
+rc-service kixdns status
+```
+</details>
+
+<details>
+<summary><b>Procd</b> (OpenWrt)</summary>
+
+Installed to: `/etc/init.d/kixdns`
+
+```sh
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+
+start_service() {
+    procd_open_instance
+    procd_set_param command "/usr/local/bin/kixdns"
+    procd_append_param command run --config /etc/kixdns/pipeline.json --listener-label default
+    procd_set_param user nobody
+    procd_set_param respawn 3600 5 0
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+service_triggers() {
+    procd_add_reload_trigger "kixdns"
+}
+```
+
+```bash
+# Manual commands
+/etc/init.d/kixdns enable
+/etc/init.d/kixdns start
+/etc/init.d/kixdns status
+```
+</details>
+
+<details>
+<summary><b>BSD rc.d</b> (FreeBSD)</summary>
+
+Installed to: `/usr/local/etc/rc.d/kixdns`
+
+```sh
+#!/bin/sh
+#
+# PROVIDE: kixdns
+# REQUIRE: NETWORKING SERVERS
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="kixdns"
+rcvar="kixdns_enable"
+
+load_rc_config $name
+
+: ${kixdns_enable:="NO"}
+: ${kixdns_config:="/usr/local/etc/kixdns/pipeline.json"}
+: ${kixdns_listener_label:="default"}
+: ${kixdns_user:="nobody"}
+
+command="/usr/local/bin/kixdns"
+command_args="run --config ${kixdns_config} --listener-label ${kixdns_listener_label}"
+command_user="${kixdns_user}"
+pidfile="/var/run/kixdns.pid"
+
+run_rc_command "$1"
+```
+
+```bash
+# Manual commands
+echo 'kixdns_enable="YES"' >> /etc/rc.conf
+service kixdns start
+service kixdns status
+```
+</details>
+
+<details>
+<summary><b>Windows</b> (SCM — Service Control Manager)</summary>
+
+```bash
+# Install (Administrator PowerShell)
+kixdns.exe service install --config config/pipeline.json
+
+# Start
+sc start KixDNS
+
+# Query status
+sc query KixDNS
+
+# Stop
+sc stop KixDNS
+
+# Uninstall (Administrator PowerShell)
+kixdns.exe service uninstall
+```
+</details>
 
 ## Configuration
 
