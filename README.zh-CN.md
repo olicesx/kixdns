@@ -90,32 +90,211 @@ OPTIONS:
   -V, --version                显示版本
 ```
 
-### systemd 服务
+### 服务管理（跨平台）
 
-创建 `/etc/systemd/system/kixdns.service`：
+KixDNS 内置服务管理功能，支持所有主流 init 系统。
+`service` 子命令在 Windows、Linux 和 FreeBSD 上均可使用。
+
+#### 快速命令
+
+```bash
+# 安装为系统服务（自动检测 init 系统）
+sudo ./target/release/kixdns service install
+
+# 使用自定义配置安装
+sudo ./target/release/kixdns service install \
+    --config /etc/kixdns/pipeline.json \
+    --listener-label edge-internal
+
+# 卸载服务
+sudo ./target/release/kixdns service uninstall
+
+# 以服务方式运行（供 init 系统内部调用）
+kixdns service run
+```
+
+> **注意**：安装和卸载需要 root/管理员权限。`service run` 由 init 系统自动调用。
+
+#### 自动检测逻辑
+
+init 系统按如下顺序自动检测：
+
+| 检测条件 | 判定结果 |
+|----------|----------|
+| `#[cfg(target_os = "windows")]` | Windows SCM |
+| `/sbin/procd` 存在 | Procd (OpenWrt) |
+| `/usr/lib/systemd/systemd` 或 `/lib/systemd/systemd` 存在 | systemd |
+| `/sbin/openrc-run` 存在 | OpenRC |
+| `#[cfg(target_os = "freebsd")]` | BSD rc.d |
+| 以上均不匹配 | 未知（需要手动配置） |
+
+#### 服务脚本
+
+<details>
+<summary><b>systemd</b>（Linux — 大多数发行版）</summary>
+
+安装到：`/etc/systemd/system/kixdns.service`
 
 ```ini
 [Unit]
-Description=KixDNS
+Description=KixDNS DNS Server
+Documentation=https://github.com/kixdns/kixdns
 After=network.target
+Wants=nss-lookup.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/kixdns --config /etc/kixdns/pipeline.json
+ExecStart=/usr/local/bin/kixdns run \
+    --config /etc/kixdns/pipeline.json \
+    --listener-label default
 Restart=on-failure
+RestartSec=5
+User=nobody
+Group=nogroup
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
 LimitNOFILE=65536
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
 ```
 
 ```bash
-sudo install -m 0755 target/release/kixdns /usr/local/bin/kixdns
-sudo mkdir -p /etc/kixdns
-sudo cp config/pipeline.json /etc/kixdns/
-sudo systemctl daemon-reload
-sudo systemctl enable --now kixdns
+# 手动命令
+systemctl daemon-reload
+systemctl enable --now kixdns
+systemctl status kixdns
+journalctl -u kixdns -f
 ```
+</details>
+
+<details>
+<summary><b>OpenRC</b>（Gentoo、Alpine Linux）</summary>
+
+安装到：`/etc/init.d/kixdns`
+
+```sh
+#!/sbin/openrc-run
+
+name="KixDNS DNS Server"
+description="High-performance async DNS server"
+command="/usr/local/bin/kixdns"
+command_args="run --config /etc/kixdns/pipeline.json --listener-label default"
+command_user="nobody:nogroup"
+pidfile="/run/${RC_SVCNAME}.pid"
+command_background=false
+
+depend() {
+    need net
+    use dns logger
+}
+```
+
+```bash
+# 手动命令
+rc-update add kixdns default
+rc-service kixdns start
+rc-service kixdns status
+```
+</details>
+
+<details>
+<summary><b>Procd</b>（OpenWrt）</summary>
+
+安装到：`/etc/init.d/kixdns`
+
+```sh
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+
+start_service() {
+    procd_open_instance
+    procd_set_param command "/usr/local/bin/kixdns"
+    procd_append_param command run --config /etc/kixdns/pipeline.json --listener-label default
+    procd_set_param user nobody
+    procd_set_param respawn 3600 5 0
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+service_triggers() {
+    procd_add_reload_trigger "kixdns"
+}
+```
+
+```bash
+# 手动命令
+/etc/init.d/kixdns enable
+/etc/init.d/kixdns start
+/etc/init.d/kixdns status
+```
+</details>
+
+<details>
+<summary><b>BSD rc.d</b>（FreeBSD）</summary>
+
+安装到：`/usr/local/etc/rc.d/kixdns`
+
+```sh
+#!/bin/sh
+#
+# PROVIDE: kixdns
+# REQUIRE: NETWORKING SERVERS
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="kixdns"
+rcvar="kixdns_enable"
+
+load_rc_config $name
+
+: ${kixdns_enable:="NO"}
+: ${kixdns_config:="/usr/local/etc/kixdns/pipeline.json"}
+: ${kixdns_listener_label:="default"}
+: ${kixdns_user:="nobody"}
+
+command="/usr/local/bin/kixdns"
+command_args="run --config ${kixdns_config} --listener-label ${kixdns_listener_label}"
+command_user="${kixdns_user}"
+pidfile="/var/run/kixdns.pid"
+
+run_rc_command "$1"
+```
+
+```bash
+# 手动命令
+echo 'kixdns_enable="YES"' >> /etc/rc.conf
+service kixdns start
+service kixdns status
+```
+</details>
+
+<details>
+<summary><b>Windows</b>（SCM — 服务控制管理器）</summary>
+
+```bash
+# 安装（管理员 PowerShell）
+kixdns.exe service install --config config/pipeline.json
+
+# 启动
+sc start KixDNS
+
+# 查询状态
+sc query KixDNS
+
+# 停止
+sc stop KixDNS
+
+# 卸载（管理员 PowerShell）
+kixdns.exe service uninstall
+```
+</details>
 
 ## 配置
 

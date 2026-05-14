@@ -41,6 +41,10 @@ rustls = { version = "0.23", features = ["ring"] }
 webpki-roots = "0.26"
 url = "2"
 quinn = { version = "0.11", features = ["runtime-tokio", "rustls"] }
+
+# Windows service support (Windows only, harmless on other platforms)
+# Windows 服务支持（仅 Windows，其他平台无害）
+windows-service = { version = "0.8" }
 [dev-dependencies]
 criterion = "0.5"
 ctor = "0.2"
@@ -97,4 +101,3 @@ strip = true
 #       详情请参考 GitHub Actions 工作流
 # [target.aarch64-unknown-freebsd]
 # linker = "aarch64-unknown-freebsd12.0-gcc"
-
