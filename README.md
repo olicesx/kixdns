@@ -393,8 +393,62 @@ Matchers support logical composition:
 
 ## Tools
 
-- `tools/config_editor.html` — Browser-based pipeline configuration editor
-- `tools/diagnose.html` — WebSocket-based DNS query diagnostic tool
+KixDNS ships with browser-based tools — no installation required, just open the `.html` file directly.
+
+### Config Editor
+
+**File**: `tools/config_editor.html`
+
+A visual editor for `pipeline.json` — no need to hand-write JSON.
+
+![Config Editor](https://img.shields.io/badge/type-browser_app-blue)
+
+**Features**:
+
+- **Visual form editor** — configure all settings (global, pipelines, matchers, actions) through a form UI
+- **Live JSON preview** — left side edits, right side shows generated JSON in real time
+- **Mermaid flowchart** — auto-generates a visual pipeline flowchart from your config
+- **Import / Export** — load existing `pipeline.json` to edit, export to download the result
+- **GeoIP & GeoSite** — configure MMDB paths, GeoSite `.dat` files, cache capacity/TTL
+- **All upstream transports** — UDP / TCP / DoH / DoT / DoQ with URL prefix auto-detection
+- **Serve Stale (RFC 8767)** — configure stale cache TTL, expiry window, client timeout
+- **DoQ 0-RTT** — per-upstream 0-RTT toggle via URL query parameter
+
+**Usage**:
+
+```bash
+# Clone the repo and open the editor in your browser
+git clone https://github.com/olicesx/kixdns.git
+open kixdns/tools/config_editor.html    # macOS
+xdg-open kixdns/tools/config_editor.html  # Linux
+
+# Or download just the file:
+curl -O https://raw.githubusercontent.com/olicesx/kixdns/main/tools/config_editor.html
+```
+
+Edit in the browser → click **Download JSON** → save as `pipeline.json` → run with:
+
+```bash
+kixdns run -c pipeline.json
+```
+
+Full documentation: [`tools/README.md`](tools/README.md)
+
+### Diagnostic Tool
+
+**File**: `tools/diagnose.html`
+
+A WebSocket-based DNS query diagnostic tool for testing KixDNS instances in real time.
+
+### GeoSite Tag Checker
+
+**File**: `tools/check_geosite_tags.rs`
+
+A standalone Rust utility to inspect available tags in a GeoSite `.dat` file:
+
+```bash
+cargo run --bin check_geosite_tags -- geosite.dat
+```
 
 ## Building from Source
 

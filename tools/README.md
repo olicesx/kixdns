@@ -87,7 +87,7 @@
 ### 6. 应用配置
 
 ```bash
-kixdns --config /path/to/pipeline.json
+kixdns run -c /path/to/pipeline.json
 ```
 
 ## 上游传输协议支持
