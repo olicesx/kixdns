@@ -54,6 +54,10 @@ A high-performance, non-recursive DNS forwarding server written in Rust, designe
 
 ## Quick Start
 
+> 💡 **New to KixDNS config?** Try the **[Visual Config Editor](#config-editor)** — a browser-based GUI that generates `pipeline.json` for you. No JSON hand-writing required.
+
+![Config Editor Preview](docs/images/config-editor.png)
+
 ### Build
 
 ```bash
@@ -399,9 +403,9 @@ KixDNS ships with browser-based tools — no installation required, just open th
 
 **File**: `tools/config_editor.html`
 
-A visual editor for `pipeline.json` — no need to hand-write JSON.
+A visual editor for `pipeline.json` — no need to hand-write JSON. Just open the HTML file in any browser.
 
-![Config Editor](https://img.shields.io/badge/type-browser_app-blue)
+![Config Editor](docs/images/config-editor.png)
 
 **Features**:
 
