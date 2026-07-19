@@ -67,21 +67,30 @@ cargo build --release
 ./target/release/kixdns
 
 # Custom config
-./target/release/kixdns --config /etc/kixdns/pipeline.json
+./target/release/kixdns run -c /etc/kixdns/pipeline.json
 
 # With listener label
-./target/release/kixdns --listener-label edge-internal
+./target/release/kixdns run --listener-label edge-internal
 
 # Debug logging
-./target/release/kixdns --debug
+./target/release/kixdns run --debug
+
+# Show help
+./target/release/kixdns --help
+./target/release/kixdns run --help
 ```
 
 ### Command Line Options
 
 ```
-kixdns [OPTIONS]
+kixdns [COMMAND]
 
-OPTIONS:
+COMMANDS:
+  run              Run DNS server (default if no subcommand given)
+  convert-geo-ip   Convert GeoIP .dat to MMDB format
+  help             Print help
+
+run OPTIONS:
   -c, --config <FILE>          Configuration file path [default: config/pipeline.json]
       --listener-label <LABEL> Listener label for pipeline selection [default: default]
       --debug                  Enable debug logging
@@ -101,7 +110,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/kixdns --config /etc/kixdns/pipeline.json
+ExecStart=/usr/local/bin/kixdns run -c /etc/kixdns/pipeline.json
 Restart=on-failure
 LimitNOFILE=65536
 
