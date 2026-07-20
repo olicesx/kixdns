@@ -1,16 +1,15 @@
-use std::time::Duration;
 use std::sync::atomic::Ordering;
-
+use std::time::Duration;
 
 use bytes::Bytes;
+use futures::future::select;
+use hickory_proto::op::ResponseCode;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-use tracing::{debug};
-use hickory_proto::op::ResponseCode;
-use futures::future::select;
+use tracing::debug;
 
-use crate::config::Transport;
 use super::Engine;
+use crate::config::Transport;
 
 /// Error indicating that all upstream attempts have been exhausted.
 /// 表示所有 upstream 尝试均已耗尽的错误。
@@ -89,7 +88,11 @@ async fn fallback_after_primary_failure(
     if remaining.is_zero() {
         other_task.abort();
         if primary_is_task_error {
-            return Err(anyhow::anyhow!("{} task error: {}", primary_label, primary_err));
+            return Err(anyhow::anyhow!(
+                "{} task error: {}",
+                primary_label,
+                primary_err
+            ));
         }
         return Err(anyhow::anyhow!(
             "{} failed and no time left for {}: {}",
@@ -99,7 +102,11 @@ async fn fallback_after_primary_failure(
         ));
     }
 
-    let prefix = if primary_is_task_error { "task error" } else { "failed" };
+    let prefix = if primary_is_task_error {
+        "task error"
+    } else {
+        "failed"
+    };
     match timeout(remaining, other_task).await {
         Ok(Ok(Ok(bytes))) => Ok((bytes, other_label)),
         Ok(Ok(Err(other_err))) => Err(anyhow::anyhow!(
@@ -147,85 +154,68 @@ async fn forward_tcp_udp_dual(
     });
 
     let tcp_task = tokio::spawn(async move {
-        engine_tcp.tcp_mux.send(&packet_tcp, &addr_tcp, timeout_dur).await
+        engine_tcp
+            .tcp_mux
+            .send(&packet_tcp, &addr_tcp, timeout_dur)
+            .await
     });
 
     let start = std::time::Instant::now();
 
     // Wait for first successful response / 等待第一个成功响应
     match select(udp_task, tcp_task).await {
-        futures::future::Either::Left((result, tcp_task)) => {
-            match result {
-                Ok(Ok(bytes)) => {
-                    tcp_task.abort();
-                    Ok((bytes, "udp"))
-                }
-                Ok(Err(err)) => {
-                    let remaining = timeout_dur
-                        .checked_sub(start.elapsed())
-                        .unwrap_or_else(|| Duration::from_millis(0));
-                    fallback_after_primary_failure(
-                        tcp_task,
-                        remaining,
-                        "udp",
-                        err,
-                        false,
-                        "tcp",
-                    )
-                    .await
-                }
-                Err(join_err) => {
-                    let remaining = timeout_dur
-                        .checked_sub(start.elapsed())
-                        .unwrap_or_else(|| Duration::from_millis(0));
-                    fallback_after_primary_failure(
-                        tcp_task,
-                        remaining,
-                        "udp",
-                        anyhow::anyhow!(join_err),
-                        true,
-                        "tcp",
-                    )
-                    .await
-                }
+        futures::future::Either::Left((result, tcp_task)) => match result {
+            Ok(Ok(bytes)) => {
+                tcp_task.abort();
+                Ok((bytes, "udp"))
             }
-        }
-        futures::future::Either::Right((result, udp_task)) => {
-            match result {
-                Ok(Ok(bytes)) => {
-                    udp_task.abort();
-                    Ok((bytes, "tcp"))
-                }
-                Ok(Err(err)) => {
-                    let remaining = timeout_dur
-                        .checked_sub(start.elapsed())
-                        .unwrap_or_else(|| Duration::from_millis(0));
-                    fallback_after_primary_failure(
-                        udp_task,
-                        remaining,
-                        "tcp",
-                        err,
-                        false,
-                        "udp",
-                    )
-                    .await
-                }
-                Err(join_err) => {
-                    let remaining = timeout_dur
-                        .checked_sub(start.elapsed())
-                        .unwrap_or_else(|| Duration::from_millis(0));
-                    fallback_after_primary_failure(
-                        udp_task,
-                        remaining,
-                        "tcp",
-                        anyhow::anyhow!(join_err),
-                        true,
-                        "udp",
-                    )
-                    .await
-                }
+            Ok(Err(err)) => {
+                let remaining = timeout_dur
+                    .checked_sub(start.elapsed())
+                    .unwrap_or_else(|| Duration::from_millis(0));
+                fallback_after_primary_failure(tcp_task, remaining, "udp", err, false, "tcp").await
             }
-        }
+            Err(join_err) => {
+                let remaining = timeout_dur
+                    .checked_sub(start.elapsed())
+                    .unwrap_or_else(|| Duration::from_millis(0));
+                fallback_after_primary_failure(
+                    tcp_task,
+                    remaining,
+                    "udp",
+                    anyhow::anyhow!(join_err),
+                    true,
+                    "tcp",
+                )
+                .await
+            }
+        },
+        futures::future::Either::Right((result, udp_task)) => match result {
+            Ok(Ok(bytes)) => {
+                udp_task.abort();
+                Ok((bytes, "tcp"))
+            }
+            Ok(Err(err)) => {
+                let remaining = timeout_dur
+                    .checked_sub(start.elapsed())
+                    .unwrap_or_else(|| Duration::from_millis(0));
+                fallback_after_primary_failure(udp_task, remaining, "tcp", err, false, "udp").await
+            }
+            Err(join_err) => {
+                let remaining = timeout_dur
+                    .checked_sub(start.elapsed())
+                    .unwrap_or_else(|| Duration::from_millis(0));
+                fallback_after_primary_failure(
+                    udp_task,
+                    remaining,
+                    "tcp",
+                    anyhow::anyhow!(join_err),
+                    true,
+                    "udp",
+                )
+                .await
+            }
+        },
     }
 }
 
@@ -256,7 +246,12 @@ pub async fn forward_upstream(
         // 单个上游：直接转发 / Single upstream: direct forward
         vec![std::sync::Arc::from(upstream)]
     } else {
-        upstream.split(',').map(|s| s.trim()).map(|s| std::sync::Arc::from(s)).filter(|s: &std::sync::Arc<str>| !s.is_empty()).collect()
+        upstream
+            .split(',')
+            .map(|s| s.trim())
+            .map(|s| std::sync::Arc::from(s))
+            .filter(|s: &std::sync::Arc<str>| !s.is_empty())
+            .collect()
     };
 
     // 快速路径：只有一个上游时，直接调用避免 spawn 开销
@@ -304,17 +299,23 @@ pub async fn forward_upstream(
 
         match res {
             Ok(ref bytes) => {
-             // 记录成功指标 / Record success metrics
-             // Increment upstream metrics - 原子操作
-             engine.metrics_upstream_calls.fetch_add(1, Ordering::Relaxed);
-             engine.metrics_upstream_ns_total.fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
-             engine.metrics_last_upstream_latency_ns.store(dur.as_nanos() as u64, Ordering::Relaxed);
-             
-             // Quick check rcode logging
-             if let Some(qr) = crate::proto_utils::parse_response_quick(bytes) {
-                tracing::debug!(upstream=%up, upstream_ns = dur.as_nanos() as u64, rcode = %qr.rcode, "upstream call succeeded");
-             }
-             return Ok((bytes.clone(), upstream_with_proto));
+                // 记录成功指标 / Record success metrics
+                // Increment upstream metrics - 原子操作
+                engine
+                    .metrics_upstream_calls
+                    .fetch_add(1, Ordering::Relaxed);
+                engine
+                    .metrics_upstream_ns_total
+                    .fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
+                engine
+                    .metrics_last_upstream_latency_ns
+                    .store(dur.as_nanos() as u64, Ordering::Relaxed);
+
+                // Quick check rcode logging
+                if let Some(qr) = crate::proto_utils::parse_response_quick(bytes) {
+                    tracing::debug!(upstream=%up, upstream_ns = dur.as_nanos() as u64, rcode = %qr.rcode, "upstream call succeeded");
+                }
+                return Ok((bytes.clone(), upstream_with_proto));
             }
             Err(err) => {
                 // 失败时不构造 prefix，只 warn
@@ -349,7 +350,14 @@ pub async fn forward_upstream(
             let start = std::time::Instant::now();
             let (proto, res) = match transport_for_task {
                 Transport::Udp => {
-                    let r = forward_udp_smart(&engine, &packet, &addr_owned, timeout_dur, !has_tcp_task).await;
+                    let r = forward_udp_smart(
+                        &engine,
+                        &packet,
+                        &addr_owned,
+                        timeout_dur,
+                        !has_tcp_task,
+                    )
+                    .await;
                     ("udp", r)
                 }
                 Transport::Tcp => {
@@ -365,7 +373,10 @@ pub async fn forward_upstream(
                     }
                 }
                 Transport::Doh => {
-                    let r = engine.doh_client.send(&packet, &addr_owned, timeout_dur).await;
+                    let r = engine
+                        .doh_client
+                        .send(&packet, &addr_owned, timeout_dur)
+                        .await;
                     ("doh", r)
                 }
                 Transport::Dot => {
@@ -373,7 +384,10 @@ pub async fn forward_upstream(
                     ("dot", r)
                 }
                 Transport::Doq => {
-                    let r = engine.doq_client.send(&packet, &addr_owned, timeout_dur).await;
+                    let r = engine
+                        .doq_client
+                        .send(&packet, &addr_owned, timeout_dur)
+                        .await;
                     ("doq", r)
                 }
             };
@@ -392,31 +406,37 @@ pub async fn forward_upstream(
             Ok((up_proto, res, dur)) => {
                 match res {
                     Ok(bytes) => {
+                        // 快速解析响应码 / Quick parse response code
+                        let should_accept =
+                            if let Some(qr) = crate::proto_utils::parse_response_quick(&bytes) {
+                                match qr.rcode {
+                                    ResponseCode::NoError => true,
+                                    ResponseCode::ServFail | ResponseCode::Refused => false,
+                                    _ => true,
+                                }
+                            } else {
+                                true
+                            };
 
-                    // 快速解析响应码 / Quick parse response code
-                    let should_accept = if let Some(qr) = crate::proto_utils::parse_response_quick(&bytes) {
-                         match qr.rcode {
-                            ResponseCode::NoError => true,
-                            ResponseCode::ServFail | ResponseCode::Refused => false,
-                            _ => true,
-                         }
-                    } else {
-                        true
-                    };
+                        if should_accept {
+                            engine
+                                .metrics_upstream_calls
+                                .fetch_add(1, Ordering::Relaxed);
+                            engine
+                                .metrics_upstream_ns_total
+                                .fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
+                            engine
+                                .metrics_last_upstream_latency_ns
+                                .store(dur.as_nanos() as u64, Ordering::Relaxed);
 
-                    if should_accept {
-                         engine.metrics_upstream_calls.fetch_add(1, Ordering::Relaxed);
-                         engine.metrics_upstream_ns_total.fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
-                         engine.metrics_last_upstream_latency_ns.store(dur.as_nanos() as u64, Ordering::Relaxed);
+                            // 显式取消其他正在进行的任务
+                            if !tasks.is_empty() {
+                                tasks.abort_all();
+                            }
 
-                        // 显式取消其他正在进行的任务
-                        if !tasks.is_empty() {
-                            tasks.abort_all();
+                            return Ok((bytes, up_proto));
                         }
-
-                        return Ok((bytes, up_proto));
                     }
-                }
                     Err(err) => {
                         tracing::warn!(upstream=%up_proto, error=%err, elapsed_ns = dur.as_nanos() as u64, "upstream call failed, waiting for others");
                         last_err = Some(err);
@@ -435,7 +455,6 @@ pub async fn forward_upstream(
     Err(anyhow::Error::new(UpstreamFailure::new(err)))
 }
 
-
 /// UDP forwarder with hedged retry and TCP fallback for better tail latency.
 async fn forward_udp_smart(
     engine: &Engine,
@@ -446,8 +465,8 @@ async fn forward_udp_smart(
 ) -> anyhow::Result<Bytes> {
     // 获取 TCP fallback 配置（Copy bool 值，避免持有 Guard 跨 await）
     // Get TCP fallback config (Copy bool value to avoid holding Guard across await)
-    let enable_tcp_fallback = allow_tcp_fallback
-        && engine.state.load().pipeline.settings.enable_tcp_fallback;
+    let enable_tcp_fallback =
+        allow_tcp_fallback && engine.state.load().pipeline.settings.enable_tcp_fallback;
 
     // Split timeout: first attempt uses 1/N budget (leaving room for TCP fallback)
     // 分割超时：第一次尝试使用 1/N 时间（为 TCP fallback 留出空间）
@@ -503,8 +522,8 @@ mod tests {
     use hickory_proto::rr::{Name, RecordType};
     use rustls::crypto::ring;
     use std::str::FromStr;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
 
@@ -524,7 +543,8 @@ mod tests {
         assert_eq!(transport, Transport::Doh);
 
         // HTTPS (alias for DoH)
-        let (addr, transport) = parse_upstream_addr("https://dns.example.com/dns-query", Transport::Udp);
+        let (addr, transport) =
+            parse_upstream_addr("https://dns.example.com/dns-query", Transport::Udp);
         assert_eq!(addr, "dns.example.com/dns-query");
         assert_eq!(transport, Transport::Doh);
 
@@ -588,12 +608,21 @@ mod tests {
         // parse_upstream_addr should extract DoQ from the URL prefix
         let (addr, transport) = parse_upstream_addr("doq://223.5.5.5:853", default_transport);
         assert_eq!(addr, "223.5.5.5:853");
-        assert_eq!(transport, Transport::Doq, "URL prefix should override default transport");
+        assert_eq!(
+            transport,
+            Transport::Doq,
+            "URL prefix should override default transport"
+        );
 
         // Simulate: { "upstream": "doh://dns.google/dns-query" } (no transport field)
-        let (addr, transport) = parse_upstream_addr("doh://dns.google/dns-query", default_transport);
+        let (addr, transport) =
+            parse_upstream_addr("doh://dns.google/dns-query", default_transport);
         assert_eq!(addr, "dns.google/dns-query");
-        assert_eq!(transport, Transport::Doh, "URL prefix should override default transport");
+        assert_eq!(
+            transport,
+            Transport::Doh,
+            "URL prefix should override default transport"
+        );
     }
 
     #[test]
@@ -602,22 +631,30 @@ mod tests {
         // 测试带 0rtt 参数的 DoQ URL 是否正确解析
 
         // DoQ with 0rtt=false
-        let (addr, transport) = parse_upstream_addr("doq://223.5.5.5:853?0rtt=false", Transport::Udp);
+        let (addr, transport) =
+            parse_upstream_addr("doq://223.5.5.5:853?0rtt=false", Transport::Udp);
         assert_eq!(addr, "223.5.5.5:853?0rtt=false");
         assert_eq!(transport, Transport::Doq);
 
         // DoQ with 0rtt=true
-        let (addr, transport) = parse_upstream_addr("doq://dns.google:853?0rtt=true", Transport::Udp);
+        let (addr, transport) =
+            parse_upstream_addr("doq://dns.google:853?0rtt=true", Transport::Udp);
         assert_eq!(addr, "dns.google:853?0rtt=true");
         assert_eq!(transport, Transport::Doq);
 
         // DoQ with SNI parameter
-        let (addr, transport) = parse_upstream_addr("doq://dns.example.com:853?sni=dns.example.com", Transport::Udp);
+        let (addr, transport) = parse_upstream_addr(
+            "doq://dns.example.com:853?sni=dns.example.com",
+            Transport::Udp,
+        );
         assert_eq!(addr, "dns.example.com:853?sni=dns.example.com");
         assert_eq!(transport, Transport::Doq);
 
         // DoQ with both 0rtt and SNI
-        let (addr, transport) = parse_upstream_addr("doq://dns.example.com:853?0rtt=false&sni=dns.example.com", Transport::Udp);
+        let (addr, transport) = parse_upstream_addr(
+            "doq://dns.example.com:853?0rtt=false&sni=dns.example.com",
+            Transport::Udp,
+        );
         assert_eq!(addr, "dns.example.com:853?0rtt=false&sni=dns.example.com");
         assert_eq!(transport, Transport::Doq);
     }
@@ -663,11 +700,8 @@ mod tests {
         let tcp_hits = Arc::new(AtomicUsize::new(0));
         let tcp_hits_clone = Arc::clone(&tcp_hits);
         let tcp_task = tokio::spawn(async move {
-            if let Ok(Ok((mut stream, _))) = tokio::time::timeout(
-                Duration::from_millis(500),
-                tcp_listener.accept(),
-            )
-            .await
+            if let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(500), tcp_listener.accept()).await
             {
                 tcp_hits_clone.fetch_add(1, Ordering::SeqCst);
                 let mut len_buf = [0u8; 2];

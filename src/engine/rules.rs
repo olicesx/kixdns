@@ -1,28 +1,30 @@
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use std::net::{IpAddr, SocketAddr};
-use std::hash::{Hash, Hasher};
-use std::collections::HashSet;
+use anyhow::Context;
 use bytes::{Bytes, BytesMut};
 use hickory_proto::op::{Message, ResponseCode};
-use hickory_proto::rr::{Record, RecordType, DNSClass, RData};
 use hickory_proto::rr::rdata::TXT;
+use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use rustc_hash::FxHasher;
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::warn;
-use anyhow::Context;
 
+use crate::cache::CacheEntry;
 use crate::config::{Action, Transport};
-use crate::matcher::RuntimeResponseMatcherWithOp;
 use crate::engine::core::Engine;
+use crate::engine::matcher_adapter::log_match;
+use crate::engine::response::{
+    extract_ttl, extract_ttl_for_refresh, make_static_ip_answer, make_static_txt_answer,
+};
 use crate::engine::types::EngineInner;
 use crate::engine::types::InflightMap;
-use crate::engine::utils::engine_helpers::{self, build_response};
-use crate::engine::response::{make_static_ip_answer, make_static_txt_answer, extract_ttl, extract_ttl_for_refresh};
-use crate::engine::matcher_adapter::log_match;
-use crate::matcher::eval_match_chain;
-use crate::cache::CacheEntry;
 use crate::engine::upstream::UpstreamFailure;
+use crate::engine::utils::engine_helpers::{self, build_response};
+use crate::matcher::RuntimeResponseMatcherWithOp;
+use crate::matcher::eval_match_chain;
 
 #[derive(Debug, Clone)]
 pub enum Decision {
@@ -41,6 +43,8 @@ pub enum Decision {
         response_actions_on_miss: Vec<Action>,
         rule_name: Arc<str>,
         transport: Option<Transport>, // None means each upstream decides itself (via protocol prefix) / None 表示每个 upstream 自己决定（通过协议前缀）
+        /// EDNS Client Subnet (RFC 7871) request rewriting mode / EDNS 客户端子网 (RFC 7871) 请求改写模式
+        ecs: Option<crate::config::EcsMode>,
         #[allow(dead_code)]
         continue_on_match: bool,
         #[allow(dead_code)]
@@ -127,7 +131,11 @@ impl RuleCacheEntry {
             qname_hash: fast_hash_str(qname),
             qtype: u16::from(qtype),
             qclass: u16::from(qclass),
-            client_ip: if uses_client_ip { Some(client_ip) } else { None },
+            client_ip: if uses_client_ip {
+                Some(client_ip)
+            } else {
+                None
+            },
             decision: Arc::new(decision),
             expires_at: None,
         }
@@ -159,13 +167,12 @@ impl RuleCacheEntry {
                 return false;
             }
         } else if self.client_ip.is_some() {
-            // Entry has IP but we don't care now? 
+            // Entry has IP but we don't care now?
             // This case shouldn't happen if we use the same uses_client_ip for both hash and entry.
             return false;
         }
 
-        self.pipeline_id.as_ref() == pipeline_id
-            && self.qname_hash == fast_hash_str(qname)
+        self.pipeline_id.as_ref() == pipeline_id && self.qname_hash == fast_hash_str(qname)
     }
 
     /// Check if entry is still valid (not expired)
@@ -175,7 +182,7 @@ impl RuleCacheEntry {
         if let Some(expires) = self.expires_at {
             Instant::now() <= expires
         } else {
-            true  // No expiration = permanent
+            true // No expiration = permanent
         }
     }
 }
@@ -189,7 +196,7 @@ pub fn fast_hash_str(s: &str) -> u64 {
 
 /// 辅助函数：获取 GeoIP 和 GeoSite 锁（带非阻塞快速路径）
 /// Helper function: Acquire GeoIP and GeoSite locks (with non-blocking fast path)
-/// 
+///
 /// 优化：消除重复的锁获取逻辑 / Optimization: Eliminate duplicate lock acquisition logic
 #[inline]
 fn acquire_geo_locks<'a>(
@@ -216,7 +223,9 @@ fn acquire_geo_locks<'a>(
 
 #[inline]
 pub fn contains_continue(actions: &[Action]) -> bool {
-    actions.iter().any(|action| matches!(action, Action::Continue))
+    actions
+        .iter()
+        .any(|action| matches!(action, Action::Continue))
 }
 
 fn parse_rcode(rcode: &str) -> Option<ResponseCode> {
@@ -332,13 +341,13 @@ pub(crate) async fn apply_response_actions(
                 } else {
                     let bytes = engine_helpers::build_servfail_response(ctx.req)?;
                     return Ok(ResponseActionResult::Static {
-                         bytes,
-                         rcode: ResponseCode::ServFail,
-                         source: "response_action",
+                        bytes,
+                        rcode: ResponseCode::ServFail,
+                        source: "response_action",
                     });
                 }
             }
-             Action::Deny => {
+            Action::Deny => {
                 let bytes = engine_helpers::build_refused_response(ctx.req)?;
                 return Ok(ResponseActionResult::Static {
                     bytes,
@@ -351,7 +360,10 @@ pub(crate) async fn apply_response_actions(
             }
             Action::ReplaceTxtResponse { text } => {
                 if let Some(ref resp_ctx) = ctx.ctx_opt {
-                    let name = resp_ctx.msg.queries().first()
+                    let name = resp_ctx
+                        .msg
+                        .queries()
+                        .first()
                         .map(|q| q.name().clone())
                         .ok_or_else(|| anyhow::anyhow!("No query name"))?;
 
@@ -380,6 +392,7 @@ pub(crate) async fn apply_response_actions(
             Action::Forward {
                 upstream,
                 transport,
+                ecs: _,
                 pre_split_upstreams,
             } => {
                 forward_attempts += 1;
@@ -401,15 +414,25 @@ pub(crate) async fn apply_response_actions(
                     });
                 }
 
-                let upstream_addr: Arc<str> = upstream.as_ref().map(|s| Arc::from(s.as_str())).unwrap_or_else(|| {
-                    ctx.ctx_opt
-                        .as_ref()
-                        .map(|c| c.upstream.clone())
-                        .unwrap_or_else(|| Arc::from(ctx.upstream_default))
-                });
+                let upstream_addr: Arc<str> = upstream
+                    .as_ref()
+                    .map(|s| Arc::from(s.as_str()))
+                    .unwrap_or_else(|| {
+                        ctx.ctx_opt
+                            .as_ref()
+                            .map(|c| c.upstream.clone())
+                            .unwrap_or_else(|| Arc::from(ctx.upstream_default))
+                    });
                 let use_transport = transport.unwrap_or(Transport::Udp);
-                let (raw, actual_upstream) = match crate::engine::upstream::forward_upstream(ctx.engine, ctx.packet, &upstream_addr, ctx.upstream_timeout, Some(use_transport), pre_split_upstreams.as_ref())
-                    .await
+                let (raw, actual_upstream) = match crate::engine::upstream::forward_upstream(
+                    ctx.engine,
+                    ctx.packet,
+                    &upstream_addr,
+                    ctx.upstream_timeout,
+                    Some(use_transport),
+                    pre_split_upstreams.as_ref(),
+                )
+                .await
                 {
                     Ok(result) => result,
                     Err(err) => {
@@ -439,7 +462,7 @@ pub(crate) async fn apply_response_actions(
                 ctx.ctx_opt = Some(ResponseContext {
                     raw,
                     msg,
-                    upstream: Arc::from(actual_upstream.as_str()),  // Use actual responding upstream
+                    upstream: Arc::from(actual_upstream.as_str()), // Use actual responding upstream
                     transport: use_transport,
                 });
             }
@@ -456,9 +479,22 @@ pub(crate) async fn apply_response_actions(
         let resp_match = eval_match_chain(
             ctx.response_matchers,
             |m| m.operator,
-            |m| m.matcher.matches(&resp_ctx.upstream, ctx.qname, ctx.qtype, ctx.qclass, &resp_ctx.msg, geoip_manager_ref, geosite_manager_ref),
+            |m| {
+                m.matcher.matches(
+                    &resp_ctx.upstream,
+                    ctx.qname,
+                    ctx.qtype,
+                    ctx.qclass,
+                    &resp_ctx.msg,
+                    geoip_manager_ref,
+                    geosite_manager_ref,
+                )
+            },
         );
-        return Ok(ResponseActionResult::Upstream { ctx: resp_ctx, resp_match });
+        return Ok(ResponseActionResult::Upstream {
+            ctx: resp_ctx,
+            resp_match,
+        });
     }
 
     let bytes = engine_helpers::build_servfail_response(ctx.req)?;
@@ -495,9 +531,13 @@ pub(crate) async fn process_response_jump(
 
     impl InflightCleanupGuard {
         fn new(inflight: Arc<InflightMap>, hash: u64) -> Self {
-            Self { inflight, hash, active: true }
+            Self {
+                inflight,
+                hash,
+                active: true,
+            }
         }
-        
+
         fn defuse(&mut self) {
             self.active = false;
         }
@@ -519,20 +559,39 @@ pub(crate) async fn process_response_jump(
     loop {
         if remaining_jumps == 0 {
             let resp_bytes = engine_helpers::build_servfail_response(req)?;
-            for g in &mut cleanup_guards { g.defuse(); }
-            for h in &inflight_hashes { engine.notify_inflight_waiters(*h, &resp_bytes).await; }
+            for g in &mut cleanup_guards {
+                g.defuse();
+            }
+            for h in &inflight_hashes {
+                engine.notify_inflight_waiters(*h, &resp_bytes).await;
+            }
             return Ok(resp_bytes);
         }
 
-        let Some(pipeline) = state.pipeline.pipelines.iter().find(|p| p.id == pipeline_id) else {
+        let Some(pipeline) = state
+            .pipeline
+            .pipelines
+            .iter()
+            .find(|p| p.id == pipeline_id)
+        else {
             let resp_bytes = engine_helpers::build_servfail_response(req)?;
-            for g in &mut cleanup_guards { g.defuse(); }
-            for h in &inflight_hashes { engine.notify_inflight_waiters(*h, &resp_bytes).await; }
+            for g in &mut cleanup_guards {
+                g.defuse();
+            }
+            for h in &inflight_hashes {
+                engine.notify_inflight_waiters(*h, &resp_bytes).await;
+            }
             return Ok(resp_bytes);
         };
 
-        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(&pipeline_id, qname.as_bytes(), qtype, qclass);
-        
+        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(
+            &pipeline_id,
+            qname.as_bytes(),
+            qtype,
+            qclass,
+            None,
+        );
+
         let mut decision = engine.apply_rules(
             state,
             pipeline,
@@ -555,13 +614,22 @@ pub(crate) async fn process_response_jump(
             if let Decision::Jump { pipeline } = decision {
                 if local_jumps == 0 {
                     let resp_bytes = engine_helpers::build_servfail_response(req)?;
-                    for g in &mut cleanup_guards { g.defuse(); }
-                    for h in &inflight_hashes { engine.notify_inflight_waiters(*h, &resp_bytes).await; }
+                    for g in &mut cleanup_guards {
+                        g.defuse();
+                    }
+                    for h in &inflight_hashes {
+                        engine.notify_inflight_waiters(*h, &resp_bytes).await;
+                    }
                     return Ok(resp_bytes);
                 }
                 pipeline_id = pipeline;
                 local_jumps -= 1;
-                if let Some(next_pipeline) = state.pipeline.pipelines.iter().find(|p| p.id == pipeline_id) {
+                if let Some(next_pipeline) = state
+                    .pipeline
+                    .pipelines
+                    .iter()
+                    .find(|p| p.id == pipeline_id)
+                {
                     skip_rules.clear();
                     decision = engine.apply_rules(
                         state,
@@ -577,8 +645,12 @@ pub(crate) async fn process_response_jump(
                     continue;
                 } else {
                     let resp_bytes = engine_helpers::build_servfail_response(req)?;
-                    for g in &mut cleanup_guards { g.defuse(); }
-                    for h in &inflight_hashes { engine.notify_inflight_waiters(*h, &resp_bytes).await; }
+                    for g in &mut cleanup_guards {
+                        g.defuse();
+                    }
+                    for h in &inflight_hashes {
+                        engine.notify_inflight_waiters(*h, &resp_bytes).await;
+                    }
                     return Ok(resp_bytes);
                 }
             }
@@ -594,7 +666,7 @@ pub(crate) async fn process_response_jump(
                     bytes: resp_bytes.clone(),
                     rcode,
                     source: Arc::from("static"),
-                    upstream: None,  // Static responses have no upstream
+                    upstream: None, // Static responses have no upstream
                     qname: Arc::from(qname),
                     pipeline_id: pipeline_id.clone(),
                     qtype: u16::from(qtype),
@@ -603,8 +675,12 @@ pub(crate) async fn process_response_jump(
                     refresh_ttl: min_ttl.as_secs() as u32,
                 };
                 engine.cache.insert(dedupe_hash, Arc::new(entry));
-                for g in &mut cleanup_guards { g.defuse(); }
-                for h in &inflight_hashes { engine.notify_inflight_waiters(*h, &resp_bytes).await; }
+                for g in &mut cleanup_guards {
+                    g.defuse();
+                }
+                for h in &inflight_hashes {
+                    engine.notify_inflight_waiters(*h, &resp_bytes).await;
+                }
                 return Ok(resp_bytes);
             }
             Decision::Forward {
@@ -616,6 +692,7 @@ pub(crate) async fn process_response_jump(
                 response_actions_on_miss,
                 rule_name,
                 transport,
+                ecs: _,
                 continue_on_match: _,
                 continue_on_miss: _,
                 allow_reuse,
@@ -632,9 +709,14 @@ pub(crate) async fn process_response_jump(
                                 Entry::Vacant(entry) => {
                                     // No other request in progress, create watch channel
                                     // 没有其他请求在进行,创建 watch channel
-                                    let (tx, _rx) = tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
+                                    let (tx, _rx) = tokio::sync::watch::channel(Err(Arc::new(
+                                        anyhow::anyhow!("Pending"),
+                                    )));
                                     entry.insert(tx);
-                                    cleanup_guards.push(InflightCleanupGuard::new(engine.inflight.clone(), dedupe_hash));
+                                    cleanup_guards.push(InflightCleanupGuard::new(
+                                        engine.inflight.clone(),
+                                        dedupe_hash,
+                                    ));
                                     inflight_hashes.push(dedupe_hash);
                                     None
                                 }
@@ -665,8 +747,12 @@ pub(crate) async fn process_response_jump(
                                                 }
                                                 let resp_bytes = resp_mut.freeze();
 
-                                                for g in &mut cleanup_guards { g.defuse(); }
-                                                for h in &inflight_hashes { engine.notify_inflight_waiters(*h, bytes).await; }
+                                                for g in &mut cleanup_guards {
+                                                    g.defuse();
+                                                }
+                                                for h in &inflight_hashes {
+                                                    engine.notify_inflight_waiters(*h, bytes).await;
+                                                }
                                                 return Ok(resp_bytes);
                                             }
                                             Err(e) => return Err(anyhow::anyhow!("{}", e)),
@@ -678,12 +764,20 @@ pub(crate) async fn process_response_jump(
                                 }
                             }
                         }
-                        crate::engine::upstream::forward_upstream(engine, packet, &upstream, upstream_timeout, transport, pre_split_upstreams.as_ref()).await
+                        crate::engine::upstream::forward_upstream(
+                            engine,
+                            packet,
+                            &upstream,
+                            upstream_timeout,
+                            transport,
+                            pre_split_upstreams.as_ref(),
+                        )
+                        .await
                     }
                 } else {
                     // If reuse is not allowed (e.g. explicit Forward action), we must clear any reused response
                     // and force a new request.
-                    
+
                     // FIX: Background refresh must skip inflight check
                     // 修复：后台刷新必须跳过 inflight 检查
                     if !skip_cache {
@@ -692,9 +786,14 @@ pub(crate) async fn process_response_jump(
                             Entry::Vacant(entry) => {
                                 // No other request in progress, create watch channel
                                 // 没有其他请求在进行,创建 watch channel
-                                let (tx, _rx) = tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
+                                let (tx, _rx) = tokio::sync::watch::channel(Err(Arc::new(
+                                    anyhow::anyhow!("Pending"),
+                                )));
                                 entry.insert(tx);
-                                cleanup_guards.push(InflightCleanupGuard::new(engine.inflight.clone(), dedupe_hash));
+                                cleanup_guards.push(InflightCleanupGuard::new(
+                                    engine.inflight.clone(),
+                                    dedupe_hash,
+                                ));
                                 inflight_hashes.push(dedupe_hash);
                                 None
                             }
@@ -725,8 +824,12 @@ pub(crate) async fn process_response_jump(
                                             }
                                             let resp_bytes = resp_mut.freeze();
 
-                                            for g in &mut cleanup_guards { g.defuse(); }
-                                            for h in &inflight_hashes { engine.notify_inflight_waiters(*h, bytes).await; }
+                                            for g in &mut cleanup_guards {
+                                                g.defuse();
+                                            }
+                                            for h in &inflight_hashes {
+                                                engine.notify_inflight_waiters(*h, bytes).await;
+                                            }
                                             return Ok(resp_bytes);
                                         }
                                         Err(e) => return Err(anyhow::anyhow!("{}", e)),
@@ -738,7 +841,15 @@ pub(crate) async fn process_response_jump(
                             }
                         }
                     }
-                    crate::engine::upstream::forward_upstream(engine, packet, &upstream, upstream_timeout, transport, pre_split_upstreams.as_ref()).await
+                    crate::engine::upstream::forward_upstream(
+                        engine,
+                        packet,
+                        &upstream,
+                        upstream_timeout,
+                        transport,
+                        pre_split_upstreams.as_ref(),
+                    )
+                    .await
                 };
 
                 match resp {
@@ -750,7 +861,8 @@ pub(crate) async fn process_response_jump(
                         // Extract TTL for refresh timing (use max to avoid premature refresh)
                         // 提取 TTL 用于刷新时机 (使用最大值避免过早刷新)
                         let ttl_secs_refresh = extract_ttl_for_refresh(&msg);
-                        let effective_ttl = Duration::from_secs(ttl_secs_cache.max(min_ttl.as_secs()));
+                        let effective_ttl =
+                            Duration::from_secs(ttl_secs_cache.max(min_ttl.as_secs()));
 
                         // Get manager references for GeoIP/GeoSite matching in response matchers
                         // Try to acquire read locks non-blockingly (fast path for concurrent reads)
@@ -765,7 +877,9 @@ pub(crate) async fn process_response_jump(
                             // Fallback to blocking read if try_read fails (rare write operation in progress)
                             // 如果 try_read 失败则回退到阻塞读取（罕见的写操作进行中）
                             if geoip_manager.is_none() || geosite_manager.is_none() {
-                                tracing::debug!("GeoIP/GeoSite lock contention, falling back to blocking read");
+                                tracing::debug!(
+                                    "GeoIP/GeoSite lock contention, falling back to blocking read"
+                                );
                                 geoip_manager = Some(engine.geoip_manager.read());
                                 geosite_manager = Some(engine.geosite_manager.read());
                             }
@@ -776,7 +890,17 @@ pub(crate) async fn process_response_jump(
                             eval_match_chain(
                                 &response_matchers,
                                 |m| m.operator,
-                                |m| m.matcher.matches(&upstream, qname, qtype, qclass, &msg, geoip_manager_ref, geosite_manager_ref),
+                                |m| {
+                                    m.matcher.matches(
+                                        &upstream,
+                                        qname,
+                                        qtype,
+                                        qclass,
+                                        &msg,
+                                        geoip_manager_ref,
+                                        geosite_manager_ref,
+                                    )
+                                },
                             )
                         }; // guards are dropped here / 锁在此处释放
 
@@ -803,20 +927,24 @@ pub(crate) async fn process_response_jump(
                                     pipeline_id: pipeline_id.clone(),
                                     qtype: u16::from(qtype),
                                     inserted_at: Instant::now(),
-                                    original_ttl: ttl_secs_cache as u32,  // Use min TTL for cache expiration / 使用最小 TTL 作为缓存过期
-                                    refresh_ttl: ttl_secs_refresh as u32,   // Use max TTL for refresh timing / 使用最大 TTL 作为刷新时机
+                                    original_ttl: ttl_secs_cache as u32, // Use min TTL for cache expiration / 使用最小 TTL 作为缓存过期
+                                    refresh_ttl: ttl_secs_refresh as u32, // Use max TTL for refresh timing / 使用最大 TTL 作为刷新时机
                                 };
                                 engine.cache.insert(dedupe_hash, Arc::new(entry));
                             }
-                            for g in &mut cleanup_guards { g.defuse(); }
-                            for h in &inflight_hashes { engine.notify_inflight_waiters(*h, &raw).await; }
+                            for g in &mut cleanup_guards {
+                                g.defuse();
+                            }
+                            for h in &inflight_hashes {
+                                engine.notify_inflight_waiters(*h, &raw).await;
+                            }
                             return Ok(raw);
                         }
 
                         let ctx = ResponseContext {
                             raw,
                             msg,
-                            upstream: Arc::from(actual_upstream.as_str()),  // Use actual responding upstream
+                            upstream: Arc::from(actual_upstream.as_str()), // Use actual responding upstream
                             transport: transport.unwrap_or(Transport::Udp),
                         };
                         let apply_ctx = ApplyResponseActionsContext {
@@ -836,8 +964,7 @@ pub(crate) async fn process_response_jump(
                             rule_name: &rule_name,
                             remaining_jumps,
                         };
-                        let action_result = apply_response_actions(apply_ctx)
-                            .await?;
+                        let action_result = apply_response_actions(apply_ctx).await?;
 
                         match action_result {
                             ResponseActionResult::Upstream { ctx, resp_match } => {
@@ -859,21 +986,32 @@ pub(crate) async fn process_response_jump(
                                         pipeline_id: pipeline_id.clone(),
                                         qtype: u16::from(qtype),
                                         inserted_at: Instant::now(),
-                                        original_ttl: ttl_secs_cache as u32,  // Use min TTL for cache expiration / 使用最小 TTL 作为缓存过期
-                                        refresh_ttl: ttl_secs_refresh as u32,  // Use max TTL for refresh timing / 使用最大 TTL 作为刷新时机
+                                        original_ttl: ttl_secs_cache as u32, // Use min TTL for cache expiration / 使用最小 TTL 作为缓存过期
+                                        refresh_ttl: ttl_secs_refresh as u32, // Use max TTL for refresh timing / 使用最大 TTL 作为刷新时机
                                     };
                                     engine.cache.insert(dedupe_hash, Arc::new(entry));
                                 }
-                                for g in &mut cleanup_guards { g.defuse(); }
-                                for h in &inflight_hashes { engine.notify_inflight_waiters(*h, &ctx.raw).await; }
+                                for g in &mut cleanup_guards {
+                                    g.defuse();
+                                }
+                                for h in &inflight_hashes {
+                                    engine.notify_inflight_waiters(*h, &ctx.raw).await;
+                                }
                                 return Ok(ctx.raw);
                             }
                             ResponseActionResult::Static { bytes, .. } => {
-                                for g in &mut cleanup_guards { g.defuse(); }
-                                for h in &inflight_hashes { engine.notify_inflight_waiters(*h, &bytes).await; }
+                                for g in &mut cleanup_guards {
+                                    g.defuse();
+                                }
+                                for h in &inflight_hashes {
+                                    engine.notify_inflight_waiters(*h, &bytes).await;
+                                }
                                 return Ok(bytes);
                             }
-                            ResponseActionResult::Jump { pipeline, remaining_jumps: next_remaining } => {
+                            ResponseActionResult::Jump {
+                                pipeline,
+                                remaining_jumps: next_remaining,
+                            } => {
                                 pipeline_id = pipeline;
                                 remaining_jumps = next_remaining;
                                 continue;
@@ -890,8 +1028,12 @@ pub(crate) async fn process_response_jump(
                             return Err(err);
                         }
                         let resp_bytes = engine_helpers::build_servfail_response(req)?;
-                        for g in &mut cleanup_guards { g.defuse(); }
-                        for h in &inflight_hashes { engine.notify_inflight_waiters(*h, &resp_bytes).await; }
+                        for g in &mut cleanup_guards {
+                            g.defuse();
+                        }
+                        for h in &inflight_hashes {
+                            engine.notify_inflight_waiters(*h, &resp_bytes).await;
+                        }
                         return Ok(resp_bytes);
                     }
                 }

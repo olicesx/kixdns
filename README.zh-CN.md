@@ -23,6 +23,7 @@
 - **监听器标签** — 同一实例为不同标签提供不同 Pipeline
 - **多种上游传输** — UDP / TCP / DoH (RFC 8484) / DoT / DoQ (RFC 9250)
 - **URL 协议前缀** — `udp://`、`tcp://`、`doh://`、`dot://`、`doq://` 自动识别
+- **EDNS Client Subnet (RFC 7871)** — 两层 ECS 配置：Pipeline 级缓存隔离 + Action 级发包注入（Clear / FromClientIp / Static）
 
 ### 💾 缓存与可靠性
 - **内存缓存** — 高性能 `moka` 缓存，可配置容量和最大 TTL

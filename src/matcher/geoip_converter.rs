@@ -3,13 +3,13 @@
 //! 将 V2Ray GeoIP .dat 文件转换为 MaxMind MMDB 格式
 //! Convert V2Ray GeoIP .dat files to MaxMind MMDB format
 
+use anyhow::{Context, Result};
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
-use anyhow::{Context, Result};
-use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use serde::{Deserialize, Serialize};
 use tracing::info;
 
 /// V2Ray GeoIP .dat 文件格式
@@ -122,8 +122,8 @@ impl GeoIpConverter {
             let field_tag = data[pos];
             pos += 1;
 
-            let entry_len = parse_varint(&data, &mut pos)
-                .context("Failed to parse varint for entry length")?;
+            let entry_len =
+                parse_varint(&data, &mut pos).context("Failed to parse varint for entry length")?;
 
             if pos + entry_len > data.len() {
                 break;
@@ -191,7 +191,12 @@ impl GeoIpConverter {
                                 let prefix = parse_varint(&data, &mut cidr_pos)?;
 
                                 // Create IPv4 network
-                                let ipv4 = std::net::Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
+                                let ipv4 = std::net::Ipv4Addr::new(
+                                    ip_bytes[0],
+                                    ip_bytes[1],
+                                    ip_bytes[2],
+                                    ip_bytes[3],
+                                );
                                 if let Ok(net) = Ipv4Net::new(ipv4, prefix as u8) {
                                     cidr_list.push(IpNet::V4(net));
                                 }
@@ -233,8 +238,8 @@ impl GeoIpConverter {
         let data = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read JSON file: {}", path.display()))?;
 
-        let list: V2RayGeoIPList = serde_json::from_str(&data)
-            .context("Failed to parse V2Ray GeoIP JSON")?;
+        let list: V2RayGeoIPList =
+            serde_json::from_str(&data).context("Failed to parse V2Ray GeoIP JSON")?;
 
         let mut count = 0;
 
@@ -301,14 +306,10 @@ impl GeoIpConverter {
     /// 应用国家代码过滤
     /// Apply country code filter
     pub fn filter_countries(&mut self, filter: &[String]) {
-        let filter_set: HashSet<String> = filter
-            .iter()
-            .map(|s| s.to_uppercase())
-            .collect();
+        let filter_set: HashSet<String> = filter.iter().map(|s| s.to_uppercase()).collect();
 
-        self.country_to_nets.retain(|country, _| {
-            filter_set.contains(country)
-        });
+        self.country_to_nets
+            .retain(|country, _| filter_set.contains(country));
 
         info!(
             "After filtering: {} countries remain",
@@ -326,7 +327,10 @@ impl GeoIpConverter {
 
         // Set metadata
         db.metadata.database_type = "KixDNS GeoIP".to_string();
-        db.metadata.description.insert("en".to_string(), "GeoIP database converted from V2Ray .dat format".to_string());
+        db.metadata.description.insert(
+            "en".to_string(),
+            "GeoIP database converted from V2Ray .dat format".to_string(),
+        );
         db.metadata.ip_version = IpVersion::V6;
 
         let mut ipv4_count = 0;
@@ -339,7 +343,8 @@ impl GeoIpConverter {
                 },
             };
 
-            let data_ref = db.insert_value(&country_data)
+            let data_ref = db
+                .insert_value(&country_data)
                 .with_context(|| format!("Failed to insert data for country: {}", country_code))?;
 
             for net in nets {
@@ -360,16 +365,15 @@ impl GeoIpConverter {
         let mut writer = BufWriter::new(file);
         db.write_to(&mut writer)
             .context("Failed to write MMDB database")?;
-        writer.flush()
-            .context("Failed to flush output")?;
+        writer.flush().context("Failed to flush output")?;
 
         // Get file sizes
-        let source_size = std::fs::metadata(source_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let source_size = std::fs::metadata(source_path).map(|m| m.len()).unwrap_or(0);
         let output_size = std::fs::metadata(output_path)
             .map(|m| m.len())
-            .with_context(|| format!("Failed to get output file size: {}", output_path.display()))?;
+            .with_context(|| {
+                format!("Failed to get output file size: {}", output_path.display())
+            })?;
 
         Ok(ConversionStats {
             source_file_size: source_size,
@@ -561,7 +565,8 @@ pub fn convert_dat_to_mmdb(
     let mut converter = GeoIpConverter::new();
 
     // Detect file type and load
-    let is_dat = dat_path.extension()
+    let is_dat = dat_path
+        .extension()
         .and_then(|s| s.to_str())
         .map(|s| s.eq_ignore_ascii_case("dat"))
         .unwrap_or(false);

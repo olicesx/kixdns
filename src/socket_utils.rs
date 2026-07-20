@@ -21,7 +21,7 @@ use std::os::fd::AsRawFd;
 #[cfg(unix)]
 #[inline]
 pub fn set_ipv6_v6only(socket: &Socket, enabled: bool) -> io::Result<()> {
-    use libc::{c_int, setsockopt, socklen_t, IPPROTO_IPV6, IPV6_V6ONLY};
+    use libc::{IPPROTO_IPV6, IPV6_V6ONLY, c_int, setsockopt, socklen_t};
 
     let val: c_int = if enabled { 1 } else { 0 };
     let fd = socket.as_raw_fd();
@@ -56,7 +56,7 @@ pub fn set_ipv6_v6only(socket: &Socket, enabled: bool) -> io::Result<()> {
 #[cfg(unix)]
 #[inline]
 pub fn set_reuseport(socket: &Socket, enabled: bool) -> io::Result<()> {
-    use libc::{c_int, setsockopt, socklen_t, SOL_SOCKET, SO_REUSEPORT};
+    use libc::{SO_REUSEPORT, SOL_SOCKET, c_int, setsockopt, socklen_t};
 
     let val: c_int = if enabled { 1 } else { 0 };
     let fd = socket.as_raw_fd();

@@ -155,7 +155,7 @@ pub struct GlobalSettings {
     pub doq_enable_0rtt: bool,
     /// 是否启用自适应流控（默认false，推荐禁用以获得更好的性能和更简单的行为）
     /// Enable adaptive flow control (default false, recommended disabled for better performance and simpler behavior)
-    /// 
+    ///
     /// 禁用后采用rustdns风格：不限制并发，依赖tokio runtime调度和超时保护
     /// When disabled, use rustdns style: no concurrency limit, rely on tokio runtime scheduling and timeout protection
     #[serde(default = "default_flow_control_enabled")]
@@ -301,6 +301,14 @@ pub struct Pipeline {
     pub id: String,
     #[serde(default)]
     pub rules: Vec<Rule>,
+    /// Pipeline 级 ECS 配置，决定缓存隔离维度（RFC 7871）。
+    /// Pipeline-level ECS config, determines cache isolation dimension (RFC 7871).
+    ///
+    /// When set, cache entries are isolated by client subnet so that different
+    /// geographic regions get distinct cached responses.
+    /// 设置后，缓存条目按客户端子网隔离，不同地理区域获得不同的缓存响应。
+    #[serde(default)]
+    pub ecs: Option<EcsMode>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -502,6 +510,10 @@ pub enum Action {
         upstream: Option<String>,
         #[serde(default)]
         transport: Option<Transport>,
+        /// EDNS Client Subnet (RFC 7871) 请求改写，缺省 None = 不修改。
+        /// EDNS Client Subnet (RFC 7871) request rewriting, default None = no modification.
+        #[serde(default)]
+        ecs: Option<EcsMode>,
         /// 预分割的 upstream 列表（性能优化）/ Pre-split upstream list (performance optimization)
         #[serde(skip)]
         pre_split_upstreams: Option<std::sync::Arc<Vec<std::sync::Arc<str>>>>,
@@ -757,12 +769,12 @@ fn default_doq_keepalive_interval_ms() -> u64 {
 }
 
 fn default_doq_enable_0rtt() -> bool {
-    true  // 默认启用 0-RTT，系统会自动检测并回退不支持的服务器
+    true // 默认启用 0-RTT，系统会自动检测并回退不支持的服务器
     // Enabled by default - system automatically detects and falls back for unsupported servers
 }
 
 fn default_flow_control_enabled() -> bool {
-    false  // 默认禁用，采用rustdns风格 / Default disabled, use rustdns style
+    false // 默认禁用，采用rustdns风格 / Default disabled, use rustdns style
 }
 
 fn default_flow_control_initial_permits() -> usize {
@@ -869,7 +881,57 @@ where
     }
 }
 
-
 fn default_enable_tcp_fallback() -> bool {
     true
+}
+
+/// EDNS Client Subnet (RFC 7871) 操作模式，用于 Forward 动作的请求改写。
+/// EDNS Client Subnet (RFC 7871) operation mode, used by the Forward action for request rewriting.
+///
+/// 三种模式覆盖典型场景：
+/// Three modes cover typical scenarios:
+/// - `Clear`: 剥离客户端自带的 ECS（隐私保护）/ Strip client-provided ECS (privacy)
+/// - `FromClientIp`: 从客户端来源 IP 推导 ECS 子网 / Derive ECS subnet from client source IP
+/// - `Static`: 使用固定 IP/前缀（伪装特定地理位置）/ Use fixed IP/prefix (spoof geo-location)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum EcsMode {
+    /// 剥离查询中的 ECS OPT 选项。
+    /// Strip the ECS OPT option from the query.
+    Clear,
+
+    /// 从客户端来源 IP（peer address）推导 ECS 子网。
+    /// Derive ECS subnet from the client source IP (peer address).
+    ///
+    /// 私有 IP（RFC 1918/ULA/loopback）不注入 ECS。
+    /// Private IPs (RFC 1918/ULA/loopback) are not injected with ECS.
+    FromClientIp {
+        /// IPv4 source prefix length (default: 24)
+        #[serde(default = "default_ecs_prefix_v4")]
+        prefix_v4: u8,
+        /// IPv6 source prefix length (default: 56)
+        #[serde(default = "default_ecs_prefix_v6")]
+        prefix_v6: u8,
+    },
+
+    /// 使用固定 IP 地址和前缀注入 ECS。
+    /// Inject ECS with a fixed IP address and prefix.
+    ///
+    /// 用于伪装特定地理位置，忽略真实客户端 IP。
+    /// Used to spoof a specific geo-location, ignoring the real client IP.
+    Static {
+        /// 固定 IP 地址（IPv4 或 IPv6）/ Fixed IP address (IPv4 or IPv6)
+        ip: String,
+        /// Source prefix length (default: 24)
+        #[serde(default = "default_ecs_prefix_v4")]
+        prefix: u8,
+    },
+}
+
+fn default_ecs_prefix_v4() -> u8 {
+    24 // RFC 7871 §11.1 recommended default
+}
+
+fn default_ecs_prefix_v6() -> u8 {
+    56 // Common ISP allocation boundary
 }

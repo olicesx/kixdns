@@ -120,9 +120,7 @@ impl GeoSiteManager {
     fn rebuild_cache(&mut self) {
         // 根据实际加载的域名数量设置缓存大小
         // 统计所有标签的域名总数
-        let total_domains: usize = self
-            .database.values().map(|matchers| matchers.len())
-            .sum();
+        let total_domains: usize = self.database.values().map(|matchers| matchers.len()).sum();
 
         // 缓存大小为域名总数的 2 倍，最小 10000，最大 1000000
         let cache_capacity = (total_domains * 2).clamp(10_000, 1_000_000) as u64;
@@ -768,8 +766,8 @@ impl GeoSiteManager {
                 dat_format::TYPE_SUBDOMAIN => DomainMatcher::Suffix(domain),
                 dat_format::TYPE_KEYWORD => DomainMatcher::Keyword(domain),
                 dat_format::TYPE_REGEX => match RegexBuilder::new(&domain)
-                    .size_limit(1_000_000)      // 1MB state space limit
-                    .dfa_size_limit(1_000_000)   // 1MB DFA limit
+                    .size_limit(1_000_000) // 1MB state space limit
+                    .dfa_size_limit(1_000_000) // 1MB DFA limit
                     .build()
                 {
                     Ok(re) => DomainMatcher::Regex(re),
@@ -1084,12 +1082,11 @@ fn run_geosite_watcher(
     let mut dir_watches: std::collections::HashMap<PathBuf, Vec<std::ffi::OsString>> =
         std::collections::HashMap::new();
     for p in &paths {
-        let parent = p.parent()
+        let parent = p
+            .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .to_path_buf();
-        let fname = p.file_name()
-            .map(|s| s.to_os_string())
-            .unwrap_or_default();
+        let fname = p.file_name().map(|s| s.to_os_string()).unwrap_or_default();
         dir_watches.entry(parent).or_default().push(fname);
     }
 
@@ -1115,7 +1112,8 @@ fn run_geosite_watcher(
             Ok(event) => {
                 // Check if the event is for any file we care about
                 let is_target_file = event.paths.iter().any(|p| {
-                    p.file_name().map_or(false, |fname| target_filenames.contains(fname))
+                    p.file_name()
+                        .map_or(false, |fname| target_filenames.contains(fname))
                 });
                 if !is_target_file {
                     continue;
@@ -1128,7 +1126,8 @@ fn run_geosite_watcher(
 
                 // Find the matching original path for this event
                 let matching_path = event.paths.iter().find(|p| {
-                    p.file_name().map_or(false, |fname| target_filenames.contains(fname))
+                    p.file_name()
+                        .map_or(false, |fname| target_filenames.contains(fname))
                 });
                 let path = match matching_path {
                     Some(p) => p.clone(),

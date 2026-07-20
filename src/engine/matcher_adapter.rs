@@ -1,7 +1,7 @@
-use std::sync::Arc;
-use std::net::IpAddr;
 use hickory_proto::rr::DNSClass;
 use hickory_proto::rr::RecordType;
+use std::net::IpAddr;
+use std::sync::Arc;
 use tracing;
 
 use crate::lock::RwLock;

@@ -22,10 +22,12 @@ fn run_watcher(path: PathBuf, engine: Engine) -> notify::Result<()> {
     // so that atomic replacement (mv newfile config.yml) is properly detected.
     // Linux inotify watches inodes, not paths; watching the parent directory
     // captures IN_MOVED_TO/IN_CREATE events for the target filename.
-    let parent_dir = path.parent()
+    let parent_dir = path
+        .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
-    let target_file_name = path.file_name()
+    let target_file_name = path
+        .file_name()
         .map(|s| s.to_os_string())
         .unwrap_or_default();
 
@@ -39,9 +41,10 @@ fn run_watcher(path: PathBuf, engine: Engine) -> notify::Result<()> {
         match res {
             Ok(event) => {
                 // Check if the event is for the file we care about
-                let is_target_file = event.paths.iter().any(|p| {
-                    p.file_name() == Some(&target_file_name)
-                });
+                let is_target_file = event
+                    .paths
+                    .iter()
+                    .any(|p| p.file_name() == Some(&target_file_name));
                 if !is_target_file {
                     continue;
                 }
@@ -54,9 +57,7 @@ fn run_watcher(path: PathBuf, engine: Engine) -> notify::Result<()> {
                 // Simple retry mechanism to handle file write races (e.g. truncate+write) / 简单的重试机制来处理文件写入竞争（如截断+写入）
                 let mut retries = 5;
                 while retries > 0 {
-                    match config::load_config(&path)
-                        .and_then(RuntimePipelineConfig::from_config)
-                    {
+                    match config::load_config(&path).and_then(RuntimePipelineConfig::from_config) {
                         Ok(new_cfg) => {
                             engine.reload(new_cfg);
                             info!(target = "watcher", path = %path.display(), "config reloaded");

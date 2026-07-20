@@ -173,6 +173,7 @@ async fn process_dns_wire(packet: &[u8], peer: SocketAddr, engine: &Engine) -> B
             tx_id,
             edns_present,
             pipeline_id,
+            ecs_key,
         })) => {
             match tokio::time::timeout(
                 timeout_dur,
@@ -186,6 +187,7 @@ async fn process_dns_wire(packet: &[u8], peer: SocketAddr, engine: &Engine) -> B
                     tx_id,
                     edns_present,
                     pipeline_id,
+                    ecs_key,
                 ),
             )
             .await

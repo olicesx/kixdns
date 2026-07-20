@@ -9,7 +9,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::config::{Action, MatchOperator};
-use crate::engine::{make_static_ip_answer, Decision};
+use crate::engine::{Decision, make_static_ip_answer};
 use crate::matcher::eval_match_chain;
 use crate::matcher::{RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig, RuntimeRule};
 

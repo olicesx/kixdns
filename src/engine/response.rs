@@ -1,9 +1,12 @@
-use std::str::FromStr;
-use std::net::IpAddr;
-use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::{Record, Name, RData, rdata::{A, AAAA, TXT}, DNSClass};
-use hickory_proto::serialize::binary::{BinEncoder, BinEncodable};
 use bytes::Bytes;
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::rr::{
+    DNSClass, Name, RData, Record,
+    rdata::{A, AAAA, TXT},
+};
+use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
+use std::net::IpAddr;
+use std::str::FromStr;
 use tracing::warn;
 
 #[inline]
@@ -125,4 +128,3 @@ pub fn extract_ttl(msg: &Message) -> u64 {
         .min()
         .unwrap_or(0)
 }
-

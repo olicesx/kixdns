@@ -162,6 +162,10 @@ pub struct RuntimePipeline {
     pub rules: Vec<RuntimeRule>,
     /// 是否包含依赖客户端 IP 的匹配规则 / Whether it contains rules that match based on client IP
     pub uses_client_ip: bool,
+    /// Pipeline 级 ECS 配置（缓存隔离维度）/ Pipeline-level ECS config (cache isolation dimension)
+    pub ecs: Option<crate::config::EcsMode>,
+    /// Pipeline 内是否有 action 使用了 ECS 配置 / Whether any action in this pipeline uses ECS config
+    pub uses_ecs: bool,
     // Indices for O(1) lookup
     // 完全域名匹配索引（最高优先级）/ Exact domain match index (highest priority)
     pub domain_exact_index: FxHashMap<Arc<str>, Vec<usize>>,
@@ -469,10 +473,33 @@ impl RuntimePipelineConfig {
                 }
             }
 
+            // Detect ECS usage: check if any Forward action has ecs configured
+            // 检测 ECS 使用：检查是否有 Forward action 配置了 ecs
+            let pipeline_uses_ecs = rules.iter().any(|r| {
+                r.actions
+                    .iter()
+                    .any(|a| matches!(a, crate::config::Action::Forward { ecs: Some(_), .. }))
+            });
+
+            // Warn if Forward actions use ECS but Pipeline-level ecs is not set
+            // 当 Forward actions 使用 ECS 但 Pipeline 级 ecs 未设置时发出警告
+            if pipeline_uses_ecs && p.ecs.is_none() {
+                tracing::warn!(
+                    pipeline = %p.id,
+                    "Pipeline has Forward actions with 'ecs' but no pipeline-level 'ecs' config. \
+                     Cache isolation may be incorrect. Consider setting pipeline-level 'ecs' or \
+                     splitting into separate pipelines. / \
+                     Pipeline 的 Forward action 有 'ecs' 但 pipeline 级未配置 'ecs'。\
+                     缓存隔离可能不正确。建议设置 pipeline 级 'ecs' 或拆分为独立 pipeline。"
+                );
+            }
+
             pipelines.push(RuntimePipeline {
                 id: Arc::from(p.id),
                 rules,
                 uses_client_ip: pipeline_uses_client_ip,
+                ecs: p.ecs.clone(),
+                uses_ecs: pipeline_uses_ecs,
                 domain_exact_index, // 添加完全匹配索引 / Add exact match index
                 domain_suffix_index,
                 query_type_index, // 添加 query_type 索引 / Add query_type index
@@ -586,12 +613,18 @@ impl RuntimePipelineConfig {
             for rule in &pipeline.rules {
                 // Check request phase actions / 检查请求阶段 actions
                 for action in &rule.actions {
-                    if let crate::config::Action::Forward { upstream, transport, .. } = action {
+                    if let crate::config::Action::Forward {
+                        upstream,
+                        transport,
+                        ..
+                    } = action
+                    {
                         let transport = transport.unwrap_or(Transport::Udp);
                         if matches!(transport, Transport::Tcp | Transport::TcpUdp) {
                             if let Some(u) = upstream {
                                 // Handle comma-separated upstreams / 处理逗号分隔的 upstreams
-                                for addr in u.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                                for addr in u.split(',').map(|s| s.trim()).filter(|s| !s.is_empty())
+                                {
                                     upstreams.insert(normalize_upstream_addr(addr));
                                 }
                             }
@@ -600,11 +633,17 @@ impl RuntimePipelineConfig {
                 }
                 // Check response phase actions / 检查响应阶段 actions
                 for action in &rule.response_actions_on_match {
-                    if let crate::config::Action::Forward { upstream, transport, .. } = action {
+                    if let crate::config::Action::Forward {
+                        upstream,
+                        transport,
+                        ..
+                    } = action
+                    {
                         let transport = transport.unwrap_or(Transport::Udp);
                         if matches!(transport, Transport::Tcp | Transport::TcpUdp) {
                             if let Some(u) = upstream {
-                                for addr in u.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                                for addr in u.split(',').map(|s| s.trim()).filter(|s| !s.is_empty())
+                                {
                                     upstreams.insert(normalize_upstream_addr(addr));
                                 }
                             }
@@ -612,11 +651,17 @@ impl RuntimePipelineConfig {
                     }
                 }
                 for action in &rule.response_actions_on_miss {
-                    if let crate::config::Action::Forward { upstream, transport, .. } = action {
+                    if let crate::config::Action::Forward {
+                        upstream,
+                        transport,
+                        ..
+                    } = action
+                    {
                         let transport = transport.unwrap_or(Transport::Udp);
                         if matches!(transport, Transport::Tcp | Transport::TcpUdp) {
                             if let Some(u) = upstream {
-                                for addr in u.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                                for addr in u.split(',').map(|s| s.trim()).filter(|s| !s.is_empty())
+                                {
                                     upstreams.insert(normalize_upstream_addr(addr));
                                 }
                             }
@@ -672,7 +717,9 @@ impl RuntimeMatcher {
                 value: parse_dns_class(&value)?,
             },
             config::Matcher::EdnsPresent { expect } => RuntimeMatcher::EdnsPresent { expect },
-            config::Matcher::GeoSite { value } => RuntimeMatcher::GeoSite { tag: Arc::from(value) },
+            config::Matcher::GeoSite { value } => RuntimeMatcher::GeoSite {
+                tag: Arc::from(value),
+            },
             config::Matcher::GeoSiteNot { value } => RuntimeMatcher::GeoSiteNot {
                 tag: Arc::from(value),
             },
@@ -700,8 +747,12 @@ impl RuntimeMatcher {
         qclass: DNSClass,
         client_ip: IpAddr,
         edns_present: bool,
-        geoip_manager: Option<&std::sync::Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>>,
-        geosite_manager: Option<&std::sync::Arc<crate::lock::RwLock<crate::matcher::geosite::GeoSiteManager>>>,
+        geoip_manager: Option<
+            &std::sync::Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>,
+        >,
+        geosite_manager: Option<
+            &std::sync::Arc<crate::lock::RwLock<crate::matcher::geosite::GeoSiteManager>>,
+        >,
     ) -> bool {
         match self {
             RuntimeMatcher::Any => true,
@@ -714,9 +765,11 @@ impl RuntimeMatcher {
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes } => {
                 // 按需获取锁：只在GeoIP matcher时才获取 / On-demand lock: only acquire for GeoIP matcher
-                geoip_manager.and_then(|mgr| Some(mgr.read())).is_some_and(|guard| {
-                    matcher_helpers::match_geoip_country(&guard, client_ip, country_codes)
-                })
+                geoip_manager
+                    .and_then(|mgr| Some(mgr.read()))
+                    .is_some_and(|guard| {
+                        matcher_helpers::match_geoip_country(&guard, client_ip, country_codes)
+                    })
             }
             RuntimeMatcher::GeoipPrivate { expect } => {
                 // 按需获取锁：只在GeoIP matcher时才获取
@@ -733,9 +786,9 @@ impl RuntimeMatcher {
             RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
             RuntimeMatcher::GeoSite { tag } => {
                 // 按需获取锁：只在GeoSite matcher时才获取 / On-demand lock: only acquire for GeoSite matcher
-                geosite_manager.and_then(|mgr| Some(mgr.read())).is_some_and(|guard| {
-                    matcher_helpers::match_geosite(&guard, qname, tag)
-                })
+                geosite_manager
+                    .and_then(|mgr| Some(mgr.read()))
+                    .is_some_and(|guard| matcher_helpers::match_geosite(&guard, qname, tag))
             }
             RuntimeMatcher::GeoSiteNot { tag } => {
                 // 按需获取锁：只在GeoSite matcher时才获取
@@ -758,8 +811,12 @@ impl RuntimeMatcher {
         client_ip: IpAddr,
         edns_present: bool,
         qtype: RecordType,
-        geoip_manager: Option<&std::sync::Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>>,
-        geosite_manager: Option<&std::sync::Arc<crate::lock::RwLock<crate::matcher::geosite::GeoSiteManager>>>,
+        geoip_manager: Option<
+            &std::sync::Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>,
+        >,
+        geosite_manager: Option<
+            &std::sync::Arc<crate::lock::RwLock<crate::matcher::geosite::GeoSiteManager>>,
+        >,
     ) -> bool {
         match self {
             RuntimeMatcher::Any => true,
@@ -772,9 +829,11 @@ impl RuntimeMatcher {
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes } => {
                 // 按需获取锁：只在GeoIP matcher时才获取 / On-demand lock: only acquire for GeoIP matcher
-                geoip_manager.and_then(|mgr| Some(mgr.read())).is_some_and(|guard| {
-                    matcher_helpers::match_geoip_country(&guard, client_ip, country_codes)
-                })
+                geoip_manager
+                    .and_then(|mgr| Some(mgr.read()))
+                    .is_some_and(|guard| {
+                        matcher_helpers::match_geoip_country(&guard, client_ip, country_codes)
+                    })
             }
             RuntimeMatcher::GeoipPrivate { expect } => {
                 // 按需获取锁：只在GeoIP matcher时才获取
@@ -791,9 +850,9 @@ impl RuntimeMatcher {
             RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
             RuntimeMatcher::GeoSite { tag } => {
                 // 按需获取锁：只在GeoSite matcher时才获取 / On-demand lock: only acquire for GeoSite matcher
-                geosite_manager.and_then(|mgr| Some(mgr.read())).is_some_and(|guard| {
-                    matcher_helpers::match_geosite(&guard, qname, tag)
-                })
+                geosite_manager
+                    .and_then(|mgr| Some(mgr.read()))
+                    .is_some_and(|guard| matcher_helpers::match_geosite(&guard, qname, tag))
             }
             RuntimeMatcher::GeoSiteNot { tag } => {
                 // 按需获取锁：只在GeoSite matcher时才获取
@@ -813,7 +872,9 @@ impl RuntimePipelineSelectorMatcher {
     fn from_config(m: config::PipelineSelectorMatcher) -> anyhow::Result<Self> {
         Ok(match m {
             config::PipelineSelectorMatcher::ListenerLabel { value } => {
-                RuntimePipelineSelectorMatcher::ListenerLabel { value: Arc::from(value) }
+                RuntimePipelineSelectorMatcher::ListenerLabel {
+                    value: Arc::from(value),
+                }
             }
             config::PipelineSelectorMatcher::ClientIp { cidr } => {
                 RuntimePipelineSelectorMatcher::ClientIp { net: cidr.parse()? }
@@ -841,13 +902,19 @@ impl RuntimePipelineSelectorMatcher {
                 RuntimePipelineSelectorMatcher::EdnsPresent { expect }
             }
             config::PipelineSelectorMatcher::GeoSite { value } => {
-                RuntimePipelineSelectorMatcher::GeoSite { tag: Arc::from(value) }
+                RuntimePipelineSelectorMatcher::GeoSite {
+                    tag: Arc::from(value),
+                }
             }
             config::PipelineSelectorMatcher::GeoSiteNot { value } => {
-                RuntimePipelineSelectorMatcher::GeoSiteNot { tag: Arc::from(value) }
+                RuntimePipelineSelectorMatcher::GeoSiteNot {
+                    tag: Arc::from(value),
+                }
             }
             config::PipelineSelectorMatcher::GeoipCountry { country_codes } => {
-                RuntimePipelineSelectorMatcher::GeoipCountry { country_codes: country_codes.into_iter().map(Arc::from).collect() }
+                RuntimePipelineSelectorMatcher::GeoipCountry {
+                    country_codes: country_codes.into_iter().map(Arc::from).collect(),
+                }
             }
             config::PipelineSelectorMatcher::GeoipPrivate { expect } => {
                 RuntimePipelineSelectorMatcher::GeoipPrivate { expect }
@@ -868,8 +935,12 @@ impl RuntimePipelineSelectorMatcher {
         qname: &str,
         qclass: DNSClass,
         edns_present: bool,
-        geoip_manager: Option<&std::sync::Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>>,
-        geosite_manager: Option<&std::sync::Arc<crate::lock::RwLock<crate::matcher::geosite::GeoSiteManager>>>,
+        geoip_manager: Option<
+            &std::sync::Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>,
+        >,
+        geosite_manager: Option<
+            &std::sync::Arc<crate::lock::RwLock<crate::matcher::geosite::GeoSiteManager>>,
+        >,
     ) -> bool {
         self.matches_with_qtype(
             listener_label,
@@ -900,7 +971,9 @@ impl RuntimePipelineSelectorMatcher {
                 value.eq_ignore_ascii_case(listener_label)
             }
             RuntimePipelineSelectorMatcher::ClientIp { net } => net.contains(&client_ip),
-            RuntimePipelineSelectorMatcher::DomainSuffix { value } => qname.ends_with(value.as_ref()),
+            RuntimePipelineSelectorMatcher::DomainSuffix { value } => {
+                qname.ends_with(value.as_ref())
+            }
             RuntimePipelineSelectorMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimePipelineSelectorMatcher::Any => true,
             RuntimePipelineSelectorMatcher::Qclass { value } => value == &qclass,
@@ -949,24 +1022,30 @@ impl RuntimePipelineSelectorMatcher {
         qclass: DNSClass,
         edns_present: bool,
         qtype: RecordType,
-        geoip_manager: Option<&std::sync::Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>>,
-        geosite_manager: Option<&std::sync::Arc<crate::lock::RwLock<crate::matcher::geosite::GeoSiteManager>>>,
+        geoip_manager: Option<
+            &std::sync::Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>,
+        >,
+        geosite_manager: Option<
+            &std::sync::Arc<crate::lock::RwLock<crate::matcher::geosite::GeoSiteManager>>,
+        >,
     ) -> bool {
         match self {
             RuntimePipelineSelectorMatcher::ListenerLabel { value } => {
                 value.eq_ignore_ascii_case(listener_label)
             }
             RuntimePipelineSelectorMatcher::ClientIp { net } => net.contains(&client_ip),
-            RuntimePipelineSelectorMatcher::DomainSuffix { value } => qname.ends_with(value.as_ref()),
+            RuntimePipelineSelectorMatcher::DomainSuffix { value } => {
+                qname.ends_with(value.as_ref())
+            }
             RuntimePipelineSelectorMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimePipelineSelectorMatcher::Any => true,
             RuntimePipelineSelectorMatcher::Qclass { value } => value == &qclass,
             RuntimePipelineSelectorMatcher::EdnsPresent { expect } => *expect == edns_present,
             RuntimePipelineSelectorMatcher::GeoSite { tag } => {
                 // 按需获取锁：只在GeoSite matcher时才获取 / On-demand lock: only acquire for GeoSite matcher
-                geosite_manager.and_then(|mgr| Some(mgr.read())).is_some_and(|guard| {
-                    guard.matches(tag, qname)
-                })
+                geosite_manager
+                    .and_then(|mgr| Some(mgr.read()))
+                    .is_some_and(|guard| guard.matches(tag, qname))
             }
             RuntimePipelineSelectorMatcher::GeoSiteNot { tag } => {
                 // 按需获取锁：只在GeoSite matcher时才获取
@@ -979,14 +1058,16 @@ impl RuntimePipelineSelectorMatcher {
             }
             RuntimePipelineSelectorMatcher::GeoipCountry { country_codes } => {
                 // 按需获取锁：只在GeoIP matcher时才获取 / On-demand lock: only acquire for GeoIP matcher
-                geoip_manager.and_then(|mgr| Some(mgr.read())).is_some_and(|guard| {
-                    let result = guard.lookup(client_ip);
-                    if let Some(cc) = result.country_code {
-                        country_codes.iter().any(|c| c.eq_ignore_ascii_case(&cc))
-                    } else {
-                        false
-                    }
-                })
+                geoip_manager
+                    .and_then(|mgr| Some(mgr.read()))
+                    .is_some_and(|guard| {
+                        let result = guard.lookup(client_ip);
+                        if let Some(cc) = result.country_code {
+                            country_codes.iter().any(|c| c.eq_ignore_ascii_case(&cc))
+                        } else {
+                            false
+                        }
+                    })
             }
             RuntimePipelineSelectorMatcher::GeoipPrivate { expect } => {
                 // 按需获取锁：只在GeoIP matcher时才获取
@@ -1080,7 +1161,9 @@ impl RuntimeResponseMatcher {
     pub fn from_config(m: config::ResponseMatcher) -> anyhow::Result<Self> {
         Ok(match m {
             config::ResponseMatcher::UpstreamEquals { value } => {
-                RuntimeResponseMatcher::UpstreamEquals { value: Arc::from(value) }
+                RuntimeResponseMatcher::UpstreamEquals {
+                    value: Arc::from(value),
+                }
             }
             config::ResponseMatcher::RequestDomainSuffix { value } => {
                 RuntimeResponseMatcher::RequestDomainSuffix {
@@ -1136,16 +1219,22 @@ impl RuntimeResponseMatcher {
                 RuntimeResponseMatcher::ResponseEdnsPresent { expect }
             }
             config::ResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } => {
-                RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes: country_codes.into_iter().map(Arc::from).collect() }
+                RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry {
+                    country_codes: country_codes.into_iter().map(Arc::from).collect(),
+                }
             }
             config::ResponseMatcher::ResponseAnswerIpGeoipPrivate { expect } => {
                 RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { expect }
             }
             config::ResponseMatcher::ResponseRequestDomainGeoSite { value } => {
-                RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value: Arc::from(value) }
+                RuntimeResponseMatcher::ResponseRequestDomainGeoSite {
+                    value: Arc::from(value),
+                }
             }
             config::ResponseMatcher::ResponseRequestDomainGeoSiteNot { value } => {
-                RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { value: Arc::from(value) }
+                RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot {
+                    value: Arc::from(value),
+                }
             }
             config::ResponseMatcher::ResponseTxtContent { mode, value } => {
                 let mode = TxtMatchMode::from_str(&mode)?;
@@ -1172,7 +1261,11 @@ impl RuntimeResponseMatcher {
                     }
                     _ => None,
                 };
-                RuntimeResponseMatcher::ResponseTxtContent { mode, value: Arc::from(value), regex }
+                RuntimeResponseMatcher::ResponseTxtContent {
+                    mode,
+                    value: Arc::from(value),
+                    regex,
+                }
             }
         })
     }
@@ -1189,7 +1282,9 @@ impl RuntimeResponseMatcher {
     ) -> bool {
         match self {
             RuntimeResponseMatcher::UpstreamEquals { value } => upstream == value.as_ref(),
-            RuntimeResponseMatcher::RequestDomainSuffix { value } => qname.ends_with(value.as_ref()),
+            RuntimeResponseMatcher::RequestDomainSuffix { value } => {
+                qname.ends_with(value.as_ref())
+            }
             RuntimeResponseMatcher::RequestDomainRegex { regex } => regex.is_match(qname),
             RuntimeResponseMatcher::ResponseUpstreamIp { nets } => try_parse_upstream_ip(upstream)
                 .map(|ip| nets.iter().any(|net| net.contains(&ip)))
@@ -1264,18 +1359,20 @@ impl RuntimeResponseMatcher {
                 // 原 collect_ips_from_message 只迭代了 msg.answers()！
                 // Check matcher_helpers code: "for record in msg.answers() { ... }" - YES, only answers.
                 // 原代码逻辑：如果 answers 为空，返回 false (all_ips.is_empty check)
-                
+
                 if !has_ip {
-                   return false;
+                    return false;
                 }
-                
+
                 true
             }
             RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { expect } => {
                 // 检查 Answer 中是否有任意 IP 为私有 IP
                 use hickory_proto::rr::RData;
                 let mut has_private_ip = msg.answers().iter().any(|record| match record.data() {
-                    Some(RData::A(a)) => crate::matcher::geoip::is_private_ip(std::net::IpAddr::V4(a.0)),
+                    Some(RData::A(a)) => {
+                        crate::matcher::geoip::is_private_ip(std::net::IpAddr::V4(a.0))
+                    }
                     Some(RData::AAAA(aaaa)) => {
                         crate::matcher::geoip::is_private_ip(std::net::IpAddr::V6(aaaa.0))
                     }
@@ -1285,7 +1382,9 @@ impl RuntimeResponseMatcher {
                 if !has_private_ip {
                     // 检查 additionals
                     has_private_ip = msg.additionals().iter().any(|record| match record.data() {
-                        Some(RData::A(a)) => crate::matcher::geoip::is_private_ip(std::net::IpAddr::V4(a.0)),
+                        Some(RData::A(a)) => {
+                            crate::matcher::geoip::is_private_ip(std::net::IpAddr::V4(a.0))
+                        }
                         Some(RData::AAAA(aaaa)) => {
                             crate::matcher::geoip::is_private_ip(std::net::IpAddr::V6(aaaa.0))
                         }
@@ -1297,15 +1396,12 @@ impl RuntimeResponseMatcher {
             }
             RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value } => {
                 // 使用辅助函数检查请求域名是否属于指定的 GeoSite 分类 / Use helper to check if request domain belongs to GeoSite category
-                geosite_manager.is_some_and(|mgr| {
-                    matcher_helpers::match_geosite(mgr, qname, value)
-                })
+                geosite_manager.is_some_and(|mgr| matcher_helpers::match_geosite(mgr, qname, value))
             }
             RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { value } => {
                 // 使用辅助函数检查请求域名是否不属于指定的 GeoSite 分类 / Use helper to check if request domain does NOT belong to GeoSite category
-                geosite_manager.is_some_and(|mgr| {
-                    !matcher_helpers::match_geosite(mgr, qname, value)
-                })
+                geosite_manager
+                    .is_some_and(|mgr| !matcher_helpers::match_geosite(mgr, qname, value))
             }
             RuntimeResponseMatcher::ResponseTxtContent { mode, value, regex } => {
                 // 从响应中提取 TXT 记录 / Extract TXT records from response

@@ -1,25 +1,25 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::Duration;
-use std::sync::atomic::{AtomicUsize, AtomicU64};
 
-use dashmap::{DashMap, DashSet};
 use arc_swap::ArcSwap;
+use dashmap::{DashMap, DashSet};
 use moka::sync::Cache;
 use rustc_hash::FxBuildHasher;
 use tracing::{info, warn};
 
+use super::utils::{extract_geosite_tags_from_config, uses_geoip_matchers};
 use crate::cache::{DnsCache, new_cache};
 use crate::lock::RwLock;
 use crate::matcher::RuntimePipelineConfig;
+use crate::matcher::advanced_rule::compile_pipelines;
 use crate::matcher::geoip::GeoIpManager;
 use crate::matcher::geosite::GeoSiteManager;
-use crate::matcher::advanced_rule::compile_pipelines;
-use super::utils::{extract_geosite_tags_from_config, uses_geoip_matchers};
 
-use super::concurrency::{PermitManager, FlowControlState};
-use super::types::{EngineInner, InflightMap};
+use super::concurrency::{FlowControlState, PermitManager};
 use super::rules::RuleCacheEntry;
-use super::transport::{UdpClient, TcpMultiplexer, DohClient, DotMultiplexer, DoqClient};
+use super::transport::{DohClient, DoqClient, DotMultiplexer, TcpMultiplexer, UdpClient};
+use super::types::{EngineInner, InflightMap};
 
 #[derive(Clone)]
 pub struct Engine {
@@ -120,7 +120,8 @@ impl Engine {
         let flow_control_min_permits = cfg.settings.flow_control_min_permits;
         let flow_control_max_permits = cfg.settings.flow_control_max_permits;
         let flow_control_latency_threshold_ms = cfg.settings.flow_control_latency_threshold_ms;
-        let flow_control_adjustment_interval_secs = cfg.settings.flow_control_adjustment_interval_secs;
+        let flow_control_adjustment_interval_secs =
+            cfg.settings.flow_control_adjustment_interval_secs;
         let dashmap_shards = cfg.settings.dashmap_shards;
         let cache_background_refresh = cfg.settings.cache_background_refresh;
         let cache_refresh_threshold_percent = cfg.settings.cache_refresh_threshold_percent;
@@ -147,13 +148,13 @@ impl Engine {
 
         // Extract GeoSite settings before moving cfg / 在 move cfg 之前提取 GeoSite 设置
         let geosite_data_paths = cfg.settings.geosite_data_paths.clone();
-        
+
         // Extract GeoSite tags used in configuration before moving cfg
         // 在 move cfg 之前提取配置中使用的 GeoSite tags
         let used_geosite_tags = extract_geosite_tags_from_config(&cfg);
-        
+
         let compiled = compile_pipelines(&cfg);
-        
+
         let state = Arc::new(ArcSwap::from_pointee(EngineInner {
             pipeline: cfg,
             compiled_pipelines: compiled,
@@ -166,8 +167,7 @@ impl Engine {
                 tracing::warn!(error = %e, "Failed to initialize GeoIpManager, running without GeoIP support");
                 // Create a dummy manager that always returns empty results
                 // This should never fail with None parameter
-                GeoIpManager::new(None)
-                    .expect("GeoIpManager::new(None) should always succeed")
+                GeoIpManager::new(None).expect("GeoIpManager::new(None) should always succeed")
             }
         };
 
@@ -177,7 +177,8 @@ impl Engine {
             let path = std::path::PathBuf::from(path_str);
             if path.exists() {
                 // 检测文件格式 / Detect file format
-                let is_dat = path.extension()
+                let is_dat = path
+                    .extension()
                     .and_then(|s| s.to_str())
                     .map(|s| s.eq_ignore_ascii_case("dat"))
                     .unwrap_or(false);
@@ -218,10 +219,8 @@ impl Engine {
         // Initialize GeoSiteManager / 初始化 GeoSiteManager
         // GeoSiteManager starts empty and is populated via add_entry() calls
         // Cache will be automatically rebuilt after loading data
-        let geosite_manager = Arc::new(RwLock::new(
-            crate::matcher::geosite::GeoSiteManager::new(),
-        ));
-        
+        let geosite_manager = Arc::new(RwLock::new(crate::matcher::geosite::GeoSiteManager::new()));
+
         // Load GeoSite data from configured files / 从配置的文件加载 GeoSite 数据
         let mut geosite_paths_for_watcher = Vec::new();
         for path_str in &geosite_data_paths {
@@ -230,9 +229,10 @@ impl Engine {
                 // Load data from file / 从文件加载数据
                 // GeoSiteManager 使用 FxHashMap 实现高性能查找，由外层 RwLock 保护线程安全
                 // GeoSiteManager uses FxHashMap for high-performance lookup, thread-safety protected by outer RwLock
-                
+
                 // 检测文件格式 / Detect file format
-                let is_dat = path.extension()
+                let is_dat = path
+                    .extension()
                     .and_then(|s| s.to_str())
                     .map(|s| s.eq_ignore_ascii_case("dat"))
                     .unwrap_or(false);
@@ -254,10 +254,10 @@ impl Engine {
                     let mut manager = geosite_manager.write();
                     manager.load_from_v2ray_file(&path)
                 };
-                
+
                 match load_result {
                     Ok(count) => {
-                        info!(path = %path.display(), loaded_count = count, 
+                        info!(path = %path.display(), loaded_count = count,
                              used_tags = used_geosite_tags.len(),
                              "loaded GeoSite data from file");
                         geosite_paths_for_watcher.push(path);
@@ -270,7 +270,7 @@ impl Engine {
                 warn!(path = %path.display(), "GeoSite data file not found, skipping");
             }
         }
-        
+
         // Start GeoSite watcher for hot-reload / 启动 GeoSite watcher 用于热重载
         if !geosite_paths_for_watcher.is_empty() {
             crate::matcher::geosite::spawn_geosite_watcher(
@@ -292,13 +292,16 @@ impl Engine {
         let (permit_manager, flow_control_state) = if flow_control_enabled {
             let pm = Arc::new(PermitManager::new(flow_control_initial_permits));
             pm.set_max_permits(flow_control_max_permits);
-            (pm, Some(Arc::new(FlowControlState {
-                max_permits: AtomicUsize::new(flow_control_max_permits),
-                min_permits: flow_control_min_permits,
-                last_adjustment_ms: AtomicU64::new(0),
-                critical_latency_threshold_ns: flow_control_latency_threshold_ms * 1_000_000,
-                adjustment_interval_ms: flow_control_adjustment_interval_secs * 1000,
-            })))
+            (
+                pm,
+                Some(Arc::new(FlowControlState {
+                    max_permits: AtomicUsize::new(flow_control_max_permits),
+                    min_permits: flow_control_min_permits,
+                    last_adjustment_ms: AtomicU64::new(0),
+                    critical_latency_threshold_ns: flow_control_latency_threshold_ms * 1_000_000,
+                    adjustment_interval_ms: flow_control_adjustment_interval_secs * 1000,
+                })),
+            )
         } else {
             // 无限制模式：创建一个max_permits=usize::MAX的PermitManager
             // Unlimited mode: create a PermitManager with max_permits=usize::MAX
@@ -319,20 +322,26 @@ impl Engine {
             tcp_idle_timeout_secs,
         ));
 
-        let dot_mux = Arc::new(DotMultiplexer::new(
-            dot_pool_size,
-            tcp_health_error_threshold,
-            tcp_max_age_secs,
-            tcp_idle_timeout_secs,
-        ).expect("initialize DoT multiplexer"));
+        let dot_mux = Arc::new(
+            DotMultiplexer::new(
+                dot_pool_size,
+                tcp_health_error_threshold,
+                tcp_max_age_secs,
+                tcp_idle_timeout_secs,
+            )
+            .expect("initialize DoT multiplexer"),
+        );
 
         let doh_client = Arc::new(DohClient::new(doh_pool_size).expect("initialize DoH client"));
-        let doq_client = Arc::new(DoqClient::new(
-            doq_pool_size,
-            doq_idle_timeout_secs,
-            doq_keepalive_interval_ms,
-            doq_enable_0rtt,
-        ).expect("initialize DoQ client"));
+        let doq_client = Arc::new(
+            DoqClient::new(
+                doq_pool_size,
+                doq_idle_timeout_secs,
+                doq_keepalive_interval_ms,
+                doq_enable_0rtt,
+            )
+            .expect("initialize DoQ client"),
+        );
 
         // Warm up TCP connection pools (create 1 connection per upstream)
         // 预热 TCP 连接池（每个 upstream 创建 1 个连接）
@@ -360,10 +369,7 @@ impl Engine {
             // If dashmap_shards is 0, use DashMap default (num_cpus * 4)
             // More shards = less lock contention but more memory overhead
             inflight: if dashmap_shards == 0 {
-                Arc::new(DashMap::with_capacity_and_hasher(
-                    128,
-                    FxBuildHasher,
-                ))
+                Arc::new(DashMap::with_capacity_and_hasher(128, FxBuildHasher))
             } else {
                 Arc::new(DashMap::with_capacity_and_hasher_and_shard_amount(
                     128,

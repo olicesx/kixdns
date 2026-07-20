@@ -23,6 +23,7 @@ A high-performance, non-recursive DNS forwarding server written in Rust, designe
 - **Listener labels** — serve different pipelines from the same instance
 - **Multiple upstream transports** — UDP / TCP / DoH (RFC 8484) / DoT / DoQ (RFC 9250)
 - **URL protocol prefixes** — `udp://`, `tcp://`, `doh://`, `dot://`, `doq://` auto-detection
+- **EDNS Client Subnet (RFC 7871)** — two-tier ECS: Pipeline-level cache isolation + Action-level injection (Clear / FromClientIp / Static)
 
 ### Cache & Reliability
 - **In-memory cache** — high-performance `moka` cache with configurable capacity and max TTL

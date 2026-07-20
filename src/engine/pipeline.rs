@@ -1,26 +1,26 @@
-use std::sync::Arc;
-use std::net::IpAddr;
 use std::collections::HashSet;
+use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use smallvec::SmallVec;
-use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
-use hickory_proto::rr::rdata::{A, AAAA, TXT};
 use hickory_proto::op::ResponseCode;
+use hickory_proto::rr::rdata::{A, AAAA, TXT};
+use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
+use smallvec::SmallVec;
 use tracing::info;
 
 use crate::config::{Action, Transport};
 use crate::lock::RwLock;
-use crate::matcher::{RuntimePipeline, RuntimePipelineConfig, eval_match_chain};
 use crate::matcher::advanced_rule::CompiledPipeline;
-use crate::matcher::geosite::GeoSiteManager;
 use crate::matcher::geoip::GeoIpManager;
+use crate::matcher::geosite::GeoSiteManager;
+use crate::matcher::{RuntimePipeline, RuntimePipelineConfig, eval_match_chain};
 
 use super::core::Engine;
-use super::types::EngineInner;
+use super::matcher_adapter::{MatcherContext, matcher_matches};
 use super::rules::Decision;
 use super::rules::{RuleCacheEntry, calculate_rule_hash, contains_continue, fast_hash_str};
-use super::matcher_adapter::{MatcherContext, matcher_matches};
+use super::types::EngineInner;
 
 pub fn select_pipeline<'a>(
     cfg: &'a RuntimePipelineConfig,
@@ -58,7 +58,11 @@ pub fn select_pipeline<'a>(
             },
         );
         if matched {
-            if let Some(p) = cfg.pipelines.iter().find(|p| p.id.as_ref() == rule.pipeline.as_str()) {
+            if let Some(p) = cfg
+                .pipelines
+                .iter()
+                .find(|p| p.id.as_ref() == rule.pipeline.as_str())
+            {
                 return (Some(p), p.id.clone());
             }
         }
@@ -71,8 +75,13 @@ pub fn select_pipeline<'a>(
 }
 
 impl Engine {
-    pub(crate) fn compiled_for<'a>(&self, state: &'a EngineInner, pipeline_id: &str) -> Option<&'a CompiledPipeline> {
-        state.compiled_pipelines
+    pub(crate) fn compiled_for<'a>(
+        &self,
+        state: &'a EngineInner,
+        pipeline_id: &str,
+    ) -> Option<&'a CompiledPipeline> {
+        state
+            .compiled_pipelines
             .iter()
             .find(|p| p.id.as_ref() == pipeline_id)
     }
@@ -158,9 +167,10 @@ impl Engine {
         // 1. Check Rule Cache
         // Use hash for lookup to avoid cloning String for key on every lookup
         let include_ip = pipeline.uses_client_ip || self.cache_background_refresh;
-        let rule_hash = calculate_rule_hash(&pipeline.id, qname, qtype, qclass, client_ip, include_ip);
+        let rule_hash =
+            calculate_rule_hash(&pipeline.id, qname, qtype, qclass, client_ip, include_ip);
         let allow_rule_cache_lookup = !skip_cache && skip_rules.is_none_or(|set| set.is_empty());
-        
+
         if allow_rule_cache_lookup {
             if let Some(entry) = self.rule_cache.get(&rule_hash) {
                 // Check validity and clean up if expired
@@ -177,11 +187,12 @@ impl Engine {
 
         // 2. Candidate Selection (compiled index if available)
         // SmallVec<[usize; 32]> avoids heap allocation for typical rule sets (<= 32 candidates)
-        let mut candidate_indices: SmallVec<[usize; 32]> = if let Some(compiled) = self.compiled_for(state, &pipeline.id) {
-            compiled.index.get_candidates(qname, qtype)
-        } else {
-            SmallVec::new()
-        };
+        let mut candidate_indices: SmallVec<[usize; 32]> =
+            if let Some(compiled) = self.compiled_for(state, &pipeline.id) {
+                compiled.index.get_candidates(qname, qtype)
+            } else {
+                SmallVec::new()
+            };
 
         if candidate_indices.is_empty() {
             // Fallback to runtime indices
@@ -249,9 +260,16 @@ impl Engine {
 
             if req_match {
                 // 检查是否有多个 forward action / Check for multiple forward actions
-                let forward_actions: Vec<_> = rule.actions.iter()
+                let forward_actions: Vec<_> = rule
+                    .actions
+                    .iter()
                     .filter_map(|a| match a {
-                        Action::Forward { upstream, transport, pre_split_upstreams } => Some((upstream, transport, pre_split_upstreams.clone())),
+                        Action::Forward {
+                            upstream,
+                            transport,
+                            ecs: _,
+                            pre_split_upstreams,
+                        } => Some((upstream, transport, pre_split_upstreams.clone())),
                         _ => None,
                     })
                     .collect();
@@ -273,21 +291,33 @@ impl Engine {
                             let action_transport = transport_opt.unwrap_or(Transport::Udp);
 
                             // 分割 upstream 字符串（可能包含逗号）
-                            for addr in upstream.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                            for addr in upstream
+                                .split(',')
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                            {
                                 // 跳过已有协议前缀的地址
                                 if addr.contains("://") {
                                     if addr.starts_with("tcp://") {
                                         tcp_upstreams.insert(addr.to_string());
                                     } else if addr.starts_with("udp://") {
                                         udp_upstreams.insert(addr.to_string());
-                                    } else if addr.starts_with("tcp+udp://") || addr.starts_with("udp+tcp://") {
+                                    } else if addr.starts_with("tcp+udp://")
+                                        || addr.starts_with("udp+tcp://")
+                                    {
                                         tcp_upstreams.insert(addr.to_string());
                                         udp_upstreams.insert(addr.to_string());
-                                    } else if addr.starts_with("doh://") || addr.starts_with("https://") {
+                                    } else if addr.starts_with("doh://")
+                                        || addr.starts_with("https://")
+                                    {
                                         doh_upstreams.insert(addr.to_string());
-                                    } else if addr.starts_with("dot://") || addr.starts_with("tls://") {
+                                    } else if addr.starts_with("dot://")
+                                        || addr.starts_with("tls://")
+                                    {
                                         dot_upstreams.insert(addr.to_string());
-                                    } else if addr.starts_with("doq://") || addr.starts_with("quic://") {
+                                    } else if addr.starts_with("doq://")
+                                        || addr.starts_with("quic://")
+                                    {
                                         doq_upstreams.insert(addr.to_string());
                                     }
                                 } else {
@@ -321,11 +351,31 @@ impl Engine {
 
                     // 合并所有 upstream（保留协议前缀）
                     let mut all_upstreams: Vec<std::sync::Arc<str>> = Vec::new();
-                    all_upstreams.extend(tcp_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
-                    all_upstreams.extend(udp_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
-                    all_upstreams.extend(doh_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
-                    all_upstreams.extend(dot_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
-                    all_upstreams.extend(doq_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
+                    all_upstreams.extend(
+                        tcp_upstreams
+                            .iter()
+                            .map(|s| std::sync::Arc::from(s.as_str())),
+                    );
+                    all_upstreams.extend(
+                        udp_upstreams
+                            .iter()
+                            .map(|s| std::sync::Arc::from(s.as_str())),
+                    );
+                    all_upstreams.extend(
+                        doh_upstreams
+                            .iter()
+                            .map(|s| std::sync::Arc::from(s.as_str())),
+                    );
+                    all_upstreams.extend(
+                        dot_upstreams
+                            .iter()
+                            .map(|s| std::sync::Arc::from(s.as_str())),
+                    );
+                    all_upstreams.extend(
+                        doq_upstreams
+                            .iter()
+                            .map(|s| std::sync::Arc::from(s.as_str())),
+                    );
 
                     if all_upstreams.is_empty() {
                         // 所有 upstream 都为空，使用默认
@@ -360,14 +410,23 @@ impl Engine {
                     };
 
                     let d = Decision::Forward {
-                        upstream: Arc::from(if merged_str.is_empty() { "" } else { merged_str.as_str() }),
-                        pre_split_upstreams: if all_upstreams.is_empty() { None } else { Some(std::sync::Arc::new(all_upstreams)) },
+                        upstream: Arc::from(if merged_str.is_empty() {
+                            ""
+                        } else {
+                            merged_str.as_str()
+                        }),
+                        pre_split_upstreams: if all_upstreams.is_empty() {
+                            None
+                        } else {
+                            Some(std::sync::Arc::new(all_upstreams))
+                        },
                         response_matchers: rule.response_matchers.clone(),
                         response_matcher_operator: rule.response_matcher_operator,
                         response_actions_on_match: rule.response_actions_on_match.clone(),
                         response_actions_on_miss: rule.response_actions_on_miss.clone(),
                         rule_name: rule.name.clone(),
                         transport: None, // 让每个 upstream 自己决定 transport / Let each upstream decide its own transport
+                        ecs: None,
                         continue_on_match: false,
                         continue_on_miss: false,
                         allow_reuse: false,
@@ -473,6 +532,7 @@ impl Engine {
                                 response_actions_on_miss: Vec::new(),
                                 rule_name: rule.name.clone(),
                                 transport: Some(Transport::Udp),
+                                ecs: None,
                                 continue_on_match: false,
                                 continue_on_miss: false,
                                 allow_reuse: true,
@@ -509,14 +569,17 @@ impl Engine {
                         Action::Forward {
                             upstream,
                             transport,
+                            ecs,
                             pre_split_upstreams,
                         } => {
                             let upstream_addr: Arc<str> = upstream
                                 .as_ref()
                                 .map(|s| Arc::from(s.as_str()))
                                 .unwrap_or_else(|| Arc::from(upstream_default.as_str()));
-                            let continue_on_match = contains_continue(&rule.response_actions_on_match);
-                            let continue_on_miss = contains_continue(&rule.response_actions_on_miss);
+                            let continue_on_match =
+                                contains_continue(&rule.response_actions_on_match);
+                            let continue_on_miss =
+                                contains_continue(&rule.response_actions_on_miss);
                             let d = Decision::Forward {
                                 upstream: upstream_addr,
                                 pre_split_upstreams: pre_split_upstreams.clone(),
@@ -526,6 +589,7 @@ impl Engine {
                                 response_actions_on_miss: rule.response_actions_on_miss.clone(),
                                 rule_name: rule.name.clone(),
                                 transport: Some(transport.unwrap_or(Transport::Udp)),
+                                ecs: ecs.clone(),
                                 continue_on_match,
                                 continue_on_miss,
                                 allow_reuse: false,
@@ -543,7 +607,12 @@ impl Engine {
                             return d;
                         }
                         Action::Log { level } => {
-                                super::matcher_adapter::log_match(level.as_deref(), &rule.name, qname, client_ip);
+                            super::matcher_adapter::log_match(
+                                level.as_deref(),
+                                &rule.name,
+                                qname,
+                                client_ip,
+                            );
                         }
                         Action::StaticTxtResponse { text, ttl } => {
                             if let Ok(name) = std::str::FromStr::from_str(qname) {
@@ -602,6 +671,7 @@ impl Engine {
             response_actions_on_miss: Vec::new(),
             rule_name: Arc::from("default"),
             transport: Some(Transport::Udp),
+            ecs: None,
             continue_on_match: false,
             continue_on_miss: false,
             allow_reuse: false,

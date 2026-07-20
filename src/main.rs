@@ -7,7 +7,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tracing::{error, info, debug, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use kixdns::config::load_config;
@@ -58,14 +58,22 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Some(Commands::ConvertGeoIp { input, output, filter }) => {
+        Some(Commands::ConvertGeoIp {
+            input,
+            output,
+            filter,
+        }) => {
             // Convert GeoIP .dat to MMDB
-            let filter_countries: Option<Vec<String>> = filter
-                .map(|f| f.split(',').map(|s| s.trim().to_uppercase()).collect());
+            let filter_countries: Option<Vec<String>> =
+                filter.map(|f| f.split(',').map(|s| s.trim().to_uppercase()).collect());
 
             let filter_slice = filter_countries.as_deref();
 
-            match kixdns::matcher::geoip::GeoIpManager::convert_dat_to_mmdb(&input, &output, filter_slice) {
+            match kixdns::matcher::geoip::GeoIpManager::convert_dat_to_mmdb(
+                &input,
+                &output,
+                filter_slice,
+            ) {
                 Ok(stats) => {
                     println!("Conversion completed successfully:\n{}", stats);
                     Ok(())
@@ -76,9 +84,12 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Some(Commands::Run { config, listener_label, debug, udp_workers_count }) => {
-            run_dns_server(config, listener_label, debug, udp_workers_count).await
-        }
+        Some(Commands::Run {
+            config,
+            listener_label,
+            debug,
+            udp_workers_count,
+        }) => run_dns_server(config, listener_label, debug, udp_workers_count).await,
         None => {
             // No subcommand provided - run DNS server with defaults
             run_dns_server(
@@ -86,7 +97,8 @@ async fn main() -> anyhow::Result<()> {
                 "default".to_string(),
                 false,
                 0,
-            ).await
+            )
+            .await
         }
     }
 }
@@ -111,200 +123,235 @@ async fn run_dns_server(
         .expect("failed to install rustls crypto provider");
 
     let cfg = load_config(&config).context("load initial config")?;
-            let cfg = RuntimePipelineConfig::from_config(cfg).context("compile matchers")?;
-            let bind_addr: SocketAddr = cfg.settings.bind_udp.parse().context("parse bind addr")?;
-            let bind_tcp: SocketAddr = cfg
+    let cfg = RuntimePipelineConfig::from_config(cfg).context("compile matchers")?;
+    let bind_addr: SocketAddr = cfg.settings.bind_udp.parse().context("parse bind addr")?;
+    let bind_tcp: SocketAddr = cfg
+        .settings
+        .bind_tcp
+        .parse()
+        .context("parse tcp bind addr")?;
+
+    // 在 cfg 被 move 到 Engine 之前提取 DoH 配置
+    // Extract DoH config before cfg is moved into Engine
+    let doh_config: Option<(SocketAddr, String, String)> =
+        if let Some(ref bind_doh) = cfg.settings.bind_doh {
+            let addr: SocketAddr = bind_doh.parse().context("parse doh bind addr")?;
+            let cert = cfg
                 .settings
-                .bind_tcp
-                .parse()
-                .context("parse tcp bind addr")?;
+                .doh_tls_cert
+                .as_ref()
+                .context("doh_tls_cert is required when bind_doh is set")?
+                .clone();
+            let key = cfg
+                .settings
+                .doh_tls_key
+                .as_ref()
+                .context("doh_tls_key is required when bind_doh is set")?
+                .clone();
+            Some((addr, cert, key))
+        } else {
+            None
+        };
 
-            // 在 cfg 被 move 到 Engine 之前提取 DoH 配置
-            // Extract DoH config before cfg is moved into Engine
-            let doh_config: Option<(SocketAddr, String, String)> =
-                if let Some(ref bind_doh) = cfg.settings.bind_doh {
-                    let addr: SocketAddr = bind_doh.parse().context("parse doh bind addr")?;
-                    let cert = cfg.settings.doh_tls_cert.as_ref()
-                        .context("doh_tls_cert is required when bind_doh is set")?.clone();
-                    let key = cfg.settings.doh_tls_key.as_ref()
-                        .context("doh_tls_key is required when bind_doh is set")?.clone();
-                    Some((addr, cert, key))
-                } else {
-                    None
-                };
+    let engine = Engine::new(cfg, listener_label.clone());
 
-            let engine = Engine::new(cfg, listener_label.clone());
+    watcher::spawn(config.clone(), engine.clone());
 
-            watcher::spawn(config.clone(), engine.clone());
+    // UDP worker 数量：默认为 CPU 核心数，最少 1 个 / UDP worker count: defaults to CPU core count, minimum 1
+    let udp_workers_final = if udp_workers_count > 0 {
+        udp_workers_count
+    } else {
+        num_cpus::get()
+    };
 
-            // UDP worker 数量：默认为 CPU 核心数，最少 1 个 / UDP worker count: defaults to CPU core count, minimum 1
-            let udp_workers_final = if udp_workers_count > 0 {
-                udp_workers_count
+    info!(bind_udp = %bind_addr, bind_tcp = %bind_tcp, udp_workers_count = udp_workers_final, "dns server started");
+
+    let mut all_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    #[cfg(unix)]
+    {
+        // ✅ OpenBSD 兼容性方案：双 socket（IPv4 + IPv6）+ 零拷贝 recv_buf_from
+        // ✅ OpenBSD compatibility: dual sockets (IPv4 + IPv6) + zero-copy recv_buf_from
+        // 为每个地址族创建独立的 socket 和 workers，避免 sockaddr 大小断言失败
+        // Create separate sockets and workers for each address family to avoid sockaddr size assertion failures
+
+        // ✅ OpenBSD 兼容性方案：双 socket（IPv4 + IPv6）+ 零拷贝 recv_buf_from
+        // ✅ OpenBSD compatibility: dual sockets (IPv4 + IPv6) + zero-copy recv_buf_from
+        // 为每个地址族创建独立的 socket 和 workers，避免 sockaddr 大小断言失败
+        // Create separate sockets and workers for each address family to avoid sockaddr size assertion failures
+
+        // 根据配置地址决定创建哪种 socket / Determine which socket type to create based on config
+        // IPv6 unspecified address (::) 需要同时创建 IPv4 和 IPv6 socket
+        // IPv6 other addresses 只创建 IPv6 socket
+        // IPv4 addresses 只创建 IPv4 socket
+        let needs_ipv4 =
+            bind_addr.is_ipv4() || (bind_addr.is_ipv6() && bind_addr.ip().is_unspecified());
+        let needs_ipv6 = bind_addr.is_ipv6();
+
+        if needs_ipv4 {
+            let workers_per_family = if needs_ipv6 {
+                udp_workers_final.div_ceil(2)
             } else {
-                num_cpus::get()
+                udp_workers_final
             };
+            spawn_ipv4_udp_workers(
+                bind_addr,
+                workers_per_family,
+                engine.clone(),
+                &mut all_handles,
+            )?;
+        }
 
-            info!(bind_udp = %bind_addr, bind_tcp = %bind_tcp, udp_workers_count = udp_workers_final, "dns server started");
+        if needs_ipv6 {
+            let workers_per_family = if needs_ipv4 {
+                udp_workers_final.div_ceil(2)
+            } else {
+                udp_workers_final
+            };
+            spawn_ipv6_udp_workers(
+                bind_addr,
+                workers_per_family,
+                engine.clone(),
+                &mut all_handles,
+            )?;
+        }
+    }
 
-            let mut all_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    #[cfg(not(unix))]
+    {
+        // Non-Unix: create a single shared socket and spawn workers that share it / 非 Unix：创建单个共享套接字并生成共享它的工作线程
+        // Use socket2 to set buffer sizes / 使用 socket2 设置缓冲区大小
+        use socket2::{Domain, Protocol, Socket, Type};
+        let domain = if bind_addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket =
+            Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create socket")?;
 
-            #[cfg(unix)]
+        // ✅ Windows 上设置 IPV6_V6ONLY=0 以支持双栈，与 Linux 行为一致
+        // ✅ On Windows, set IPV6_V6ONLY=0 for dual-stack support, consistent with Linux behavior
+        if domain == Domain::IPV6 {
+            if let Err(e) = socket.set_only_v6(false) {
+                debug!(
+                    "failed to set IPV6_V6ONLY=0: {}, IPv4 may not work on [::] bind",
+                    e
+                );
+            } else {
+                info!("UDP IPv6 socket set to dual-stack mode (IPV6_V6ONLY=0)");
+            }
+        }
+
+        // Set buffer sizes to prevent packet loss under load
+        // Try 4MB first, then fall back to 1MB if it fails
+        let desired_size = 4 * 1024 * 1024;
+        let fallback_size = 1024 * 1024;
+
+        if let Err(e) = socket.set_recv_buffer_size(desired_size) {
+            debug!(
+                "failed to set udp recv buffer to {} bytes: {}, trying {}",
+                desired_size, e, fallback_size
+            );
+            let _ = socket.set_recv_buffer_size(fallback_size);
+        }
+        if let Err(e) = socket.set_send_buffer_size(desired_size) {
+            debug!(
+                "failed to set udp send buffer to {} bytes: {}, trying {}",
+                desired_size, e, fallback_size
+            );
+            let _ = socket.set_send_buffer_size(fallback_size);
+        }
+
+        socket.set_nonblocking(true).context("set nonblocking")?;
+        socket.bind(&bind_addr.into()).context("bind socket")?;
+
+        let udp_socket = Arc::new(UdpSocket::from_std(socket.into()).context("from_std")?);
+        for worker_id in 0..udp_workers_final {
+            let engine = engine.clone();
+            let socket = Arc::clone(&udp_socket);
+            let handle = tokio::spawn(async move {
+                if let Err(err) = run_udp_worker(worker_id, socket, engine).await {
+                    error!(worker_id, error = %err, "udp worker exited");
+                }
+            });
+            all_handles.push(handle);
+        }
+    }
+
+    // TCP listener / TCP 监听器
+    // ✅ 双 socket 方案，与 UDP 行为一致 / Dual-socket approach, consistent with UDP
+    let needs_ipv4_tcp =
+        bind_tcp.is_ipv4() || (bind_tcp.is_ipv6() && bind_tcp.ip().is_unspecified());
+
+    // --- 启动 IPv4 TCP 监听 / Start IPv4 TCP listener ---
+    if needs_ipv4_tcp {
+        let addr = if bind_tcp.is_ipv4() {
+            bind_tcp
+        } else {
+            SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+                bind_tcp.port(),
+            )
+        };
+        // 纯 IPv4 绑定，不受 bindv6only 影响 / Pure IPv4 bind, unaffected by bindv6only
+        let listener = TcpListener::bind(addr).await.context("bind ipv4 tcp")?;
+        let engine = engine.clone();
+        let h = tokio::spawn(async move {
+            if let Err(err) = run_tcp(listener, engine).await {
+                error!(error = %err, "ipv4 tcp server exited");
+            }
+        });
+        all_handles.push(h);
+    }
+
+    // --- 启动 IPv6 TCP 监听 / Start IPv6 TCP listener ---
+    if bind_tcp.is_ipv6() {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+
+        // ⭐️ 核心：强制 IPV6_V6ONLY=1，避免和 IPv4 监听器冲突
+        // ⭐️ Key: force IPV6_V6ONLY=1 to avoid conflict with IPv4 listener
+        socket
+            .set_only_v6(true)
+            .context("set ipv6 only for kixdns")?;
+        socket.set_reuse_address(true)?;
+
+        socket
+            .bind(&bind_tcp.into())
+            .context("bind ipv6 tcp socket")?;
+        socket.listen(128)?;
+        socket.set_nonblocking(true)?;
+
+        let listener = TcpListener::from_std(socket.into())?;
+        let engine = engine.clone();
+        let h = tokio::spawn(async move {
+            if let Err(err) = run_tcp(listener, engine).await {
+                error!(error = %err, "ipv6 tcp server exited");
+            }
+        });
+        all_handles.push(h);
+    }
+
+    // DoH listener — 仅在配置了 bind_doh 时启动 / DoH listener — only if bind_doh is configured
+    if let Some((doh_addr, cert_path, key_path)) = doh_config {
+        let engine = engine.clone();
+        let h = tokio::spawn(async move {
+            if let Err(err) =
+                kixdns::doh_server::run_doh(doh_addr, &cert_path, &key_path, engine).await
             {
-                // ✅ OpenBSD 兼容性方案：双 socket（IPv4 + IPv6）+ 零拷贝 recv_buf_from
-                // ✅ OpenBSD compatibility: dual sockets (IPv4 + IPv6) + zero-copy recv_buf_from
-                // 为每个地址族创建独立的 socket 和 workers，避免 sockaddr 大小断言失败
-                // Create separate sockets and workers for each address family to avoid sockaddr size assertion failures
-
-                // ✅ OpenBSD 兼容性方案：双 socket（IPv4 + IPv6）+ 零拷贝 recv_buf_from
-                // ✅ OpenBSD compatibility: dual sockets (IPv4 + IPv6) + zero-copy recv_buf_from
-                // 为每个地址族创建独立的 socket 和 workers，避免 sockaddr 大小断言失败
-                // Create separate sockets and workers for each address family to avoid sockaddr size assertion failures
-
-                // 根据配置地址决定创建哪种 socket / Determine which socket type to create based on config
-                // IPv6 unspecified address (::) 需要同时创建 IPv4 和 IPv6 socket
-                // IPv6 other addresses 只创建 IPv6 socket
-                // IPv4 addresses 只创建 IPv4 socket
-                let needs_ipv4 = bind_addr.is_ipv4() ||
-                    (bind_addr.is_ipv6() && bind_addr.ip().is_unspecified());
-                let needs_ipv6 = bind_addr.is_ipv6();
-
-                if needs_ipv4 {
-                    let workers_per_family = if needs_ipv6 {
-                        udp_workers_final.div_ceil(2)
-                    } else {
-                        udp_workers_final
-                    };
-                    spawn_ipv4_udp_workers(bind_addr, workers_per_family, engine.clone(), &mut all_handles)?;
-                }
-
-                if needs_ipv6 {
-                    let workers_per_family = if needs_ipv4 {
-                        udp_workers_final.div_ceil(2)
-                    } else {
-                        udp_workers_final
-                    };
-                    spawn_ipv6_udp_workers(bind_addr, workers_per_family, engine.clone(), &mut all_handles)?;
-                }
+                error!(error = %err, "DoH server exited");
             }
+        });
+        all_handles.push(h);
+    }
 
-            #[cfg(not(unix))]
-            {
-                // Non-Unix: create a single shared socket and spawn workers that share it / 非 Unix：创建单个共享套接字并生成共享它的工作线程
-                // Use socket2 to set buffer sizes / 使用 socket2 设置缓冲区大小
-                use socket2::{Domain, Protocol, Socket, Type};
-                let domain = if bind_addr.is_ipv4() {
-                    Domain::IPV4
-                } else {
-                    Domain::IPV6
-                };
-                let socket =
-                    Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create socket")?;
+    // 等待所有任务 / Wait for all tasks
+    for h in all_handles {
+        let _ = h.await;
+    }
 
-                // ✅ Windows 上设置 IPV6_V6ONLY=0 以支持双栈，与 Linux 行为一致
-                // ✅ On Windows, set IPV6_V6ONLY=0 for dual-stack support, consistent with Linux behavior
-                if domain == Domain::IPV6 {
-                    if let Err(e) = socket.set_only_v6(false) {
-                        debug!("failed to set IPV6_V6ONLY=0: {}, IPv4 may not work on [::] bind", e);
-                    } else {
-                        info!("UDP IPv6 socket set to dual-stack mode (IPV6_V6ONLY=0)");
-                    }
-                }
-
-                // Set buffer sizes to prevent packet loss under load
-                // Try 4MB first, then fall back to 1MB if it fails
-                let desired_size = 4 * 1024 * 1024;
-                let fallback_size = 1024 * 1024;
-
-                if let Err(e) = socket.set_recv_buffer_size(desired_size) {
-                    debug!("failed to set udp recv buffer to {} bytes: {}, trying {}", desired_size, e, fallback_size);
-                    let _ = socket.set_recv_buffer_size(fallback_size);
-                }
-                if let Err(e) = socket.set_send_buffer_size(desired_size) {
-                    debug!("failed to set udp send buffer to {} bytes: {}, trying {}", desired_size, e, fallback_size);
-                    let _ = socket.set_send_buffer_size(fallback_size);
-                }
-
-                socket.set_nonblocking(true).context("set nonblocking")?;
-                socket.bind(&bind_addr.into()).context("bind socket")?;
-
-                let udp_socket = Arc::new(UdpSocket::from_std(socket.into()).context("from_std")?);
-                for worker_id in 0..udp_workers_final {
-                    let engine = engine.clone();
-                    let socket = Arc::clone(&udp_socket);
-                    let handle = tokio::spawn(async move {
-                        if let Err(err) = run_udp_worker(worker_id, socket, engine).await {
-                            error!(worker_id, error = %err, "udp worker exited");
-                        }
-                    });
-                    all_handles.push(handle);
-                }
-            }
-
-            // TCP listener / TCP 监听器
-            // ✅ 双 socket 方案，与 UDP 行为一致 / Dual-socket approach, consistent with UDP
-            let needs_ipv4_tcp = bind_tcp.is_ipv4() || (bind_tcp.is_ipv6() && bind_tcp.ip().is_unspecified());
-
-            // --- 启动 IPv4 TCP 监听 / Start IPv4 TCP listener ---
-            if needs_ipv4_tcp {
-                let addr = if bind_tcp.is_ipv4() {
-                    bind_tcp
-                } else {
-                    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), bind_tcp.port())
-                };
-                // 纯 IPv4 绑定，不受 bindv6only 影响 / Pure IPv4 bind, unaffected by bindv6only
-                let listener = TcpListener::bind(addr).await.context("bind ipv4 tcp")?;
-                let engine = engine.clone();
-                let h = tokio::spawn(async move {
-                    if let Err(err) = run_tcp(listener, engine).await {
-                        error!(error = %err, "ipv4 tcp server exited");
-                    }
-                });
-                all_handles.push(h);
-            }
-
-            // --- 启动 IPv6 TCP 监听 / Start IPv6 TCP listener ---
-            if bind_tcp.is_ipv6() {
-                use socket2::{Domain, Protocol, Socket, Type};
-                let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
-
-                // ⭐️ 核心：强制 IPV6_V6ONLY=1，避免和 IPv4 监听器冲突
-                // ⭐️ Key: force IPV6_V6ONLY=1 to avoid conflict with IPv4 listener
-                socket.set_only_v6(true).context("set ipv6 only for kixdns")?;
-                socket.set_reuse_address(true)?;
-
-                socket.bind(&bind_tcp.into()).context("bind ipv6 tcp socket")?;
-                socket.listen(128)?;
-                socket.set_nonblocking(true)?;
-
-                let listener = TcpListener::from_std(socket.into())?;
-                let engine = engine.clone();
-                let h = tokio::spawn(async move {
-                    if let Err(err) = run_tcp(listener, engine).await {
-                        error!(error = %err, "ipv6 tcp server exited");
-                    }
-                });
-                all_handles.push(h);
-            }
-
-            // DoH listener — 仅在配置了 bind_doh 时启动 / DoH listener — only if bind_doh is configured
-            if let Some((doh_addr, cert_path, key_path)) = doh_config {
-                let engine = engine.clone();
-                let h = tokio::spawn(async move {
-                    if let Err(err) = kixdns::doh_server::run_doh(
-                        doh_addr, &cert_path, &key_path, engine,
-                    ).await {
-                        error!(error = %err, "DoH server exited");
-                    }
-                });
-                all_handles.push(h);
-            }
-
-            // 等待所有任务 / Wait for all tasks
-            for h in all_handles {
-                let _ = h.await;
-            }
-
-            Ok(())
+    Ok(())
 }
 
 fn init_tracing(debug: bool) {
@@ -336,7 +383,10 @@ fn spawn_ipv4_udp_workers(
     } else {
         // 预编译的常量地址，避免 unwrap / Precompiled constant address, avoid unwrap
         // 使用配置中的端口号而非硬编码 / Use port from config instead of hardcoded
-        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), bind_addr.port())
+        SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+            bind_addr.port(),
+        )
     };
 
     info!(bind_addr = %ipv4_addr, workers = worker_count, "Starting IPv4 UDP workers");
@@ -370,7 +420,10 @@ fn spawn_ipv6_udp_workers(
     } else {
         // 预编译的常量地址，避免 unwrap / Precompiled constant address, avoid unwrap
         // 使用配置中的端口号而非硬编码 / Use port from config instead of hardcoded
-        SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)), bind_addr.port())
+        SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)),
+            bind_addr.port(),
+        )
     };
 
     info!(bind_addr = %ipv6_addr, workers = worker_count, "Starting IPv6 UDP workers");
@@ -411,7 +464,10 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
     // This allows us to safely use zero-copy recv_buf_from
     if domain == Domain::IPV6 {
         if let Err(e) = kixdns::socket_utils::set_ipv6_v6only(&socket, true) {
-            tracing::warn!("Failed to set IPV6_V6ONLY=1: {}, this may cause issues on OpenBSD", e);
+            tracing::warn!(
+                "Failed to set IPV6_V6ONLY=1: {}, this may cause issues on OpenBSD",
+                e
+            );
         }
     }
 
@@ -427,11 +483,17 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
     let fallback_size = 1024 * 1024;
 
     if let Err(e) = socket.set_recv_buffer_size(desired_size) {
-        debug!("failed to set udp recv buffer to {} bytes: {}, trying {}", desired_size, e, fallback_size);
+        debug!(
+            "failed to set udp recv buffer to {} bytes: {}, trying {}",
+            desired_size, e, fallback_size
+        );
         let _ = socket.set_recv_buffer_size(fallback_size);
     }
     if let Err(e) = socket.set_send_buffer_size(desired_size) {
-        debug!("failed to set udp send buffer to {} bytes: {}, trying {}", desired_size, e, fallback_size);
+        debug!(
+            "failed to set udp send buffer to {} bytes: {}, trying {}",
+            desired_size, e, fallback_size
+        );
         let _ = socket.set_send_buffer_size(fallback_size);
     }
 
@@ -456,7 +518,7 @@ async fn run_udp_worker(
     // 自适应流控：每 100 个请求检查一次是否需要调整 permits
     // Adaptive flow control: check if adjustment needed every 100 requests
     let mut request_count = 0u32;
-    
+
     info!(worker_id, "UDP worker started");
 
     loop {
@@ -490,7 +552,11 @@ async fn run_udp_worker(
                         // 已包含正确 TXID，可直接发送 / Already contains correct TXID
                         let _ = socket.send_to(&bytes, peer).await;
                     }
-                    Ok(Some(FastPathResponse::CacheHit { cached, tx_id, inserted_at })) => {
+                    Ok(Some(FastPathResponse::CacheHit {
+                        cached,
+                        tx_id,
+                        inserted_at,
+                    })) => {
                         // 复用 send_buf：copy + patch TXID / Reuse send_buf: copy + patch TXID
                         send_buf.clear();
                         if send_buf.capacity() < cached.len() {
@@ -511,7 +577,15 @@ async fn run_udp_worker(
                         }
                         let _ = socket.send_to(&send_buf, peer).await;
                     }
-                    Ok(Some(FastPathResponse::AsyncNeeded { qname, qtype, qclass, tx_id, edns_present, pipeline_id })) => {
+                    Ok(Some(FastPathResponse::AsyncNeeded {
+                        qname,
+                        qtype,
+                        qclass,
+                        tx_id,
+                        edns_present,
+                        pipeline_id,
+                        ecs_key,
+                    })) => {
                         // 缓存未命中，使用预解析的数据避免重复解析
                         // Cache miss, use pre-parsed data to avoid re-parsing
                         let permit_mgr = Arc::clone(&engine.permit_manager);
@@ -540,8 +614,11 @@ async fn run_udp_worker(
                                         tx_id,
                                         edns_present,
                                         pipeline_id,
-                                    )
-                                ).await {
+                                        ecs_key,
+                                    ),
+                                )
+                                .await
+                                {
                                     Ok(Ok(resp)) => {
                                         let _ = socket.send_to(&resp, peer).await;
                                     }
@@ -573,7 +650,12 @@ async fn run_udp_worker(
                             let packet_bytes = packet_bytes.clone();
                             tokio::spawn(async move {
                                 let _permit = permit; // 自动释放 / Auto-release on drop
-                                match tokio::time::timeout(timeout_dur, engine.handle_packet(&packet_bytes, peer)).await {
+                                match tokio::time::timeout(
+                                    timeout_dur,
+                                    engine.handle_packet(&packet_bytes, peer),
+                                )
+                                .await
+                                {
                                     Ok(Ok(resp)) => {
                                         let _ = socket.send_to(&resp, peer).await;
                                     }
@@ -663,7 +745,11 @@ async fn handle_tcp_conn(
                 // 快速路径命中：直接返回 / Fast path hit: return directly
                 bytes
             }
-            Ok(Some(FastPathResponse::CacheHit { cached, tx_id, inserted_at })) => {
+            Ok(Some(FastPathResponse::CacheHit {
+                cached,
+                tx_id,
+                inserted_at,
+            })) => {
                 // 缓存命中：patch TXID / Cache hit: patch TXID
                 let mut resp_buf = bytes::BytesMut::with_capacity(cached.len());
                 resp_buf.extend_from_slice(&cached);
@@ -681,7 +767,15 @@ async fn handle_tcp_conn(
                 }
                 resp_buf.freeze()
             }
-            Ok(Some(FastPathResponse::AsyncNeeded { qname, qtype, qclass, tx_id, edns_present, pipeline_id })) => {
+            Ok(Some(FastPathResponse::AsyncNeeded {
+                qname,
+                qtype,
+                qclass,
+                tx_id,
+                edns_present,
+                pipeline_id,
+                ecs_key,
+            })) => {
                 // 缓存未命中：使用预解析数据避免重复解析
                 // Cache miss: use pre-parsed data to avoid re-parsing
                 match tokio::time::timeout(
@@ -696,8 +790,11 @@ async fn handle_tcp_conn(
                         tx_id,
                         edns_present,
                         pipeline_id,
-                    )
-                ).await {
+                        ecs_key,
+                    ),
+                )
+                .await
+                {
                     Ok(Ok(r)) => r,
                     Ok(Err(_)) => return Ok(()),
                     Err(_) => {
@@ -713,7 +810,9 @@ async fn handle_tcp_conn(
             Ok(None) => {
                 // 快速解析失败，回退到完整处理
                 // Fast parse failed, fallback to full processing
-                match tokio::time::timeout(timeout_dur, engine.handle_packet(&packet_bytes, peer)).await {
+                match tokio::time::timeout(timeout_dur, engine.handle_packet(&packet_bytes, peer))
+                    .await
+                {
                     Ok(Ok(r)) => r,
                     Ok(Err(_)) => return Ok(()),
                     Err(_) => {

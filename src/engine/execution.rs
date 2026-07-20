@@ -42,6 +42,9 @@ pub struct PreParsedData {
     tx_id: u16,
     edns_present: bool,
     pipeline_id: Arc<str>,
+    /// Pre-computed ECS cache key from fast path (avoids recomputation)
+    /// 快速路径预计算的 ECS 缓存键（避免重算）
+    ecs_key: Option<crate::ecs::EcsKey>,
 }
 
 // ============================================================================
@@ -186,6 +189,7 @@ impl Engine {
         qname: &[u8],
         qtype: hickory_proto::rr::RecordType,
         qclass: hickory_proto::rr::DNSClass,
+        ecs_key: Option<&crate::ecs::EcsKey>,
     ) -> u64 {
         let mut h = FxHasher::default();
         pipeline_id.hash(&mut h);
@@ -198,6 +202,11 @@ impl Engine {
         u16::from(qtype).hash(&mut h);
         // DNSClass implements Copy+Debug, hash by its u16 representation / DNSClass 实现了 Copy+Debug，使用其 u16 表示进行哈希
         u16::from(qclass).hash(&mut h);
+        // ECS key for cache isolation by client subnet (RFC 7871)
+        // ECS key 用于按客户端子网隔离缓存 (RFC 7871)
+        if let Some(ecs) = ecs_key {
+            ecs.hash_into(&mut h);
+        }
         h.finish()
     }
 
@@ -296,8 +305,20 @@ impl Engine {
         );
 
         // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
-        let cache_hash =
-            Self::calculate_cache_hash_for_dedupe(&pipeline_id, q.qname_bytes, qtype, qclass);
+        // Compute ECS cache key from pipeline config + peer IP (RFC 7871)
+        // 从 Pipeline ECS 配置 + peer IP 计算 ECS 缓存键 (RFC 7871)
+        let ecs_key = pipeline_opt.and_then(|p| {
+            p.ecs
+                .as_ref()
+                .and_then(|mode| crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip()))
+        });
+        let cache_hash = Self::calculate_cache_hash_for_dedupe(
+            &pipeline_id,
+            q.qname_bytes,
+            qtype,
+            qclass,
+            ecs_key.as_ref(),
+        );
 
         if let Some(hit) = self.cache.get(&cache_hash) {
             // Verify collision / 验证冲突
@@ -461,11 +482,13 @@ impl Engine {
             tx_id: q.tx_id,
             edns_present: q.edns_present,
             pipeline_id,
+            ecs_key, // Pass pre-computed ECS key to avoid recomputation / 传递预计算的 ECS key 避免重算
         }))
     }
 
     pub async fn handle_packet(&self, packet: &[u8], peer: SocketAddr) -> anyhow::Result<Bytes> {
-        self.handle_packet_internal(packet, peer, false, None).await
+        self.handle_packet_internal(packet, peer, false, None, None)
+            .await
     }
 
     /// Public wrapper for handle_packet_internal with pre-parsed data
@@ -484,6 +507,7 @@ impl Engine {
         tx_id: u16,
         edns_present: bool,
         pipeline_id: Arc<str>,
+        ecs_key: Option<crate::ecs::EcsKey>,
     ) -> anyhow::Result<Bytes> {
         let pre_parsed = PreParsedData {
             qname,
@@ -492,8 +516,9 @@ impl Engine {
             tx_id,
             edns_present,
             pipeline_id,
+            ecs_key,
         };
-        self.handle_packet_internal(packet, peer, skip_cache, Some(pre_parsed))
+        self.handle_packet_internal(packet, peer, skip_cache, Some(pre_parsed), None)
             .await
     }
 
@@ -511,12 +536,18 @@ impl Engine {
     ///
     /// pre_parsed: Optional pre-parsed data from handle_packet_fast to avoid re-parsing
     /// pre_parsed: 来自 handle_packet_fast 的可选预解析数据，避免重新解析
+    ///
+    /// explicit_cache_hash: Optional pre-computed cache hash for background refresh.
+    /// When provided, skips ECS key computation to ensure the same hash as the original request.
+    /// explicit_cache_hash: 后台刷新用的预计算 cache hash。
+    /// 提供时跳过 ECS key 计算，确保与原始请求的 hash 一致。
     pub(crate) async fn handle_packet_internal(
         &self,
         packet: &[u8],
         peer: SocketAddr,
         skip_cache: bool,
         pre_parsed: Option<PreParsedData>,
+        explicit_cache_hash: Option<u64>,
     ) -> anyhow::Result<Bytes> {
         // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
         let _req_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
@@ -536,7 +567,7 @@ impl Engine {
         let response_jump_limit = cfg.settings.response_jump_limit as usize;
 
         // Use pre-parsed data if available, otherwise parse / 如果有预解析数据则使用，否则解析
-        let (qname_cow, qtype, qclass, tx_id, edns_present, pipeline_id) =
+        let (qname_cow, qtype, qclass, tx_id, edns_present, pipeline_id, pre_ecs_key) =
             if let Some(pre) = pre_parsed {
                 (
                     std::borrow::Cow::Owned(pre.qname),
@@ -545,6 +576,7 @@ impl Engine {
                     pre.tx_id,
                     pre.edns_present,
                     pre.pipeline_id,
+                    pre.ecs_key,
                 )
             } else {
                 // Lazy Parse: Use quick parse first / 延迟解析：首先使用快速解析
@@ -599,7 +631,15 @@ impl Engine {
                     pipeline_id
                 }; // geosite_mgr 在这里释放 / geosite_mgr released here
 
-                (qname_cow, qtype, qclass, tx_id, edns_present, pipeline_id)
+                (
+                    qname_cow,
+                    qtype,
+                    qclass,
+                    tx_id,
+                    edns_present,
+                    pipeline_id,
+                    None,
+                )
             };
 
         let qname_ref = &qname_cow;
@@ -613,8 +653,31 @@ impl Engine {
 
         // Convert qname_ref to bytes for hash calculation / 将 qname_ref 转换为 bytes 进行哈希计算
         let qname_bytes = qname_ref.as_bytes();
-        let dedupe_hash =
-            Self::calculate_cache_hash_for_dedupe(&pipeline_id, qname_bytes, qtype, qclass);
+        // Compute dedupe hash: use explicit hash for background refresh, or pre-computed ECS key,
+        // otherwise compute with ECS key from pipeline config
+        // 计算 dedupe hash：后台刷新用显式 hash，或用预计算 ECS key，否则从 pipeline 配置计算
+        let ecs_key = if explicit_cache_hash.is_some() {
+            None // explicit hash overrides; ecs_key not needed / 显式 hash 优先；不需要 ecs_key
+        } else {
+            pre_ecs_key.or_else(|| {
+                pipeline_opt.and_then(|p| {
+                    p.ecs
+                        .as_ref()
+                        .and_then(|mode| crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip()))
+                })
+            })
+        };
+        let dedupe_hash = if let Some(h) = explicit_cache_hash {
+            h
+        } else {
+            Self::calculate_cache_hash_for_dedupe(
+                &pipeline_id,
+                qname_bytes,
+                qtype,
+                qclass,
+                ecs_key.as_ref(),
+            )
+        };
 
         // Background refresh: Skip cache lookup when skip_cache=true
         // 后台刷新：当 skip_cache=true 时跳过缓存查找
@@ -733,8 +796,9 @@ impl Engine {
         let mut current_pipeline_id = pipeline_id.clone();
         // Convert qname to bytes for hash calculation / 将 qname 转换为 bytes 进行哈希计算
         let qname_bytes = qname.as_bytes();
-        let mut dedupe_hash =
-            Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, qname_bytes, qtype, qclass);
+        // Reuse dedupe_hash from earlier computation (includes ECS key isolation)
+        // 复用之前计算的 dedupe_hash（已含 ECS key 隔离维度）
+        let mut dedupe_hash = dedupe_hash;
         let mut reused_response: Option<ResponseContext> = None;
 
         let mut decision = match pipeline_opt {
@@ -770,6 +834,7 @@ impl Engine {
                     response_actions_on_miss: Vec::new(),
                     rule_name: Arc::from("default"),
                     transport: Some(Transport::Udp),
+                    ecs: None,
                     continue_on_match: false,
                     continue_on_miss: false,
                     allow_reuse: false,
@@ -819,11 +884,19 @@ impl Engine {
                         .find(|p| p.id.as_ref() == pipeline.as_ref())
                     {
                         current_pipeline_id = p.id.clone();
+                        // Must recompute ECS key + dedupe_hash: pipeline changed via Jump,
+                        // so the target pipeline's ECS config may differ from the source.
+                        // 必须重算 ECS key + dedupe_hash：pipeline 因 Jump 改变，
+                        // 目标 pipeline 的 ECS 配置可能与源 pipeline 不同。
+                        let jump_ecs_key = p.ecs.as_ref().and_then(|mode| {
+                            crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip())
+                        });
                         dedupe_hash = Self::calculate_cache_hash_for_dedupe(
                             &current_pipeline_id,
                             qname_bytes,
                             qtype,
                             qclass,
+                            jump_ecs_key.as_ref(),
                         );
                         skip_rules.clear();
                         decision = self.apply_rules(
@@ -879,6 +952,7 @@ impl Engine {
                     response_actions_on_miss,
                     rule_name,
                     transport,
+                    ecs,
                     continue_on_match: _,
                     continue_on_miss: _,
                     allow_reuse,
@@ -905,6 +979,7 @@ impl Engine {
                         &response_actions_on_match,
                         &response_actions_on_miss,
                         transport,
+                        ecs.as_ref(),
                         allow_reuse,
                         &mut reused_response,
                     )
@@ -1685,8 +1760,13 @@ mod tests {
         let qname = "expire.com";
         let qtype = RecordType::A;
         let qclass = DNSClass::IN;
-        let dedupe_hash =
-            Engine::calculate_cache_hash_for_dedupe(&pipeline_id, qname.as_bytes(), qtype, qclass);
+        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(
+            &pipeline_id,
+            qname.as_bytes(),
+            qtype,
+            qclass,
+            None,
+        );
 
         // Insert an entry that expired 5 seconds ago
         let entry = CacheEntry {
@@ -1724,7 +1804,9 @@ mod tests {
                 panic!("Expired cache should not produce a Direct response");
             }
             None => {
-                panic!("parse_quick should succeed for valid packet; expected AsyncNeeded, got None");
+                panic!(
+                    "parse_quick should succeed for valid packet; expected AsyncNeeded, got None"
+                );
             }
         }
 
@@ -1868,12 +1950,14 @@ mod tests {
             qname.as_bytes(),
             qtype,
             qclass_in,
+            None,
         );
         let hash_ch = Engine::calculate_cache_hash_for_dedupe(
             pipeline_id,
             qname.as_bytes(),
             qtype,
             qclass_ch,
+            None,
         );
 
         // Assert: Verify different QCLASS produces different hashes
@@ -1888,6 +1972,7 @@ mod tests {
             qname.as_bytes(),
             qtype,
             qclass_in,
+            None,
         );
 
         // Assert: Verify same QCLASS produces same hash
@@ -1918,18 +2003,21 @@ mod tests {
             qname_lower.to_lowercase().as_bytes(),
             qtype,
             qclass,
+            None,
         );
         let hash2 = Engine::calculate_cache_hash_for_dedupe(
             pipeline_id,
             qname_upper.to_lowercase().as_bytes(),
             qtype,
             qclass,
+            None,
         );
         let hash3 = Engine::calculate_cache_hash_for_dedupe(
             pipeline_id,
             qname_mixed.to_lowercase().as_bytes(),
             qtype,
             qclass,
+            None,
         );
 
         // Assert: Verify case-insensitive hashing produces same results
@@ -1948,13 +2036,19 @@ mod tests {
         let qclass = DNSClass::IN;
 
         // Act: Calculate hashes for different QTYPE values
-        let hash_a =
-            Engine::calculate_cache_hash_for_dedupe(pipeline_id, qname.as_bytes(), qtype_a, qclass);
+        let hash_a = Engine::calculate_cache_hash_for_dedupe(
+            pipeline_id,
+            qname.as_bytes(),
+            qtype_a,
+            qclass,
+            None,
+        );
         let hash_aaaa = Engine::calculate_cache_hash_for_dedupe(
             pipeline_id,
             qname.as_bytes(),
             qtype_aaaa,
             qclass,
+            None,
         );
 
         // Assert: Verify different QTYPE produces different hashes
@@ -1975,10 +2069,20 @@ mod tests {
         let qclass = DNSClass::IN;
 
         // Act: Calculate hashes for different QNAME values
-        let hash1 =
-            Engine::calculate_cache_hash_for_dedupe(pipeline_id, qname1.as_bytes(), qtype, qclass);
-        let hash2 =
-            Engine::calculate_cache_hash_for_dedupe(pipeline_id, qname2.as_bytes(), qtype, qclass);
+        let hash1 = Engine::calculate_cache_hash_for_dedupe(
+            pipeline_id,
+            qname1.as_bytes(),
+            qtype,
+            qclass,
+            None,
+        );
+        let hash2 = Engine::calculate_cache_hash_for_dedupe(
+            pipeline_id,
+            qname2.as_bytes(),
+            qtype,
+            qclass,
+            None,
+        );
 
         // Assert: Verify different QNAME produces different hashes
         assert_ne!(

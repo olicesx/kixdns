@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// 动态信号量调整的自适应流控状态 / Adaptive flow control state for dynamic semaphore adjustment
 pub struct FlowControlState {
@@ -32,9 +32,12 @@ impl FlowControlState {
 
             // Try to update timestamp - only one thread will succeed
             match self.last_adjustment_ms.compare_exchange_weak(
-                last_ms, now_ms, Ordering::AcqRel, Ordering::Relaxed
+                last_ms,
+                now_ms,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
             ) {
-                Ok(_) => break,  // Successfully acquired adjustment right
+                Ok(_) => break, // Successfully acquired adjustment right
                 Err(current) => {
                     // Another thread updated timestamp, reload and recheck
                     last_ms = current;
@@ -82,7 +85,8 @@ impl FlowControlState {
                 "reducing permits due to high latency or load"
             );
         } else if should_increase && current_permits < self.max_permits.load(Ordering::Relaxed) {
-            let new_permits = (current_permits * 11 / 10).min(self.max_permits.load(Ordering::Relaxed));
+            let new_permits =
+                (current_permits * 11 / 10).min(self.max_permits.load(Ordering::Relaxed));
             permit_manager.set_max_permits(new_permits);
             tracing::info!(
                 event = "flow_control_increase",
@@ -96,7 +100,6 @@ impl FlowControlState {
         }
     }
 }
-
 
 /// 动态流控的 Permit 管理器 / Permit manager for dynamic flow control feedback
 pub struct PermitManager {
@@ -130,7 +133,7 @@ impl PermitManager {
             dropped_requests: AtomicU64::new(0),
         }
     }
-    
+
     /// Try to acquire a permit without blocking / 非阻塞地尝试获取 permit
     /// Returns a guard that holds Arc<PermitManager> to ensure permit is released
     ///
@@ -141,11 +144,11 @@ impl PermitManager {
         loop {
             let active = self.active_permits.load(Ordering::Acquire);
             let max = self.max_permits.load(Ordering::Acquire);
-            
+
             if active >= max {
                 // Pool exhausted: increment counter and log / Pool耗尽：增加计数器并记录
                 let dropped = self.dropped_requests.fetch_add(1, Ordering::Relaxed);
-                
+
                 // Log every 1000 dropped requests to avoid spam / 每1000个丢弃请求记录一次，避免刷屏
                 if dropped % 1000 == 0 {
                     tracing::warn!(
@@ -154,13 +157,13 @@ impl PermitManager {
                         dropped_total = dropped + 1,
                         "UDP permit pool exhausted, requests are being dropped"
                     );
-                    
+
                     // Trigger recovery check if pool is exhausted / 如果pool耗尽，触发恢复检查
                     self.check_and_recover();
                 }
                 return None;
             }
-            
+
             match self.active_permits.compare_exchange(
                 active,
                 active + 1,
@@ -193,7 +196,7 @@ impl PermitManager {
             }
         }
     }
-    
+
     /// Get current inflight permits count / 获取当前进行中的 permits 数
     #[inline]
     pub fn inflight(&self) -> usize {
@@ -228,7 +231,7 @@ impl PermitManager {
             .unwrap_or(0);
 
         let last_ms = self.last_recovery_ms.load(Ordering::Relaxed);
-        
+
         // Only recover once per minute to avoid excessive recovery attempts
         // 每分钟只恢复一次，避免过度恢复尝试
         if now_ms.saturating_sub(last_ms) < 60_000 {
@@ -237,13 +240,16 @@ impl PermitManager {
 
         // Try to update recovery timestamp / 尝试更新恢复时间戳
         match self.last_recovery_ms.compare_exchange_weak(
-            last_ms, now_ms, Ordering::AcqRel, Ordering::Relaxed
+            last_ms,
+            now_ms,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
         ) {
             Ok(_) => {
                 // We won the race, perform recovery / 我们赢得了竞争，执行恢复
                 let active = self.active_permits.load(Ordering::Acquire);
                 let max = self.max_permits.load(Ordering::Acquire);
-                
+
                 // If active permits exceed max significantly, it indicates leakage
                 // 如果活跃permits显著超过最大值，表示有泄漏
                 if active > max {
@@ -252,10 +258,10 @@ impl PermitManager {
                         max = max,
                         "Detected permit leakage: active permits exceed max, forcing recovery"
                     );
-                    
+
                     // Force reset to max to recover from leakage / 强制重置为最大值以从泄漏中恢复
                     self.active_permits.store(max, Ordering::Release);
-                    
+
                     let dropped = self.dropped_requests.load(Ordering::Relaxed);
                     tracing::warn!(
                         recovered = active - max,
@@ -284,14 +290,10 @@ impl PermitManager {
     pub fn force_recover(&self) {
         let active = self.active_permits.load(Ordering::Acquire);
         let max = self.max_permits.load(Ordering::Acquire);
-        
+
         if active > max {
             self.active_permits.store(max, Ordering::Release);
-            tracing::warn!(
-                active = active,
-                max = max,
-                "Force recovered permit pool"
-            );
+            tracing::warn!(active = active, max = max, "Force recovered permit pool");
         }
     }
 
@@ -305,7 +307,7 @@ impl PermitManager {
 }
 
 /// RAII guard for automatic permit release / RAII 守卫用于自动 permit 释放
-/// 
+///
 /// This guard ensures that permits are properly released even in panic scenarios
 /// by using defensive programming techniques.
 /// 该守卫通过使用防御性编程技术，确保即使在panic场景下也能正确释放permits。
@@ -329,9 +331,11 @@ impl PermitGuard {
     /// 消耗 self 防止双重释放；Drop 实现会看到 released=true 并跳过。
     pub fn release(self) {
         // Mark as released and decrement / 标记为已释放并递减
-        if self.released.compare_exchange(
-            false, true, Ordering::AcqRel, Ordering::Relaxed
-        ).is_ok() {
+        if self
+            .released
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
             self.manager.active_permits.fetch_sub(1, Ordering::Release);
         }
         // self is dropped here; Drop::drop sees released=true → no double free
@@ -342,9 +346,11 @@ impl Drop for PermitGuard {
     fn drop(&mut self) {
         // Use compare_exchange to handle potential double-drop scenarios
         // 使用compare_exchange处理潜在的双重释放场景
-        if self.released.compare_exchange(
-            false, true, Ordering::AcqRel, Ordering::Relaxed
-        ).is_ok() {
+        if self
+            .released
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
             self.manager.active_permits.fetch_sub(1, Ordering::Release);
         }
     }

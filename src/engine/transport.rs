@@ -1,33 +1,39 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicUsize, AtomicU64, Ordering};
-use std::time::Duration;
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use dashmap::mapref::entry;
-use rustc_hash::FxBuildHasher;
-use socket2::{Domain, Protocol, Socket, Type, SockRef, TcpKeepalive};
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HOST};
-use reqwest::Client as DohHttpClient;
-use rustls::{ClientConfig, RootCertStore};
-use rustls::pki_types::ServerName;
 use quinn::crypto::rustls::QuicClientConfig;
-use tokio_rustls::TlsConnector;
-use webpki_roots::TLS_SERVER_ROOTS;
-use url::Url;
-use quinn::{Endpoint as QuicEndpoint, Connection as QuicConnection, TransportConfig as QuicTransportConfig};
+use quinn::{
+    Connection as QuicConnection, Endpoint as QuicEndpoint, TransportConfig as QuicTransportConfig,
+};
+use reqwest::Client as DohHttpClient;
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HOST};
+use rustc_hash::FxBuildHasher;
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, RootCertStore};
+use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, tcp::{OwnedReadHalf, OwnedWriteHalf}};
+use tokio::net::{
+    TcpStream,
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
+};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::timeout;
+use tokio_rustls::TlsConnector;
 use tracing::{debug, info, warn};
+use url::Url;
+use webpki_roots::TLS_SERVER_ROOTS;
 
-use super::concurrency::{PermitManager, PermitGuard};
+use super::concurrency::{PermitGuard, PermitManager};
 
 /// Type alias for UDP inflight request tracking
 /// ID -> (OriginalID, ExpectedAddr, Sender)
-type UdpInflightMap = DashMap<u16, (u16, SocketAddr, oneshot::Sender<anyhow::Result<Bytes>>), FxBuildHasher>;
+type UdpInflightMap =
+    DashMap<u16, (u16, SocketAddr, oneshot::Sender<anyhow::Result<Bytes>>), FxBuildHasher>;
 
 /// RAII Guard to ensure inflight entries are removed even on cancellation/panic
 /// RAII Guard 确保即使在取消或 panic 时也能移除 inflight 条目
@@ -62,7 +68,8 @@ impl UdpClient {
         let mut pool = Vec::with_capacity(effective_size);
         for idx in 0..effective_size {
             // Use socket2 to set buffer sizes
-            let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("create socket");
+            let socket =
+                Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("create socket");
             // Set buffer sizes to 4MB to prevent packet loss under load
             if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
                 warn!("failed to set udp recv buffer size: {}", e);
@@ -70,9 +77,16 @@ impl UdpClient {
             if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
                 warn!("failed to set udp send buffer size: {}", e);
             }
-            socket.bind(&"0.0.0.0:0".parse::<SocketAddr>().expect("parse ephemeral address").into()).expect("bind");
+            socket
+                .bind(
+                    &"0.0.0.0:0"
+                        .parse::<SocketAddr>()
+                        .expect("parse ephemeral address")
+                        .into(),
+                )
+                .expect("bind");
             socket.set_nonblocking(true).expect("set nonblocking");
-            
+
             let std_sock: std::net::UdpSocket = socket.into();
             let socket = Arc::new(tokio::net::UdpSocket::from_std(std_sock).expect("from_std"));
             let inflight = Arc::new(DashMap::with_hasher(FxBuildHasher));
@@ -93,7 +107,7 @@ impl UdpClient {
                     // Reset buffer: keep capacity but length=0
                     // 重置缓冲区：保留容量但长度设为 0
                     buf.clear();
-                    
+
                     // Use recv_buf_from to write directly into uninitialized memory part of BytesMut
                     // avoid zero-filling overhead from resize()
                     // 使用 recv_buf_from 直接写入 BytesMut 的未初始化内存部分，避免 resize() 的置零开销
@@ -204,8 +218,14 @@ impl UdpClient {
                 entry::Entry::Occupied(_) => {
                     attempts += 1;
                     if attempts > 100 {
-                        warn!("udp pool exhausted: socket_idx={} inflight_count={}", idx, state.inflight.len());
-                        return Err(anyhow::anyhow!("udp pool exhausted (too many inflight requests)"));
+                        warn!(
+                            "udp pool exhausted: socket_idx={} inflight_count={}",
+                            idx,
+                            state.inflight.len()
+                        );
+                        return Err(anyhow::anyhow!(
+                            "udp pool exhausted (too many inflight requests)"
+                        ));
                     }
                 }
             }
@@ -237,9 +257,7 @@ impl UdpClient {
                 // Channel closed by receiver (should not happen normally unless logic error or panic)
                 Err(anyhow::anyhow!("channel closed"))
             }
-            Err(_) => {
-                Err(anyhow::anyhow!("upstream timeout"))
-            }
+            Err(_) => Err(anyhow::anyhow!("upstream timeout")),
         }
     }
 }
@@ -338,7 +356,11 @@ impl TcpMultiplexer {
             .entry(upstream_key.clone())
             .or_insert_with(|| {
                 let mut clients = Vec::with_capacity(self.pool_size);
-                let size = if self.pool_size == 0 { 1 } else { self.pool_size };
+                let size = if self.pool_size == 0 {
+                    1
+                } else {
+                    self.pool_size
+                };
                 // Create per-upstream permit manager to avoid global TCP limit
                 let permit_mgr = Arc::new(PermitManager::new(size));
                 for _ in 0..size {
@@ -374,7 +396,11 @@ impl TcpMultiplexer {
             .entry(upstream_key.clone())
             .or_insert_with(|| {
                 let mut clients = Vec::with_capacity(self.pool_size);
-                let size = if self.pool_size == 0 { 1 } else { self.pool_size };
+                let size = if self.pool_size == 0 {
+                    1
+                } else {
+                    self.pool_size
+                };
                 // Create per-upstream permit manager to avoid global TCP limit
                 // 为每个 upstream 创建独立的 permit manager，避免全局 TCP 限制
                 let permit_mgr = Arc::new(PermitManager::new(size));
@@ -511,27 +537,40 @@ impl TcpMuxClient {
             consecutive_errors: AtomicUsize::new(0),
             health_threshold: AtomicUsize::new(3),
             conn_create_time: AtomicU64::new(0),
-            max_age_ms: AtomicU64::new(300_000),  // 5 分钟
+            max_age_ms: AtomicU64::new(300_000), // 5 分钟
             last_request_time: AtomicU64::new(0),
-            idle_timeout_ms: AtomicU64::new(60_000),  // 1 分钟
+            idle_timeout_ms: AtomicU64::new(60_000), // 1 分钟
             last_health_check_time: AtomicU64::new(0),
         }
     }
 
     /// 设置健康检查参数
     /// Set health check parameters
-    fn set_health_check_config(&self, error_threshold: usize, max_age_secs: u64, idle_timeout_secs: u64) {
-        self.health_threshold.store(error_threshold, Ordering::Release);
-        self.max_age_ms.store(max_age_secs * 1000, Ordering::Release);
-        self.idle_timeout_ms.store(idle_timeout_secs * 1000, Ordering::Release);
+    fn set_health_check_config(
+        &self,
+        error_threshold: usize,
+        max_age_secs: u64,
+        idle_timeout_secs: u64,
+    ) {
+        self.health_threshold
+            .store(error_threshold, Ordering::Release);
+        self.max_age_ms
+            .store(max_age_secs * 1000, Ordering::Release);
+        self.idle_timeout_ms
+            .store(idle_timeout_secs * 1000, Ordering::Release);
     }
 
-    async fn spawn_reader(&self, mut reader: OwnedReadHalf, my_generation: u64, global_generation: Arc<AtomicU64>) {
+    async fn spawn_reader(
+        &self,
+        mut reader: OwnedReadHalf,
+        my_generation: u64,
+        global_generation: Arc<AtomicU64>,
+    ) {
         let pending = Arc::clone(&self.pending);
         let upstream = self.upstream.clone();
         let conn = Arc::clone(&self.conn);
-        let conn_permit = Arc::clone(&self.conn_permit);  // Clone conn_permit
-        
+        let conn_permit = Arc::clone(&self.conn_permit); // Clone conn_permit
+
         tokio::spawn(async move {
             // Pre-allocate a reusable buffer for TCP reads
             // DNS TCP max is 65535 bytes, but typical responses are much smaller
@@ -547,7 +586,7 @@ impl TcpMuxClient {
                 // Ensure buffer has enough space for length prefix
                 // 确保缓冲区有足够空间读取长度前缀
                 if reusable_buf.capacity() < 2 {
-                     reusable_buf.reserve(4096);
+                    reusable_buf.reserve(4096);
                 }
 
                 let mut len_buf = [0u8; 2];
@@ -555,7 +594,13 @@ impl TcpMuxClient {
                     // Check generation again before resetting anything
                     if global_generation.load(Ordering::Relaxed) == my_generation {
                         debug!(target = "tcp_mux", upstream = %upstream, error = %err, "tcp read len failed");
-                        Self::fail_all_async(&pending, anyhow::anyhow!("tcp read len failed"), &conn, &conn_permit).await;
+                        Self::fail_all_async(
+                            &pending,
+                            anyhow::anyhow!("tcp read len failed"),
+                            &conn,
+                            &conn_permit,
+                        )
+                        .await;
                     } else {
                         debug!(target = "tcp_mux", upstream = %upstream, gen = my_generation, "TCP reader failed but generation changed, ignoring");
                     }
@@ -574,7 +619,13 @@ impl TcpMuxClient {
                     // Check generation again
                     if global_generation.load(Ordering::Relaxed) == my_generation {
                         debug!(target = "tcp_mux", upstream = %upstream, error = %err, "tcp read body failed");
-                        Self::fail_all_async(&pending, anyhow::anyhow!("tcp read body failed"), &conn, &conn_permit).await;
+                        Self::fail_all_async(
+                            &pending,
+                            anyhow::anyhow!("tcp read body failed"),
+                            &conn,
+                            &conn_permit,
+                        )
+                        .await;
                     }
                     break;
                 }
@@ -616,7 +667,6 @@ impl TcpMuxClient {
         });
     }
 
-
     // ========== Health check methods / 健康检查方法 ==========
 
     /// Record error and check if connection reset is needed
@@ -649,9 +699,9 @@ impl TcpMuxClient {
             // Clear error counter to avoid immediate re-triggering on next error
             // 清零错误计数器，避免下次错误时立即重新触发
             self.consecutive_errors.store(0, Ordering::Release);
-            true  // Connection was reset / 连接已重置
+            true // Connection was reset / 连接已重置
         } else {
-            false  // Connection was not reset / 连接未重置
+            false // Connection was not reset / 连接未重置
         }
     }
 
@@ -729,8 +779,8 @@ impl TcpMuxClient {
         // Check if we are reusing an existing connection (for potential retry strategy)
         // 检查我们是否在重用现有连接（用于潜在的重试策略）
         let is_reused = {
-             let guard = self.conn.lock().await;
-             guard.is_some()
+            let guard = self.conn.lock().await;
+            guard.is_some()
         };
 
         match self.send_attempt(packet, timeout_dur).await {
@@ -777,7 +827,7 @@ impl TcpMuxClient {
 
         // 性能优化：仅在距离上次检查超过 30 秒时才执行健康检查
         // Performance: Only check connection health if 30 seconds have passed since last check
-        const HEALTH_CHECK_INTERVAL_MS: u64 = 30_000;  // 30 秒
+        const HEALTH_CHECK_INTERVAL_MS: u64 = 30_000; // 30 秒
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("SystemTime should be after UNIX_EPOCH")
@@ -801,17 +851,19 @@ impl TcpMuxClient {
 
         let elapsed = start.elapsed();
         if elapsed >= timeout_dur {
-             anyhow::bail!("tcp timeout before processing");
+            anyhow::bail!("tcp timeout before processing");
         }
         let remaining = timeout_dur - elapsed;
 
         let original_id = u16::from_be_bytes([packet[0], packet[1]]);
-        
+
         // 生成通道
         let (tx, rx) = oneshot::channel();
-        
+
         // 原子操作：分配 ID 并注册到 pending map，避免竞态条件
-        let (new_packet, new_id) = self.register_pending(packet, original_id, tx, is_reused).await?;
+        let (new_packet, new_id) = self
+            .register_pending(packet, original_id, tx, is_reused)
+            .await?;
 
         // RAII Guard: ensures entry is removed from map when guard is dropped
         // RAII Guard：确保在 guard 丢弃时（超时、取消、提前返回）移除条目
@@ -836,24 +888,25 @@ impl TcpMuxClient {
             // 连接必须存在（ensure_connection 已在之前调用）
             // Pre-flight check: if writer is closed or broken, fail fast
             let writer = guard.as_mut().context("tcp write half missing")?;
-            
+
             // Note: OwnedWriteHalf doesn't support peek/checking error directly easily without shared socket access.
             // But if the previous read failed, guard should be None (reset).
             // The fact we are here means 'guard' is Some, so we think connection is alive.
             // Writing to a closed socket usually triggers error immediately on Linux/BSD.
-            
+
             if let Err(e) = writer.write_all(&out).await {
-                 return Err(anyhow::anyhow!(e).context("tcp write failed"));
+                return Err(anyhow::anyhow!(e).context("tcp write failed"));
             }
             Ok::<(), anyhow::Error>(())
-        }).await;
+        })
+        .await;
 
         match write_res {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 // Guard will remove pending entry automatically
                 // Guard 会自动移除 pending 条目
-                
+
                 // Record error and FORCE RESET on write failure (socket likely dead)
                 // 记录错误并在写入失败时强制重置（socket 可能已死）
                 self.record_error().await;
@@ -867,13 +920,13 @@ impl TcpMuxClient {
             }
             Err(_) => {
                 // Guard will remove pending entry automatically
-                
+
                 // Record error and FORCE RESET on write timeout
                 // 记录错误并在写入超时时强制重置
                 self.record_error().await;
                 Self::reset_conn(&self.conn, &self.conn_permit).await;
                 self.consecutive_errors.store(0, Ordering::Release);
-                
+
                 return Err(anyhow::anyhow!(
                     "TCP write/connect timeout for upstream {upstream} (timeout: {timeout_ms}ms)",
                     upstream = self.upstream,
@@ -887,7 +940,7 @@ impl TcpMuxClient {
         let elapsed_after_write = start.elapsed();
         if elapsed_after_write >= timeout_dur {
             // Guard will remove pending entry automatically
-            
+
             // Record error and FORCE RESET on prereq timeout
             // 记录错误并在超时时强制重置
             self.record_error().await;
@@ -912,7 +965,7 @@ impl TcpMuxClient {
             }
             Ok(Err(_canceled)) => {
                 // Guard will remove pending entry automatically
-                
+
                 // Record error but DO NOT reset - Mux handles ignored responses
                 // 记录错误但不重置 - Mux 会处理被忽略的响应
                 self.record_error().await;
@@ -923,13 +976,13 @@ impl TcpMuxClient {
             }
             Err(_elapsed) => {
                 // Guard will remove pending entry automatically
-                
+
                 // Record error and FORCE RESET on response timeout (connection likely dead/stalled)
                 // 记录错误并在响应超时时强制重置（连接可能死锁/停滞）
                 self.record_error().await;
                 Self::reset_conn(&self.conn, &self.conn_permit).await;
                 self.consecutive_errors.store(0, Ordering::Release);
-                
+
                 return Err(anyhow::anyhow!(
                     "TCP response timeout from upstream {upstream} (remaining: {timeout_ms}ms)",
                     upstream = self.upstream,
@@ -974,12 +1027,15 @@ impl TcpMuxClient {
         if guard.is_none() {
             // Acquire connection-level permit (non-blocking)
             // 获取连接级别 permit（非阻塞）
-            let permit = self.permit_manager.try_acquire()
+            let permit = self
+                .permit_manager
+                .try_acquire()
                 .ok_or_else(|| anyhow::anyhow!("tcp connection limit exceeded"))?;
 
             // Establish TCP connection
             // 建立 TCP 连接
-            let stream = TcpStream::connect(&*self.upstream).await
+            let stream = TcpStream::connect(&*self.upstream)
+                .await
                 .map_err(|e| anyhow::anyhow!("tcp connect failed: {}", e))?;
 
             // Configure socket options for robustness
@@ -994,7 +1050,7 @@ impl TcpMuxClient {
 
             // Explicitly enable SO_KEEPALIVE (Essential for Windows/Linux)
             if let Err(e) = sock.set_keepalive(true) {
-                 warn!(upstream = %self.upstream, error = %e, "Failed to enable SO_KEEPALIVE");
+                warn!(upstream = %self.upstream, error = %e, "Failed to enable SO_KEEPALIVE");
             }
             if let Err(e) = sock.set_tcp_keepalive(&ka) {
                 warn!(upstream = %self.upstream, error = %e, "Failed to set TCP keepalive params");
@@ -1003,14 +1059,15 @@ impl TcpMuxClient {
             let (read_half, write_half) = stream.into_split();
 
             *guard = Some(write_half);
-            
+
             // Increment generation for new connection
             // 为新连接增加代数
             let new_gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
 
             // Spawn reader while holding the lock to prevent races
             // 持有锁时启动 reader 以防止竞争
-            self.spawn_reader(read_half, new_gen, self.generation.clone()).await;
+            self.spawn_reader(read_half, new_gen, self.generation.clone())
+                .await;
 
             // Store permit in connection (held for connection lifetime)
             // 将 permit 保存在连接中（连接生命周期内持有）
@@ -1042,46 +1099,46 @@ impl TcpMuxClient {
     /// Rewrite DNS transaction ID and register in pending map atomically, returning BytesMut for efficient further operations
     /// 原子操作：重写 DNS 事务 ID 并注册到 pending map，返回 BytesMut 以进行高效的后续操作
     async fn register_pending(
-        &self, 
-        packet: &[u8], 
-        original_id: u16, 
+        &self,
+        packet: &[u8],
+        original_id: u16,
         tx: oneshot::Sender<anyhow::Result<Bytes>>,
-        is_reused: bool
+        is_reused: bool,
     ) -> anyhow::Result<(BytesMut, u16)> {
         // Critical Check: If we are reusing a connection, we MUST verify the connection is still considered "alive"
         // before registering. If conn is None, it means Reader has already reset it, so we shouldn't register.
         // 关键检查：如果我们正在复用连接，必须在注册前验证连接是否仍然被认为是“活着”的。
         // 如果 conn 为 None，说明 Reader 已经重置了它，我们不应该注册。
         if is_reused {
-             let guard = self.conn.lock().await;
-             if guard.is_none() {
-                 anyhow::bail!("connection closed before registration");
-             }
-             // Optional: Check if generation is still valid?
-             // Since we hold the lock, Reader reset_conn needs the lock too.
-             // So if we hold the lock and it is Some, Reader hasn't reset it yet.
-             // But Reader might be stuck in fail_all_async waiting for lock?
-             // If Reader is waiting for lock to reset, it means it already encountered error.
-             // But Reader clears pending map BEFORE resetting conn.
-             // Race:
-             // 1. Reader gets error.
-             // 2. Reader calls fail_all_async.
-             // 3. Sender calls register_pending (here).
-             // 4. Sender inserts into pending.
-             // 5. Reader removes keys from pending (might miss the new one if iterator is already created?).
-             // dashmap is concurrent, but iterator consistency varies.
-             //
-             // Safer Logic: 
-             // We need to know if Reader is dead.
-             // But we can rely on `is_reused` check in `send` loop.
-             // If we fail here, `send` loop catches it and retries with fresh conn.
+            let guard = self.conn.lock().await;
+            if guard.is_none() {
+                anyhow::bail!("connection closed before registration");
+            }
+            // Optional: Check if generation is still valid?
+            // Since we hold the lock, Reader reset_conn needs the lock too.
+            // So if we hold the lock and it is Some, Reader hasn't reset it yet.
+            // But Reader might be stuck in fail_all_async waiting for lock?
+            // If Reader is waiting for lock to reset, it means it already encountered error.
+            // But Reader clears pending map BEFORE resetting conn.
+            // Race:
+            // 1. Reader gets error.
+            // 2. Reader calls fail_all_async.
+            // 3. Sender calls register_pending (here).
+            // 4. Sender inserts into pending.
+            // 5. Reader removes keys from pending (might miss the new one if iterator is already created?).
+            // dashmap is concurrent, but iterator consistency varies.
+            //
+            // Safer Logic:
+            // We need to know if Reader is dead.
+            // But we can rely on `is_reused` check in `send` loop.
+            // If we fail here, `send` loop catches it and retries with fresh conn.
         }
 
         let mut tries = 0;
         let new_id = loop {
             let cand = self.next_id.fetch_add(1, Ordering::Relaxed);
             tries += 1;
-            
+
             // Use Entry API to check vacancy and insert atomically
             // 使用 Entry API 检查空位并原子插入
             if let entry::Entry::Vacant(e) = self.pending.entry(cand) {
@@ -1156,7 +1213,8 @@ impl DohClient {
     ) -> anyhow::Result<Bytes> {
         let (url, host_override) = build_doh_url(upstream)?;
 
-        let mut req = self.client
+        let mut req = self
+            .client
             .post(url)
             .header(ACCEPT, "application/dns-message")
             .header(CONTENT_TYPE, "application/dns-message")
@@ -1179,8 +1237,9 @@ impl DohClient {
             }
 
             resp.bytes().await.context("read doh response body")
-        }).await
-            .context("doh request timeout")??;
+        })
+        .await
+        .context("doh request timeout")??;
 
         Ok(Bytes::from(bytes))
     }
@@ -1301,7 +1360,11 @@ impl DotMultiplexer {
             .entry(upstream_key.clone())
             .or_insert_with(|| {
                 let mut clients = Vec::with_capacity(self.pool_size.max(1));
-                let size = if self.pool_size == 0 { 1 } else { self.pool_size };
+                let size = if self.pool_size == 0 {
+                    1
+                } else {
+                    self.pool_size
+                };
                 let permit_mgr = Arc::new(PermitManager::new(size));
                 for _ in 0..size {
                     let client = Arc::new(DotMuxClient::new(
@@ -1329,7 +1392,11 @@ impl DotMultiplexer {
 }
 
 impl DotMuxClient {
-    fn new(upstream: Arc<str>, tls_config: Arc<ClientConfig>, permit_manager: Arc<PermitManager>) -> Self {
+    fn new(
+        upstream: Arc<str>,
+        tls_config: Arc<ClientConfig>,
+        permit_manager: Arc<PermitManager>,
+    ) -> Self {
         Self {
             upstream,
             target: Mutex::new(None),
@@ -1350,13 +1417,26 @@ impl DotMuxClient {
         }
     }
 
-    fn set_health_check_config(&self, error_threshold: usize, max_age_secs: u64, idle_timeout_secs: u64) {
-        self.health_threshold.store(error_threshold, Ordering::Release);
-        self.max_age_ms.store(max_age_secs * 1000, Ordering::Release);
-        self.idle_timeout_ms.store(idle_timeout_secs * 1000, Ordering::Release);
+    fn set_health_check_config(
+        &self,
+        error_threshold: usize,
+        max_age_secs: u64,
+        idle_timeout_secs: u64,
+    ) {
+        self.health_threshold
+            .store(error_threshold, Ordering::Release);
+        self.max_age_ms
+            .store(max_age_secs * 1000, Ordering::Release);
+        self.idle_timeout_ms
+            .store(idle_timeout_secs * 1000, Ordering::Release);
     }
 
-    async fn spawn_reader(&self, mut reader: DotReadHalf, my_generation: u64, global_generation: Arc<AtomicU64>) {
+    async fn spawn_reader(
+        &self,
+        mut reader: DotReadHalf,
+        my_generation: u64,
+        global_generation: Arc<AtomicU64>,
+    ) {
         let pending = Arc::clone(&self.pending);
         let upstream = self.upstream.clone();
         let conn = Arc::clone(&self.conn);
@@ -1374,7 +1454,13 @@ impl DotMuxClient {
                 if let Err(err) = reader.read_exact(&mut len_buf).await {
                     if global_generation.load(Ordering::Relaxed) == my_generation {
                         debug!(target = "dot_mux", upstream = %upstream, error = %err, "dot read len failed");
-                        Self::fail_all_async(&pending, anyhow::anyhow!("dot read len failed"), &conn, &conn_permit).await;
+                        Self::fail_all_async(
+                            &pending,
+                            anyhow::anyhow!("dot read len failed"),
+                            &conn,
+                            &conn_permit,
+                        )
+                        .await;
                     }
                     break;
                 }
@@ -1387,7 +1473,13 @@ impl DotMuxClient {
                 if let Err(err) = reader.read_exact(&mut reusable_buf[..resp_len]).await {
                     if global_generation.load(Ordering::Relaxed) == my_generation {
                         debug!(target = "dot_mux", upstream = %upstream, error = %err, "dot read body failed");
-                        Self::fail_all_async(&pending, anyhow::anyhow!("dot read body failed"), &conn, &conn_permit).await;
+                        Self::fail_all_async(
+                            &pending,
+                            anyhow::anyhow!("dot read body failed"),
+                            &conn,
+                            &conn_permit,
+                        )
+                        .await;
                     }
                     break;
                 }
@@ -1555,7 +1647,9 @@ impl DotMuxClient {
 
         let original_id = u16::from_be_bytes([packet[0], packet[1]]);
         let (tx, rx) = oneshot::channel();
-        let (new_packet, new_id) = self.register_pending(packet, original_id, tx, is_reused).await?;
+        let (new_packet, new_id) = self
+            .register_pending(packet, original_id, tx, is_reused)
+            .await?;
 
         let _guard = TcpPendingGuard {
             pending: self.pending.clone(),
@@ -1573,7 +1667,8 @@ impl DotMuxClient {
                 return Err(anyhow::anyhow!(e).context("dot write failed"));
             }
             Ok::<(), anyhow::Error>(())
-        }).await;
+        })
+        .await;
 
         match write_res {
             Ok(Ok(())) => {}
@@ -1657,7 +1752,9 @@ impl DotMuxClient {
 
         let mut guard = self.conn.lock().await;
         if guard.is_none() {
-            let permit = self.permit_manager.try_acquire()
+            let permit = self
+                .permit_manager
+                .try_acquire()
                 .ok_or_else(|| anyhow::anyhow!("dot connection limit exceeded"))?;
 
             let target = {
@@ -1665,10 +1762,14 @@ impl DotMuxClient {
                 if guard.is_none() {
                     *guard = Some(parse_dot_target(&self.upstream)?);
                 }
-                guard.as_ref().expect("dot target must be initialized").clone()
+                guard
+                    .as_ref()
+                    .expect("dot target must be initialized")
+                    .clone()
             };
 
-            let stream = TcpStream::connect(&*target.connect_addr).await
+            let stream = TcpStream::connect(&*target.connect_addr)
+                .await
                 .map_err(|e| anyhow::anyhow!("dot connect failed: {}", e))?;
 
             let _ = stream.set_nodelay(true);
@@ -1681,14 +1782,17 @@ impl DotMuxClient {
 
             let tls_connector = TlsConnector::from(self.tls_config.clone());
             let server_name = build_server_name(&target.sni)?;
-            let tls_stream = tls_connector.connect(server_name, stream).await
+            let tls_stream = tls_connector
+                .connect(server_name, stream)
+                .await
                 .context("dot tls handshake failed")?;
 
             let (read_half, write_half) = tokio::io::split(tls_stream);
             *guard = Some(write_half);
 
             let new_gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-            self.spawn_reader(read_half, new_gen, self.generation.clone()).await;
+            self.spawn_reader(read_half, new_gen, self.generation.clone())
+                .await;
 
             let mut conn_permit_guard = self.conn_permit.lock().await;
             *conn_permit_guard = Some(permit);
@@ -1780,8 +1884,7 @@ fn build_server_name(name: &str) -> anyhow::Result<ServerName<'static>> {
         let ip = rustls::pki_types::IpAddr::from(ip);
         Ok(ServerName::IpAddress(ip))
     } else {
-        ServerName::try_from(name.to_string())
-            .context("invalid tls server name")
+        ServerName::try_from(name.to_string()).context("invalid tls server name")
     }
 }
 
@@ -1887,7 +1990,6 @@ pub struct DoqMuxClient {
     idle_timeout_ms: AtomicU64,
     /// 性能优化：上次健康检查时间（毫秒）/ Performance: last health check time (ms)
     last_health_check_time: AtomicU64,
-
 }
 
 impl DoqClient {
@@ -1920,25 +2022,25 @@ impl DoqClient {
             );
         }
 
-        let quic_crypto = QuicClientConfig::try_from(tls)
-            .context("build quic client config")?;
+        let quic_crypto = QuicClientConfig::try_from(tls).context("build quic client config")?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
 
         let mut transport_config = QuicTransportConfig::default();
-        
+
         // Set initial RTT to 100ms (idoq best practice)
         // This helps QUIC estimate initial round-trip time for better congestion control
         // 设置初始 RTT 为 100ms（idoq 最佳实践）
         // 这有助于 QUIC 估算初始往返时间，以实现更好的拥塞控制
         transport_config.initial_rtt(Duration::from_millis(100));
-        
+
         // Set max concurrent streams (idoq best practice)
         // 设置最大并发流数（idoq 最佳实践）
         transport_config.max_concurrent_bidi_streams(100u32.into());
         transport_config.max_concurrent_uni_streams(100u32.into());
-        
+
         if keepalive_interval_ms > 0 {
-            transport_config.keep_alive_interval(Some(Duration::from_millis(keepalive_interval_ms)));
+            transport_config
+                .keep_alive_interval(Some(Duration::from_millis(keepalive_interval_ms)));
         }
         if idle_timeout_secs > 0 {
             let idle_timeout = Duration::from_secs(idle_timeout_secs)
@@ -2108,24 +2210,24 @@ impl DoqMuxClient {
         false
     }
 
-    pub async fn send(
-        &self,
-        packet: &[u8],
-        timeout_dur: Duration,
-    ) -> anyhow::Result<Bytes> {
+    pub async fn send(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes> {
         let target = {
             let mut guard = self.target.lock().await;
             if guard.is_none() {
                 *guard = Some(parse_doq_target(&self.upstream)?);
             }
-            guard.as_ref().expect("doq target must be initialized").clone()
+            guard
+                .as_ref()
+                .expect("doq target must be initialized")
+                .clone()
         };
 
         if target.host.is_empty() {
             anyhow::bail!("invalid doq upstream: {}", self.upstream);
         }
 
-        self.send_with_retry(&target, packet, timeout_dur, true).await
+        self.send_with_retry(&target, packet, timeout_dur, true)
+            .await
     }
 
     async fn send_with_retry(
@@ -2208,7 +2310,7 @@ impl DoqMuxClient {
                 }
 
                 let msg_len = u16::from_be_bytes([all_data[0], all_data[1]]) as usize;
-                
+
                 // idoq-style length validation: response length must match length prefix
                 // idoq 风格的长度验证：响应长度必须匹配长度前缀
                 if all_data.len() != 2 + msg_len {
@@ -2240,7 +2342,8 @@ impl DoqMuxClient {
                         // Only reset if record_error() didn't already reset (below threshold)
                         self.reset_connection().await;
                     }
-                    if allow_retry && used_0rtt && self.should_retry_without_0rtt(target, &err_str) {
+                    if allow_retry && used_0rtt && self.should_retry_without_0rtt(target, &err_str)
+                    {
                         self.disable_zero_rtt();
                         let remaining = timeout_dur.saturating_sub(start.elapsed());
                         if remaining.is_zero() {
@@ -2277,11 +2380,14 @@ impl DoqMuxClient {
 
                     // Timeout occurred - check if this was a 0-RTT connection
                     // 超时发生 - 检查是否是 0-RTT 连接
-                    let was_rejected = self.zero_rtt_rejected.load(std::sync::atomic::Ordering::Relaxed);
+                    let was_rejected = self
+                        .zero_rtt_rejected
+                        .load(std::sync::atomic::Ordering::Relaxed);
                     if !was_rejected {
                         // Mark 0-RTT as rejected for this upstream (cached until restart)
                         // 标记此上游的 0-RTT 为被拒绝（缓存直到重启）
-                        self.zero_rtt_rejected.store(true, std::sync::atomic::Ordering::Relaxed);
+                        self.zero_rtt_rejected
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
                         warn!(
                             upstream = %self.upstream,
                             "DoQ 0-RTT timeout detected, automatically disabling 0-RTT for this upstream. \
@@ -2304,7 +2410,10 @@ impl DoqMuxClient {
         if !enable_0rtt {
             return false;
         }
-        if self.zero_rtt_rejected.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .zero_rtt_rejected
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return false;
         }
         err.contains("doq connection closed by server")
@@ -2316,9 +2425,12 @@ impl DoqMuxClient {
     }
 
     fn disable_zero_rtt(&self) {
-        let was_rejected = self.zero_rtt_rejected.load(std::sync::atomic::Ordering::Relaxed);
+        let was_rejected = self
+            .zero_rtt_rejected
+            .load(std::sync::atomic::Ordering::Relaxed);
         if !was_rejected {
-            self.zero_rtt_rejected.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.zero_rtt_rejected
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             warn!(
                 upstream = %self.upstream,
                 "DoQ 0-RTT rejected or unstable, disabling 0-RTT for this upstream until restart"
@@ -2358,9 +2470,14 @@ impl DoqMuxClient {
         Ok(DoqConnectionInfo { conn, used_0rtt })
     }
 
-    async fn connect_new(&self, target: &DoqTarget, timeout_dur: Duration) -> anyhow::Result<(QuicConnection, bool)> {
+    async fn connect_new(
+        &self,
+        target: &DoqTarget,
+        timeout_dur: Duration,
+    ) -> anyhow::Result<(QuicConnection, bool)> {
         let addr_str = format!("{}:{}", target.host, target.port);
-        let addrs = tokio::net::lookup_host(&addr_str).await
+        let addrs = tokio::net::lookup_host(&addr_str)
+            .await
             .context("doq resolve failed")?;
 
         // 优先使用 IPv4 地址，避免 IPv6 连接问题
@@ -2376,8 +2493,13 @@ impl DoqMuxClient {
 
         let addr = *addr;
 
-        let endpoint = if addr.is_ipv6() { &self.runtime.endpoint_v6 } else { &self.runtime.endpoint_v4 };
-        let connecting = endpoint.connect(addr, target.sni.as_ref())
+        let endpoint = if addr.is_ipv6() {
+            &self.runtime.endpoint_v6
+        } else {
+            &self.runtime.endpoint_v4
+        };
+        let connecting = endpoint
+            .connect(addr, target.sni.as_ref())
             .context("doq connect failed")?;
 
         // Determine whether to enable 0-RTT for this specific upstream
@@ -2388,7 +2510,9 @@ impl DoqMuxClient {
 
         // Auto-fallback: if 0-RTT was previously rejected, skip it for this connection
         // 自动回退：如果 0-RTT 之前被拒绝，跳过本次连接的 0-RTT
-        let was_rejected = self.zero_rtt_rejected.load(std::sync::atomic::Ordering::Relaxed);
+        let was_rejected = self
+            .zero_rtt_rejected
+            .load(std::sync::atomic::Ordering::Relaxed);
         let should_try_0rtt = enable_0rtt && !was_rejected;
 
         if should_try_0rtt {
@@ -2409,14 +2533,16 @@ impl DoqMuxClient {
                 Err(connecting) => {
                     // 0-RTT not available (no previous session), fall back to normal connect
                     // 0-RTT 不可用（无先前会话），回退到正常连接
-                    let connection = timeout(timeout_dur, connecting).await
+                    let connection = timeout(timeout_dur, connecting)
+                        .await
                         .context("doq connect timeout")??;
                     return Ok((connection, false));
                 }
             }
         }
 
-        let connection = timeout(timeout_dur, connecting).await
+        let connection = timeout(timeout_dur, connecting)
+            .await
             .context("doq connect timeout")??;
 
         Ok((connection, false))
@@ -2509,9 +2635,9 @@ fn parse_doq_target(upstream: &str) -> anyhow::Result<DoqTarget> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::future::join_all;
     use std::time::Duration;
     use tokio::time::timeout;
-    use futures::future::join_all;
 
     #[test]
     fn doq_query_message_id_must_be_zero() {
@@ -2562,7 +2688,10 @@ mod tests {
                 async move {
                     let dummy = vec![0u8; 4];
                     let (tx, _) = oneshot::channel();
-                    client.register_pending(&dummy, 0, tx, false).await.map(|(_, id)| id)
+                    client
+                        .register_pending(&dummy, 0, tx, false)
+                        .await
+                        .map(|(_, id)| id)
                 }
             })
             .collect::<Vec<_>>();
@@ -2605,7 +2734,15 @@ mod tests {
             !Arc::ptr_eq(&permit_a, &permit_b),
             "Different upstreams should have distinct permit managers"
         );
-        assert_eq!(permit_a.max_permits(), 2, "Permit manager should match pool size for upstream A");
-        assert_eq!(permit_b.max_permits(), 2, "Permit manager should match pool size for upstream B");
+        assert_eq!(
+            permit_a.max_permits(),
+            2,
+            "Permit manager should match pool size for upstream A"
+        );
+        assert_eq!(
+            permit_b.max_permits(),
+            2,
+            "Permit manager should match pool size for upstream B"
+        );
     }
 }

@@ -10,7 +10,7 @@ use serde::Deserialize;
 // Re-export from geoip_converter module
 // Note: geoip_converter is a sibling module at the crate root level
 pub use crate::lock::RwLock;
-pub use crate::matcher::geoip_converter::{convert_dat_to_mmdb, ConversionStats};
+pub use crate::matcher::geoip_converter::{ConversionStats, convert_dat_to_mmdb};
 
 /// MaxMind GeoLite2-Country 数据库结构 / MaxMind GeoLite2-Country database structure
 #[derive(Deserialize)]
@@ -650,10 +650,7 @@ pub fn is_private_ip(ip: IpAddr) -> bool {
 /// Note: Watches the parent directory instead of the file itself to support
 /// atomic replacement (mv). Linux inotify watches inodes; atomic replacement
 /// creates a new inode that would be missed when watching the file directly.
-pub fn spawn_geoip_watcher(
-    dat_path: Option<PathBuf>,
-    manager: Arc<RwLock<GeoIpManager>>,
-) {
+pub fn spawn_geoip_watcher(dat_path: Option<PathBuf>, manager: Arc<RwLock<GeoIpManager>>) {
     let path = match dat_path {
         Some(p) => p,
         None => return,
@@ -669,16 +666,15 @@ pub fn spawn_geoip_watcher(
 }
 
 /// 运行 GeoIP watcher / Run GeoIP watcher
-fn run_geoip_watcher(
-    path: PathBuf,
-    manager: Arc<RwLock<GeoIpManager>>,
-) -> notify::Result<()> {
+fn run_geoip_watcher(path: PathBuf, manager: Arc<RwLock<GeoIpManager>>) -> notify::Result<()> {
     // Watch the parent directory instead of the file itself,
     // so that atomic replacement (mv newfile geoip.dat) is properly detected.
-    let parent_dir = path.parent()
+    let parent_dir = path
+        .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf();
-    let target_file_name = path.file_name()
+    let target_file_name = path
+        .file_name()
         .map(|s| s.to_os_string())
         .unwrap_or_default();
 
@@ -695,9 +691,10 @@ fn run_geoip_watcher(
         match res {
             Ok(event) => {
                 // Check if the event is for the file we care about
-                let is_target_file = event.paths.iter().any(|p| {
-                    p.file_name() == Some(&target_file_name)
-                });
+                let is_target_file = event
+                    .paths
+                    .iter()
+                    .any(|p| p.file_name() == Some(&target_file_name));
                 if !is_target_file {
                     continue;
                 }

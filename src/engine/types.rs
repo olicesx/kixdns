@@ -1,13 +1,14 @@
-use std::time::Instant;
-use std::sync::Arc;
+use crate::matcher::RuntimePipelineConfig;
+use crate::matcher::advanced_rule::CompiledPipeline;
 use bytes::Bytes;
 use dashmap::DashMap;
 use rustc_hash::FxBuildHasher;
+use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::watch;
-use crate::matcher::RuntimePipelineConfig;
-use crate::matcher::advanced_rule::CompiledPipeline;
 
-pub type InflightMap = DashMap<u64, watch::Sender<Result<Bytes, Arc<anyhow::Error>>>, FxBuildHasher>;
+pub type InflightMap =
+    DashMap<u64, watch::Sender<Result<Bytes, Arc<anyhow::Error>>>, FxBuildHasher>;
 
 // ============================================================================
 // Fast-path Response / 快速路径响应
@@ -37,6 +38,9 @@ pub enum FastPathResponse {
         edns_present: bool,
         /// Pre-selected pipeline ID to avoid re-selecting / 预选择的 pipeline ID，避免重新选择
         pipeline_id: Arc<str>,
+        /// Pre-computed ECS cache key from fast path, avoids recomputation in handle_packet_internal
+        /// 快速路径预计算的 ECS 缓存键，避免在 handle_packet_internal 中重新计算
+        ecs_key: Option<crate::ecs::EcsKey>,
     },
 }
 

@@ -235,6 +235,50 @@ kixdns run -c /path/to/pipeline.json
 - `serve_stale`：在 TTL 已过期或上游失败时返回过期数据（补救性）
 - 两者可以同时启用，提供完整的缓存管理策略
 
+### EDNS Client Subnet (ECS, RFC 7871)
+
+KixDNS 支持 EDNS Client Subnet，允许向上游 DNS 注入客户端子网信息，
+获得地理优化的解析结果。ECS 配置分两层：
+
+#### 两层 ECS 配置
+
+| 层级 | 位置 | 作用 |
+|------|------|------|
+| Pipeline 级 | Pipeline → "Pipeline ECS" 卡片 | **缓存隔离** — 不同子网的响应分别缓存 |
+| Action 级 | Forward action → "ECS" 下拉框 | **发包注入** — 实际发给上游的 ECS 值 |
+
+> ⚠ **约束**：同一 Pipeline 内所有 Forward action 的 ECS 模式应与 Pipeline 级一致。
+> 需要不同 ECS 行为时，请拆分为不同 Pipeline（用 pipeline_select 区分）。
+
+#### ECS 模式
+
+- **None**（默认）— 不处理 ECS，原包直传，缓存不区分子网
+- **Clear** — 剥离请求中已有的 ECS OPT 选项
+- **FromClientIp** — 从客户端来源 IP 推导 ECS（默认 IPv4 /24, IPv6 /56）
+- **Static** — 使用固定 IP 注入 ECS
+
+#### 配置示例
+
+```json
+{
+  "pipelines": [
+    {
+      "id": "google-ecs",
+      "ecs": { "mode": "from_client_ip", "prefix_v4": 24 },
+      "rules": [{
+        "name": "google",
+        "matchers": [{ "type": "geo_site", "value": "google" }],
+        "actions": [{
+          "type": "forward",
+          "upstream": "8.8.8.8:53",
+          "ecs": { "mode": "from_client_ip", "prefix_v4": 24 }
+        }]
+      }]
+    }
+  ]
+}
+```
+
 ## 配置示例
 
 ### 示例 1：国内网站分流

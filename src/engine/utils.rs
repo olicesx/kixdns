@@ -1,14 +1,14 @@
+use super::types::InflightMap;
+use crate::matcher::RuntimePipelineConfig;
+use bytes::Bytes;
+use dashmap::DashSet;
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::rr::{DNSClass, Name, RecordType};
+use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use dashmap::DashSet;
-use hickory_proto::op::{Message, ResponseCode, MessageType, OpCode, Query};
-use hickory_proto::rr::{DNSClass, RecordType, Name};
-use bytes::Bytes;
-use crate::matcher::RuntimePipelineConfig;
-use hickory_proto::serialize::binary::{BinEncoder, BinEncodable};
-use super::types::InflightMap;
 
 /// RAII Guard for cleaning up inflight request map
 /// 为清理进行中请求映射的 RAII Guard
@@ -20,9 +20,13 @@ pub struct InflightCleanupGuard {
 
 impl InflightCleanupGuard {
     pub fn new(inflight: Arc<InflightMap>, hash: u64) -> Self {
-        Self { inflight, hash, active: true }
+        Self {
+            inflight,
+            hash,
+            active: true,
+        }
     }
-    
+
     pub fn defuse(&mut self) {
         self.active = false;
     }
@@ -44,7 +48,11 @@ impl Drop for InflightCleanupGuard {
 pub mod engine_helpers {
     use super::*;
 
-    pub fn build_response(req: &Message, rcode: ResponseCode, answers: Vec<hickory_proto::rr::Record>) -> anyhow::Result<Bytes> {
+    pub fn build_response(
+        req: &Message,
+        rcode: ResponseCode,
+        answers: Vec<hickory_proto::rr::Record>,
+    ) -> anyhow::Result<Bytes> {
         let mut msg = Message::new();
         msg.set_id(req.id());
         msg.set_message_type(hickory_proto::op::MessageType::Response);
@@ -54,7 +62,7 @@ pub mod engine_helpers {
         msg.set_recursion_available(true);
         msg.add_queries(req.queries().iter().cloned());
         msg.insert_answers(answers);
-        
+
         let mut buf = Vec::with_capacity(512);
         let mut encoder = BinEncoder::new(&mut buf);
         msg.emit(&mut encoder)?;
@@ -207,16 +215,19 @@ impl Drop for RefreshingGuard {
 ///
 /// 扫描配置以查找所有在匹配器中实际使用的GeoSite标签，这样可以只从数据文件中加载这些标签 / Scans the configuration to find all GeoSite tags actually used in matchers, so we can load only those tags from the data file.
 pub fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<String> {
-    
     let mut tags_set: HashSet<std::sync::Arc<str>> = HashSet::new();
 
     // Scan pipeline_select rules / 扫描 pipeline_select 规则
     for rule in &cfg.pipeline_select {
         for matcher in &rule.matchers {
-            if let crate::matcher::RuntimePipelineSelectorMatcher::GeoSite { tag } = &matcher.matcher {
+            if let crate::matcher::RuntimePipelineSelectorMatcher::GeoSite { tag } =
+                &matcher.matcher
+            {
                 tags_set.insert(tag.clone());
             }
-            if let crate::matcher::RuntimePipelineSelectorMatcher::GeoSiteNot { tag } = &matcher.matcher {
+            if let crate::matcher::RuntimePipelineSelectorMatcher::GeoSiteNot { tag } =
+                &matcher.matcher
+            {
                 tags_set.insert(tag.clone());
             }
         }
@@ -237,10 +248,16 @@ pub fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<Stri
 
             // Scan response matchers / 扫描响应匹配器
             for matcher in &rule.response_matchers {
-                if let crate::matcher::RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value } = &matcher.matcher {
+                if let crate::matcher::RuntimeResponseMatcher::ResponseRequestDomainGeoSite {
+                    value,
+                } = &matcher.matcher
+                {
                     tags_set.insert(value.clone());
                 }
-                if let crate::matcher::RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { value } = &matcher.matcher {
+                if let crate::matcher::RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot {
+                    value,
+                } = &matcher.matcher
+                {
                     tags_set.insert(value.clone());
                 }
             }
@@ -261,8 +278,8 @@ pub fn uses_geoip_matchers(cfg: &RuntimePipelineConfig) -> bool {
             for matcher in &rule.matchers {
                 if matches!(
                     matcher.matcher,
-                    crate::matcher::RuntimeMatcher::GeoipCountry { .. } |
-                    crate::matcher::RuntimeMatcher::GeoipPrivate { .. }
+                    crate::matcher::RuntimeMatcher::GeoipCountry { .. }
+                        | crate::matcher::RuntimeMatcher::GeoipPrivate { .. }
                 ) {
                     return true;
                 }
@@ -272,8 +289,8 @@ pub fn uses_geoip_matchers(cfg: &RuntimePipelineConfig) -> bool {
             for matcher in &rule.response_matchers {
                 if matches!(
                     matcher.matcher,
-                    crate::matcher::RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { .. } |
-                    crate::matcher::RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { .. }
+                    crate::matcher::RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { .. }
+                        | crate::matcher::RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { .. }
                 ) {
                     return true;
                 }
