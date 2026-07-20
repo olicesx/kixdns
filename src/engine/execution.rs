@@ -12,30 +12,25 @@ use bytes::Bytes;
 use rustc_hash::FxHasher;
 
 use hickory_proto::op::{Message, ResponseCode};
-#[cfg(test)]
-use hickory_proto::rr::rdata::A;
+use hickory_proto::rr::DNSClass;
 #[cfg(test)]
 use hickory_proto::rr::Name;
-use hickory_proto::rr::DNSClass;
-
-
+#[cfg(test)]
+use hickory_proto::rr::rdata::A;
 
 use hickory_proto::serialize::binary::BinDecodable;
 use tracing::warn;
 
 use crate::cache::CacheEntry;
-use crate::matcher::advanced_rule::{compile_pipelines, fast_static_match};
 use crate::config::Transport;
 use crate::matcher::RuntimePipelineConfig;
+use crate::matcher::advanced_rule::{compile_pipelines, fast_static_match};
 use crate::proto_utils::parse_quick;
 
 use super::response::build_fast_static_response;
 use super::types::{EngineInner, FastPathResponse};
-use super::utils::{
-    is_refreshing,
-    engine_helpers,
-};
-use crate::engine::rules::{ResponseContext, calculate_rule_hash, Decision};
+use super::utils::{engine_helpers, is_refreshing};
+use crate::engine::rules::{Decision, ResponseContext, calculate_rule_hash};
 
 /// Pre-parsed data from handle_packet_fast to avoid re-parsing
 /// 来自 handle_packet_fast 的预解析数据，避免重新解析
@@ -49,36 +44,18 @@ pub struct PreParsedData {
     pipeline_id: Arc<str>,
 }
 
-
-
 // ============================================================================
 // Constants / 常量
 // ============================================================================
 
-
-
-
-
-
-
 use super::core::Engine;
 use super::pipeline::select_pipeline;
-
-
-
-
 
 // ============================================================================
 // Refreshing Bitmap Helpers / 刷新位图辅助函数
 // ============================================================================
 
-
-
-
-
 impl Engine {
-
-
     /// Reload configuration and update compiled pipelines / 重新加载配置并更新编译后的管线
     pub fn reload(&self, new_cfg: RuntimePipelineConfig) {
         let compiled = compile_pipelines(&new_cfg);
@@ -98,7 +75,7 @@ impl Engine {
 
     /// Get or initialize the background refresh dedicated rule
     /// 获取或初始化后台刷新专用规则
-    /// 
+    ///
     /// Design: Uses OnceLock for thread-safe lazy initialization
     /// 设计：使用 OnceLock 实现线程安全的延迟初始化
     /// - First call: Creates rule from config or default
@@ -115,7 +92,9 @@ impl Engine {
     /// 动态调整 flow control permits 基于系统负载和延迟 / Adaptively adjust flow control permits based on system load and latency
     pub fn adjust_flow_control(&self) {
         if let Some(state) = &self.flow_control_state {
-            let latest_latency = self.metrics_last_upstream_latency_ns.load(Ordering::Relaxed);
+            let latest_latency = self
+                .metrics_last_upstream_latency_ns
+                .load(Ordering::Relaxed);
             state.adjust(&self.permit_manager, latest_latency);
         }
     }
@@ -152,7 +131,7 @@ impl Engine {
             // - hedge usually returns early, not counted in max time
             // - Actual path: hedge attempt → full attempt → tcp fallback
             // - Max time: upstream * 2.5 (conservative estimate)
-            settings.upstream_timeout_ms * 5 / 2  // * 2.5
+            settings.upstream_timeout_ms * 5 / 2 // * 2.5
         }
     }
 
@@ -197,13 +176,17 @@ impl Engine {
     /// Increment parse_quick_failures counter using simple atomic operation
     #[inline]
     fn incr_parse_quick_failures(&self) {
-        self.metrics_parse_quick_failures.fetch_add(1, Ordering::Relaxed);
+        self.metrics_parse_quick_failures
+            .fetch_add(1, Ordering::Relaxed);
     }
 
-
-
     #[inline]
-    pub fn calculate_cache_hash_for_dedupe(pipeline_id: &str, qname: &[u8], qtype: hickory_proto::rr::RecordType, qclass: hickory_proto::rr::DNSClass) -> u64 {
+    pub fn calculate_cache_hash_for_dedupe(
+        pipeline_id: &str,
+        qname: &[u8],
+        qtype: hickory_proto::rr::RecordType,
+        qclass: hickory_proto::rr::DNSClass,
+    ) -> u64 {
         let mut h = FxHasher::default();
         pipeline_id.hash(&mut h);
         // Hash qname case-insensitively without allocation / 不分配内存地进行不区分大小写的 qname 哈希
@@ -239,7 +222,7 @@ impl Engine {
             rcode,
             source,
             upstream,
-            qname: Arc::from(qname),  // 一次 Arc::from，避免多次
+            qname: Arc::from(qname), // 一次 Arc::from，避免多次
             pipeline_id,
             qtype: u16::from(qtype),
             inserted_at: Instant::now(),
@@ -289,7 +272,7 @@ impl Engine {
         };
         // Count incoming quick-parsed requests / 计数进入的快速解析请求
         self.incr_total_requests();
-        
+
         // Get pipeline ID / 获取 pipeline ID
         let state = self.state.load();
         let cfg = &state.pipeline;
@@ -311,13 +294,17 @@ impl Engine {
             Some(&self.geosite_manager),
             Some(&self.geoip_manager),
         );
-        
+
         // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
-        let cache_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, q.qname_bytes, qtype, qclass);
+        let cache_hash =
+            Self::calculate_cache_hash_for_dedupe(&pipeline_id, q.qname_bytes, qtype, qclass);
 
         if let Some(hit) = self.cache.get(&cache_hash) {
             // Verify collision / 验证冲突
-            if hit.qtype == u16::from(qtype) && q.qname_matches(hit.qname.as_ref()) && hit.pipeline_id == pipeline_id {
+            if hit.qtype == u16::from(qtype)
+                && q.qname_matches(hit.qname.as_ref())
+                && hit.pipeline_id == pipeline_id
+            {
                 // Check if expired / 检查是否已过期
                 let elapsed_secs = hit.inserted_at.elapsed().as_secs() as u32;
                 if elapsed_secs >= hit.original_ttl {
@@ -338,10 +325,16 @@ impl Engine {
                         // Calculate remaining TTL and refresh threshold
                         // 计算剩余 TTL 和刷新阈值
                         let remaining_ttl = hit.refresh_ttl.saturating_sub(elapsed_secs);
-                        let threshold = (hit.refresh_ttl as u64 * self.cache_refresh_threshold_percent as u64) / 100;
+                        let threshold = (hit.refresh_ttl as u64
+                            * self.cache_refresh_threshold_percent as u64)
+                            / 100;
 
                         // OPTIMIZATION: Hybrid bloom filter + DashSet check / 优化：混合布隆过滤器 + DashSet 检查
-                        let is_refreshing = is_refreshing(&self.refreshing_bitmap, &self.refreshing_set, cache_hash);
+                        let is_refreshing = is_refreshing(
+                            &self.refreshing_bitmap,
+                            &self.refreshing_set,
+                            cache_hash,
+                        );
 
                         tracing::warn!(
                             original_ttl = hit.original_ttl,
@@ -363,7 +356,7 @@ impl Engine {
                             // 触发后台刷新（异步，不阻塞当前请求）
                             // Note: RefreshingGuard inside spawn_background_refresh will handle cleanup
                             // 注意：spawn_background_refresh 内部的 RefreshingGuard 将处理清理
-                            let qname_str = q.qname_str_unchecked();  // Zero-allocation / 零分配
+                            let qname_str = q.qname_str_unchecked(); // Zero-allocation / 零分配
                             tracing::warn!(
                                 qname = %qname_str,
                                 original_ttl = hit.original_ttl,
@@ -399,7 +392,7 @@ impl Engine {
         // 2. Compiled rule fast-path for static decisions / 2. 编译规则的静态决策快速路径
         if let Some(compiled) = self.compiled_for(&state, &pipeline_id) {
             let qclass = DNSClass::from(q.qclass);
-            let qname_str = q.qname_str_unchecked();  // Zero-allocation / 零分配
+            let qname_str = q.qname_str_unchecked(); // Zero-allocation / 零分配
             if let Some(decision) = fast_static_match(
                 compiled,
                 qname_str,
@@ -410,12 +403,7 @@ impl Engine {
             ) {
                 if let Decision::Static { rcode, answers } = decision {
                     let resp = build_fast_static_response(
-                        q.tx_id,
-                        qname_str,
-                        q.qtype,
-                        q.qclass,
-                        rcode,
-                        &answers,
+                        q.tx_id, qname_str, q.qtype, q.qclass, rcode, &answers,
                     )?;
                     self.incr_fastpath_hits();
                     return Ok(Some(FastPathResponse::Direct(resp)));
@@ -454,12 +442,7 @@ impl Engine {
                 ) {
                     if let Decision::Static { rcode, answers } = entry.decision.as_ref() {
                         let resp = build_fast_static_response(
-                            q.tx_id,
-                            qname_str,
-                            q.qtype,
-                            q.qclass,
-                            *rcode,
-                            answers,
+                            q.tx_id, qname_str, q.qtype, q.qclass, *rcode, answers,
                         )?;
                         self.incr_fastpath_hits();
                         return Ok(Some(FastPathResponse::Direct(resp)));
@@ -480,8 +463,6 @@ impl Engine {
             pipeline_id,
         }))
     }
-
-
 
     pub async fn handle_packet(&self, packet: &[u8], peer: SocketAddr) -> anyhow::Result<Bytes> {
         self.handle_packet_internal(packet, peer, false, None).await
@@ -512,7 +493,8 @@ impl Engine {
             edns_present,
             pipeline_id,
         };
-        self.handle_packet_internal(packet, peer, skip_cache, Some(pre_parsed)).await
+        self.handle_packet_internal(packet, peer, skip_cache, Some(pre_parsed))
+            .await
     }
 
     /// Internal handle_packet implementation with skip_cache option
@@ -554,77 +536,86 @@ impl Engine {
         let response_jump_limit = cfg.settings.response_jump_limit as usize;
 
         // Use pre-parsed data if available, otherwise parse / 如果有预解析数据则使用，否则解析
-        let (qname_cow, qtype, qclass, tx_id, edns_present, pipeline_id) = if let Some(pre) = pre_parsed {
-            (
-                std::borrow::Cow::Owned(pre.qname),
-                pre.qtype,
-                pre.qclass,
-                pre.tx_id,
-                pre.edns_present,
-                pre.pipeline_id,
-            )
-        } else {
-            // Lazy Parse: Use quick parse first / 延迟解析：首先使用快速解析
-            // Allocate qname_buf outside the if-else to extend lifetime
-            // 在 if-else 外部分配 qname_buf 以延长生命周期
-            let mut qname_buf = [0u8; 256];
-            let q = parse_quick(packet, &mut qname_buf);
-
-            let (qname_cow, qtype, qclass, tx_id, edns_present) = if let Some(q) = q {
-                // Use unchecked conversion to avoid double allocation / 使用未检查转换避免双重分配
-                // SAFETY: qname_bytes is validated ASCII from parse_quick()
-                // ASCII is always valid UTF-8, so this is safe
-                // 安全性：qname_bytes 在 parse_quick() 中已验证为 ASCII
-                // ASCII 始终是有效的 UTF-8，所以这是安全的
-                let qname_str = unsafe {
-                    std::str::from_utf8_unchecked(q.qname_bytes)
-                };
-                (std::borrow::Cow::Owned(qname_str.to_string()), hickory_proto::rr::RecordType::from(q.qtype), DNSClass::from(q.qclass), q.tx_id, q.edns_present)
-            } else {
-                // Fallback to full parse if quick parse fails (unlikely for standard queries) / 如果快速解析失败则回退到完整解析（对于标准查询不太可能）
-                let req = Message::from_bytes(packet).context("parse request")?;
-                let question = req.queries().first().context("empty question")?;
+        let (qname_cow, qtype, qclass, tx_id, edns_present, pipeline_id) =
+            if let Some(pre) = pre_parsed {
                 (
-                    std::borrow::Cow::Owned(question.name().to_lowercase().to_string()),
-                    question.query_type(),
-                    question.query_class(),
-                    req.id(),
-                    req.extensions().is_some(),
+                    std::borrow::Cow::Owned(pre.qname),
+                    pre.qtype,
+                    pre.qclass,
+                    pre.tx_id,
+                    pre.edns_present,
+                    pre.pipeline_id,
                 )
+            } else {
+                // Lazy Parse: Use quick parse first / 延迟解析：首先使用快速解析
+                // Allocate qname_buf outside the if-else to extend lifetime
+                // 在 if-else 外部分配 qname_buf 以延长生命周期
+                let mut qname_buf = [0u8; 256];
+                let q = parse_quick(packet, &mut qname_buf);
+
+                let (qname_cow, qtype, qclass, tx_id, edns_present) = if let Some(q) = q {
+                    // Use unchecked conversion to avoid double allocation / 使用未检查转换避免双重分配
+                    // SAFETY: qname_bytes is validated ASCII from parse_quick()
+                    // ASCII is always valid UTF-8, so this is safe
+                    // 安全性：qname_bytes 在 parse_quick() 中已验证为 ASCII
+                    // ASCII 始终是有效的 UTF-8，所以这是安全的
+                    let qname_str = unsafe { std::str::from_utf8_unchecked(q.qname_bytes) };
+                    (
+                        std::borrow::Cow::Owned(qname_str.to_string()),
+                        hickory_proto::rr::RecordType::from(q.qtype),
+                        DNSClass::from(q.qclass),
+                        q.tx_id,
+                        q.edns_present,
+                    )
+                } else {
+                    // Fallback to full parse if quick parse fails (unlikely for standard queries) / 如果快速解析失败则回退到完整解析（对于标准查询不太可能）
+                    let req = Message::from_bytes(packet).context("parse request")?;
+                    let question = req.queries().first().context("empty question")?;
+                    (
+                        std::borrow::Cow::Owned(question.name().to_lowercase().to_string()),
+                        question.query_type(),
+                        question.query_class(),
+                        req.id(),
+                        req.extensions().is_some(),
+                    )
+                };
+
+                // Scope geosite_mgr to ensure lock is released before await
+                // 限制 geosite_mgr 的作用域，确保在 await 之前释放锁
+                let pipeline_id = {
+                    // GeoSiteManager now uses DashMap, no Mutex lock needed
+                    // GeoSiteManager 现在使用 DashMap，无需 Mutex 锁
+                    let (_, pipeline_id) = select_pipeline(
+                        cfg,
+                        &qname_cow,
+                        peer.ip(),
+                        qclass,
+                        edns_present,
+                        qtype,
+                        &self.listener_label,
+                        Some(&self.geosite_manager),
+                        Some(&self.geoip_manager),
+                    );
+                    pipeline_id
+                }; // geosite_mgr 在这里释放 / geosite_mgr released here
+
+                (qname_cow, qtype, qclass, tx_id, edns_present, pipeline_id)
             };
-
-            // Scope geosite_mgr to ensure lock is released before await
-            // 限制 geosite_mgr 的作用域，确保在 await 之前释放锁
-            let pipeline_id = {
-                // GeoSiteManager now uses DashMap, no Mutex lock needed
-                // GeoSiteManager 现在使用 DashMap，无需 Mutex 锁
-                let (_, pipeline_id) = select_pipeline(
-                    cfg,
-                    &qname_cow,
-                    peer.ip(),
-                    qclass,
-                    edns_present,
-                    qtype,
-                    &self.listener_label,
-                    Some(&self.geosite_manager),
-                    Some(&self.geoip_manager),
-                );
-                pipeline_id
-            }; // geosite_mgr 在这里释放 / geosite_mgr released here
-
-            (qname_cow, qtype, qclass, tx_id, edns_present, pipeline_id)
-        };
 
         let qname_ref = &qname_cow;
         let start = std::time::Instant::now();
 
         // Find pipeline_opt from pipeline_id / 从 pipeline_id 查找 pipeline_opt
-        let pipeline_opt = cfg.pipelines.iter().find(|p| p.id.as_ref() == pipeline_id.as_ref());
+        let pipeline_opt = cfg
+            .pipelines
+            .iter()
+            .find(|p| p.id.as_ref() == pipeline_id.as_ref());
 
         // Convert qname_ref to bytes for hash calculation / 将 qname_ref 转换为 bytes 进行哈希计算
         let qname_bytes = qname_ref.as_bytes();
-        let dedupe_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, qname_bytes, qtype, qclass);
-        
+        let dedupe_hash =
+            Self::calculate_cache_hash_for_dedupe(&pipeline_id, qname_bytes, qtype, qclass);
+
         // Background refresh: Skip cache lookup when skip_cache=true
         // 后台刷新：当 skip_cache=true 时跳过缓存查找
         if !skip_cache {
@@ -655,19 +646,22 @@ impl Engine {
         // 设计：check_cache() 在 client_timeout > 0 且缓存过期时已触发 spawn_background_refresh。
         // 这里以 5ms 间隔轮询缓存，检测后台刷新是否完成。超时则返回过期数据。
         if !skip_cache && self.serve_stale && self.serve_stale_client_timeout_ms > 0 {
-            let has_stale = self.cache.get(&dedupe_hash)
+            let has_stale = self
+                .cache
+                .get(&dedupe_hash)
                 .filter(|h| {
                     h.qtype == u16::from(qtype)
-                    && h.pipeline_id.as_ref() == pipeline_id.as_ref()
-                    && h.qname.as_ref() == qname_ref
-                    && h.inserted_at.elapsed().as_secs() >= h.original_ttl as u64
-                    && h.rcode != ResponseCode::ServFail
-                    && h.rcode != ResponseCode::Refused
+                        && h.pipeline_id.as_ref() == pipeline_id.as_ref()
+                        && h.qname.as_ref() == qname_ref
+                        && h.inserted_at.elapsed().as_secs() >= h.original_ttl as u64
+                        && h.rcode != ResponseCode::ServFail
+                        && h.rcode != ResponseCode::Refused
                 })
                 .is_some();
 
             if has_stale {
-                let client_timeout = std::time::Duration::from_millis(self.serve_stale_client_timeout_ms);
+                let client_timeout =
+                    std::time::Duration::from_millis(self.serve_stale_client_timeout_ms);
                 let poll_interval = std::time::Duration::from_millis(5);
                 let wait_start = Instant::now();
 
@@ -677,11 +671,19 @@ impl Engine {
                     tokio::time::sleep(poll_interval).await;
                     // Check if background refresh put fresh data in cache
                     if let Some(fresh_hit) = self.cache.get(&dedupe_hash) {
-                        if fresh_hit.inserted_at.elapsed().as_secs() < fresh_hit.original_ttl as u64 {
+                        if fresh_hit.inserted_at.elapsed().as_secs() < fresh_hit.original_ttl as u64
+                        {
                             // Fresh data available! Serve it.
                             if let Some(fresh_bytes) = phases::check_cache(
-                                self, qname_ref, qtype, qclass, &pipeline_id,
-                                dedupe_hash, tx_id, start, &peer,
+                                self,
+                                qname_ref,
+                                qtype,
+                                qclass,
+                                &pipeline_id,
+                                dedupe_hash,
+                                tx_id,
+                                start,
+                                &peer,
                             ) {
                                 tracing::debug!(
                                     event = "serve_fresh_after_client_wait",
@@ -698,7 +700,14 @@ impl Engine {
                 // Client timeout expired - serve stale response
                 // 客户端超时 - 返回过期缓存响应
                 if let Some(stale_bytes) = phases::check_stale_cache(
-                    self, qname_ref, qtype, qclass, &pipeline_id, dedupe_hash, tx_id, &peer,
+                    self,
+                    qname_ref,
+                    qtype,
+                    qclass,
+                    &pipeline_id,
+                    dedupe_hash,
+                    tx_id,
+                    &peer,
                 ) {
                     tracing::debug!(
                         event = "serve_stale_on_client_timeout",
@@ -724,19 +733,34 @@ impl Engine {
         let mut current_pipeline_id = pipeline_id.clone();
         // Convert qname to bytes for hash calculation / 将 qname 转换为 bytes 进行哈希计算
         let qname_bytes = qname.as_bytes();
-        let mut dedupe_hash = Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, qname_bytes, qtype, qclass);
+        let mut dedupe_hash =
+            Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, qname_bytes, qtype, qclass);
         let mut reused_response: Option<ResponseContext> = None;
 
         let mut decision = match pipeline_opt {
-            Some(p) => self.apply_rules(&state, p, peer.ip(), &qname, qtype, qclass, edns_present, None, skip_cache),
+            Some(p) => self.apply_rules(
+                &state,
+                p,
+                peer.ip(),
+                &qname,
+                qtype,
+                qclass,
+                edns_present,
+                None,
+                skip_cache,
+            ),
             None => {
                 // 使用预分割的默认 upstream 以支持并发查询 / Use pre-split default upstream for concurrent queries
-                let (upstream, pre_split) = if let Some(pre) = &cfg.settings.default_upstream_pre_split {
-                    (Arc::from(cfg.settings.default_upstream.as_str()), Some(pre.clone()))
-                } else {
-                    (Arc::from(cfg.settings.default_upstream.as_str()), None)
-                };
-                
+                let (upstream, pre_split) =
+                    if let Some(pre) = &cfg.settings.default_upstream_pre_split {
+                        (
+                            Arc::from(cfg.settings.default_upstream.as_str()),
+                            Some(pre.clone()),
+                        )
+                    } else {
+                        (Arc::from(cfg.settings.default_upstream.as_str()), None)
+                    };
+
                 Decision::Forward {
                     upstream,
                     pre_split_upstreams: pre_split,
@@ -750,7 +774,7 @@ impl Engine {
                     continue_on_miss: false,
                     allow_reuse: false,
                 }
-            },
+            }
         };
 
         // DESIGN NOTE: InflightCleanupGuard safety analysis
@@ -789,9 +813,18 @@ impl Engine {
                         };
                         break;
                     }
-                    if let Some(p) = cfg.pipelines.iter().find(|p| p.id.as_ref() == pipeline.as_ref()) {
+                    if let Some(p) = cfg
+                        .pipelines
+                        .iter()
+                        .find(|p| p.id.as_ref() == pipeline.as_ref())
+                    {
                         current_pipeline_id = p.id.clone();
-                        dedupe_hash = Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, qname_bytes, qtype, qclass);
+                        dedupe_hash = Self::calculate_cache_hash_for_dedupe(
+                            &current_pipeline_id,
+                            qname_bytes,
+                            qtype,
+                            qclass,
+                        );
                         skip_rules.clear();
                         decision = self.apply_rules(
                             &state,
@@ -819,102 +852,104 @@ impl Engine {
             }
 
             match decision {
-            Decision::Jump { .. } => {
-                anyhow::bail!("unresolved pipeline jump");
-            }
-            Decision::Static { rcode, answers } => {
-                return phases::handle_static_decision(
-                    self,
-                    packet,
-                    &qname,
-                    qtype,
-                    &current_pipeline_id,
-                    dedupe_hash,
-                    min_ttl,
-                    start,
-                    &peer,
-                    rcode,
-                    answers,
-                );
-            }
-            Decision::Forward {
-                upstream,
-                pre_split_upstreams,
-                response_matchers,
-                response_matcher_operator,
-                response_actions_on_match,
-                response_actions_on_miss,
-                rule_name,
-                transport,
-                continue_on_match: _,
-                continue_on_miss: _,
-                allow_reuse,
-            } => {
-                let res = phases::handle_forward_decision(
-                    self,
-                    packet,
-                    &qname,
-                    qtype,
-                    qclass,
-                    tx_id,
-                    &current_pipeline_id,
-                    &rule_name,
-                    dedupe_hash,
-                    min_ttl,
-                    upstream_timeout,
-                    start,
-                    &peer,
-                    skip_cache,
-                    &upstream,
-                    pre_split_upstreams.as_ref(),
-                    &response_matchers,
+                Decision::Jump { .. } => {
+                    anyhow::bail!("unresolved pipeline jump");
+                }
+                Decision::Static { rcode, answers } => {
+                    return phases::handle_static_decision(
+                        self,
+                        packet,
+                        &qname,
+                        qtype,
+                        &current_pipeline_id,
+                        dedupe_hash,
+                        min_ttl,
+                        start,
+                        &peer,
+                        rcode,
+                        answers,
+                    );
+                }
+                Decision::Forward {
+                    upstream,
+                    pre_split_upstreams,
+                    response_matchers,
                     response_matcher_operator,
-                    &response_actions_on_match,
-                    &response_actions_on_miss,
+                    response_actions_on_match,
+                    response_actions_on_miss,
+                    rule_name,
                     transport,
+                    continue_on_match: _,
+                    continue_on_miss: _,
                     allow_reuse,
-                    &mut reused_response,
-                ).await;
+                } => {
+                    let res = phases::handle_forward_decision(
+                        self,
+                        packet,
+                        &qname,
+                        qtype,
+                        qclass,
+                        tx_id,
+                        &current_pipeline_id,
+                        &rule_name,
+                        dedupe_hash,
+                        min_ttl,
+                        upstream_timeout,
+                        start,
+                        &peer,
+                        skip_cache,
+                        &upstream,
+                        pre_split_upstreams.as_ref(),
+                        &response_matchers,
+                        response_matcher_operator,
+                        &response_actions_on_match,
+                        &response_actions_on_miss,
+                        transport,
+                        allow_reuse,
+                        &mut reused_response,
+                    )
+                    .await;
 
-                match res {
-                    Ok(phases::ForwardResult::Success(bytes)) => return Ok(bytes),
-                    Ok(phases::ForwardResult::Continue(ctx)) => {
-                        reused_response = *ctx;
-                        skip_rules.insert(rule_name.clone());
-                        let skip_ref = if skip_rules.is_empty() {
-                            None
-                        } else {
-                            Some(&skip_rules)
-                        };
-                        
-                        let pipeline = if let Some(p) = cfg.pipelines.iter().find(|p| p.id == current_pipeline_id) {
-                            p
-                        } else {
-                            warn!("pipeline missing while continuing: {}", current_pipeline_id);
-                            let req = Message::from_bytes(packet).context("parse request")?;
-                            return engine_helpers::build_servfail_response(&req);
-                        };
+                    match res {
+                        Ok(phases::ForwardResult::Success(bytes)) => return Ok(bytes),
+                        Ok(phases::ForwardResult::Continue(ctx)) => {
+                            reused_response = *ctx;
+                            skip_rules.insert(rule_name.clone());
+                            let skip_ref = if skip_rules.is_empty() {
+                                None
+                            } else {
+                                Some(&skip_rules)
+                            };
 
-                        decision = self.apply_rules(
-                            &state,
-                            pipeline,
-                            peer.ip(),
-                            &qname,
-                            qtype,
-                            qclass,
-                            edns_present,
-                            skip_ref,
-                            skip_cache,
-                        );
-                        continue 'decision_loop;
-                    },
-                    Err(e) => return Err(e),
+                            let pipeline = if let Some(p) =
+                                cfg.pipelines.iter().find(|p| p.id == current_pipeline_id)
+                            {
+                                p
+                            } else {
+                                warn!("pipeline missing while continuing: {}", current_pipeline_id);
+                                let req = Message::from_bytes(packet).context("parse request")?;
+                                return engine_helpers::build_servfail_response(&req);
+                            };
+
+                            decision = self.apply_rules(
+                                &state,
+                                pipeline,
+                                peer.ip(),
+                                &qname,
+                                qtype,
+                                qclass,
+                                edns_present,
+                                skip_ref,
+                                skip_cache,
+                            );
+                            continue 'decision_loop;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
         }
     }
-}
-
 
     pub(crate) async fn notify_inflight_waiters(&self, dedupe_hash: u64, bytes: &Bytes) {
         // ========== NEW: Use tokio::watch for lock-free notification ==========
@@ -943,7 +978,7 @@ impl Engine {
         qname: &str,
         qtype: hickory_proto::rr::RecordType,
         qclass: DNSClass,
-        upstream: Option<&str>,  // Reserved for future use
+        upstream: Option<&str>, // Reserved for future use
     ) {
         crate::engine::refresh::spawn_background_refresh(
             self,
@@ -952,13 +987,13 @@ impl Engine {
             qname,
             qtype,
             qclass,
-            upstream
+            upstream,
         )
     }
 
     /// Construct standard DNS query packet using hickory_proto
     /// 使用 hickory_proto 构造标准 DNS 查询包
-    /// 
+    ///
     /// Design: Use hickory-proto to ensure RFC compliance
     /// 设计：使用 hickory-proto 确保 RFC 合规性
     /// - Generates valid TXID (not 0)
@@ -971,53 +1006,50 @@ impl Engine {
         &self,
         qname: &str,
         qtype: hickory_proto::rr::RecordType,
-        _qclass: DNSClass,  // Currently defaults to IN class, parameter reserved for future use
+        _qclass: DNSClass, // Currently defaults to IN class, parameter reserved for future use
     ) -> anyhow::Result<Bytes> {
         use hickory_proto::op::{Message, MessageType, Query};
         use hickory_proto::rr::Name;
-        
+
         // Generate unique TXID (not 0!)
         // 生成唯一的 TXID（不是 0！）
         let tx_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed) as u16;
-        
+
         // Build DNS query message
         // 构建 DNS 查询消息
         let mut msg = Message::new();
         msg.set_id(tx_id);
         msg.set_message_type(MessageType::Query);
         msg.set_recursion_desired(true);
-        
+
         // Add question section
         // 添加问题部分
         let name = Name::from_str(qname)?;
         let query = Query::query(name.clone(), qtype);
         msg.add_query(query);
-        
+
         // Serialize to bytes
         // 序列化为字节
         let bytes = msg.to_vec()?;
-        
+
         Ok(Bytes::from(bytes))
     }
 }
 
 use super::phases;
 
-
-
-
 #[cfg(test)]
 #[allow(unnameable_test_items)]
 mod tests {
     use super::*;
-    use std::net::IpAddr;
-    use hickory_proto::rr::{Record, RData};
-    use crate::engine::rules::*;
+    use crate::config::{Action, GlobalSettings, MatchOperator};
     use crate::engine::response::*;
-    use crate::config::{GlobalSettings, MatchOperator, Action};
+    use crate::engine::rules::*;
     use crate::matcher::RuntimeResponseMatcherWithOp;
-    use hickory_proto::rr::RecordType;
     use hickory_proto::op::{Message, OpCode, Query};
+    use hickory_proto::rr::RecordType;
+    use hickory_proto::rr::{RData, Record};
+    use std::net::IpAddr;
     use std::sync::Arc;
 
     // ========================================================================
@@ -1038,14 +1070,21 @@ mod tests {
         let result = engine_helpers::build_servfail_response(&req);
 
         // Assert: Verify response
-        assert!(result.is_ok(), "Should successfully build ServFail response");
+        assert!(
+            result.is_ok(),
+            "Should successfully build ServFail response"
+        );
         let bytes = result.unwrap();
         assert!(!bytes.is_empty(), "Response should not be empty");
 
         // Verify it's a valid DNS message
         let msg = Message::from_bytes(&bytes).unwrap();
         assert_eq!(msg.id(), 12345, "TXID should be preserved");
-        assert_eq!(msg.response_code(), ResponseCode::ServFail, "Should be ServFail");
+        assert_eq!(
+            msg.response_code(),
+            ResponseCode::ServFail,
+            "Should be ServFail"
+        );
         assert_eq!(msg.op_code(), OpCode::Query, "Should be Query opcode");
         assert!(msg.recursion_desired(), "RD flag should be preserved");
         assert_eq!(msg.queries().len(), 1, "Should have one query");
@@ -1071,7 +1110,11 @@ mod tests {
         // Verify it's a valid DNS message
         let msg = Message::from_bytes(&bytes).unwrap();
         assert_eq!(msg.id(), 54321, "TXID should be preserved");
-        assert_eq!(msg.response_code(), ResponseCode::Refused, "Should be Refused");
+        assert_eq!(
+            msg.response_code(),
+            ResponseCode::Refused,
+            "Should be Refused"
+        );
         assert_eq!(msg.queries().len(), 1, "Should have one query");
     }
 
@@ -1088,7 +1131,10 @@ mod tests {
         let refused = engine_helpers::build_refused_response(&req).unwrap();
 
         // Assert: Should produce different responses
-        assert_ne!(servfail, refused, "ServFail and Refused should be different");
+        assert_ne!(
+            servfail, refused,
+            "ServFail and Refused should be different"
+        );
 
         // Verify different response codes
         let sf_msg = Message::from_bytes(&servfail).unwrap();
@@ -1100,8 +1146,8 @@ mod tests {
     // ========================================================================
     // Original Engine Tests / 原有引擎测试
     // ========================================================================
-    use std::net::Ipv4Addr;
     use crate::matcher::RuntimeResponseMatcher;
+    use std::net::Ipv4Addr;
     use tokio::time::Duration;
 
     #[test]
@@ -1109,14 +1155,22 @@ mod tests {
         // Arrange: Define test domain and IPv4 address
         let domain = "example.com";
         let ipv4 = "1.2.3.4";
-        
+
         // Act: Generate static IP answer
         let (rcode, answers) = make_static_ip_answer(domain, ipv4);
-        
+
         // Assert: Verify response code and record type
-        assert_eq!(rcode, ResponseCode::NoError, "Should return NoError for valid IP");
+        assert_eq!(
+            rcode,
+            ResponseCode::NoError,
+            "Should return NoError for valid IP"
+        );
         assert_eq!(answers.len(), 1, "Should have exactly one answer");
-        assert_eq!(answers[0].record_type(), RecordType::A, "Should be A record for IPv4");
+        assert_eq!(
+            answers[0].record_type(),
+            RecordType::A,
+            "Should be A record for IPv4"
+        );
     }
 
     #[test]
@@ -1124,14 +1178,22 @@ mod tests {
         // Arrange: Define test domain and IPv6 address
         let domain = "example.com";
         let ipv6 = "2001:db8::1";
-        
+
         // Act: Generate static IP answer
         let (rcode, answers) = make_static_ip_answer(domain, ipv6);
-        
+
         // Assert: Verify response code and record type
-        assert_eq!(rcode, ResponseCode::NoError, "Should return NoError for valid IP");
+        assert_eq!(
+            rcode,
+            ResponseCode::NoError,
+            "Should return NoError for valid IP"
+        );
         assert_eq!(answers.len(), 1, "Should have exactly one answer");
-        assert_eq!(answers[0].record_type(), RecordType::AAAA, "Should be AAAA record for IPv6");
+        assert_eq!(
+            answers[0].record_type(),
+            RecordType::AAAA,
+            "Should be AAAA record for IPv6"
+        );
     }
 
     #[test]
@@ -1139,16 +1201,18 @@ mod tests {
         // Arrange: Define test domain and invalid IP
         let domain = "example.com";
         let invalid_ip = "not-an-ip";
-        
+
         // Act: Generate static IP answer with invalid input
         let (rcode, answers) = make_static_ip_answer(domain, invalid_ip);
-        
+
         // Assert: Verify ServFail response and empty answers
-        assert_eq!(rcode, ResponseCode::ServFail, "Should return ServFail for invalid IP");
+        assert_eq!(
+            rcode,
+            ResponseCode::ServFail,
+            "Should return ServFail for invalid IP"
+        );
         assert!(answers.is_empty(), "Should have no answers for invalid IP");
     }
-
-
 
     #[test]
     fn pipeline_select_picks_matching_pipeline() {
@@ -1179,10 +1243,14 @@ mod tests {
             None,
             None,
         );
-        
+
         // Assert: Verify correct pipeline was selected
         assert!(opt.is_some(), "Should find matching pipeline");
-        assert_eq!(id.as_ref(), "p2", "Should select p2 pipeline for edge listener");
+        assert_eq!(
+            id.as_ref(),
+            "p2",
+            "Should select p2 pipeline for edge listener"
+        );
     }
 
     #[test]
@@ -1221,10 +1289,14 @@ mod tests {
             None,
             None,
         );
-        
+
         // Assert: Verify correct pipeline was selected
         assert!(opt.is_some(), "Should find matching pipeline");
-        assert_eq!(id.as_ref(), "p2", "Should select p2 pipeline for edge listener");
+        assert_eq!(
+            id.as_ref(),
+            "p2",
+            "Should select p2 pipeline for edge listener"
+        );
     }
 
     #[allow(dead_code)]
@@ -1263,12 +1335,16 @@ mod tests {
             hickory_proto::rr::DNSClass::IN,
             false,
             None,
-            false,  // skip_cache
+            false, // skip_cache
         );
 
         // Assert: Verify StaticResponse returns NXDOMAIN
         match decision {
-            Decision::Static { rcode, .. } => assert_eq!(rcode, ResponseCode::NXDomain, "StaticResponse should return NXDOMAIN"),
+            Decision::Static { rcode, .. } => assert_eq!(
+                rcode,
+                ResponseCode::NXDomain,
+                "StaticResponse should return NXDOMAIN"
+            ),
             _ => panic!("expected static decision"),
         }
 
@@ -1305,7 +1381,7 @@ mod tests {
             hickory_proto::rr::DNSClass::IN,
             false,
             None,
-            false,  // skip_cache
+            false, // skip_cache
         );
 
         // Assert: Verify Forward action returns correct upstream and matchers
@@ -1316,9 +1392,21 @@ mod tests {
                 response_matcher_operator,
                 ..
             } => {
-                assert_eq!(upstream.as_ref(), "8.8.8.8:53", "Forward should use configured upstream");
-                assert_eq!(response_matchers.len(), 1, "Forward should have one response matcher");
-                assert_eq!(response_matcher_operator, crate::config::MatchOperator::And, "Forward should use AND operator");
+                assert_eq!(
+                    upstream.as_ref(),
+                    "8.8.8.8:53",
+                    "Forward should use configured upstream"
+                );
+                assert_eq!(
+                    response_matchers.len(),
+                    1,
+                    "Forward should have one response matcher"
+                );
+                assert_eq!(
+                    response_matcher_operator,
+                    crate::config::MatchOperator::And,
+                    "Forward should use AND operator"
+                );
             }
             _ => panic!("expected forward decision"),
         }
@@ -1343,12 +1431,16 @@ mod tests {
             hickory_proto::rr::DNSClass::IN,
             false,
             None,
-            false,  // skip_cache
+            false, // skip_cache
         );
 
         // Assert: Verify Allow action forwards to default upstream
         match decision3 {
-            Decision::Forward { upstream, .. } => assert_eq!(upstream.as_ref(), "1.2.3.4:53", "Allow should forward to default upstream"),
+            Decision::Forward { upstream, .. } => assert_eq!(
+                upstream.as_ref(),
+                "1.2.3.4:53",
+                "Allow should forward to default upstream"
+            ),
             _ => panic!("expected forward decision from allow"),
         }
 
@@ -1371,12 +1463,16 @@ mod tests {
             hickory_proto::rr::DNSClass::IN,
             false,
             None,
-            false,  // skip_cache
+            false, // skip_cache
         );
 
         // Assert: Verify JumpToPipeline returns correct target pipeline
         match decision4 {
-            Decision::Jump { pipeline } => assert_eq!(pipeline.as_ref(), "other", "JumpToPipeline should jump to target pipeline"),
+            Decision::Jump { pipeline } => assert_eq!(
+                pipeline.as_ref(),
+                "other",
+                "JumpToPipeline should jump to target pipeline"
+            ),
             _ => panic!("expected jump decision"),
         }
     }
@@ -1449,7 +1545,11 @@ mod tests {
         match result {
             ResponseActionResult::Upstream { ctx, resp_match } => {
                 assert!(resp_match, "Allow action should match response type");
-                assert_eq!(ctx.upstream.as_ref(), TEST_UPSTREAM, "Allow should use test upstream");
+                assert_eq!(
+                    ctx.upstream.as_ref(),
+                    TEST_UPSTREAM,
+                    "Allow should use test upstream"
+                );
             }
             _ => panic!("expected upstream result"),
         }
@@ -1495,7 +1595,9 @@ mod tests {
 
         // Assert: Verify Allow action reports match failure
         match result {
-            ResponseActionResult::Upstream { resp_match, .. } => assert!(!resp_match, "Allow should report matcher miss"),
+            ResponseActionResult::Upstream { resp_match, .. } => {
+                assert!(!resp_match, "Allow should report matcher miss")
+            }
             _ => panic!("expected upstream result"),
         }
     }
@@ -1536,7 +1638,10 @@ mod tests {
         match result {
             ResponseActionResult::Static { rcode, source, .. } => {
                 assert_eq!(rcode, ResponseCode::Refused, "Deny should return Refused");
-                assert_eq!(source, "response_action", "Source should be response_action");
+                assert_eq!(
+                    source, "response_action",
+                    "Source should be response_action"
+                );
             }
             _ => panic!("expected static refused"),
         }
@@ -1560,10 +1665,16 @@ mod tests {
         // Act & Assert: When uses_client_ip is true, different IPs should result in different hashes
         let h1_with_ip = calculate_rule_hash(pipeline_id, qname, qtype, qclass, ip1, true);
         let h2_with_ip = calculate_rule_hash(pipeline_id, qname, qtype, qclass, ip2, true);
-        assert_ne!(h1_with_ip, h2_with_ip, "Hashes should differ when IP is included");
-        
+        assert_ne!(
+            h1_with_ip, h2_with_ip,
+            "Hashes should differ when IP is included"
+        );
+
         // Assert: Hash with IP should differ from hash without IP
-        assert_ne!(h1_no_ip, h1_with_ip, "Hash with IP should differ from hash without IP");
+        assert_ne!(
+            h1_no_ip, h1_with_ip,
+            "Hash with IP should differ from hash without IP"
+        );
     }
 
     #[tokio::test]
@@ -1574,7 +1685,8 @@ mod tests {
         let qname = "expire.com";
         let qtype = RecordType::A;
         let qclass = DNSClass::IN;
-        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(&pipeline_id, qname.as_bytes(), qtype, qclass);
+        let dedupe_hash =
+            Engine::calculate_cache_hash_for_dedupe(&pipeline_id, qname.as_bytes(), qtype, qclass);
 
         // Insert an entry that expired 5 seconds ago
         let entry = CacheEntry {
@@ -1593,18 +1705,34 @@ mod tests {
 
         // Act: Create DNS query packet and check fast path
         let mut packet = vec![0u8; 12];
-        packet[0] = 0xAA; packet[1] = 0xBB; // TXID
+        packet[0] = 0xAA;
+        packet[1] = 0xBB; // TXID
         packet[5] = 1; // QDCOUNT
         packet.extend_from_slice(b"\x06expire\x03com\x00\x00\x01\x00\x01");
 
         let peer = "127.0.0.1:12345".parse().unwrap();
         let fast_res = engine.handle_packet_fast(&packet, peer).unwrap();
 
-        // Assert: Verify expired cache results in None (cache miss)
-        assert!(fast_res.is_none(), "Expired cache should result in None from handle_packet_fast");
-        
-        // Assert: Verify cache entry was invalidated
-        assert!(engine.cache.get(&dedupe_hash).is_none(), "Cache entry should be removed after expiration check");
+        // Assert: Expired cache should NOT be served — should fall through to AsyncNeeded
+        // (None means parse_quick failed; AsyncNeeded means "parsed OK, need upstream query")
+        match &fast_res {
+            Some(FastPathResponse::CacheHit { .. }) => {
+                panic!("Expired cache entry should not be served as CacheHit");
+            }
+            Some(FastPathResponse::AsyncNeeded { .. }) => { /* correct: requery needed */ }
+            Some(FastPathResponse::Direct(_)) => {
+                panic!("Expired cache should not produce a Direct response");
+            }
+            None => {
+                panic!("parse_quick should succeed for valid packet; expected AsyncNeeded, got None");
+            }
+        }
+
+        // Assert: Verify cache entry was invalidated (serve_stale disabled in build_test_engine)
+        assert!(
+            engine.cache.get(&dedupe_hash).is_none(),
+            "Cache entry should be removed after expiration check"
+        );
     }
 
     #[test]
@@ -1616,7 +1744,10 @@ mod tests {
         let qclass = DNSClass::IN;
         let ip1 = "1.2.3.4".parse::<IpAddr>().unwrap();
         let ip2 = "5.6.7.8".parse::<IpAddr>().unwrap();
-        let decision = Arc::new(Decision::Static { rcode: ResponseCode::NoError, answers: vec![] });
+        let decision = Arc::new(Decision::Static {
+            rcode: ResponseCode::NoError,
+            answers: vec![],
+        });
 
         // Arrange: Entry created WITHOUT IP
         let entry_no_ip = RuleCacheEntry {
@@ -1638,7 +1769,7 @@ mod tests {
             entry_no_ip.matches("test_p", qname, qtype, qclass, ip2, false),
             "Entry without IP should match any IP when uses_client_ip is false"
         );
-        
+
         // Act & Assert: Should NOT match if we now care about IP (since entry doesn't have it)
         assert!(
             !entry_no_ip.matches("test_p", qname, qtype, qclass, ip1, true),
@@ -1681,7 +1812,10 @@ mod tests {
         let qtype = RecordType::A;
         let qclass = DNSClass::IN;
         let ip = "1.2.3.4".parse::<IpAddr>().unwrap();
-        let decision = Arc::new(Decision::Static { rcode: ResponseCode::NoError, answers: vec![] });
+        let decision = Arc::new(Decision::Static {
+            rcode: ResponseCode::NoError,
+            answers: vec![],
+        });
 
         // Arrange: Expired entry
         let entry_expired = RuleCacheEntry {
@@ -1693,7 +1827,7 @@ mod tests {
             decision: decision.clone(),
             expires_at: Some(Instant::now() - Duration::from_secs(1)),
         };
-        
+
         // Act & Assert: Expired entry should not match
         assert!(
             !entry_expired.matches("test_p", qname, qtype, qclass, ip, false),
@@ -1710,7 +1844,7 @@ mod tests {
             decision,
             expires_at: Some(Instant::now() + Duration::from_secs(60)),
         };
-        
+
         // Act & Assert: Fresh entry should match
         assert!(
             entry_fresh.matches("test_p", qname, qtype, qclass, ip, false),
@@ -1730,37 +1864,35 @@ mod tests {
 
         // Act: Calculate hashes for same QNAME+QTYPE but different QCLASS
         let hash_in = Engine::calculate_cache_hash_for_dedupe(
-            pipeline_id, 
-            qname.as_bytes(), 
-            qtype, 
-            qclass_in
+            pipeline_id,
+            qname.as_bytes(),
+            qtype,
+            qclass_in,
         );
         let hash_ch = Engine::calculate_cache_hash_for_dedupe(
-            pipeline_id, 
-            qname.as_bytes(), 
-            qtype, 
-            qclass_ch
+            pipeline_id,
+            qname.as_bytes(),
+            qtype,
+            qclass_ch,
         );
 
         // Assert: Verify different QCLASS produces different hashes
         assert_ne!(
-            hash_in, 
-            hash_ch, 
+            hash_in, hash_ch,
             "Different QCLASS should produce different cache hashes"
         );
 
         // Act: Calculate hash for same QCLASS to verify consistency
         let hash_in2 = Engine::calculate_cache_hash_for_dedupe(
-            pipeline_id, 
-            qname.as_bytes(), 
-            qtype, 
-            qclass_in
+            pipeline_id,
+            qname.as_bytes(),
+            qtype,
+            qclass_in,
         );
 
         // Assert: Verify same QCLASS produces same hash
         assert_eq!(
-            hash_in, 
-            hash_in2, 
+            hash_in, hash_in2,
             "Same QCLASS should produce same cache hash"
         );
     }
@@ -1782,35 +1914,27 @@ mod tests {
         // 注意：在 parse_quick() 中，qname 在传递给此函数之前已经转为小写
         // 所以我们通过先小写输入来模拟这种行为
         let hash1 = Engine::calculate_cache_hash_for_dedupe(
-            pipeline_id, 
-            qname_lower.to_lowercase().as_bytes(), 
-            qtype, 
-            qclass
+            pipeline_id,
+            qname_lower.to_lowercase().as_bytes(),
+            qtype,
+            qclass,
         );
         let hash2 = Engine::calculate_cache_hash_for_dedupe(
-            pipeline_id, 
-            qname_upper.to_lowercase().as_bytes(), 
-            qtype, 
-            qclass
+            pipeline_id,
+            qname_upper.to_lowercase().as_bytes(),
+            qtype,
+            qclass,
         );
         let hash3 = Engine::calculate_cache_hash_for_dedupe(
-            pipeline_id, 
-            qname_mixed.to_lowercase().as_bytes(), 
-            qtype, 
-            qclass
+            pipeline_id,
+            qname_mixed.to_lowercase().as_bytes(),
+            qtype,
+            qclass,
         );
 
         // Assert: Verify case-insensitive hashing produces same results
-        assert_eq!(
-            hash1, 
-            hash2, 
-            "QNAME hash should be case-insensitive"
-        );
-        assert_eq!(
-            hash1, 
-            hash3, 
-            "QNAME hash should be case-insensitive"
-        );
+        assert_eq!(hash1, hash2, "QNAME hash should be case-insensitive");
+        assert_eq!(hash1, hash3, "QNAME hash should be case-insensitive");
     }
 
     /// 测试不同 QTYPE 的哈希也不同
@@ -1824,23 +1948,18 @@ mod tests {
         let qclass = DNSClass::IN;
 
         // Act: Calculate hashes for different QTYPE values
-        let hash_a = Engine::calculate_cache_hash_for_dedupe(
-            pipeline_id, 
-            qname.as_bytes(), 
-            qtype_a, 
-            qclass
-        );
+        let hash_a =
+            Engine::calculate_cache_hash_for_dedupe(pipeline_id, qname.as_bytes(), qtype_a, qclass);
         let hash_aaaa = Engine::calculate_cache_hash_for_dedupe(
-            pipeline_id, 
-            qname.as_bytes(), 
-            qtype_aaaa, 
-            qclass
+            pipeline_id,
+            qname.as_bytes(),
+            qtype_aaaa,
+            qclass,
         );
 
         // Assert: Verify different QTYPE produces different hashes
         assert_ne!(
-            hash_a, 
-            hash_aaaa, 
+            hash_a, hash_aaaa,
             "Different QTYPE should produce different cache hashes"
         );
     }
@@ -1856,23 +1975,14 @@ mod tests {
         let qclass = DNSClass::IN;
 
         // Act: Calculate hashes for different QNAME values
-        let hash1 = Engine::calculate_cache_hash_for_dedupe(
-            pipeline_id, 
-            qname1.as_bytes(), 
-            qtype, 
-            qclass
-        );
-        let hash2 = Engine::calculate_cache_hash_for_dedupe(
-            pipeline_id, 
-            qname2.as_bytes(), 
-            qtype, 
-            qclass
-        );
+        let hash1 =
+            Engine::calculate_cache_hash_for_dedupe(pipeline_id, qname1.as_bytes(), qtype, qclass);
+        let hash2 =
+            Engine::calculate_cache_hash_for_dedupe(pipeline_id, qname2.as_bytes(), qtype, qclass);
 
         // Assert: Verify different QNAME produces different hashes
         assert_ne!(
-            hash1, 
-            hash2, 
+            hash1, hash2,
             "Different QNAME should produce different cache hashes"
         );
     }
@@ -1962,10 +2072,6 @@ mod tests {
     }
 }
 
-
-
-
-
 // Multi-upstream parsing tests / 多上游解析测试
 // Tests for parsing and validating multi-upstream configurations
 #[cfg(test)]
@@ -1984,9 +2090,9 @@ mod tests_multi_upstream {
                         {
                             "name": "multi",
                             "matchers": [ { "type": "any" } ],
-                            "actions": [ { 
-                                "type": "forward", 
-                                "upstream": "1.1.1.1:53,8.8.8.8:53,9.9.9.9:53" 
+                            "actions": [ {
+                                "type": "forward",
+                                "upstream": "1.1.1.1:53,8.8.8.8:53,9.9.9.9:53"
                             } ]
                         }
                     ]
@@ -1997,11 +2103,15 @@ mod tests_multi_upstream {
         // Act: Parse configuration
         let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse");
         let rule = &cfg.pipelines[0].rules[0];
-        
+
         // Assert: Verify upstream is parsed correctly as comma-separated string
         match &rule.actions[0] {
             Action::Forward { upstream, .. } => {
-                assert_eq!(upstream.as_ref().map(|s| s.as_str()), Some("1.1.1.1:53,8.8.8.8:53,9.9.9.9:53"), "Comma-separated upstream should be preserved");
+                assert_eq!(
+                    upstream.as_ref().map(|s| s.as_str()),
+                    Some("1.1.1.1:53,8.8.8.8:53,9.9.9.9:53"),
+                    "Comma-separated upstream should be preserved"
+                );
             }
             _ => panic!("expected forward action"),
         }
@@ -2018,8 +2128,8 @@ mod tests_multi_upstream {
                         {
                             "name": "multi",
                             "matchers": [ { "type": "any" } ],
-                            "actions": [ { 
-                                "type": "forward", 
+                            "actions": [ {
+                                "type": "forward",
                                 "upstream": ["1.1.1.1:53", "8.8.8.8:53", "9.9.9.9:53"]
                             } ]
                         }
@@ -2031,11 +2141,15 @@ mod tests_multi_upstream {
         // Act: Parse configuration
         let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse");
         let rule = &cfg.pipelines[0].rules[0];
-        
+
         // Assert: Verify upstream array is converted to comma-separated string
         match &rule.actions[0] {
             Action::Forward { upstream, .. } => {
-                assert_eq!(upstream.as_ref().map(|s| s.as_str()), Some("1.1.1.1:53,8.8.8.8:53,9.9.9.9:53"), "Array upstream should be joined with commas");
+                assert_eq!(
+                    upstream.as_ref().map(|s| s.as_str()),
+                    Some("1.1.1.1:53,8.8.8.8:53,9.9.9.9:53"),
+                    "Array upstream should be joined with commas"
+                );
             }
             _ => panic!("expected forward action"),
         }
@@ -2052,8 +2166,8 @@ mod tests_multi_upstream {
                         {
                             "name": "empty",
                             "matchers": [ { "type": "any" } ],
-                            "actions": [ { 
-                                "type": "forward", 
+                            "actions": [ {
+                                "type": "forward",
                                 "upstream": []
                             } ]
                         }
@@ -2065,11 +2179,14 @@ mod tests_multi_upstream {
         // Act: Parse configuration
         let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse");
         let rule = &cfg.pipelines[0].rules[0];
-        
+
         // Assert: Verify empty array results in None upstream
         match &rule.actions[0] {
             Action::Forward { upstream, .. } => {
-                assert!(upstream.is_none(), "Empty upstream array should result in None");
+                assert!(
+                    upstream.is_none(),
+                    "Empty upstream array should result in None"
+                );
             }
             _ => panic!("expected forward action"),
         }
@@ -2086,8 +2203,8 @@ mod tests_multi_upstream {
                         {
                             "name": "single",
                             "matchers": [ { "type": "any" } ],
-                            "actions": [ { 
-                                "type": "forward", 
+                            "actions": [ {
+                                "type": "forward",
                                 "upstream": ["1.1.1.1:53"]
                             } ]
                         }
@@ -2099,11 +2216,15 @@ mod tests_multi_upstream {
         // Act: Parse configuration
         let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse");
         let rule = &cfg.pipelines[0].rules[0];
-        
+
         // Assert: Verify single-element array is converted to string
         match &rule.actions[0] {
             Action::Forward { upstream, .. } => {
-                assert_eq!(upstream.as_ref().map(|s| s.as_str()), Some("1.1.1.1:53"), "Single-element array should be converted to string");
+                assert_eq!(
+                    upstream.as_ref().map(|s| s.as_str()),
+                    Some("1.1.1.1:53"),
+                    "Single-element array should be converted to string"
+                );
             }
             _ => panic!("expected forward action"),
         }
