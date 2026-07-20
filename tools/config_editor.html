@@ -67,6 +67,19 @@
                                 <input type="text" class="form-control" v-model="config.settings.bind_tcp">
                             </div>
                             <div class="col-md-6">
+                                <label class="form-label">DoH 监听地址</label>
+                                <input type="text" class="form-control" v-model="config.settings.bind_doh" placeholder="留空则不启用 DoH">
+                                <div class="form-text small">如 0.0.0.0:443，留空则不启用 DoH 入站 (RFC 8484)</div>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label">DoH TLS 证书路径</label>
+                                <input type="text" class="form-control" v-model="config.settings.doh_tls_cert" placeholder="如 /path/to/cert.pem">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label">DoH TLS 私钥路径</label>
+                                <input type="text" class="form-control" v-model="config.settings.doh_tls_key" placeholder="如 /path/to/key.pem">
+                            </div>
+                            <div class="col-md-6">
                                 <label class="form-label">默认上游</label>
                                 <input type="text" class="form-control" v-model="config.settings.default_upstream">
                             </div>
@@ -868,6 +881,9 @@
                         min_ttl: 0,
                         bind_udp: "0.0.0.0:5353",
                         bind_tcp: "0.0.0.0:5353",
+                        bind_doh: "",
+                        doh_tls_cert: "",
+                        doh_tls_key: "",
                         default_upstream: "1.1.1.1:53",
                         upstream_timeout_ms: 2000,
                         request_timeout_ms: null,
@@ -1021,24 +1037,29 @@
                 };
 
                 const toCleanJsonString = (cfgObj) => {
-                    // 深拷贝 + 过滤 _ 前缀字段 + 过滤空 geosite_data_paths + 过滤扁平 ECS 字段
+                    // 深拷贝，过滤 _ 前缀字段和空 geosite_data_paths
+                    // 保留 ecs_* 扁平字段供下方 buildEcsObject 使用
                     const clean = JSON.parse(JSON.stringify(cfgObj, (key, value) => {
                         if (key && key.startsWith('_')) return undefined;
                         if (key === 'geosite_data_paths' && Array.isArray(value) && value.length === 0) return undefined;
-                        if (key.startsWith('ecs_')) return undefined;
                         return value;
                     }));
-                    // 重建嵌套 ecs 对象（Pipeline 级 + Forward action 级）
+                    // 构建嵌套 ecs 对象，然后删除扁平 ecs_* 字段
+                    const processEcs = (obj) => {
+                        const ecs = buildEcsObject(obj);
+                        if (ecs) obj.ecs = ecs;
+                        delete obj.ecs_mode;
+                        delete obj.ecs_ip;
+                        delete obj.ecs_prefix;
+                        delete obj.ecs_prefix_v4;
+                        delete obj.ecs_prefix_v6;
+                    };
                     (clean.pipelines || []).forEach(pipe => {
-                        const ecs = buildEcsObject(pipe);
-                        if (ecs) pipe.ecs = ecs;
+                        processEcs(pipe);
                         (pipe.rules || []).forEach(rule => {
                             [rule.actions, rule.response_actions_on_match, rule.response_actions_on_miss]
                                 .forEach(actions => (actions || []).forEach(a => {
-                                    if (a.type === 'forward') {
-                                        const ecs = buildEcsObject(a);
-                                        if (ecs) a.ecs = ecs;
-                                    }
+                                    if (a.type === 'forward') processEcs(a);
                                 }));
                         });
                     });
