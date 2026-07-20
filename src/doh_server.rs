@@ -14,8 +14,8 @@ use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
@@ -32,6 +32,19 @@ pub async fn run_doh(
     key_path: &str,
     engine: Engine,
 ) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(addr).await.context("bind doh tcp")?;
+    info!(%addr, "DoH server listening");
+    run_doh_with_listener(listener, cert_path, key_path, engine).await
+}
+
+/// 从已绑定的 TcpListener 启动 DoH 服务器（便于测试获取实际端口）
+/// Start DoH server from a pre-bound TcpListener (allows tests to discover the actual port)
+pub async fn run_doh_with_listener(
+    listener: TcpListener,
+    cert_path: &str,
+    key_path: &str,
+    engine: Engine,
+) -> anyhow::Result<()> {
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
 
@@ -41,9 +54,6 @@ pub async fn run_doh(
         .context("build TLS server config")?;
 
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
-    let listener = TcpListener::bind(addr).await.context("bind doh tcp")?;
-
-    info!(%addr, "DoH server listening");
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -80,18 +90,16 @@ async fn handle_doh_request(
     // RFC 8484 §4.1: POST with application/dns-message
     // RFC 8484 §4.1.5: GET with ?dns=base64url
     let dns_wire = match (req.method(), req.uri().path()) {
-        (&Method::POST, "/dns-query") => {
-            match req.into_body().collect().await {
-                Ok(collected) => {
-                    let body = collected.to_bytes();
-                    if body.len() > MAX_DNS_MESSAGE {
-                        return Ok(error_response(StatusCode::PAYLOAD_TOO_LARGE));
-                    }
-                    body
+        (&Method::POST, "/dns-query") => match req.into_body().collect().await {
+            Ok(collected) => {
+                let body = collected.to_bytes();
+                if body.len() > MAX_DNS_MESSAGE {
+                    return Ok(error_response(StatusCode::PAYLOAD_TOO_LARGE));
                 }
-                Err(_) => return Ok(error_response(StatusCode::BAD_REQUEST)),
+                body
             }
-        }
+            Err(_) => return Ok(error_response(StatusCode::BAD_REQUEST)),
+        },
         (&Method::GET, "/dns-query") => {
             match extract_get_dns_param(req.uri().query().unwrap_or("")) {
                 Some(data) => data,
@@ -118,7 +126,7 @@ async fn handle_doh_request(
 
 /// 从 GET ?dns=base64url 提取 DNS 报文 / Extract DNS wire from GET ?dns=base64url
 fn extract_get_dns_param(query: &str) -> Option<Bytes> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     for pair in query.split('&') {
         if let Some(val) = pair.strip_prefix("dns=") {
             let decoded = URL_SAFE_NO_PAD.decode(val).ok()?;
@@ -169,7 +177,14 @@ async fn process_dns_wire(packet: &[u8], peer: SocketAddr, engine: &Engine) -> B
             match tokio::time::timeout(
                 timeout_dur,
                 engine.handle_packet_internal_with_pre_parsed(
-                    packet, peer, false, qname, qtype, qclass, tx_id, edns_present,
+                    packet,
+                    peer,
+                    false,
+                    qname,
+                    qtype,
+                    qclass,
+                    tx_id,
+                    edns_present,
                     pipeline_id,
                 ),
             )
@@ -241,4 +256,223 @@ fn load_private_key(path: &str) -> anyhow::Result<PrivateKeyDer<'static>> {
     rustls_pemfile::private_key(&mut reader)
         .context("parse PEM private key")?
         .context("no private key found in PEM file")
+}
+
+// ============================================================================
+// Tests / 单元测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+
+    /// Install rustls crypto provider for tests that create Engine (which internally creates TLS clients).
+    #[ctor::ctor]
+    fn init_crypto() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
+    // ---- extract_get_dns_param ----
+
+    #[test]
+    fn test_extract_get_dns_param_valid() {
+        // A minimal DNS query for example.com A record
+        let dns_wire = [
+            0xAB, 0xCD, // TXID
+            0x01, 0x00, // Flags: standard query, RD=1
+            0x00, 0x01, // QDCOUNT = 1
+            0x00, 0x00, // ANCOUNT
+            0x00, 0x00, // NSCOUNT
+            0x00, 0x00, // ARCOUNT
+            // Question: example.com A IN
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm',
+            0, // null terminator
+            0x00, 0x01, // QTYPE = A
+            0x00, 0x01, // QCLASS = IN
+        ];
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&dns_wire);
+        let query = format!("dns={encoded}");
+        let result = extract_get_dns_param(&query);
+        assert!(result.is_some(), "should decode valid base64url");
+        assert_eq!(result.unwrap().as_ref(), &dns_wire[..]);
+    }
+
+    #[test]
+    fn test_extract_get_dns_param_missing_param() {
+        assert!(extract_get_dns_param("foo=bar").is_none());
+        assert!(extract_get_dns_param("").is_none());
+    }
+
+    #[test]
+    fn test_extract_get_dns_param_empty_value() {
+        assert!(extract_get_dns_param("dns=").is_none());
+        assert!(extract_get_dns_param("dns=&foo=bar").is_none());
+    }
+
+    #[test]
+    fn test_extract_get_dns_param_multiple_params() {
+        let dns_wire = [0x00; 12];
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&dns_wire);
+        // dns= should be found among multiple params
+        let query = format!("foo=bar&dns={encoded}&baz=qux");
+        let result = extract_get_dns_param(&query);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().as_ref(), &dns_wire[..]);
+    }
+
+    #[test]
+    fn test_extract_get_dns_param_invalid_base64() {
+        assert!(extract_get_dns_param("dns=!!!invalid").is_none());
+    }
+
+    #[test]
+    fn test_extract_get_dns_param_standard_base64url_no_pad() {
+        // RFC 8484 uses base64url without padding
+        let dns_wire = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x12];
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&dns_wire);
+        let result = extract_get_dns_param(&format!("dns={encoded}"));
+        assert!(result.is_some());
+    }
+
+    // ---- empty_dns_response ----
+
+    #[test]
+    fn test_empty_dns_response_preserves_txid() {
+        let request = [
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let resp = empty_dns_response(&request);
+        assert_eq!(resp.len(), 12);
+        assert_eq!(resp[0], 0x12, "TXID high byte preserved");
+        assert_eq!(resp[1], 0x34, "TXID low byte preserved");
+    }
+
+    #[test]
+    fn test_empty_dns_response_qr_and_rcode() {
+        let request = [0xAB, 0xCD];
+        let resp = empty_dns_response(&request);
+        assert_eq!(resp.len(), 12);
+        // Byte 2: QR=1, Opcode=0, AA=0, TC=0, RD=0 → 0x80
+        assert_eq!(resp[2], 0x80, "QR should be 1");
+        // Byte 3: RA=0, Z=0, RCODE=2 (SERVFAIL) → 0x02
+        assert_eq!(resp[3], 0x02, "RCODE should be SERVFAIL (2)");
+    }
+
+    #[test]
+    fn test_empty_dns_response_short_input() {
+        let resp = empty_dns_response(&[0xFF]);
+        assert!(resp.is_empty(), "input < 2 bytes should return empty");
+        let resp = empty_dns_response(&[]);
+        assert!(resp.is_empty());
+    }
+
+    // ---- error_response ----
+
+    #[test]
+    fn test_error_response_status() {
+        let resp = error_response(StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = error_response(StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = error_response(StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // ---- process_dns_wire (with static-response Engine) ----
+
+    fn make_static_engine(rcode: &str) -> Engine {
+        use crate::config::PipelineConfig;
+        use crate::matcher::RuntimePipelineConfig;
+
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:5300" },
+            "pipelines": [
+                {
+                    "id": "p",
+                    "rules": [
+                        {
+                            "name": "static",
+                            "matchers": [ { "type": "any" } ],
+                            "actions": [ { "type": "static_response", "rcode": rcode } ]
+                        }
+                    ]
+                }
+            ]
+        });
+        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(cfg).expect("build runtime");
+        Engine::new(runtime, "test".to_string())
+    }
+
+    fn make_dns_query_a(domain: &str, txid: u16) -> Vec<u8> {
+        use hickory_proto::op::{Message, OpCode, Query};
+        use hickory_proto::rr::{Name, RecordType};
+        use std::str::FromStr;
+
+        let mut msg = Message::new();
+        msg.set_id(txid);
+        msg.set_op_code(OpCode::Query);
+        msg.set_recursion_desired(true);
+        msg.add_query(Query::query(Name::from_str(domain).unwrap(), RecordType::A));
+        msg.to_vec().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_process_dns_wire_static_nxdomain() {
+        let engine = make_static_engine("NXDOMAIN");
+        let query = make_dns_query_a("test.example.com", 0x4242);
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        let resp = process_dns_wire(&query, peer, &engine).await;
+
+        // Should be a valid DNS response
+        assert!(resp.len() >= 12, "response should be >= 12 bytes");
+        // TXID preserved
+        assert_eq!(resp[0], 0x42, "TXID high byte preserved");
+        assert_eq!(resp[1], 0x42, "TXID low byte preserved");
+        // QR=1
+        assert_eq!(resp[2] & 0x80, 0x80, "QR bit should be set");
+        // RCODE = NXDOMAIN (3)
+        assert_eq!(resp[3] & 0x0F, 0x03, "RCODE should be NXDOMAIN (3)");
+    }
+
+    #[tokio::test]
+    async fn test_process_dns_wire_static_noerror() {
+        let engine = make_static_engine("NOERROR");
+        let query = make_dns_query_a("ok.example.com", 0x0001);
+        let peer: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let resp = process_dns_wire(&query, peer, &engine).await;
+
+        assert!(resp.len() >= 12);
+        assert_eq!(resp[0], 0x00, "TXID high byte preserved");
+        assert_eq!(resp[1], 0x01, "TXID low byte preserved");
+        // RCODE = NOERROR (0)
+        assert_eq!(resp[3] & 0x0F, 0x00, "RCODE should be NOERROR (0)");
+    }
+
+    #[tokio::test]
+    async fn test_process_dns_wire_short_query_returns_servfail() {
+        // Query shorter than DNS header — fast parse fails → fallback → SERVFAIL
+        let engine = make_static_engine("NXDOMAIN");
+        let short = [0x12, 0x34, 0x00]; // only 3 bytes, not a valid DNS message
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        let resp = process_dns_wire(&short, peer, &engine).await;
+
+        // Should return a SERVFAIL response preserving TXID
+        assert_eq!(resp.len(), 12);
+        assert_eq!(resp[0], 0x12, "TXID high byte preserved");
+        assert_eq!(resp[1], 0x34, "TXID low byte preserved");
+        assert_eq!(resp[3] & 0x0F, 0x02, "RCODE should be SERVFAIL (2)");
+    }
+
+    // ---- MAX_DNS_MESSAGE size guard ----
+
+    #[test]
+    fn test_max_dns_message_constant() {
+        // RFC 1035 limits DNS messages to 65535 bytes; we cap at 64KB for safety
+        assert_eq!(MAX_DNS_MESSAGE, 64 * 1024);
+    }
 }

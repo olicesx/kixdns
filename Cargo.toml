@@ -52,6 +52,9 @@ base64 = "0.22"
 [dev-dependencies]
 criterion = "0.5"
 ctor = "0.2"
+rcgen = "0.13"
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [profile.release]
 opt-level = 3

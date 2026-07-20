@@ -218,3 +218,19 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/kixdns-freebsd-${{ matrix.arch }}
+
+  test-linux:
+    name: Test Linux (unit + DoH integration)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run unit tests
+        run: cargo test --lib
+
+      - name: Run DoH integration tests
+        run: cargo test --test doh_integration
