@@ -31,10 +31,11 @@ pub async fn run_doh(
     cert_path: &str,
     key_path: &str,
     engine: Engine,
+    doh_path: String,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await.context("bind doh tcp")?;
-    info!(%addr, "DoH server listening");
-    run_doh_with_listener(listener, cert_path, key_path, engine).await
+    info!(%addr, %doh_path, "DoH server listening");
+    run_doh_with_listener(listener, cert_path, key_path, engine, doh_path).await
 }
 
 /// 从已绑定的 TcpListener 启动 DoH 服务器（便于测试获取实际端口）
@@ -44,6 +45,7 @@ pub async fn run_doh_with_listener(
     cert_path: &str,
     key_path: &str,
     engine: Engine,
+    doh_path: String,
 ) -> anyhow::Result<()> {
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
@@ -59,6 +61,7 @@ pub async fn run_doh_with_listener(
         let (stream, peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let engine = engine.clone();
+        let doh_path = doh_path.clone();
         tokio::spawn(async move {
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
@@ -66,7 +69,8 @@ pub async fn run_doh_with_listener(
                     let io = hyper_util::rt::TokioIo::new(tls_stream);
                     let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
                         let engine = engine.clone();
-                        async move { handle_doh_request(req, peer, engine).await }
+                        let doh_path = doh_path.clone();
+                        async move { handle_doh_request(req, peer, engine, &doh_path).await }
                     });
                     let _ = http1::Builder::new()
                         .keep_alive(true)
@@ -86,11 +90,12 @@ async fn handle_doh_request(
     req: Request<hyper::body::Incoming>,
     peer: SocketAddr,
     engine: Engine,
+    doh_path: &str,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     // RFC 8484 §4.1: POST with application/dns-message
     // RFC 8484 §4.1.5: GET with ?dns=base64url
     let dns_wire = match (req.method(), req.uri().path()) {
-        (&Method::POST, "/dns-query") => match req.into_body().collect().await {
+        (&Method::POST, path) if path == doh_path => match req.into_body().collect().await {
             Ok(collected) => {
                 let body = collected.to_bytes();
                 if body.len() > MAX_DNS_MESSAGE {
@@ -100,7 +105,7 @@ async fn handle_doh_request(
             }
             Err(_) => return Ok(error_response(StatusCode::BAD_REQUEST)),
         },
-        (&Method::GET, "/dns-query") => {
+        (&Method::GET, path) if path == doh_path => {
             match extract_get_dns_param(req.uri().query().unwrap_or("")) {
                 Some(data) => data,
                 None => return Ok(error_response(StatusCode::BAD_REQUEST)),

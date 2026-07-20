@@ -80,6 +80,11 @@
                                 <input type="text" class="form-control" v-model="config.settings.doh_tls_key" placeholder="如 /path/to/key.pem">
                             </div>
                             <div class="col-md-6">
+                                <label class="form-label">DoH 查询路径</label>
+                                <input type="text" class="form-control" v-model="config.settings.doh_path" placeholder="/dns-query">
+                                <div class="form-text small">自定义查询路径可避免探测，如 /s/xxxxx（默认 /dns-query）</div>
+                            </div>
+                            <div class="col-md-6">
                                 <label class="form-label">默认上游</label>
                                 <input type="text" class="form-control" v-model="config.settings.default_upstream">
                             </div>
@@ -884,6 +889,7 @@
                         bind_doh: "",
                         doh_tls_cert: "",
                         doh_tls_key: "",
+                        doh_path: "/dns-query",
                         default_upstream: "1.1.1.1:53",
                         upstream_timeout_ms: 2000,
                         request_timeout_ms: null,

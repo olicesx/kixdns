@@ -90,6 +90,10 @@ pub struct GlobalSettings {
     /// DoH TLS 私钥路径（PEM）。 / TLS private key path for DoH (PEM)
     #[serde(default)]
     pub doh_tls_key: Option<String>,
+    /// DoH 查询路径，默认 /dns-query。可自定义为任意路径以避免探测。
+    /// / DoH query path, defaults to /dns-query. Can be customized to any path to avoid detection.
+    #[serde(default = "default_doh_path")]
+    pub doh_path: String,
     /// Moka 缓存最大条目数（默认 10000） / Moka cache max entries (default 10000)
     #[serde(default = "default_cache_capacity")]
     pub cache_capacity: u64,
@@ -241,6 +245,7 @@ impl Default for GlobalSettings {
             bind_doh: None,
             doh_tls_cert: None,
             doh_tls_key: None,
+            doh_path: default_doh_path(),
             default_upstream: default_upstream(),
             default_upstream_pre_split: None,
             upstream_timeout_ms: default_upstream_timeout_ms(),
@@ -738,6 +743,11 @@ fn default_tcp_pool_size() -> usize {
 
 fn default_doh_pool_size() -> usize {
     8
+}
+
+/// Default DoH query path (RFC 8484 standard) / 默认 DoH 查询路径（RFC 8484 标准）
+fn default_doh_path() -> String {
+    "/dns-query".to_string()
 }
 
 fn default_dot_pool_size() -> usize {

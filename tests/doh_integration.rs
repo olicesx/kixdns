@@ -129,7 +129,14 @@ async fn start_doh(engine: Engine) -> DohTestServer {
     let port = listener.local_addr().expect("local addr").port();
 
     tokio::spawn(async move {
-        let _ = run_doh_with_listener(listener, &cert_path, &key_path, engine).await;
+        let _ = run_doh_with_listener(
+            listener,
+            &cert_path,
+            &key_path,
+            engine,
+            "/dns-query".to_string(),
+        )
+        .await;
     });
 
     // Brief delay to let the spawned task load certs and enter accept loop
