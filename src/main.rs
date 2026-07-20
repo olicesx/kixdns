@@ -119,6 +119,20 @@ async fn run_dns_server(
                 .parse()
                 .context("parse tcp bind addr")?;
 
+            // 在 cfg 被 move 到 Engine 之前提取 DoH 配置
+            // Extract DoH config before cfg is moved into Engine
+            let doh_config: Option<(SocketAddr, String, String)> =
+                if let Some(ref bind_doh) = cfg.settings.bind_doh {
+                    let addr: SocketAddr = bind_doh.parse().context("parse doh bind addr")?;
+                    let cert = cfg.settings.doh_tls_cert.as_ref()
+                        .context("doh_tls_cert is required when bind_doh is set")?.clone();
+                    let key = cfg.settings.doh_tls_key.as_ref()
+                        .context("doh_tls_key is required when bind_doh is set")?.clone();
+                    Some((addr, cert, key))
+                } else {
+                    None
+                };
+
             let engine = Engine::new(cfg, listener_label.clone());
 
             watcher::spawn(config.clone(), engine.clone());
@@ -267,6 +281,19 @@ async fn run_dns_server(
                 let h = tokio::spawn(async move {
                     if let Err(err) = run_tcp(listener, engine).await {
                         error!(error = %err, "ipv6 tcp server exited");
+                    }
+                });
+                all_handles.push(h);
+            }
+
+            // DoH listener — 仅在配置了 bind_doh 时启动 / DoH listener — only if bind_doh is configured
+            if let Some((doh_addr, cert_path, key_path)) = doh_config {
+                let engine = engine.clone();
+                let h = tokio::spawn(async move {
+                    if let Err(err) = kixdns::doh_server::run_doh(
+                        doh_addr, &cert_path, &key_path, engine,
+                    ).await {
+                        error!(error = %err, "DoH server exited");
                     }
                 });
                 all_handles.push(h);

@@ -148,6 +148,9 @@ Configuration uses JSON format with the following top-level structure:
 - `min_ttl` — Minimum TTL in seconds (default: 0)
 - `bind_udp` — UDP listen address (default: `0.0.0.0:5353`)
 - `bind_tcp` — TCP listen address (default: `0.0.0.0:5353`)
+- `bind_doh` — DoH (DNS over HTTPS) listen address, null = disabled (default: null)
+- `doh_tls_cert` — TLS certificate path (PEM) for DoH, required when `bind_doh` is set
+- `doh_tls_key` — TLS private key path (PEM) for DoH, required when `bind_doh` is set
 - `cache_capacity` — Max cache entries (default: 10000)
 - `cache_max_ttl` — Max cache TTL in seconds (default: 86400)
 - `default_upstream` — Default upstream DNS (default: `1.1.1.1:53`)

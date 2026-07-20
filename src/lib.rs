@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod config;
+pub mod doh_server;
 pub mod engine;
 pub mod lock;
 pub mod matcher;

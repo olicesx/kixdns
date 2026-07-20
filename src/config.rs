@@ -81,6 +81,15 @@ pub struct GlobalSettings {
     /// TCP监听地址，缺省0.0.0.0:5353。 / TCP listen address, defaults to 0.0.0.0:5353
     #[serde(default = "default_bind_tcp")]
     pub bind_tcp: String,
+    /// DoH 监听地址（留空则不启用）。 / DoH listen address (empty/null = disabled)
+    #[serde(default)]
+    pub bind_doh: Option<String>,
+    /// DoH TLS 证书路径（PEM）。 / TLS certificate path for DoH (PEM)
+    #[serde(default)]
+    pub doh_tls_cert: Option<String>,
+    /// DoH TLS 私钥路径（PEM）。 / TLS private key path for DoH (PEM)
+    #[serde(default)]
+    pub doh_tls_key: Option<String>,
     /// Moka 缓存最大条目数（默认 10000） / Moka cache max entries (default 10000)
     #[serde(default = "default_cache_capacity")]
     pub cache_capacity: u64,
@@ -229,6 +238,9 @@ impl Default for GlobalSettings {
             min_ttl: default_min_ttl(),
             bind_udp: default_bind_udp(),
             bind_tcp: default_bind_tcp(),
+            bind_doh: None,
+            doh_tls_cert: None,
+            doh_tls_key: None,
             default_upstream: default_upstream(),
             default_upstream_pre_split: None,
             upstream_timeout_ms: default_upstream_timeout_ms(),
