@@ -150,7 +150,7 @@ impl PermitManager {
                 let dropped = self.dropped_requests.fetch_add(1, Ordering::Relaxed);
 
                 // Log every 1000 dropped requests to avoid spam / 每1000个丢弃请求记录一次，避免刷屏
-                if dropped % 1000 == 0 {
+                if dropped.is_multiple_of(1000) {
                     tracing::warn!(
                         active = active,
                         max = max,
@@ -180,7 +180,7 @@ impl PermitManager {
                         // Exceeded new limit — return the permit and report exhaustion
                         self.active_permits.fetch_sub(1, Ordering::Release);
                         let dropped = self.dropped_requests.fetch_add(1, Ordering::Relaxed);
-                        if dropped % 1000 == 0 {
+                        if dropped.is_multiple_of(1000) {
                             tracing::warn!(
                                 active = active,
                                 new_max = current_max,

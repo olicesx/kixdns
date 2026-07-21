@@ -539,19 +539,17 @@ impl Action {
     #[inline]
     pub fn pre_split_upstreams(&mut self) {
         if let Action::Forward {
-            upstream,
+            upstream: Some(upstream_str),
             pre_split_upstreams,
             ..
         } = self
         {
-            if let Some(upstream_str) = upstream {
-                let split: Vec<std::sync::Arc<str>> = upstream_str
-                    .split(',')
-                    .map(|s| std::sync::Arc::from(s.trim()))
-                    .filter(|s: &std::sync::Arc<str>| !s.is_empty())
-                    .collect();
-                *pre_split_upstreams = Some(std::sync::Arc::new(split));
-            }
+            let split: Vec<std::sync::Arc<str>> = upstream_str
+                .split(',')
+                .map(|s| std::sync::Arc::from(s.trim()))
+                .filter(|s: &std::sync::Arc<str>| !s.is_empty())
+                .collect();
+            *pre_split_upstreams = Some(std::sync::Arc::new(split));
         }
     }
 }

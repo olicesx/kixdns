@@ -32,6 +32,7 @@ pub enum TxtMatchMode {
 
 impl TxtMatchMode {
     /// 从字符串解析匹配模式 / Parse match mode from string
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> anyhow::Result<Self> {
         match s.to_lowercase().as_str() {
             "exact" => Ok(TxtMatchMode::Exact),
@@ -765,11 +766,9 @@ impl RuntimeMatcher {
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes } => {
                 // 按需获取锁：只在GeoIP matcher时才获取 / On-demand lock: only acquire for GeoIP matcher
-                geoip_manager
-                    .and_then(|mgr| Some(mgr.read()))
-                    .is_some_and(|guard| {
-                        matcher_helpers::match_geoip_country(&guard, client_ip, country_codes)
-                    })
+                geoip_manager.map(|mgr| mgr.read()).is_some_and(|guard| {
+                    matcher_helpers::match_geoip_country(&guard, client_ip, country_codes)
+                })
             }
             RuntimeMatcher::GeoipPrivate { expect } => {
                 // 按需获取锁：只在GeoIP matcher时才获取
@@ -787,7 +786,7 @@ impl RuntimeMatcher {
             RuntimeMatcher::GeoSite { tag } => {
                 // 按需获取锁：只在GeoSite matcher时才获取 / On-demand lock: only acquire for GeoSite matcher
                 geosite_manager
-                    .and_then(|mgr| Some(mgr.read()))
+                    .map(|mgr| mgr.read())
                     .is_some_and(|guard| matcher_helpers::match_geosite(&guard, qname, tag))
             }
             RuntimeMatcher::GeoSiteNot { tag } => {
@@ -829,11 +828,9 @@ impl RuntimeMatcher {
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes } => {
                 // 按需获取锁：只在GeoIP matcher时才获取 / On-demand lock: only acquire for GeoIP matcher
-                geoip_manager
-                    .and_then(|mgr| Some(mgr.read()))
-                    .is_some_and(|guard| {
-                        matcher_helpers::match_geoip_country(&guard, client_ip, country_codes)
-                    })
+                geoip_manager.map(|mgr| mgr.read()).is_some_and(|guard| {
+                    matcher_helpers::match_geoip_country(&guard, client_ip, country_codes)
+                })
             }
             RuntimeMatcher::GeoipPrivate { expect } => {
                 // 按需获取锁：只在GeoIP matcher时才获取
@@ -851,7 +848,7 @@ impl RuntimeMatcher {
             RuntimeMatcher::GeoSite { tag } => {
                 // 按需获取锁：只在GeoSite matcher时才获取 / On-demand lock: only acquire for GeoSite matcher
                 geosite_manager
-                    .and_then(|mgr| Some(mgr.read()))
+                    .map(|mgr| mgr.read())
                     .is_some_and(|guard| matcher_helpers::match_geosite(&guard, qname, tag))
             }
             RuntimeMatcher::GeoSiteNot { tag } => {
@@ -1044,7 +1041,7 @@ impl RuntimePipelineSelectorMatcher {
             RuntimePipelineSelectorMatcher::GeoSite { tag } => {
                 // 按需获取锁：只在GeoSite matcher时才获取 / On-demand lock: only acquire for GeoSite matcher
                 geosite_manager
-                    .and_then(|mgr| Some(mgr.read()))
+                    .map(|mgr| mgr.read())
                     .is_some_and(|guard| guard.matches(tag, qname))
             }
             RuntimePipelineSelectorMatcher::GeoSiteNot { tag } => {
@@ -1058,16 +1055,14 @@ impl RuntimePipelineSelectorMatcher {
             }
             RuntimePipelineSelectorMatcher::GeoipCountry { country_codes } => {
                 // 按需获取锁：只在GeoIP matcher时才获取 / On-demand lock: only acquire for GeoIP matcher
-                geoip_manager
-                    .and_then(|mgr| Some(mgr.read()))
-                    .is_some_and(|guard| {
-                        let result = guard.lookup(client_ip);
-                        if let Some(cc) = result.country_code {
-                            country_codes.iter().any(|c| c.eq_ignore_ascii_case(&cc))
-                        } else {
-                            false
-                        }
-                    })
+                geoip_manager.map(|mgr| mgr.read()).is_some_and(|guard| {
+                    let result = guard.lookup(client_ip);
+                    if let Some(cc) = result.country_code {
+                        country_codes.iter().any(|c| c.eq_ignore_ascii_case(&cc))
+                    } else {
+                        false
+                    }
+                })
             }
             RuntimePipelineSelectorMatcher::GeoipPrivate { expect } => {
                 // 按需获取锁：只在GeoIP matcher时才获取

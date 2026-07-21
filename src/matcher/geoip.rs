@@ -513,18 +513,16 @@ impl GeoIpManager {
 
         for geoip in list.entries {
             for ip_str in &geoip.ips {
-                if let Ok(net) = ip_str.parse::<ipnet::IpNet>() {
-                    if let ipnet::IpNet::V4(v4net) = net {
-                        let start = u32::from(v4net.network());
-                        let prefix_len = v4net.prefix_len() as u32;
-                        let end = start + (1u32 << (32 - prefix_len)) - 1;
+                if let Ok(ipnet::IpNet::V4(v4net)) = ip_str.parse::<ipnet::IpNet>() {
+                    let start = u32::from(v4net.network());
+                    let prefix_len = v4net.prefix_len() as u32;
+                    let end = start + (1u32 << (32 - prefix_len)) - 1;
 
-                        self.ip_ranges.push(IpRange {
-                            start,
-                            end,
-                            country_code: geoip.country_code.clone(),
-                        });
-                    }
+                    self.ip_ranges.push(IpRange {
+                        start,
+                        end,
+                        country_code: geoip.country_code.clone(),
+                    });
                 }
             }
         }

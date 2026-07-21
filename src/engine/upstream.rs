@@ -249,7 +249,7 @@ pub async fn forward_upstream(
         upstream
             .split(',')
             .map(|s| s.trim())
-            .map(|s| std::sync::Arc::from(s))
+            .map(std::sync::Arc::from)
             .filter(|s: &std::sync::Arc<str>| !s.is_empty())
             .collect()
     };

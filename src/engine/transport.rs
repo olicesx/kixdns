@@ -1241,15 +1241,15 @@ impl DohClient {
         .await
         .context("doh request timeout")??;
 
-        Ok(Bytes::from(bytes))
+        Ok(bytes)
     }
 }
 
 fn build_doh_url(upstream: &str) -> anyhow::Result<(Url, Option<String>)> {
     let url_str = if upstream.starts_with("http://") || upstream.starts_with("https://") {
         upstream.to_string()
-    } else if upstream.starts_with("doh://") {
-        format!("https://{}", &upstream[6..])
+    } else if let Some(stripped) = upstream.strip_prefix("doh://") {
+        format!("https://{}", stripped)
     } else {
         format!("https://{}", upstream)
     };
@@ -2327,7 +2327,7 @@ impl DoqMuxClient {
                 }
                 // Restore original DNS Message ID before returning to caller.
                 // 返回调用方前恢复原始 DNS Message ID。
-                Ok::<Bytes, anyhow::Error>(restore_doq_response_id(buf, original_id)?)
+                restore_doq_response_id(buf, original_id)
             }).await;
 
             match resp {
