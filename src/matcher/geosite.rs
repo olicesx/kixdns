@@ -40,8 +40,8 @@ impl DomainMatcher {
             DomainMatcher::Suffix(suffix) => {
                 // 移除前导点后再进行匹配，让 .github.com 也能匹配 github.com
                 // Remove leading dot for matching, so .github.com can match github.com
-                let suffix_clean = if suffix.starts_with('.') {
-                    &suffix[1..]
+                let suffix_clean = if let Some(stripped) = suffix.strip_prefix('.') {
+                    stripped
                 } else {
                     suffix
                 };
@@ -210,7 +210,11 @@ impl GeoSiteManager {
                 // s 已经在加载时预小写 / s already lowercased during loading
                 // 移除前导点后再进行匹配，让 .github.com 也能匹配 github.com
                 // Remove leading dot for matching, so .github.com can match github.com
-                let s_clean = if s.starts_with('.') { &s[1..] } else { s };
+                let s_clean = if let Some(stripped) = s.strip_prefix('.') {
+                    stripped
+                } else {
+                    s
+                };
 
                 // 先尝试完全匹配（快速路径）/ Try exact match first (fast path)
                 if domain.eq_ignore_ascii_case(s_clean) {
@@ -736,6 +740,7 @@ impl GeoSiteManager {
     /// 解析 .dat 格式的域名列表 / Parse domain list in .dat format
     /// Note: Reserved for future use in dat file parsing
     #[allow(dead_code)]
+    #[allow(clippy::regex_creation_in_loops)]
     fn parse_dat_domain_list(&self, data: &[u8]) -> anyhow::Result<Vec<DomainMatcher>> {
         let mut matchers = Vec::new();
         let mut pos = 0;
@@ -802,6 +807,7 @@ impl GeoSiteManager {
     /// The domains field in V2Ray .dat file is repeated Domain messages
     /// 每个 Domain 消息包含: type (field 1, varint) 和 value (field 2, string)
     /// Each Domain message contains: type (field 1, varint) and value (field 2, string)
+    #[allow(clippy::regex_creation_in_loops)]
     fn parse_v2ray_domains(&self, data: &[u8]) -> anyhow::Result<Vec<DomainMatcher>> {
         let mut matchers = Vec::new();
         let mut pos = 0;
@@ -1113,7 +1119,7 @@ fn run_geosite_watcher(
                 // Check if the event is for any file we care about
                 let is_target_file = event.paths.iter().any(|p| {
                     p.file_name()
-                        .map_or(false, |fname| target_filenames.contains(fname))
+                        .is_some_and(|fname| target_filenames.contains(fname))
                 });
                 if !is_target_file {
                     continue;
@@ -1127,7 +1133,7 @@ fn run_geosite_watcher(
                 // Find the matching original path for this event
                 let matching_path = event.paths.iter().find(|p| {
                     p.file_name()
-                        .map_or(false, |fname| target_filenames.contains(fname))
+                        .is_some_and(|fname| target_filenames.contains(fname))
                 });
                 let path = match matching_path {
                     Some(p) => p.clone(),
@@ -1173,16 +1179,16 @@ fn run_geosite_watcher(
 
                     match load_result {
                         Ok(loaded_count) => {
-                            info!(target = "geosite_watcher", path = %path.display(), 
-                                 loaded_count = loaded_count, 
+                            info!(target = "geosite_watcher", path = %path.display(),
+                                 loaded_count = loaded_count,
                                  "GeoSite data reloaded");
                             break;
                         }
                         Err(err) => {
                             retries -= 1;
                             if retries == 0 {
-                                warn!(target = "geosite_watcher", path = %path.display(), 
-                                     error = %err, 
+                                warn!(target = "geosite_watcher", path = %path.display(),
+                                     error = %err,
                                      "GeoSite reload failed, keeping old data");
                             } else {
                                 // 稍等后重试 / Wait a bit and retry

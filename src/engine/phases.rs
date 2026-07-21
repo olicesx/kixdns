@@ -485,7 +485,7 @@ pub async fn handle_forward_decision(
                 };
 
                 if let Some(mut rx) = rx {
-                    if let Ok(_) = rx.changed().await {
+                    if rx.changed().await.is_ok() {
                         let result = rx.borrow().clone();
                         match &result {
                             Ok(bytes) => {
@@ -533,7 +533,7 @@ pub async fn handle_forward_decision(
             };
 
             if let Some(mut rx) = rx {
-                if let Ok(_) = rx.changed().await {
+                if rx.changed().await.is_ok() {
                     let result = rx.borrow().clone();
                     match &result {
                         Ok(bytes) => {

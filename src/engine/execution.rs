@@ -248,7 +248,7 @@ impl Engine {
         let fast = self.metrics_fastpath_hits.load(Ordering::Relaxed);
         let up_ns = self.metrics_upstream_ns_total.load(Ordering::Relaxed);
         let up_calls = self.metrics_upstream_calls.load(Ordering::Relaxed);
-        let avg_up_ns = if up_calls > 0 { up_ns / up_calls } else { 0 };
+        let avg_up_ns = up_ns.checked_div(up_calls).unwrap_or(0);
         format!(
             "inflight={} total={} fastpath_hits={} upstream_avg_us={}",
             inflight,
@@ -414,7 +414,7 @@ impl Engine {
         if let Some(compiled) = self.compiled_for(&state, &pipeline_id) {
             let qclass = DNSClass::from(q.qclass);
             let qname_str = q.qname_str_unchecked(); // Zero-allocation / 零分配
-            if let Some(decision) = fast_static_match(
+            if let Some(Decision::Static { rcode, answers }) = fast_static_match(
                 compiled,
                 qname_str,
                 qtype,
@@ -422,13 +422,11 @@ impl Engine {
                 peer.ip(),
                 q.edns_present,
             ) {
-                if let Decision::Static { rcode, answers } = decision {
-                    let resp = build_fast_static_response(
-                        q.tx_id, qname_str, q.qtype, q.qclass, rcode, &answers,
-                    )?;
-                    self.incr_fastpath_hits();
-                    return Ok(Some(FastPathResponse::Direct(resp)));
-                }
+                let resp = build_fast_static_response(
+                    q.tx_id, qname_str, q.qtype, q.qclass, rcode, &answers,
+                )?;
+                self.incr_fastpath_hits();
+                return Ok(Some(FastPathResponse::Direct(resp)));
             }
         }
 
@@ -867,59 +865,55 @@ impl Engine {
         //   Jump → Forward(Continue) → [jump_count reset to 0] → Jump → …
         let mut jump_count = 0;
         'decision_loop: loop {
-            loop {
-                if let Decision::Jump { pipeline } = &decision {
-                    jump_count += 1;
-                    if jump_count > response_jump_limit {
-                        warn!("max jump limit reached");
-                        decision = Decision::Static {
-                            rcode: ResponseCode::ServFail,
-                            answers: Vec::new(),
-                        };
-                        break;
-                    }
-                    if let Some(p) = cfg
-                        .pipelines
-                        .iter()
-                        .find(|p| p.id.as_ref() == pipeline.as_ref())
-                    {
-                        current_pipeline_id = p.id.clone();
-                        // Must recompute ECS key + dedupe_hash: pipeline changed via Jump,
-                        // so the target pipeline's ECS config may differ from the source.
-                        // 必须重算 ECS key + dedupe_hash：pipeline 因 Jump 改变，
-                        // 目标 pipeline 的 ECS 配置可能与源 pipeline 不同。
-                        let jump_ecs_key = p.ecs.as_ref().and_then(|mode| {
-                            crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip())
-                        });
-                        dedupe_hash = Self::calculate_cache_hash_for_dedupe(
-                            &current_pipeline_id,
-                            qname_bytes,
-                            qtype,
-                            qclass,
-                            jump_ecs_key.as_ref(),
-                        );
-                        skip_rules.clear();
-                        decision = self.apply_rules(
-                            &state,
-                            p,
-                            peer.ip(),
-                            &qname,
-                            qtype,
-                            qclass,
-                            edns_present,
-                            None,
-                            skip_cache,
-                        );
-                        continue;
-                    } else {
-                        warn!("jump target pipeline not found: {}", pipeline);
-                        decision = Decision::Static {
-                            rcode: ResponseCode::ServFail,
-                            answers: Vec::new(),
-                        };
-                        break;
-                    }
+            while let Decision::Jump { pipeline } = &decision {
+                jump_count += 1;
+                if jump_count > response_jump_limit {
+                    warn!("max jump limit reached");
+                    decision = Decision::Static {
+                        rcode: ResponseCode::ServFail,
+                        answers: Vec::new(),
+                    };
+                    break;
+                }
+                if let Some(p) = cfg
+                    .pipelines
+                    .iter()
+                    .find(|p| p.id.as_ref() == pipeline.as_ref())
+                {
+                    current_pipeline_id = p.id.clone();
+                    // Must recompute ECS key + dedupe_hash: pipeline changed via Jump,
+                    // so the target pipeline's ECS config may differ from the source.
+                    // 必须重算 ECS key + dedupe_hash：pipeline 因 Jump 改变，
+                    // 目标 pipeline 的 ECS 配置可能与源 pipeline 不同。
+                    let jump_ecs_key = p
+                        .ecs
+                        .as_ref()
+                        .and_then(|mode| crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip()));
+                    dedupe_hash = Self::calculate_cache_hash_for_dedupe(
+                        &current_pipeline_id,
+                        qname_bytes,
+                        qtype,
+                        qclass,
+                        jump_ecs_key.as_ref(),
+                    );
+                    skip_rules.clear();
+                    decision = self.apply_rules(
+                        &state,
+                        p,
+                        peer.ip(),
+                        &qname,
+                        qtype,
+                        qclass,
+                        edns_present,
+                        None,
+                        skip_cache,
+                    );
                 } else {
+                    warn!("jump target pipeline not found: {}", pipeline);
+                    decision = Decision::Static {
+                        rcode: ResponseCode::ServFail,
+                        answers: Vec::new(),
+                    };
                     break;
                 }
             }

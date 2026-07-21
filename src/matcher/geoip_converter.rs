@@ -267,7 +267,7 @@ impl GeoIpConverter {
     /// 合并重叠或相邻的 CIDR
     /// Merge overlapping or adjacent CIDRs
     pub fn merge_cidrs(&mut self) {
-        for (_, nets) in self.country_to_nets.iter_mut() {
+        for nets in self.country_to_nets.values_mut() {
             // Separate IPv4 and IPv6
             let mut ipv4_nets: Vec<Ipv4Net> = Vec::new();
             let mut ipv6_nets: Vec<Ipv6Net> = Vec::new();
