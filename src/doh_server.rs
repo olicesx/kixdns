@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bytes::Bytes;
+use hickory_proto::op::{Message, MessageType, ResponseCode};
+use hickory_proto::serialize::binary::BinDecodable;
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -159,7 +161,7 @@ async fn process_dns_wire(packet: &[u8], peer: SocketAddr, engine: &Engine) -> B
             let mut resp_buf = bytes::BytesMut::with_capacity(cached.len());
             resp_buf.extend_from_slice(&cached);
 
-            let elapsed = inserted_at.elapsed().as_secs() as u32;
+            let elapsed = proto_utils::saturating_u64_to_u32(inserted_at.elapsed().as_secs());
             if elapsed > 0 {
                 proto_utils::patch_all_ttls(&mut resp_buf, elapsed);
             }
@@ -228,16 +230,35 @@ async fn process_dns_wire(packet: &[u8], peer: SocketAddr, engine: &Engine) -> B
 
 /// 构造空 DNS 响应（SERVFAIL） / Build empty SERVFAIL response
 fn empty_dns_response(request: &[u8]) -> Bytes {
-    if request.len() < 2 {
-        return Bytes::new();
+    fn header_only(request: &[u8]) -> Bytes {
+        if request.len() < 2 {
+            return Bytes::new();
+        }
+        let mut response = vec![0u8; 12];
+        response[0] = request[0];
+        response[1] = request[1];
+        response[2] = 0x80;
+        response[3] = 0x02;
+        Bytes::from(response)
     }
-    // 复制前 2 字节（TXID），设 QR=1 + RCODE=2 (SERVFAIL)
-    let mut resp = vec![0u8; 12];
-    resp[0] = request[0];
-    resp[1] = request[1];
-    resp[2] = 0x80; // QR=1, Opcode=0, AA=0, TC=0, RD=0
-    resp[3] = 0x02; // RA=0, Z=0, RCODE=2 (SERVFAIL)
-    Bytes::from(resp)
+
+    let Ok(request_message) = Message::from_bytes(request) else {
+        return header_only(request);
+    };
+
+    let mut response = Message::new();
+    response
+        .set_id(request_message.id())
+        .set_message_type(MessageType::Response)
+        .set_op_code(request_message.op_code())
+        .set_response_code(ResponseCode::ServFail)
+        .set_recursion_desired(request_message.recursion_desired())
+        .add_queries(request_message.queries().iter().cloned());
+
+    response
+        .to_vec()
+        .map(Bytes::from)
+        .unwrap_or_else(|_| header_only(request))
 }
 
 fn error_response(status: StatusCode) -> Response<Full<Bytes>> {
@@ -374,6 +395,20 @@ mod tests {
         assert!(resp.is_empty());
     }
 
+    #[test]
+    fn test_empty_dns_response_preserves_question() {
+        let request = make_dns_query_a("question.example.com", 0x1234);
+        let response = empty_dns_response(&request);
+        let decoded = Message::from_bytes(&response).expect("decode SERVFAIL response");
+
+        assert_eq!(decoded.response_code(), ResponseCode::ServFail);
+        assert_eq!(decoded.queries().len(), 1);
+        assert_eq!(
+            decoded.queries()[0].name().to_utf8(),
+            "question.example.com."
+        );
+    }
+
     // ---- error_response ----
 
     #[test]
@@ -409,7 +444,7 @@ mod tests {
         });
         let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
         let runtime = RuntimePipelineConfig::from_config(cfg).expect("build runtime");
-        Engine::new(runtime, "test".to_string())
+        Engine::new(runtime, "test".to_string()).expect("initialize test engine")
     }
 
     fn make_dns_query_a(domain: &str, txid: u16) -> Vec<u8> {

@@ -30,6 +30,15 @@ use webpki_roots::TLS_SERVER_ROOTS;
 
 use super::concurrency::{PermitGuard, PermitManager};
 
+#[inline]
+fn unix_time_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            duration.as_millis().min(u64::MAX as u128) as u64
+        })
+}
+
 /// Type alias for UDP inflight request tracking
 /// ID -> (OriginalID, ExpectedAddr, Sender)
 type UdpInflightMap =
@@ -62,14 +71,14 @@ pub struct UdpClient {
 }
 
 impl UdpClient {
-    pub fn new(size: usize) -> Self {
+    pub fn new(size: usize) -> anyhow::Result<Self> {
         // Prevent port exhaustion by enforcing minimum pool size
         let effective_size = if size == 0 { 1 } else { size };
         let mut pool = Vec::with_capacity(effective_size);
         for idx in 0..effective_size {
             // Use socket2 to set buffer sizes
-            let socket =
-                Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("create socket");
+            let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+                .context("create UDP pool socket")?;
             // Set buffer sizes to 4MB to prevent packet loss under load
             if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
                 warn!("failed to set udp recv buffer size: {}", e);
@@ -77,18 +86,19 @@ impl UdpClient {
             if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
                 warn!("failed to set udp send buffer size: {}", e);
             }
+            let bind_addr = SocketAddr::from(([0, 0, 0, 0], 0));
             socket
-                .bind(
-                    &"0.0.0.0:0"
-                        .parse::<SocketAddr>()
-                        .expect("parse ephemeral address")
-                        .into(),
-                )
-                .expect("bind");
-            socket.set_nonblocking(true).expect("set nonblocking");
+                .bind(&bind_addr.into())
+                .context("bind UDP pool socket")?;
+            socket
+                .set_nonblocking(true)
+                .context("set UDP pool socket nonblocking")?;
 
             let std_sock: std::net::UdpSocket = socket.into();
-            let socket = Arc::new(tokio::net::UdpSocket::from_std(std_sock).expect("from_std"));
+            let socket = Arc::new(
+                tokio::net::UdpSocket::from_std(std_sock)
+                    .context("create Tokio UDP pool socket")?,
+            );
             let inflight = Arc::new(DashMap::with_hasher(FxBuildHasher));
 
             let state = UdpSocketState {
@@ -175,10 +185,10 @@ impl UdpClient {
                 }
             });
         }
-        Self {
+        Ok(Self {
             pool,
             next_idx: AtomicUsize::new(0),
-        }
+        })
     }
 
     #[inline]
@@ -709,10 +719,7 @@ impl TcpMuxClient {
     /// 记录成功并清零错误计数
     fn record_success(&self) {
         self.consecutive_errors.store(0, Ordering::Release);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("SystemTime should be after UNIX_EPOCH")
-            .as_millis() as u64;
+        let now = unix_time_millis();
         self.last_request_time.store(now, Ordering::Release);
     }
 
@@ -722,10 +729,7 @@ impl TcpMuxClient {
     /// Returns true if connection was reset, false otherwise.
     /// 如果连接被重置返回 true，否则返回 false。
     async fn check_connection_health(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("SystemTime should be after UNIX_EPOCH")
-            .as_millis() as u64;
+        let now = unix_time_millis();
 
         // Check connection aging / 检查连接老化
         let create_time = self.conn_create_time.load(Ordering::Acquire);
@@ -828,10 +832,7 @@ impl TcpMuxClient {
         // 性能优化：仅在距离上次检查超过 30 秒时才执行健康检查
         // Performance: Only check connection health if 30 seconds have passed since last check
         const HEALTH_CHECK_INTERVAL_MS: u64 = 30_000; // 30 秒
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("SystemTime should be after UNIX_EPOCH")
-            .as_millis() as u64;
+        let now = unix_time_millis();
         let last_check = self.last_health_check_time.load(Ordering::Relaxed);
         if last_check == 0 || now.saturating_sub(last_check) >= HEALTH_CHECK_INTERVAL_MS {
             self.check_connection_health().await;
@@ -841,13 +842,6 @@ impl TcpMuxClient {
         // 1. Ensure connection exists (acquires connection-level permit if needed)
         // 确保连接存在（如果需要则获取连接级别 permit）
         self.ensure_connection().await?;
-
-        // Determine if connection is being reused for race-condition check
-        // 判断是否正在复用连接以进行竞态条件检查
-        let is_reused = {
-            let guard = self.conn.lock().await;
-            guard.is_some() && self.last_request_time.load(Ordering::Relaxed) > 0
-        };
 
         let elapsed = start.elapsed();
         if elapsed >= timeout_dur {
@@ -861,9 +855,7 @@ impl TcpMuxClient {
         let (tx, rx) = oneshot::channel();
 
         // 原子操作：分配 ID 并注册到 pending map，避免竞态条件
-        let (new_packet, new_id) = self
-            .register_pending(packet, original_id, tx, is_reused)
-            .await?;
+        let (new_packet, new_id) = self.register_pending(packet, original_id, tx).await?;
 
         // RAII Guard: ensures entry is removed from map when guard is dropped
         // RAII Guard：确保在 guard 丢弃时（超时、取消、提前返回）移除条目
@@ -1076,10 +1068,7 @@ impl TcpMuxClient {
 
             // 设置连接创建时间
             // Set connection creation time
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("SystemTime should be after UNIX_EPOCH")
-                .as_millis() as u64;
+            let now = unix_time_millis();
             self.conn_create_time.store(now, Ordering::Release);
             self.last_request_time.store(now, Ordering::Release);
 
@@ -1103,35 +1092,12 @@ impl TcpMuxClient {
         packet: &[u8],
         original_id: u16,
         tx: oneshot::Sender<anyhow::Result<Bytes>>,
-        is_reused: bool,
     ) -> anyhow::Result<(BytesMut, u16)> {
-        // Critical Check: If we are reusing a connection, we MUST verify the connection is still considered "alive"
-        // before registering. If conn is None, it means Reader has already reset it, so we shouldn't register.
-        // 关键检查：如果我们正在复用连接，必须在注册前验证连接是否仍然被认为是“活着”的。
-        // 如果 conn 为 None，说明 Reader 已经重置了它，我们不应该注册。
-        if is_reused {
-            let guard = self.conn.lock().await;
-            if guard.is_none() {
-                anyhow::bail!("connection closed before registration");
-            }
-            // Optional: Check if generation is still valid?
-            // Since we hold the lock, Reader reset_conn needs the lock too.
-            // So if we hold the lock and it is Some, Reader hasn't reset it yet.
-            // But Reader might be stuck in fail_all_async waiting for lock?
-            // If Reader is waiting for lock to reset, it means it already encountered error.
-            // But Reader clears pending map BEFORE resetting conn.
-            // Race:
-            // 1. Reader gets error.
-            // 2. Reader calls fail_all_async.
-            // 3. Sender calls register_pending (here).
-            // 4. Sender inserts into pending.
-            // 5. Reader removes keys from pending (might miss the new one if iterator is already created?).
-            // dashmap is concurrent, but iterator consistency varies.
-            //
-            // Safer Logic:
-            // We need to know if Reader is dead.
-            // But we can rely on `is_reused` check in `send` loop.
-            // If we fail here, `send` loop catches it and retries with fresh conn.
+        // Serialize registration with connection teardown so a failed reader cannot miss a waiter.
+        // 将 pending 注册与连接清理串行化，避免失败的 reader 遗漏 waiter。
+        let conn_guard = self.conn.lock().await;
+        if conn_guard.is_none() {
+            anyhow::bail!("connection closed before registration");
         }
 
         let mut tries = 0;
@@ -1150,6 +1116,7 @@ impl TcpMuxClient {
                 anyhow::bail!("no available dns ids for tcp mux");
             }
         };
+        drop(conn_guard);
         let mut buf = BytesMut::with_capacity(packet.len());
         buf.extend_from_slice(packet);
         buf[0..2].copy_from_slice(&new_id.to_be_bytes());
@@ -1163,13 +1130,18 @@ impl TcpMuxClient {
         conn_permit: &Arc<Mutex<Option<PermitGuard>>>,
     ) {
         let err_msg = err.to_string();
+        // Hold the connection lock while resetting and draining. register_pending uses the same
+        // lock, so it either registers before this drain or observes the closed connection.
+        let mut conn_guard = conn.lock().await;
+        *conn_guard = None;
         let keys: Vec<u16> = pending.iter().map(|item| *item.key()).collect();
         for key in keys {
             if let Some((_, p)) = pending.remove(&key) {
                 let _ = p.tx.send(Err(anyhow::anyhow!(err_msg.clone())));
             }
         }
-        Self::reset_conn(conn, conn_permit).await;
+        let mut permit_guard = conn_permit.lock().await;
+        *permit_guard = None;
     }
 
     /// Reset TCP connection and release connection-level permit
@@ -1529,18 +1501,12 @@ impl DotMuxClient {
 
     fn record_success(&self) {
         self.consecutive_errors.store(0, Ordering::Release);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("SystemTime should be after UNIX_EPOCH")
-            .as_millis() as u64;
+        let now = unix_time_millis();
         self.last_request_time.store(now, Ordering::Release);
     }
 
     async fn check_connection_health(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("SystemTime should be after UNIX_EPOCH")
-            .as_millis() as u64;
+        let now = unix_time_millis();
 
         let create_time = self.conn_create_time.load(Ordering::Acquire);
         let max_age = self.max_age_ms.load(Ordering::Acquire);
@@ -1622,10 +1588,7 @@ impl DotMuxClient {
         let start = tokio::time::Instant::now();
 
         const HEALTH_CHECK_INTERVAL_MS: u64 = 30_000;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("SystemTime should be after UNIX_EPOCH")
-            .as_millis() as u64;
+        let now = unix_time_millis();
         let last_check = self.last_health_check_time.load(Ordering::Relaxed);
         if last_check == 0 || now.saturating_sub(last_check) >= HEALTH_CHECK_INTERVAL_MS {
             self.check_connection_health().await;
@@ -1633,11 +1596,6 @@ impl DotMuxClient {
         }
 
         self.ensure_connection().await?;
-
-        let is_reused = {
-            let guard = self.conn.lock().await;
-            guard.is_some() && self.last_request_time.load(Ordering::Relaxed) > 0
-        };
 
         let elapsed = start.elapsed();
         if elapsed >= timeout_dur {
@@ -1647,9 +1605,7 @@ impl DotMuxClient {
 
         let original_id = u16::from_be_bytes([packet[0], packet[1]]);
         let (tx, rx) = oneshot::channel();
-        let (new_packet, new_id) = self
-            .register_pending(packet, original_id, tx, is_reused)
-            .await?;
+        let (new_packet, new_id) = self.register_pending(packet, original_id, tx).await?;
 
         let _guard = TcpPendingGuard {
             pending: self.pending.clone(),
@@ -1764,7 +1720,7 @@ impl DotMuxClient {
                 }
                 guard
                     .as_ref()
-                    .expect("dot target must be initialized")
+                    .context("dot target missing after initialization")?
                     .clone()
             };
 
@@ -1797,10 +1753,7 @@ impl DotMuxClient {
             let mut conn_permit_guard = self.conn_permit.lock().await;
             *conn_permit_guard = Some(permit);
 
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("SystemTime should be after UNIX_EPOCH")
-                .as_millis() as u64;
+            let now = unix_time_millis();
             self.conn_create_time.store(now, Ordering::Release);
             self.last_request_time.store(now, Ordering::Release);
             self.consecutive_errors.store(0, Ordering::Release);
@@ -1816,13 +1769,12 @@ impl DotMuxClient {
         packet: &[u8],
         original_id: u16,
         tx: oneshot::Sender<anyhow::Result<Bytes>>,
-        is_reused: bool,
     ) -> anyhow::Result<(BytesMut, u16)> {
-        if is_reused {
-            let guard = self.conn.lock().await;
-            if guard.is_none() {
-                anyhow::bail!("connection closed before registration");
-            }
+        // Serialize registration with connection teardown so a failed reader cannot miss a waiter.
+        // 将 pending 注册与连接清理串行化，避免失败的 reader 遗漏 waiter。
+        let conn_guard = self.conn.lock().await;
+        if conn_guard.is_none() {
+            anyhow::bail!("connection closed before registration");
         }
 
         let mut tries = 0;
@@ -1837,6 +1789,7 @@ impl DotMuxClient {
                 anyhow::bail!("no available dns ids for dot mux");
             }
         };
+        drop(conn_guard);
         let mut buf = BytesMut::with_capacity(packet.len());
         buf.extend_from_slice(packet);
         buf[0..2].copy_from_slice(&new_id.to_be_bytes());
@@ -1850,13 +1803,18 @@ impl DotMuxClient {
         conn_permit: &Arc<Mutex<Option<PermitGuard>>>,
     ) {
         let err_msg = err.to_string();
+        // Hold the connection lock while resetting and draining. register_pending uses the same
+        // lock, so it either registers before this drain or observes the closed connection.
+        let mut conn_guard = conn.lock().await;
+        *conn_guard = None;
         let keys: Vec<u16> = pending.iter().map(|item| *item.key()).collect();
         for key in keys {
             if let Some((_, p)) = pending.remove(&key) {
                 let _ = p.tx.send(Err(anyhow::anyhow!(err_msg.clone())));
             }
         }
-        Self::reset_conn(conn, conn_permit).await;
+        let mut permit_guard = conn_permit.lock().await;
+        *permit_guard = None;
     }
 
     async fn reset_conn(
@@ -2149,20 +2107,14 @@ impl DoqMuxClient {
     /// 记录成功并清零错误计数
     fn record_success(&self) {
         self.consecutive_errors.store(0, Ordering::Release);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("SystemTime should be after UNIX_EPOCH")
-            .as_millis() as u64;
+        let now = unix_time_millis();
         self.last_request_time.store(now, Ordering::Release);
     }
 
     /// Check if connection needs reset due to aging or idle timeout
     /// 检查连接是否需要重置（老化或空闲超时）
     async fn check_connection_health(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("SystemTime should be after UNIX_EPOCH")
-            .as_millis() as u64;
+        let now = unix_time_millis();
 
         // Throttle health checks: only check once per second
         let last_check = self.last_health_check_time.load(Ordering::Acquire);
@@ -2218,7 +2170,7 @@ impl DoqMuxClient {
             }
             guard
                 .as_ref()
-                .expect("doq target must be initialized")
+                .context("doq target missing after initialization")?
                 .clone()
         };
 
@@ -2460,10 +2412,7 @@ impl DoqMuxClient {
 
         // Record connection creation time for aging checks
         // 记录连接创建时间用于老化检查
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("SystemTime should be after UNIX_EPOCH")
-            .as_millis() as u64;
+        let now = unix_time_millis();
         self.conn_create_time.store(now, Ordering::Release);
         self.last_request_time.store(now, Ordering::Release);
 
@@ -2639,6 +2588,18 @@ mod tests {
     use std::time::Duration;
     use tokio::time::timeout;
 
+    async fn connected_tcp_write_half() -> (OwnedWriteHalf, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind TCP test listener");
+        let addr = listener.local_addr().expect("read TCP test address");
+        let (client, server) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let client = client.expect("connect TCP test client");
+        let (server, _) = server.expect("accept TCP test client");
+        let (_, write_half) = client.into_split();
+        (write_half, server)
+    }
+
     #[test]
     fn doq_query_message_id_must_be_zero() {
         let packet = [0x12, 0x34, 0x01, 0x00, 0xaa, 0xbb];
@@ -2671,6 +2632,8 @@ mod tests {
         // Arrange: Prepare a TCP client with many pending IDs to force contention
         let permit_manager = Arc::new(PermitManager::new(128)); // Default TCP limit
         let client = Arc::new(TcpMuxClient::new(Arc::from("127.0.0.1:0"), permit_manager));
+        let (write_half, _server) = connected_tcp_write_half().await;
+        *client.conn.lock().await = Some(write_half);
         for id in 1u16..200u16 {
             client.pending.insert(
                 id,
@@ -2689,7 +2652,7 @@ mod tests {
                     let dummy = vec![0u8; 4];
                     let (tx, _) = oneshot::channel();
                     client
-                        .register_pending(&dummy, 0, tx, false)
+                        .register_pending(&dummy, 0, tx)
                         .await
                         .map(|(_, id)| id)
                 }
@@ -2706,6 +2669,53 @@ mod tests {
             let id = r.expect("register_pending failed");
             assert!(ids.insert(id), "duplicate id allocated under contention");
         }
+    }
+
+    #[tokio::test]
+    async fn tcp_fail_all_cannot_miss_a_concurrent_registration() {
+        let permit_manager = Arc::new(PermitManager::new(1));
+        let client = Arc::new(TcpMuxClient::new(Arc::from("127.0.0.1:0"), permit_manager));
+        let (write_half, _server) = connected_tcp_write_half().await;
+        *client.conn.lock().await = Some(write_half);
+
+        // Hold the connection lock so registration queues before fail_all. The old implementation
+        // took its pending snapshot before this lock, then allowed the queued registration to land
+        // after the snapshot. The waiter was never notified.
+        let conn_guard = client.conn.lock().await;
+        let register_client = Arc::clone(&client);
+        let register = tokio::spawn(async move {
+            let packet = [0u8; 4];
+            let (tx, rx) = oneshot::channel();
+            let result = register_client.register_pending(&packet, 0, tx).await;
+            (result, rx)
+        });
+        tokio::task::yield_now().await;
+
+        let pending = Arc::clone(&client.pending);
+        let conn = Arc::clone(&client.conn);
+        let conn_permit = Arc::clone(&client.conn_permit);
+        let fail_all = tokio::spawn(async move {
+            TcpMuxClient::fail_all_async(
+                &pending,
+                anyhow::anyhow!("reader failed"),
+                &conn,
+                &conn_permit,
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+        drop(conn_guard);
+
+        let (registration, receiver) = register.await.expect("join registration task");
+        registration.expect("registration should complete before teardown");
+        fail_all.await.expect("join fail_all task");
+
+        assert!(client.pending.is_empty());
+        let result = timeout(Duration::from_millis(100), receiver)
+            .await
+            .expect("pending waiter was not notified")
+            .expect("pending sender was dropped without a result");
+        assert!(result.is_err(), "reader failure should reach the waiter");
     }
 
     #[test]

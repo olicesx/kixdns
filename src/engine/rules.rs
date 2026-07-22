@@ -584,13 +584,10 @@ pub(crate) async fn process_response_jump(
             return Ok(resp_bytes);
         };
 
-        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(
-            &pipeline_id,
-            qname.as_bytes(),
-            qtype,
-            qclass,
-            None,
-        );
+        let mut ecs_key = pipeline
+            .ecs
+            .as_ref()
+            .and_then(|mode| crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip()));
 
         let mut decision = engine.apply_rules(
             state,
@@ -630,6 +627,10 @@ pub(crate) async fn process_response_jump(
                     .iter()
                     .find(|p| p.id == pipeline_id)
                 {
+                    ecs_key = next_pipeline
+                        .ecs
+                        .as_ref()
+                        .and_then(|mode| crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip()));
                     skip_rules.clear();
                     decision = engine.apply_rules(
                         state,
@@ -658,6 +659,13 @@ pub(crate) async fn process_response_jump(
         }
 
         remaining_jumps = local_jumps;
+        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(
+            &pipeline_id,
+            qname.as_bytes(),
+            qtype,
+            qclass,
+            ecs_key.as_ref(),
+        );
 
         match decision {
             Decision::Static { rcode, answers } => {
@@ -671,8 +679,8 @@ pub(crate) async fn process_response_jump(
                     pipeline_id: pipeline_id.clone(),
                     qtype: u16::from(qtype),
                     inserted_at: Instant::now(),
-                    original_ttl: min_ttl.as_secs() as u32,
-                    refresh_ttl: min_ttl.as_secs() as u32,
+                    original_ttl: crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
+                    refresh_ttl: crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
                 };
                 engine.cache.insert(dedupe_hash, Arc::new(entry));
                 for g in &mut cleanup_guards {
@@ -927,8 +935,12 @@ pub(crate) async fn process_response_jump(
                                     pipeline_id: pipeline_id.clone(),
                                     qtype: u16::from(qtype),
                                     inserted_at: Instant::now(),
-                                    original_ttl: ttl_secs_cache as u32, // Use min TTL for cache expiration / 使用最小 TTL 作为缓存过期
-                                    refresh_ttl: ttl_secs_refresh as u32, // Use max TTL for refresh timing / 使用最大 TTL 作为刷新时机
+                                    original_ttl: crate::proto_utils::saturating_u64_to_u32(
+                                        ttl_secs_cache,
+                                    ), // Use min TTL for cache expiration / 使用最小 TTL 作为缓存过期
+                                    refresh_ttl: crate::proto_utils::saturating_u64_to_u32(
+                                        ttl_secs_refresh,
+                                    ), // Use max TTL for refresh timing / 使用最大 TTL 作为刷新时机
                                 };
                                 engine.cache.insert(dedupe_hash, Arc::new(entry));
                             }
@@ -986,8 +998,12 @@ pub(crate) async fn process_response_jump(
                                         pipeline_id: pipeline_id.clone(),
                                         qtype: u16::from(qtype),
                                         inserted_at: Instant::now(),
-                                        original_ttl: ttl_secs_cache as u32, // Use min TTL for cache expiration / 使用最小 TTL 作为缓存过期
-                                        refresh_ttl: ttl_secs_refresh as u32, // Use max TTL for refresh timing / 使用最大 TTL 作为刷新时机
+                                        original_ttl: crate::proto_utils::saturating_u64_to_u32(
+                                            ttl_secs_cache,
+                                        ), // Use min TTL for cache expiration / 使用最小 TTL 作为缓存过期
+                                        refresh_ttl: crate::proto_utils::saturating_u64_to_u32(
+                                            ttl_secs_refresh,
+                                        ), // Use max TTL for refresh timing / 使用最大 TTL 作为刷新时机
                                     };
                                     engine.cache.insert(dedupe_hash, Arc::new(entry));
                                 }

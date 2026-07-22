@@ -102,6 +102,13 @@ pub fn spawn_background_refresh(
                     error = %e,
                     "Background refresh failed"
                 );
+                // Keep the refresh marker during a short retry backoff. This reuses the existing
+                // singleflight state and prevents repeated stale hits from spawning a retry storm.
+                // 在短暂退避期间保留刷新标记，避免 stale 请求持续触发失败重试。
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    engine.cache_refresh_min_ttl.max(1) as u64,
+                ))
+                .await;
             }
         }
         // _guard dropped here, automatically clearing the refresh mark

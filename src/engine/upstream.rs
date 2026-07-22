@@ -670,7 +670,7 @@ mod tests {
             pipeline_select: Vec::new(),
             pipelines: Vec::new(),
         };
-        Engine::new(runtime, "test".to_string())
+        Engine::new(runtime, "test".to_string()).expect("initialize test engine")
     }
 
     fn build_dns_query_packet(qname: &str) -> Vec<u8> {

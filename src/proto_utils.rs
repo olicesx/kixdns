@@ -122,16 +122,18 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     // Fast ASCII validation (zero-allocation, early exit)
     // 快速 ASCII 验证（零分配，提前退出）
     // DNS domain names should be LDH (Letters, Digits, Hyphen) + dots
-    // LDH is a subset of ASCII, which is always valid UTF-8
+    // Reject control characters so qnames are safe to include in structured logs.
     // 域名应该是 LDH（字母、数字、连字符）+ 点号
-    // LDH 是 ASCII 的子集，而 ASCII 始终是有效的 UTF-8
+    // 拒绝控制字符，确保 qname 可安全写入结构化日志。
     // This is ~10x faster than full UTF-8 validation
     // 这比完整的 UTF-8 验证快约 10 倍
-    let is_ascii = buf[..buf_pos].iter().all(|b| b.is_ascii());
-    if !is_ascii {
-        // Reject non-ASCII domain names (extremely rare, < 0.001%)
+    let is_safe_ascii = buf[..buf_pos]
+        .iter()
+        .all(|b| b.is_ascii() && !b.is_ascii_control());
+    if !is_safe_ascii {
+        // Reject non-ASCII domain names and control characters
         // Similar to Unbound's strategy: reject invalid input for performance
-        // 拒绝非 ASCII 域名（极其罕见，< 0.001%）
+        // 拒绝非 ASCII 域名和控制字符
         // 类似 Unbound 的策略：为了性能拒绝无效输入
         return None;
     }
@@ -512,6 +514,13 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     })
 }
 
+/// Saturating conversion for DNS TTLs and elapsed seconds.
+/// DNS TTL fields are u32, while Duration and configuration calculations use u64.
+#[inline]
+pub fn saturating_u64_to_u32(value: u64) -> u32 {
+    value.min(u32::MAX as u64) as u32
+}
+
 /// 批量修正 DNS 响应包中的 TTL 值 / Batch patch TTL values in a DNS response packet
 /// decrement: 需要减少的秒数 / seconds to decrement
 pub fn patch_all_ttls(packet: &mut [u8], decrement: u32) {
@@ -641,5 +650,42 @@ pub fn set_all_ttls(packet: &mut [u8], new_ttl: u32) {
         }
 
         pos += record_total_len;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn query_with_label(label: &[u8]) -> Vec<u8> {
+        let mut packet = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        packet.push(label.len() as u8);
+        packet.extend_from_slice(label);
+        packet.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]);
+        packet
+    }
+
+    #[test]
+    fn parse_quick_rejects_qname_control_characters() {
+        let packet = query_with_label(b"bad\nlabel");
+        let mut qname = [0u8; 256];
+
+        assert!(parse_quick(&packet, &mut qname).is_none());
+    }
+
+    #[test]
+    fn parse_quick_accepts_regular_ascii_qname() {
+        let packet = query_with_label(b"example");
+        let mut qname = [0u8; 256];
+
+        assert!(parse_quick(&packet, &mut qname).is_some());
+    }
+
+    #[test]
+    fn saturating_u64_to_u32_caps_large_values() {
+        assert_eq!(saturating_u64_to_u32(42), 42);
+        assert_eq!(saturating_u64_to_u32(u64::MAX), u32::MAX);
     }
 }

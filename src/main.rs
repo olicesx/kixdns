@@ -120,7 +120,7 @@ async fn run_dns_server(
     // 当有多个加密后端可用时，rustls 0.23+ 需要此调用
     rustls::crypto::ring::default_provider()
         .install_default()
-        .expect("failed to install rustls crypto provider");
+        .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))?;
 
     let cfg = load_config(&config).context("load initial config")?;
     let cfg = RuntimePipelineConfig::from_config(cfg).context("compile matchers")?;
@@ -154,7 +154,7 @@ async fn run_dns_server(
             None
         };
 
-    let engine = Engine::new(cfg, listener_label.clone());
+    let engine = Engine::new(cfg, listener_label.clone()).context("initialize DNS engine")?;
 
     watcher::spawn(config.clone(), engine.clone());
 
@@ -566,7 +566,9 @@ async fn run_udp_worker(
                         send_buf.extend_from_slice(&cached);
 
                         // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
-                        let elapsed = inserted_at.elapsed().as_secs() as u32;
+                        let elapsed = kixdns::proto_utils::saturating_u64_to_u32(
+                            inserted_at.elapsed().as_secs(),
+                        );
                         if elapsed > 0 {
                             kixdns::proto_utils::patch_all_ttls(&mut send_buf, elapsed);
                         }
@@ -756,7 +758,8 @@ async fn handle_tcp_conn(
                 resp_buf.extend_from_slice(&cached);
 
                 // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
-                let elapsed = inserted_at.elapsed().as_secs() as u32;
+                let elapsed =
+                    kixdns::proto_utils::saturating_u64_to_u32(inserted_at.elapsed().as_secs());
                 if elapsed > 0 {
                     kixdns::proto_utils::patch_all_ttls(&mut resp_buf, elapsed);
                 }

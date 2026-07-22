@@ -327,7 +327,8 @@ impl Engine {
                 && hit.pipeline_id == pipeline_id
             {
                 // Check if expired / 检查是否已过期
-                let elapsed_secs = hit.inserted_at.elapsed().as_secs() as u32;
+                let elapsed_secs =
+                    crate::proto_utils::saturating_u64_to_u32(hit.inserted_at.elapsed().as_secs());
                 if elapsed_secs >= hit.original_ttl {
                     // RFC 8767: When serve_stale is enabled, keep stale entries for fallback
                     // RFC 8767: 当 serve_stale 启用时，保留过期条目以便 fallback
@@ -731,29 +732,29 @@ impl Engine {
                 while wait_start.elapsed() < client_timeout {
                     tokio::time::sleep(poll_interval).await;
                     // Check if background refresh put fresh data in cache
-                    if let Some(fresh_hit) = self.cache.get(&dedupe_hash) {
-                        if fresh_hit.inserted_at.elapsed().as_secs() < fresh_hit.original_ttl as u64
-                        {
-                            // Fresh data available! Serve it.
-                            if let Some(fresh_bytes) = phases::check_cache(
-                                self,
-                                qname_ref,
-                                qtype,
-                                qclass,
-                                &pipeline_id,
-                                dedupe_hash,
-                                tx_id,
-                                start,
-                                &peer,
-                            ) {
-                                tracing::debug!(
-                                    event = "serve_fresh_after_client_wait",
-                                    qname = %qname_ref,
-                                    wait_ms = wait_start.elapsed().as_millis() as u64,
-                                    "background refresh completed within client_timeout"
-                                );
-                                return Ok(fresh_bytes);
-                            }
+                    let Some(fresh_hit) = self.cache.get(&dedupe_hash) else {
+                        break;
+                    };
+                    if fresh_hit.inserted_at.elapsed().as_secs() < fresh_hit.original_ttl as u64 {
+                        // Fresh data available! Serve it.
+                        if let Some(fresh_bytes) = phases::check_cache(
+                            self,
+                            qname_ref,
+                            qtype,
+                            qclass,
+                            &pipeline_id,
+                            dedupe_hash,
+                            tx_id,
+                            start,
+                            &peer,
+                        ) {
+                            tracing::debug!(
+                                event = "serve_fresh_after_client_wait",
+                                qname = %qname_ref,
+                                wait_ms = wait_start.elapsed().as_millis() as u64,
+                                "background refresh completed within client_timeout"
+                            );
+                            return Ok(fresh_bytes);
                         }
                     }
                 }
@@ -1391,7 +1392,7 @@ mod tests {
         // Act: Parse configuration and create engine
         let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse");
         let runtime = RuntimePipelineConfig::from_config(cfg.clone()).expect("runtime");
-        let engine = Engine::new(runtime.clone(), "lbl".to_string());
+        let engine = Engine::new(runtime.clone(), "lbl".to_string()).expect("initialize engine");
         let state = engine.state.load();
 
         // Act: Apply rules - StaticResponse should return Static decision
@@ -1437,7 +1438,7 @@ mod tests {
         });
         let cfg2: crate::config::PipelineConfig = serde_json::from_value(raw2).expect("parse");
         let runtime2 = RuntimePipelineConfig::from_config(cfg2.clone()).expect("runtime");
-        let engine2 = Engine::new(runtime2.clone(), "lbl".to_string());
+        let engine2 = Engine::new(runtime2.clone(), "lbl".to_string()).expect("initialize engine");
         let state2 = engine2.state.load();
 
         // Act: Apply rules - Forward should return Forward decision with upstream and matchers
@@ -1487,7 +1488,7 @@ mod tests {
         });
         let cfg3: crate::config::PipelineConfig = serde_json::from_value(raw3).expect("parse");
         let runtime3 = RuntimePipelineConfig::from_config(cfg3.clone()).expect("runtime");
-        let engine3 = Engine::new(runtime3.clone(), "lbl".to_string());
+        let engine3 = Engine::new(runtime3.clone(), "lbl".to_string()).expect("initialize engine");
         let state3 = engine3.state.load();
 
         // Act: Apply rules - Allow should forward to default upstream
@@ -1519,7 +1520,7 @@ mod tests {
         });
         let cfg4: crate::config::PipelineConfig = serde_json::from_value(raw4).expect("parse");
         let runtime4 = RuntimePipelineConfig::from_config(cfg4.clone()).expect("runtime");
-        let engine4 = Engine::new(runtime4.clone(), "lbl".to_string());
+        let engine4 = Engine::new(runtime4.clone(), "lbl".to_string()).expect("initialize engine");
         let state4 = engine4.state.load();
 
         // Act: Apply rules - JumpToPipeline should return Jump decision
@@ -1557,7 +1558,7 @@ mod tests {
             pipeline_select: Vec::new(),
             pipelines: Vec::new(),
         };
-        Engine::new(runtime, "lbl".to_string())
+        Engine::new(runtime, "lbl".to_string()).expect("initialize test engine")
     }
 
     fn build_response_context() -> ResponseContext {

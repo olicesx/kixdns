@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::Duration;
 
+use anyhow::Context;
 use arc_swap::ArcSwap;
 use dashmap::{DashMap, DashSet};
 use moka::sync::Cache;
@@ -93,7 +94,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(cfg: RuntimePipelineConfig, listener_label: String) -> Self {
+    pub fn new(cfg: RuntimePipelineConfig, listener_label: String) -> anyhow::Result<Self> {
         // moka 缓存：容量由配置控制（默认 10000 条），最大生存时间由 cache_max_ttl 控制
         // moka cache capacity and max TTL are configurable via settings
         let cache_capacity = cfg.settings.cache_capacity;
@@ -329,10 +330,10 @@ impl Engine {
                 tcp_max_age_secs,
                 tcp_idle_timeout_secs,
             )
-            .expect("initialize DoT multiplexer"),
+            .context("initialize DoT multiplexer")?,
         );
 
-        let doh_client = Arc::new(DohClient::new(doh_pool_size).expect("initialize DoH client"));
+        let doh_client = Arc::new(DohClient::new(doh_pool_size).context("initialize DoH client")?);
         let doq_client = Arc::new(
             DoqClient::new(
                 doq_pool_size,
@@ -340,17 +341,17 @@ impl Engine {
                 doq_keepalive_interval_ms,
                 doq_enable_0rtt,
             )
-            .expect("initialize DoQ client"),
+            .context("initialize DoQ client")?,
         );
 
         // Warm up TCP connection pools (create 1 connection per upstream)
         // 预热 TCP 连接池（每个 upstream 创建 1 个连接）
         tcp_mux.warm_up_pools(&tcp_upstreams);
 
-        Self {
+        Ok(Self {
             state,
             cache,
-            udp_client: Arc::new(UdpClient::new(udp_pool_size)),
+            udp_client: Arc::new(UdpClient::new(udp_pool_size).context("initialize UDP client")?),
             tcp_mux,
             doh_client,
             dot_mux,
@@ -397,6 +398,6 @@ impl Engine {
             geosite_manager,
             // Background refresh dedicated rule (lazy initialization) / 后台刷新专用规则（延迟初始化）
             background_refresh_rule: std::sync::OnceLock::new(),
-        }
+        })
     }
 }

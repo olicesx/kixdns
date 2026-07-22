@@ -174,7 +174,7 @@ pub fn check_cache(
                 resp_bytes.extend_from_slice(&hit.bytes);
 
                 // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
-                let elapsed = elapsed_secs as u32;
+                let elapsed = crate::proto_utils::saturating_u64_to_u32(elapsed_secs);
                 if elapsed > 0 {
                     crate::proto_utils::patch_all_ttls(&mut resp_bytes, elapsed);
                 }
@@ -388,8 +388,8 @@ pub fn handle_static_decision(
             pipeline_id: current_pipeline_id.clone(),
             qtype: u16::from(qtype),
             inserted_at: Instant::now(),
-            original_ttl: min_ttl.as_secs() as u32,
-            refresh_ttl: min_ttl.as_secs() as u32,
+            original_ttl: crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
+            refresh_ttl: crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
         };
         engine.cache.insert(dedupe_hash, Arc::new(entry));
     }
@@ -595,7 +595,6 @@ pub async fn handle_forward_decision(
             let enable_tcp_fallback = engine.state.load().pipeline.settings.enable_tcp_fallback;
             if truncated && transport == Some(Transport::Udp) && enable_tcp_fallback {
                 tracing::debug!(event = "tc_flag_retry", upstream = %upstream, "response truncated, retrying with tcp");
-                drop(cleanup_guard);
                 let (tcp_resp, _) = crate::engine::upstream::forward_upstream(
                     engine,
                     packet,
@@ -605,7 +604,8 @@ pub async fn handle_forward_decision(
                     pre_split_upstreams,
                 )
                 .await?;
-                if let Some(_g) = engine.inflight.get(&dedupe_hash) {
+                if let Some(guard) = cleanup_guard.as_mut() {
+                    guard.defuse();
                     engine.notify_inflight_waiters(dedupe_hash, &tcp_resp).await;
                 }
                 return Ok(ForwardResult::Success(tcp_resp));
@@ -681,8 +681,8 @@ pub async fn handle_forward_decision(
                         qname,
                         Arc::from(pipeline_id),
                         qtype,
-                        ttl_secs_cache as u32,
-                        ttl_secs_refresh as u32,
+                        crate::proto_utils::saturating_u64_to_u32(ttl_secs_cache),
+                        crate::proto_utils::saturating_u64_to_u32(ttl_secs_refresh),
                     );
                 }
                 if let Some(g) = cleanup_guard.as_mut() {
@@ -760,8 +760,8 @@ pub async fn handle_forward_decision(
                             qname,
                             Arc::from(pipeline_id),
                             qtype,
-                            ttl_secs_cache as u32,
-                            ttl_secs_refresh as u32,
+                            crate::proto_utils::saturating_u64_to_u32(ttl_secs_cache),
+                            crate::proto_utils::saturating_u64_to_u32(ttl_secs_refresh),
                         );
                     }
                     if let Some(g) = cleanup_guard.as_mut() {
@@ -785,8 +785,8 @@ pub async fn handle_forward_decision(
                             qname,
                             Arc::from(pipeline_id),
                             qtype,
-                            min_ttl.as_secs() as u32,
-                            min_ttl.as_secs() as u32,
+                            crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
+                            crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
                         );
                     }
                     if let Some(g) = cleanup_guard.as_mut() {
@@ -961,8 +961,8 @@ pub async fn handle_forward_decision(
                                 qname,
                                 Arc::from(pipeline_id),
                                 qtype,
-                                ttl_secs_cache as u32,
-                                ttl_secs_refresh as u32,
+                                crate::proto_utils::saturating_u64_to_u32(ttl_secs_cache),
+                                crate::proto_utils::saturating_u64_to_u32(ttl_secs_refresh),
                             );
                         }
                         if let Some(g) = cleanup_guard.as_mut() {
@@ -986,8 +986,8 @@ pub async fn handle_forward_decision(
                                 qname,
                                 Arc::from(pipeline_id),
                                 qtype,
-                                min_ttl.as_secs() as u32,
-                                min_ttl.as_secs() as u32,
+                                crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
+                                crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
                             );
                         }
                         if let Some(g) = cleanup_guard.as_mut() {

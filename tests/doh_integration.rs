@@ -46,7 +46,7 @@ fn make_nxdomain_engine() -> Engine {
     });
     let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
     let runtime = RuntimePipelineConfig::from_config(cfg).expect("build runtime");
-    Engine::new(runtime, "test".to_string())
+    Engine::new(runtime, "test".to_string()).expect("initialize test engine")
 }
 
 /// Build an Engine that returns a fixed static IP (1.2.3.4) for A queries.
@@ -64,7 +64,7 @@ fn make_static_ip_engine() -> Engine {
     });
     let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
     let runtime = RuntimePipelineConfig::from_config(cfg).expect("build runtime");
-    Engine::new(runtime, "test".to_string())
+    Engine::new(runtime, "test".to_string()).expect("initialize test engine")
 }
 
 /// Generate a self-signed TLS certificate, write cert + key PEM to temp files.
