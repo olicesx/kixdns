@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use hickory_proto::rr::{DNSClass, RecordType};
 use tracing::{error, warn};
 
@@ -11,6 +13,16 @@ use crate::engine::utils::{RefreshingGuard, is_refreshing};
 /// 1. 检查 is_refreshing
 /// 2. 后台请求设置 skip_cache=true
 /// 3. RefreshingGuard 确保刷新标记在任务完成后被清除
+///
+/// `peer_ip` is the original client IP from the request that triggered this refresh.
+/// It must be the real client IP — not loopback — so that:
+/// - ECS injection (RFC 7871) uses the correct client subnet
+/// - Pipeline selection matches the original request path
+///
+/// `peer_ip` 是触发刷新的原始请求的客户端 IP。
+/// 必须使用真实客户端 IP 而非回环地址，以确保：
+/// - ECS 注入 (RFC 7871) 使用正确的客户端子网
+/// - Pipeline 选择与原始请求路径一致
 pub fn spawn_background_refresh(
     engine: &Engine,
     cache_hash: u64,
@@ -18,6 +30,7 @@ pub fn spawn_background_refresh(
     qname: &str,
     qtype: RecordType,
     qclass: DNSClass,
+    peer_ip: IpAddr,
     _upstream: Option<&str>, // Reserved for future use
 ) {
     // FIX: Check if already refreshing to prevent duplicate refreshes
@@ -66,19 +79,19 @@ pub fn spawn_background_refresh(
         // 将 guard 移动到异步任务中，这样任务完成时会清除标记
         let _guard = _guard;
 
-        // Use loopback address as peer (background refresh is internal)
-        // 使用回环地址作为 peer（后台刷新是内部的）
-        let peer_addr = std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-            53,
-        );
+        // Use original client peer IP for correct ECS injection (RFC 7871) and pipeline selection.
+        // Port is irrelevant — only .ip() is consumed downstream.
+        //
+        // 使用原始客户端 peer IP 确保正确的 ECS 注入 (RFC 7871) 和 pipeline 选择。
+        // 端口无关 — 下游仅消费 .ip()。
+        let peer_addr = std::net::SocketAddr::new(peer_ip, 53);
 
-        // Call handle_packet_internal with skip_cache=true and explicit cache_hash
-        // 调用 handle_packet_internal 并设置 skip_cache=true，传入显式 cache_hash
-        // This ensures the background refresh writes to the same cache slot as the original request,
-        // even when the peer IP (127.0.0.1) would produce a different ECS key.
-        // 这确保后台刷新写入与原始请求相同的缓存槽，
-        // 即使 peer IP (127.0.0.1) 会产生不同的 ECS key。
+        // Call handle_packet_internal with skip_cache=true and explicit cache_hash.
+        // Together with the original peer_ip, this ensures the background refresh
+        // both writes to the correct cache slot AND injects the correct ECS (RFC 7871).
+        //
+        // 调用 handle_packet_internal 并设置 skip_cache=true，传入显式 cache_hash。
+        // 配合原始 peer_ip，确保后台刷新既写入正确的缓存槽，又注入正确的 ECS (RFC 7871)。
         let result = engine
             .handle_packet_internal(&packet, peer_addr, true, None, Some(cache_hash))
             .await;

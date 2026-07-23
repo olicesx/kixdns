@@ -392,6 +392,7 @@ impl Engine {
                                 qname_str,
                                 qtype,
                                 qclass,
+                                peer.ip(),
                                 hit.upstream.as_deref(),
                             );
                         }
@@ -1048,6 +1049,7 @@ impl Engine {
         qname: &str,
         qtype: hickory_proto::rr::RecordType,
         qclass: DNSClass,
+        peer_ip: std::net::IpAddr,
         upstream: Option<&str>, // Reserved for future use
     ) {
         crate::engine::refresh::spawn_background_refresh(
@@ -1057,6 +1059,7 @@ impl Engine {
             qname,
             qtype,
             qclass,
+            peer_ip,
             upstream,
         )
     }
