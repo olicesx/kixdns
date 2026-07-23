@@ -93,6 +93,7 @@ pub fn check_cache(
                             qname_ref,
                             qtype,
                             qclass,
+                            peer.ip(),
                             Some(upstream_ref),
                         );
                     }
@@ -145,6 +146,7 @@ pub fn check_cache(
                         qname_ref,
                         qtype,
                         qclass,
+                        peer.ip(),
                         Some(upstream_ref),
                     );
                 }
@@ -223,6 +225,7 @@ pub fn check_cache(
                         qname_ref,
                         qtype,
                         qclass,
+                        peer.ip(),
                         hit.upstream.as_deref(), // Pass upstream if available
                     );
                 }
@@ -348,6 +351,7 @@ pub fn check_stale_cache(
                         qname_ref,
                         qtype,
                         qclass,
+                        peer.ip(),
                         Some(upstream_ref),
                     );
                 }
