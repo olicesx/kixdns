@@ -24,6 +24,7 @@ use tokio::net::{
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use url::Url;
 use webpki_roots::TLS_SERVER_ROOTS;
@@ -514,6 +515,8 @@ pub struct TcpMuxClient {
     idle_timeout_ms: AtomicU64,
     /// 性能优化：上次健康检查时间（毫秒）/ Performance: last health check time (ms)
     last_health_check_time: AtomicU64,
+    /// Reader 取消令牌 / Reader cancellation token
+    read_cancel: Mutex<CancellationToken>,
 }
 
 struct Pending {
@@ -551,6 +554,7 @@ impl TcpMuxClient {
             last_request_time: AtomicU64::new(0),
             idle_timeout_ms: AtomicU64::new(60_000), // 1 分钟
             last_health_check_time: AtomicU64::new(0),
+            read_cancel: Mutex::new(CancellationToken::new()),
         }
     }
 
@@ -573,6 +577,7 @@ impl TcpMuxClient {
     async fn spawn_reader(
         &self,
         mut reader: OwnedReadHalf,
+        cancel_token: CancellationToken,
         my_generation: u64,
         global_generation: Arc<AtomicU64>,
     ) {
@@ -600,21 +605,31 @@ impl TcpMuxClient {
                 }
 
                 let mut len_buf = [0u8; 2];
-                if let Err(err) = reader.read_exact(&mut len_buf).await {
-                    // Check generation again before resetting anything
-                    if global_generation.load(Ordering::Relaxed) == my_generation {
-                        debug!(target = "tcp_mux", upstream = %upstream, error = %err, "tcp read len failed");
-                        Self::fail_all_async(
-                            &pending,
-                            anyhow::anyhow!("tcp read len failed"),
-                            &conn,
-                            &conn_permit,
-                        )
-                        .await;
-                    } else {
-                        debug!(target = "tcp_mux", upstream = %upstream, gen = my_generation, "TCP reader failed but generation changed, ignoring");
+                // Cancellation: select! interrupts blocked read_exact on reset
+                // 取消机制：select! 在 reset 时中断阻塞的 read_exact
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        debug!(target = "tcp_mux", upstream = %upstream, gen = my_generation, "TCP reader cancelled by reset, exiting");
+                        return;
                     }
-                    break;
+                    result = reader.read_exact(&mut len_buf) => {
+                        if let Err(err) = result {
+                            // Check generation again before resetting anything
+                            if global_generation.load(Ordering::Relaxed) == my_generation {
+                                debug!(target = "tcp_mux", upstream = %upstream, error = %err, "tcp read len failed");
+                                Self::fail_all_async(
+                                    &pending,
+                                    anyhow::anyhow!("tcp read len failed"),
+                                    &conn,
+                                    &conn_permit,
+                                )
+                                .await;
+                            } else {
+                                debug!(target = "tcp_mux", upstream = %upstream, gen = my_generation, "TCP reader failed but generation changed, ignoring");
+                            }
+                            break;
+                        }
+                    }
                 }
                 let resp_len = u16::from_be_bytes(len_buf) as usize;
 
@@ -625,19 +640,27 @@ impl TcpMuxClient {
                 }
                 reusable_buf.resize(resp_len, 0);
 
-                if let Err(err) = reader.read_exact(&mut reusable_buf[..resp_len]).await {
-                    // Check generation again
-                    if global_generation.load(Ordering::Relaxed) == my_generation {
-                        debug!(target = "tcp_mux", upstream = %upstream, error = %err, "tcp read body failed");
-                        Self::fail_all_async(
-                            &pending,
-                            anyhow::anyhow!("tcp read body failed"),
-                            &conn,
-                            &conn_permit,
-                        )
-                        .await;
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        debug!(target = "tcp_mux", upstream = %upstream, gen = my_generation, "TCP reader cancelled by reset during body read, exiting");
+                        return;
                     }
-                    break;
+                    result = reader.read_exact(&mut reusable_buf[..resp_len]) => {
+                        if let Err(err) = result {
+                            // Check generation again
+                            if global_generation.load(Ordering::Relaxed) == my_generation {
+                                debug!(target = "tcp_mux", upstream = %upstream, error = %err, "tcp read body failed");
+                                Self::fail_all_async(
+                                    &pending,
+                                    anyhow::anyhow!("tcp read body failed"),
+                                    &conn,
+                                    &conn_permit,
+                                )
+                                .await;
+                            }
+                            break;
+                        }
+                    }
                 }
 
                 if resp_len < 2 {
@@ -705,7 +728,7 @@ impl TcpMuxClient {
                 threshold = threshold,
                 "TCP connection error threshold exceeded, resetting connection"
             );
-            Self::reset_conn(&self.conn, &self.conn_permit).await;
+            self.reset().await;
             // Clear error counter to avoid immediate re-triggering on next error
             // 清零错误计数器，避免下次错误时立即重新触发
             self.consecutive_errors.store(0, Ordering::Release);
@@ -743,7 +766,7 @@ impl TcpMuxClient {
                     max_age_ms = max_age,
                     "TCP connection too old, resetting"
                 );
-                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                self.reset().await;
                 // Clear error counter since we're starting fresh
                 // 清零错误计数器，因为我们重新开始
                 self.consecutive_errors.store(0, Ordering::Release);
@@ -763,7 +786,7 @@ impl TcpMuxClient {
                     idle_timeout_ms = idle_timeout,
                     "TCP connection idle timeout, resetting"
                 );
-                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                self.reset().await;
                 // Clear error counter since we're starting fresh
                 // 清零错误计数器，因为我们重新开始
                 self.consecutive_errors.store(0, Ordering::Release);
@@ -902,7 +925,7 @@ impl TcpMuxClient {
                 // Record error and FORCE RESET on write failure (socket likely dead)
                 // 记录错误并在写入失败时强制重置（socket 可能已死）
                 self.record_error().await;
-                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                self.reset().await;
                 self.consecutive_errors.store(0, Ordering::Release);
 
                 return Err(err).context(format!(
@@ -916,7 +939,7 @@ impl TcpMuxClient {
                 // Record error and FORCE RESET on write timeout
                 // 记录错误并在写入超时时强制重置
                 self.record_error().await;
-                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                self.reset().await;
                 self.consecutive_errors.store(0, Ordering::Release);
 
                 return Err(anyhow::anyhow!(
@@ -936,7 +959,7 @@ impl TcpMuxClient {
             // Record error and FORCE RESET on prereq timeout
             // 记录错误并在超时时强制重置
             self.record_error().await;
-            Self::reset_conn(&self.conn, &self.conn_permit).await;
+            self.reset().await;
             self.consecutive_errors.store(0, Ordering::Release);
 
             return Err(anyhow::anyhow!(
@@ -972,7 +995,7 @@ impl TcpMuxClient {
                 // Record error and FORCE RESET on response timeout (connection likely dead/stalled)
                 // 记录错误并在响应超时时强制重置（连接可能死锁/停滞）
                 self.record_error().await;
-                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                self.reset().await;
                 self.consecutive_errors.store(0, Ordering::Release);
 
                 return Err(anyhow::anyhow!(
@@ -1011,7 +1034,7 @@ impl TcpMuxClient {
                 consecutive_errors = errors,
                 "TCP connection has errors, resetting before ensure"
             );
-            Self::reset_conn(&self.conn, &self.conn_permit).await;
+            self.reset().await;
         }
 
         let mut guard = self.conn.lock().await;
@@ -1056,10 +1079,26 @@ impl TcpMuxClient {
             // 为新连接增加代数
             let new_gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
 
+            // Create fresh cancellation token for this connection lifecycle
+            // 为此连接生命周期创建新的取消令牌
+            let new_token = CancellationToken::new();
+
             // Spawn reader while holding the lock to prevent races
             // 持有锁时启动 reader 以防止竞争
-            self.spawn_reader(read_half, new_gen, self.generation.clone())
-                .await;
+            self.spawn_reader(
+                read_half,
+                new_token.clone(),
+                new_gen,
+                self.generation.clone(),
+            )
+            .await;
+
+            // Store token AFTER spawn so reset() can only cancel a live reader
+            // 在 spawn 之后存储 token，确保 reset() 只能取消已启动的 reader
+            {
+                let mut token_guard = self.read_cancel.lock().await;
+                *token_guard = new_token;
+            }
 
             // Store permit in connection (held for connection lifetime)
             // 将 permit 保存在连接中（连接生命周期内持有）
@@ -1142,6 +1181,17 @@ impl TcpMuxClient {
         }
         let mut permit_guard = conn_permit.lock().await;
         *permit_guard = None;
+    }
+
+    /// Reset connection: cancel reader task, then drop write half and release permit
+    /// 重置连接：取消 reader 任务，然后丢弃写半部并释放许可
+    ///
+    /// The cancellation token interrupts the reader's blocked read so it
+    /// exits immediately instead of leaking the TCP connection.
+    /// 取消令牌中断 reader 阻塞的读取操作，使其立即退出而非泄漏 TCP 连接。
+    async fn reset(&self) {
+        self.read_cancel.lock().await.cancel();
+        Self::reset_conn(&self.conn, &self.conn_permit).await;
     }
 
     /// Reset TCP connection and release connection-level permit
@@ -1299,6 +1349,8 @@ pub struct DotMuxClient {
     last_request_time: AtomicU64,
     idle_timeout_ms: AtomicU64,
     last_health_check_time: AtomicU64,
+    /// Reader 取消令牌 / Reader cancellation token
+    read_cancel: Mutex<CancellationToken>,
 }
 
 impl DotMultiplexer {
@@ -1386,6 +1438,7 @@ impl DotMuxClient {
             last_request_time: AtomicU64::new(0),
             idle_timeout_ms: AtomicU64::new(60_000),
             last_health_check_time: AtomicU64::new(0),
+            read_cancel: Mutex::new(CancellationToken::new()),
         }
     }
 
@@ -1406,6 +1459,7 @@ impl DotMuxClient {
     async fn spawn_reader(
         &self,
         mut reader: DotReadHalf,
+        cancel_token: CancellationToken,
         my_generation: u64,
         global_generation: Arc<AtomicU64>,
     ) {
@@ -1423,18 +1477,28 @@ impl DotMuxClient {
                 }
 
                 let mut len_buf = [0u8; 2];
-                if let Err(err) = reader.read_exact(&mut len_buf).await {
-                    if global_generation.load(Ordering::Relaxed) == my_generation {
-                        debug!(target = "dot_mux", upstream = %upstream, error = %err, "dot read len failed");
-                        Self::fail_all_async(
-                            &pending,
-                            anyhow::anyhow!("dot read len failed"),
-                            &conn,
-                            &conn_permit,
-                        )
-                        .await;
+                // Cancellation: select! interrupts blocked read_exact on reset
+                // 取消机制：select! 在 reset 时中断阻塞的 read_exact
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        debug!(target = "dot_mux", upstream = %upstream, gen = my_generation, "DoT reader cancelled by reset, exiting");
+                        return;
                     }
-                    break;
+                    result = reader.read_exact(&mut len_buf) => {
+                        if let Err(err) = result {
+                            if global_generation.load(Ordering::Relaxed) == my_generation {
+                                debug!(target = "dot_mux", upstream = %upstream, error = %err, "dot read len failed");
+                                Self::fail_all_async(
+                                    &pending,
+                                    anyhow::anyhow!("dot read len failed"),
+                                    &conn,
+                                    &conn_permit,
+                                )
+                                .await;
+                            }
+                            break;
+                        }
+                    }
                 }
                 let resp_len = u16::from_be_bytes(len_buf) as usize;
                 if reusable_buf.capacity() < resp_len {
@@ -1442,18 +1506,26 @@ impl DotMuxClient {
                 }
                 reusable_buf.resize(resp_len, 0);
 
-                if let Err(err) = reader.read_exact(&mut reusable_buf[..resp_len]).await {
-                    if global_generation.load(Ordering::Relaxed) == my_generation {
-                        debug!(target = "dot_mux", upstream = %upstream, error = %err, "dot read body failed");
-                        Self::fail_all_async(
-                            &pending,
-                            anyhow::anyhow!("dot read body failed"),
-                            &conn,
-                            &conn_permit,
-                        )
-                        .await;
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        debug!(target = "dot_mux", upstream = %upstream, gen = my_generation, "DoT reader cancelled by reset during body read, exiting");
+                        return;
                     }
-                    break;
+                    result = reader.read_exact(&mut reusable_buf[..resp_len]) => {
+                        if let Err(err) = result {
+                            if global_generation.load(Ordering::Relaxed) == my_generation {
+                                debug!(target = "dot_mux", upstream = %upstream, error = %err, "dot read body failed");
+                                Self::fail_all_async(
+                                    &pending,
+                                    anyhow::anyhow!("dot read body failed"),
+                                    &conn,
+                                    &conn_permit,
+                                )
+                                .await;
+                            }
+                            break;
+                        }
+                    }
                 }
 
                 if resp_len < 2 {
@@ -1491,7 +1563,7 @@ impl DotMuxClient {
                 threshold = threshold,
                 "DoT connection error threshold exceeded, resetting"
             );
-            Self::reset_conn(&self.conn, &self.conn_permit).await;
+            self.reset().await;
             self.consecutive_errors.store(0, Ordering::Release);
             true
         } else {
@@ -1519,7 +1591,7 @@ impl DotMuxClient {
                     max_age_ms = max_age,
                     "DoT connection too old, resetting"
                 );
-                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                self.reset().await;
                 self.consecutive_errors.store(0, Ordering::Release);
                 return true;
             }
@@ -1536,7 +1608,7 @@ impl DotMuxClient {
                     idle_timeout_ms = idle_timeout,
                     "DoT connection idle timeout, resetting"
                 );
-                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                self.reset().await;
                 self.consecutive_errors.store(0, Ordering::Release);
                 return true;
             }
@@ -1630,7 +1702,7 @@ impl DotMuxClient {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 self.record_error().await;
-                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                self.reset().await;
                 self.consecutive_errors.store(0, Ordering::Release);
 
                 return Err(err).context(format!(
@@ -1640,7 +1712,7 @@ impl DotMuxClient {
             }
             Err(_) => {
                 self.record_error().await;
-                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                self.reset().await;
                 self.consecutive_errors.store(0, Ordering::Release);
 
                 return Err(anyhow::anyhow!(
@@ -1654,7 +1726,7 @@ impl DotMuxClient {
         let elapsed_after_write = start.elapsed();
         if elapsed_after_write >= timeout_dur {
             self.record_error().await;
-            Self::reset_conn(&self.conn, &self.conn_permit).await;
+            self.reset().await;
             self.consecutive_errors.store(0, Ordering::Release);
 
             return Err(anyhow::anyhow!(
@@ -1680,7 +1752,7 @@ impl DotMuxClient {
             }
             Err(_) => {
                 self.record_error().await;
-                Self::reset_conn(&self.conn, &self.conn_permit).await;
+                self.reset().await;
                 self.consecutive_errors.store(0, Ordering::Release);
 
                 return Err(anyhow::anyhow!(
@@ -1703,7 +1775,7 @@ impl DotMuxClient {
                 consecutive_errors = errors,
                 "DoT connection has errors, resetting before ensure"
             );
-            Self::reset_conn(&self.conn, &self.conn_permit).await;
+            self.reset().await;
         }
 
         let mut guard = self.conn.lock().await;
@@ -1747,8 +1819,25 @@ impl DotMuxClient {
             *guard = Some(write_half);
 
             let new_gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-            self.spawn_reader(read_half, new_gen, self.generation.clone())
-                .await;
+
+            // Create fresh cancellation token for this connection lifecycle
+            // 为此连接生命周期创建新的取消令牌
+            let new_token = CancellationToken::new();
+
+            self.spawn_reader(
+                read_half,
+                new_token.clone(),
+                new_gen,
+                self.generation.clone(),
+            )
+            .await;
+
+            // Store token AFTER spawn so reset() can only cancel a live reader
+            // 在 spawn 之后存储 token，确保 reset() 只能取消已启动的 reader
+            {
+                let mut token_guard = self.read_cancel.lock().await;
+                *token_guard = new_token;
+            }
 
             let mut conn_permit_guard = self.conn_permit.lock().await;
             *conn_permit_guard = Some(permit);
@@ -1815,6 +1904,17 @@ impl DotMuxClient {
         }
         let mut permit_guard = conn_permit.lock().await;
         *permit_guard = None;
+    }
+
+    /// Reset connection: cancel reader task, then drop write half and release permit
+    /// 重置连接：取消 reader 任务，然后丢弃写半部并释放许可
+    ///
+    /// The cancellation token interrupts the reader's blocked read so it
+    /// exits immediately instead of leaking the TLS connection.
+    /// 取消令牌中断 reader 阻塞的读取操作，使其立即退出而非泄漏 TLS 连接。
+    async fn reset(&self) {
+        self.read_cancel.lock().await.cancel();
+        Self::reset_conn(&self.conn, &self.conn_permit).await;
     }
 
     async fn reset_conn(
