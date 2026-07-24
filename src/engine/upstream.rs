@@ -143,8 +143,11 @@ async fn forward_tcp_udp_dual(
 ) -> anyhow::Result<(Bytes, &'static str)> {
     let engine_udp = engine.clone();
     let engine_tcp = engine.clone();
-    let packet_udp = packet.to_vec();
-    let packet_tcp = packet.to_vec();
+    // Use Bytes for cheap clone (refcount) instead of Vec full copy
+    // 使用 Bytes 实现低成本克隆（引用计数）而非 Vec 全量拷贝
+    let packet_shared = Bytes::copy_from_slice(packet);
+    let packet_udp = packet_shared.clone();
+    let packet_tcp = packet_shared.clone();
     let addr_udp = addr.to_string();
     let addr_tcp = addr.to_string();
 
@@ -328,7 +331,9 @@ pub async fn forward_upstream(
     // Multiple upstreams: use JoinSet for concurrency
     // 多个上游：使用 JoinSet 进行并发
     let mut tasks = JoinSet::new();
-    let packet_owned = packet.to_vec();
+    // Use Bytes for cheap clone (refcount) instead of Vec full copy
+    // 使用 Bytes 实现低成本克隆（引用计数）而非 Vec 全量拷贝
+    let packet_owned = Bytes::copy_from_slice(packet);
     let mut last_err: Option<anyhow::Error> = None;
 
     // If any TCP/TCP+UDP upstream is present, avoid UDP->TCP fallback to prevent duplicate TCP sends
@@ -520,6 +525,7 @@ mod tests {
     use crate::matcher::RuntimePipelineConfig;
     use hickory_proto::op::{Message, MessageType, Query};
     use hickory_proto::rr::{Name, RecordType};
+    use rustc_hash::FxHashMap;
     use rustls::crypto::ring;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -669,6 +675,7 @@ mod tests {
             settings,
             pipeline_select: Vec::new(),
             pipelines: Vec::new(),
+            pipeline_id_index: FxHashMap::default(),
         };
         Engine::new(runtime, "test".to_string()).expect("initialize test engine")
     }

@@ -5,7 +5,7 @@ use dashmap::DashSet;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RecordType};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -215,7 +215,7 @@ impl Drop for RefreshingGuard {
 ///
 /// 扫描配置以查找所有在匹配器中实际使用的GeoSite标签，这样可以只从数据文件中加载这些标签 / Scans the configuration to find all GeoSite tags actually used in matchers, so we can load only those tags from the data file.
 pub fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<String> {
-    let mut tags_set: HashSet<std::sync::Arc<str>> = HashSet::new();
+    let mut tags_set: FxHashSet<std::sync::Arc<str>> = FxHashSet::default();
 
     // Scan pipeline_select rules / 扫描 pipeline_select 规则
     for rule in &cfg.pipeline_select {
@@ -299,4 +299,22 @@ pub fn uses_geoip_matchers(cfg: &RuntimePipelineConfig) -> bool {
     }
 
     false
+}
+
+/// 将字符串形式的 DNS Rcode 解析为 ResponseCode
+/// Parse DNS Rcode string to ResponseCode
+///
+/// 支持的 Rcode: NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED
+/// Supported Rcodes: NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED
+#[inline]
+pub(crate) fn parse_rcode(rcode: &str) -> Option<ResponseCode> {
+    match rcode.to_ascii_uppercase().as_str() {
+        "NOERROR" => Some(ResponseCode::NoError),
+        "FORMERR" => Some(ResponseCode::FormErr),
+        "SERVFAIL" => Some(ResponseCode::ServFail),
+        "NXDOMAIN" => Some(ResponseCode::NXDomain),
+        "NOTIMP" => Some(ResponseCode::NotImp),
+        "REFUSED" => Some(ResponseCode::Refused),
+        _ => None,
+    }
 }

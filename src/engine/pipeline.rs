@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,6 +10,7 @@ use smallvec::SmallVec;
 use tracing::info;
 
 use crate::config::{Action, Transport};
+use crate::engine::utils::parse_rcode;
 use crate::lock::RwLock;
 use crate::matcher::advanced_rule::CompiledPipeline;
 use crate::matcher::geoip::GeoIpManager;
@@ -58,11 +59,8 @@ pub fn select_pipeline<'a>(
             },
         );
         if matched {
-            if let Some(p) = cfg
-                .pipelines
-                .iter()
-                .find(|p| p.id.as_ref() == rule.pipeline.as_str())
-            {
+            if let Some(&idx) = cfg.pipeline_id_index.get(rule.pipeline.as_str()) {
+                let p = &cfg.pipelines[idx];
                 return (Some(p), p.id.clone());
             }
         }
@@ -81,9 +79,9 @@ impl Engine {
         pipeline_id: &str,
     ) -> Option<&'a CompiledPipeline> {
         state
-            .compiled_pipelines
-            .iter()
-            .find(|p| p.id.as_ref() == pipeline_id)
+            .pipeline_index
+            .get(pipeline_id)
+            .and_then(|&idx| state.compiled_pipelines.get(idx))
     }
 
     pub fn insert_rule_cache(
@@ -161,7 +159,7 @@ impl Engine {
         qtype: RecordType,
         qclass: DNSClass,
         edns_present: bool,
-        skip_rules: Option<&HashSet<Arc<str>>>,
+        skip_rules: Option<&FxHashSet<Arc<str>>>,
         skip_cache: bool,
     ) -> Decision {
         // 1. Check Rule Cache
@@ -276,13 +274,13 @@ impl Engine {
 
                 if forward_actions.len() > 1 {
                     // 多个 forward action：按 transport 类型分别合并，并去重 / Multiple forward actions: merge by transport type with deduplication
-                    use std::collections::HashSet;
+                    // FxHashSet already imported at module level / 模块级已导入 FxHashSet
 
-                    let mut tcp_upstreams: HashSet<String> = HashSet::new();
-                    let mut udp_upstreams: HashSet<String> = HashSet::new();
-                    let mut doh_upstreams: HashSet<String> = HashSet::new();
-                    let mut dot_upstreams: HashSet<String> = HashSet::new();
-                    let mut doq_upstreams: HashSet<String> = HashSet::new();
+                    let mut tcp_upstreams: FxHashSet<String> = FxHashSet::default();
+                    let mut udp_upstreams: FxHashSet<String> = FxHashSet::default();
+                    let mut doh_upstreams: FxHashSet<String> = FxHashSet::default();
+                    let mut dot_upstreams: FxHashSet<String> = FxHashSet::default();
+                    let mut doq_upstreams: FxHashSet<String> = FxHashSet::default();
 
                     // 收集并按 transport 分组，同时去重
                     for (upstream_opt, transport_opt, _pre_split) in forward_actions.iter() {
@@ -687,17 +685,5 @@ impl Engine {
             include_ip,
         );
         d
-    }
-}
-
-fn parse_rcode(rcode: &str) -> Option<ResponseCode> {
-    match rcode.to_ascii_uppercase().as_str() {
-        "NOERROR" => Some(ResponseCode::NoError),
-        "FORMERR" => Some(ResponseCode::FormErr),
-        "SERVFAIL" => Some(ResponseCode::ServFail),
-        "NXDOMAIN" => Some(ResponseCode::NXDomain),
-        "NOTIMP" => Some(ResponseCode::NotImp),
-        "REFUSED" => Some(ResponseCode::Refused),
-        _ => None,
     }
 }

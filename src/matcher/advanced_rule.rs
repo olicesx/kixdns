@@ -9,6 +9,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::config::{Action, MatchOperator};
+use crate::engine::utils::parse_rcode;
 use crate::engine::{Decision, make_static_ip_answer};
 use crate::matcher::eval_match_chain;
 use crate::matcher::{RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig, RuntimeRule};
@@ -356,18 +357,5 @@ fn compiled_matcher_matches(
             }
             RuntimeMatcher::Qtype { value } => *value == qtype,
         },
-    }
-}
-
-#[inline]
-fn parse_rcode(rcode: &str) -> Option<ResponseCode> {
-    match rcode.to_ascii_uppercase().as_str() {
-        "NOERROR" => Some(ResponseCode::NoError),
-        "FORMERR" => Some(ResponseCode::FormErr),
-        "SERVFAIL" => Some(ResponseCode::ServFail),
-        "NXDOMAIN" => Some(ResponseCode::NXDomain),
-        "NOTIMP" => Some(ResponseCode::NotImp),
-        "REFUSED" => Some(ResponseCode::Refused),
-        _ => None,
     }
 }

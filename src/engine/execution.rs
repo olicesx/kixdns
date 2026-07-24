@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::{FxHashMap, FxHasher, FxHashSet};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -9,7 +9,6 @@ use std::time::Instant;
 use anyhow::Context;
 
 use bytes::Bytes;
-use rustc_hash::FxHasher;
 
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::DNSClass;
@@ -62,9 +61,16 @@ impl Engine {
     /// Reload configuration and update compiled pipelines / 重新加载配置并更新编译后的管线
     pub fn reload(&self, new_cfg: RuntimePipelineConfig) {
         let compiled = compile_pipelines(&new_cfg);
+        // Build O(1) compiled pipeline lookup index / 构建 O(1) 编译管道查找索引
+        let pipeline_index: FxHashMap<Arc<str>, usize> = compiled
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.id.clone(), i))
+            .collect();
         self.state.store(Arc::new(EngineInner {
             pipeline: new_cfg,
             compiled_pipelines: compiled,
+            pipeline_index,
         }));
         // Clear rule cache to ensure new rules take effect immediately / 清除规则缓存以确保新规则立即生效
         self.rule_cache.invalidate_all();
@@ -218,7 +224,6 @@ impl Engine {
         cache_hash: u64,
         bytes: Bytes,
         rcode: ResponseCode,
-        source: Arc<str>,
         upstream: Option<Arc<str>>,
         qname: &str,
         pipeline_id: Arc<str>,
@@ -229,7 +234,6 @@ impl Engine {
         let entry = CacheEntry {
             bytes,
             rcode,
-            source,
             upstream,
             qname: Arc::from(qname), // 一次 Arc::from，避免多次
             pipeline_id,
@@ -604,6 +608,8 @@ impl Engine {
                     let req = Message::from_bytes(packet).context("parse request")?;
                     let question = req.queries().first().context("empty question")?;
                     (
+                        // Name::to_lowercase() returns Name, .to_string() converts to String
+                        // Name::to_lowercase() 返回 Name，.to_string() 转换为 String
                         std::borrow::Cow::Owned(question.name().to_lowercase().to_string()),
                         question.query_type(),
                         question.query_class(),
@@ -647,9 +653,9 @@ impl Engine {
 
         // Find pipeline_opt from pipeline_id / 从 pipeline_id 查找 pipeline_opt
         let pipeline_opt = cfg
-            .pipelines
-            .iter()
-            .find(|p| p.id.as_ref() == pipeline_id.as_ref());
+            .pipeline_id_index
+            .get(pipeline_id.as_ref())
+            .and_then(|&idx| cfg.pipelines.get(idx));
 
         // Convert qname_ref to bytes for hash calculation / 将 qname_ref 转换为 bytes 进行哈希计算
         let qname_bytes = qname_ref.as_bytes();
@@ -792,7 +798,7 @@ impl Engine {
         // 大部分情况下 qname_cow 是 Borrowed（零拷贝），只有快速解析失败时才是 Owned
         // In most cases qname_cow is Borrowed (zero-copy), only Owned when quick parse fails
         let qname = qname_cow;
-        let mut skip_rules: HashSet<Arc<str>> = HashSet::new();
+        let mut skip_rules: FxHashSet<Arc<str>> = FxHashSet::default();
         let mut current_pipeline_id = pipeline_id.clone();
         // Convert qname to bytes for hash calculation / 将 qname 转换为 bytes 进行哈希计算
         let qname_bytes = qname.as_bytes();
@@ -877,11 +883,8 @@ impl Engine {
                     };
                     break;
                 }
-                if let Some(p) = cfg
-                    .pipelines
-                    .iter()
-                    .find(|p| p.id.as_ref() == pipeline.as_ref())
-                {
+                if let Some(&idx) = cfg.pipeline_id_index.get(pipeline.as_ref()) {
+                    let p = &cfg.pipelines[idx];
                     current_pipeline_id = p.id.clone();
                     // Must recompute ECS key + dedupe_hash: pipeline changed via Jump,
                     // so the target pipeline's ECS config may differ from the source.
@@ -992,10 +995,10 @@ impl Engine {
                                 Some(&skip_rules)
                             };
 
-                            let pipeline = if let Some(p) =
-                                cfg.pipelines.iter().find(|p| p.id == current_pipeline_id)
+                            let pipeline = if let Some(&idx) =
+                                cfg.pipeline_id_index.get(current_pipeline_id.as_ref())
                             {
-                                p
+                                &cfg.pipelines[idx]
                             } else {
                                 warn!("pipeline missing while continuing: {}", current_pipeline_id);
                                 let req = Message::from_bytes(packet).context("parse request")?;
@@ -1560,6 +1563,7 @@ mod tests {
             },
             pipeline_select: Vec::new(),
             pipelines: Vec::new(),
+            pipeline_id_index: FxHashMap::default(),
         };
         Engine::new(runtime, "lbl".to_string()).expect("initialize test engine")
     }
@@ -1587,7 +1591,7 @@ mod tests {
         let actions = [Action::Allow];
         let response_matchers = vec![RuntimeResponseMatcherWithOp {
             operator: MatchOperator::And,
-            matcher: RuntimeResponseMatcher::ResponseType { value: "A".into() },
+            matcher: RuntimeResponseMatcher::ResponseType { value: RecordType::A },
         }];
         let packet = [0u8];
         let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -1638,7 +1642,7 @@ mod tests {
         let response_matchers = vec![RuntimeResponseMatcherWithOp {
             operator: MatchOperator::And,
             matcher: RuntimeResponseMatcher::ResponseType {
-                value: "AAAA".into(),
+                value: RecordType::AAAA,
             },
         }];
         let packet = [0u8];
@@ -1770,7 +1774,6 @@ mod tests {
         let entry = CacheEntry {
             bytes: Bytes::from_static(b"old_resp"),
             rcode: ResponseCode::NoError,
-            source: Arc::from("old_source"),
             upstream: None,
             qname: Arc::from(qname),
             pipeline_id: pipeline_id.clone(),

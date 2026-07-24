@@ -312,7 +312,7 @@ impl TcpMultiplexer {
     /// This creates a minimal pool with 1 connection per upstream to avoid
     /// lazy initialization overhead on first query.
     /// 这会为每个 upstream 创建只包含 1 个连接的最小连接池，以避免首次查询时的懒加载开销。
-    pub fn warm_up_pools(&self, upstreams: &std::collections::HashSet<String>) {
+    pub fn warm_up_pools(&self, upstreams: &rustc_hash::FxHashSet<String>) {
         use tracing::info;
 
         if upstreams.is_empty() {
@@ -1318,6 +1318,11 @@ struct DotTarget {
     sni: Arc<str>,
 }
 
+/// DoT (DNS over TLS) 多路复用器，管理多个上游的连接池
+/// DoT (DNS over TLS) multiplexer, managing connection pools for multiple upstreams
+///
+/// 参考 RFC 7858 (DNS over TLS) 实现
+/// Implements RFC 7858 (DNS over TLS)
 pub struct DotMultiplexer {
     pools: dashmap::DashMap<Arc<str>, Arc<DotConnectionPool>, FxBuildHasher>,
     pool_size: usize,
@@ -1327,11 +1332,21 @@ pub struct DotMultiplexer {
     idle_timeout_secs: u64,
 }
 
+/// DoT (DNS over TLS) 连接池
+/// DoT (DNS over TLS) connection pool
+///
+/// 参考 RFC 7858 (DNS over TLS) 实现
+/// Implements RFC 7858 (DNS over TLS)
 pub struct DotConnectionPool {
     clients: Vec<Arc<DotMuxClient>>,
     next_idx: AtomicUsize,
 }
 
+/// DoT (DNS over TLS) 多路复用客户端，管理单个上游的 TLS 连接
+/// DoT (DNS over TLS) multiplexing client, managing TLS connection for a single upstream
+///
+/// 参考 RFC 7858 (DNS over TLS) 实现
+/// Implements RFC 7858 (DNS over TLS)
 pub struct DotMuxClient {
     pub upstream: Arc<str>,
     target: Mutex<Option<DotTarget>>,
@@ -2013,17 +2028,32 @@ struct DoqConnectionInfo {
     used_0rtt: bool,
 }
 
+/// DoQ (DNS over QUIC) 连接池
+/// DoQ (DNS over QUIC) connection pool
+///
+/// 参考 RFC 9250 (DNS over Dedicated QUIC Connections) 实现
+/// Implements RFC 9250 (DNS over Dedicated QUIC Connections)
 pub struct DoqConnectionPool {
     clients: Vec<Arc<DoqMuxClient>>,
     next_idx: AtomicUsize,
 }
 
+/// DoQ (DNS over QUIC) 客户端，管理多个上游的 QUIC 连接池
+/// DoQ (DNS over QUIC) client, managing QUIC connection pools for multiple upstreams
+///
+/// 参考 RFC 9250 (DNS over Dedicated QUIC Connections) 实现
+/// Implements RFC 9250 (DNS over Dedicated QUIC Connections)
 pub struct DoqClient {
     pools: DashMap<Arc<str>, Arc<DoqConnectionPool>, FxBuildHasher>,
     pool_size: usize,
     runtime: Arc<DoqRuntime>,
 }
 
+/// DoQ (DNS over QUIC) 多路复用客户端，管理单个上游的 QUIC 连接
+/// DoQ (DNS over QUIC) multiplexing client, managing QUIC connection for a single upstream
+///
+/// 参考 RFC 9250 (DNS over Dedicated QUIC Connections) 实现
+/// Implements RFC 9250 (DNS over Dedicated QUIC Connections)
 pub struct DoqMuxClient {
     upstream: Arc<str>,
     target: Mutex<Option<DoqTarget>>,
@@ -2764,7 +2794,7 @@ mod tests {
             .expect("register_pending stalled under contention");
 
         // Assert: Verify all IDs are unique (no duplicates under contention)
-        let mut ids = std::collections::HashSet::new();
+        let mut ids = rustc_hash::FxHashSet::default();
         for r in results {
             let id = r.expect("register_pending failed");
             assert!(ids.insert(id), "duplicate id allocated under contention");

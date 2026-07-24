@@ -2,7 +2,7 @@ use crate::matcher::RuntimePipelineConfig;
 use crate::matcher::advanced_rule::CompiledPipeline;
 use bytes::Bytes;
 use dashmap::DashMap;
-use rustc_hash::FxBuildHasher;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::watch;
@@ -47,4 +47,6 @@ pub enum FastPathResponse {
 pub struct EngineInner {
     pub pipeline: RuntimePipelineConfig,
     pub compiled_pipelines: Vec<CompiledPipeline>,
+    /// O(1) pipeline lookup index: pipeline_id -> index in compiled_pipelines / O(1) 管道查找索引：pipeline_id -> compiled_pipelines 中的索引
+    pub pipeline_index: FxHashMap<Arc<str>, usize>,
 }

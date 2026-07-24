@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -101,7 +101,7 @@ pub struct GeoIpConverter {
 impl GeoIpConverter {
     pub fn new() -> Self {
         Self {
-            country_to_nets: HashMap::new(),
+            country_to_nets: HashMap::default(),
         }
     }
 

@@ -6,11 +6,11 @@ use anyhow::Context;
 use arc_swap::ArcSwap;
 use dashmap::{DashMap, DashSet};
 use moka::sync::Cache;
-use rustc_hash::FxBuildHasher;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use tracing::{info, warn};
 
 use super::utils::{extract_geosite_tags_from_config, uses_geoip_matchers};
-use crate::cache::{DnsCache, new_cache};
+use crate::cache::{CacheEntry, DnsCache, new_cache};
 use crate::lock::RwLock;
 use crate::matcher::RuntimePipelineConfig;
 use crate::matcher::advanced_rule::compile_pipelines;
@@ -156,9 +156,17 @@ impl Engine {
 
         let compiled = compile_pipelines(&cfg);
 
+        // Build O(1) compiled pipeline lookup index / 构建 O(1) 编译管道查找索引
+        let pipeline_index: FxHashMap<Arc<str>, usize> = compiled
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.id.clone(), i))
+            .collect();
+
         let state = Arc::new(ArcSwap::from_pointee(EngineInner {
             pipeline: cfg,
             compiled_pipelines: compiled,
+            pipeline_index,
         }));
 
         // Initialize GeoIpManager / 初始化 GeoIpManager
@@ -399,5 +407,20 @@ impl Engine {
             // Background refresh dedicated rule (lazy initialization) / 后台刷新专用规则（延迟初始化）
             background_refresh_rule: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Retrieve a cached entry by hash / 通过哈希获取缓存条目
+    pub(crate) fn cache_get(&self, hash: &u64) -> Option<Arc<CacheEntry>> {
+        self.cache.get(hash)
+    }
+
+    /// Invalidate a cached entry by hash / 通过哈希使缓存条目失效
+    pub(crate) fn cache_invalidate(&self, hash: &u64) {
+        self.cache.invalidate(hash);
+    }
+
+    /// Insert a cached entry / 插入缓存条目
+    pub(crate) fn cache_insert(&self, hash: u64, entry: Arc<CacheEntry>) {
+        self.cache.insert(hash, entry);
     }
 }

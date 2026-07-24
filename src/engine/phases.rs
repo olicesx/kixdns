@@ -1,5 +1,4 @@
 use super::Engine;
-use crate::cache::CacheEntry;
 use crate::config::{Action, MatchOperator, Transport};
 use crate::engine::response::{extract_ttl, extract_ttl_for_refresh};
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
@@ -40,7 +39,7 @@ pub fn check_cache(
     peer: &std::net::SocketAddr,
 ) -> Option<Bytes> {
     // moka 同步缓存自动处理过期，无需检查 expires_at / moka sync cache automatically handles expiration, no need to check expires_at
-    if let Some(hit) = engine.cache.get(&dedupe_hash) {
+    if let Some(hit) = engine.cache_get(&dedupe_hash) {
         // Validate hit against query parameters to avoid collisions
         if hit.qtype == u16::from(qtype)
             && hit.pipeline_id.as_ref() == pipeline_id
@@ -52,12 +51,12 @@ pub fn check_cache(
             if elapsed_secs >= hit.original_ttl as u64 {
                 // serve_stale disabled → invalidate and miss
                 if !engine.serve_stale {
-                    engine.cache.invalidate(&dedupe_hash);
+                    engine.cache_invalidate(&dedupe_hash);
                     return None;
                 }
                 // Don't serve SERVFAIL/REFUSED as stale
                 if hit.rcode == ResponseCode::ServFail || hit.rcode == ResponseCode::Refused {
-                    engine.cache.invalidate(&dedupe_hash);
+                    engine.cache_invalidate(&dedupe_hash);
                     return None;
                 }
 
@@ -67,7 +66,7 @@ pub fn check_cache(
                 if engine.serve_stale_expire_ttl > 0 && stale_age > engine.serve_stale_expire_ttl {
                     // Stale entry has exceeded the maximum stale window
                     // 过期条目已超过最大过期窗口
-                    engine.cache.invalidate(&dedupe_hash);
+                    engine.cache_invalidate(&dedupe_hash);
                     debug!(
                         event = "serve_stale_expired",
                         qname = %qname_ref,
@@ -119,23 +118,9 @@ pub fn check_cache(
                 // serve_stale_ttl_reset: reset stale expiry timer by re-inserting with shifted inserted_at
                 // 重置过期计时器：通过重新插入条目并将 inserted_at 设置为"刚过期"的时间点
                 if engine.serve_stale_ttl_reset {
-                    let new_entry = crate::cache::CacheEntry {
-                        bytes: hit.bytes.clone(),
-                        rcode: hit.rcode,
-                        source: hit.source.clone(),
-                        upstream: hit.upstream.clone(),
-                        qname: hit.qname.clone(),
-                        pipeline_id: hit.pipeline_id.clone(),
-                        qtype: hit.qtype,
-                        // Reset inserted_at so that stale_age starts from 0 again
-                        // 重置 inserted_at 使 stale_age 从 0 重新开始
-                        inserted_at: Instant::now() - Duration::from_secs(hit.original_ttl as u64),
-                        original_ttl: hit.original_ttl,
-                        refresh_ttl: hit.refresh_ttl,
-                    };
+                    let new_entry = hit.clone_with_refreshed_ttl();
                     engine
-                        .cache
-                        .insert(dedupe_hash, std::sync::Arc::new(new_entry));
+                        .cache_insert(dedupe_hash, std::sync::Arc::new(new_entry));
                 }
 
                 // Trigger background refresh to get fresh data
@@ -232,7 +217,7 @@ pub fn check_cache(
 
                 debug!(
                     event = "dns_response",
-                    upstream = %hit.source,
+                    upstream = %hit.source(),
                     qname = %qname_ref,
                     qtype = ?qtype,
                     rcode = ?hit.rcode,
@@ -271,7 +256,7 @@ pub fn check_stale_cache(
         return None;
     }
 
-    if let Some(hit) = engine.cache.get(&dedupe_hash) {
+    if let Some(hit) = engine.cache_get(&dedupe_hash) {
         if hit.qtype == u16::from(qtype)
             && hit.pipeline_id.as_ref() == pipeline_id
             && hit.qname.as_ref() == qname_ref
@@ -311,21 +296,9 @@ pub fn check_stale_cache(
                 // serve_stale_ttl_reset: reset stale expiry timer
                 // 重置过期计时器
                 if engine.serve_stale_ttl_reset {
-                    let new_entry = crate::cache::CacheEntry {
-                        bytes: hit.bytes.clone(),
-                        rcode: hit.rcode,
-                        source: hit.source.clone(),
-                        upstream: hit.upstream.clone(),
-                        qname: hit.qname.clone(),
-                        pipeline_id: hit.pipeline_id.clone(),
-                        qtype: hit.qtype,
-                        inserted_at: Instant::now() - Duration::from_secs(hit.original_ttl as u64),
-                        original_ttl: hit.original_ttl,
-                        refresh_ttl: hit.refresh_ttl,
-                    };
+                    let new_entry = hit.clone_with_refreshed_ttl();
                     engine
-                        .cache
-                        .insert(dedupe_hash, std::sync::Arc::new(new_entry));
+                        .cache_insert(dedupe_hash, std::sync::Arc::new(new_entry));
                 }
 
                 debug!(
@@ -383,19 +356,17 @@ pub fn handle_static_decision(
     let resp_bytes = build_response(&req, rcode, answers)?;
 
     if min_ttl > Duration::from_secs(0) {
-        let entry = CacheEntry {
-            bytes: resp_bytes.clone(),
+        engine.insert_dns_cache_entry(
+            dedupe_hash,
+            resp_bytes.clone(),
             rcode,
-            source: Arc::from("static"),
-            upstream: None, // Static responses have no upstream
-            qname: Arc::from(qname),
-            pipeline_id: current_pipeline_id.clone(),
-            qtype: u16::from(qtype),
-            inserted_at: Instant::now(),
-            original_ttl: crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
-            refresh_ttl: crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
-        };
-        engine.cache.insert(dedupe_hash, Arc::new(entry));
+            None, // Static responses have no upstream
+            qname,
+            current_pipeline_id.clone(),
+            qtype,
+            crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
+            crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
+        );
     }
 
     let latency = start.elapsed();
@@ -680,7 +651,6 @@ pub async fn handle_forward_decision(
                         dedupe_hash,
                         raw.clone(),
                         rcode,
-                        Arc::from(actual_upstream.as_str()),
                         Some(Arc::from(actual_upstream.as_str())),
                         qname,
                         Arc::from(pipeline_id),
@@ -759,7 +729,6 @@ pub async fn handle_forward_decision(
                             dedupe_hash,
                             ctx.raw.clone(),
                             ctx.msg.response_code(),
-                            ctx.upstream.clone(),
                             Some(ctx.upstream.clone()),
                             qname,
                             Arc::from(pipeline_id),
@@ -777,14 +746,13 @@ pub async fn handle_forward_decision(
                 ResponseActionResult::Static {
                     bytes,
                     rcode,
-                    source,
+                    ..
                 } => {
                     if min_ttl > Duration::from_secs(0) {
                         engine.insert_dns_cache_entry(
                             dedupe_hash,
                             bytes.clone(),
                             rcode,
-                            Arc::from(source),
                             None,
                             qname,
                             Arc::from(pipeline_id),
@@ -960,7 +928,6 @@ pub async fn handle_forward_decision(
                                 dedupe_hash,
                                 ctx.raw.clone(),
                                 ctx.msg.response_code(),
-                                ctx.upstream.clone(),
                                 Some(ctx.upstream.clone()),
                                 qname,
                                 Arc::from(pipeline_id),
@@ -978,14 +945,13 @@ pub async fn handle_forward_decision(
                     ResponseActionResult::Static {
                         bytes,
                         rcode,
-                        source,
+                        ..
                     } => {
                         if min_ttl > Duration::from_secs(0) {
                             engine.insert_dns_cache_entry(
                                 dedupe_hash,
                                 bytes.clone(),
                                 rcode,
-                                Arc::from(source),
                                 None,
                                 qname,
                                 Arc::from(pipeline_id),

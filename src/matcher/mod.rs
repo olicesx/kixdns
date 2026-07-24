@@ -7,11 +7,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::Context;
-use hickory_proto::op::Message;
+use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::{DNSClass, RecordType};
 use ipnet::IpNet;
 use regex::{Regex, RegexBuilder};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::config::{self, Action, MatchOperator, PipelineConfig};
 
@@ -155,6 +155,8 @@ pub struct RuntimePipelineConfig {
     pub settings: config::GlobalSettings,
     pub pipeline_select: Vec<RuntimePipelineSelectRule>,
     pub pipelines: Vec<RuntimePipeline>,
+    /// O(1) pipeline lookup index: pipeline_id -> index in pipelines / O(1) 管道查找索引：pipeline_id -> pipelines 中的索引
+    pub pipeline_id_index: FxHashMap<Arc<str>, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -261,11 +263,15 @@ pub enum RuntimeResponseMatcher {
     ResponseAnswerIp {
         nets: Vec<IpNet>,
     },
+    /// 匹配 Answer 中第一个记录的记录类型 / Match the record type of the first record in the Answer
     ResponseType {
-        value: Arc<str>,
+        value: RecordType,
     },
+    /// 匹配响应码 / Match the response code
+    /// `Some(rc)` 精确匹配指定响应码；`None` 表示"OTHER"回退，匹配任何非标准响应码
+    /// `Some(rc)` for exact match; `None` for "OTHER" fallback matching any non-standard rcode
     ResponseRcode {
-        value: Arc<str>,
+        value: Option<ResponseCode>,
     },
     ResponseQclass {
         value: DNSClass,
@@ -585,10 +591,18 @@ impl RuntimePipelineConfig {
             None => None, // 未配置，将在 Engine::new 中使用默认规则
         };
 
+        // Build O(1) pipeline id lookup index / 构建 O(1) pipeline id 查找索引
+        let pipeline_id_index: FxHashMap<Arc<str>, usize> = pipelines
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.id.clone(), i))
+            .collect();
+
         Ok(Self {
             settings: cfg.settings,
             pipeline_select,
             pipelines,
+            pipeline_id_index,
             // background_refresh_rule,  // ✅ 暂时注释，等待 RuntimePipelineConfig 结构更新
         })
     }
@@ -606,9 +620,9 @@ impl RuntimePipelineConfig {
     ///
     /// Returns a HashSet of upstream addresses that use TCP transport.
     /// 返回使用 TCP transport 的 upstream 地址的 HashSet。
-    pub fn collect_tcp_upstreams(&self) -> std::collections::HashSet<String> {
+    pub fn collect_tcp_upstreams(&self) -> FxHashSet<String> {
         use crate::config::Transport;
-        let mut upstreams = std::collections::HashSet::new();
+        let mut upstreams = FxHashSet::default();
 
         for pipeline in &self.pipelines {
             for rule in &pipeline.rules {
@@ -1197,12 +1211,22 @@ impl RuntimeResponseMatcher {
             }
             config::ResponseMatcher::ResponseType { value } => {
                 RuntimeResponseMatcher::ResponseType {
-                    value: Arc::from(value.to_ascii_uppercase()),
+                    value: parse_dns_type(&value)?,
                 }
             }
             config::ResponseMatcher::ResponseRcode { value } => {
+                let upper = value.to_ascii_uppercase();
+                let rc = match upper.as_str() {
+                    "NOERROR" => Some(ResponseCode::NoError),
+                    "FORMERR" => Some(ResponseCode::FormErr),
+                    "SERVFAIL" => Some(ResponseCode::ServFail),
+                    "NXDOMAIN" => Some(ResponseCode::NXDomain),
+                    "NOTIMP" => Some(ResponseCode::NotImp),
+                    "REFUSED" => Some(ResponseCode::Refused),
+                    _ => None, // "OTHER" 或未知码 — 回退为 catch-all / "OTHER" or unknown — fallback to catch-all
+                };
                 RuntimeResponseMatcher::ResponseRcode {
-                    value: Arc::from(value.to_ascii_uppercase()),
+                    value: rc,
                 }
             }
             config::ResponseMatcher::ResponseQclass { value } => {
@@ -1294,19 +1318,20 @@ impl RuntimeResponseMatcher {
                     .first()
                     .map(|r| r.record_type())
                     .unwrap_or(qtype);
-                format!("{}", rrty) == value.as_ref()
+                rrty == *value
             }
             RuntimeResponseMatcher::ResponseRcode { value } => {
-                let code_str = match msg.response_code() {
-                    hickory_proto::op::ResponseCode::NoError => "NOERROR",
-                    hickory_proto::op::ResponseCode::FormErr => "FORMERR",
-                    hickory_proto::op::ResponseCode::ServFail => "SERVFAIL",
-                    hickory_proto::op::ResponseCode::NXDomain => "NXDOMAIN",
-                    hickory_proto::op::ResponseCode::NotImp => "NOTIMP",
-                    hickory_proto::op::ResponseCode::Refused => "REFUSED",
-                    _ => "OTHER",
-                };
-                code_str == value.as_ref()
+                match value {
+                    Some(rc) => msg.response_code() == *rc,
+                    None => {
+                        // "OTHER" fallback: match any response code that is NOT one of the 6 standard codes
+                        // "OTHER" 回退：匹配不在6个标准码中的任何响应码
+                        !matches!(msg.response_code(),
+                            ResponseCode::NoError | ResponseCode::FormErr |
+                            ResponseCode::ServFail | ResponseCode::NXDomain |
+                            ResponseCode::NotImp | ResponseCode::Refused)
+                    }
+                }
             }
             RuntimeResponseMatcher::ResponseQclass { value } => value == &qclass,
             RuntimeResponseMatcher::ResponseEdnsPresent { expect } => {

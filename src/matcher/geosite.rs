@@ -12,8 +12,7 @@ use anyhow::Context;
 use moka::sync::Cache as MokaCache;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::{Regex, RegexBuilder};
-use rustc_hash::FxHashMap;
-use rustc_hash::FxHasher;
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -582,7 +581,7 @@ impl GeoSiteManager {
         }
 
         // 创建 tag 查找集合（小写）/ Create tag lookup set (lowercase)
-        let tags_set: std::collections::HashSet<String> =
+        let tags_set: FxHashSet<String> =
             tags.iter().map(|s| s.to_lowercase()).collect();
 
         info!(target = "geosite", requested_tags = ?tags,
@@ -1085,8 +1084,8 @@ fn run_geosite_watcher(
     // for the target filenames, properly detecting atomic replacements.
 
     // Collect unique parent directories and their target filenames
-    let mut dir_watches: std::collections::HashMap<PathBuf, Vec<std::ffi::OsString>> =
-        std::collections::HashMap::new();
+    let mut dir_watches: FxHashMap<PathBuf, Vec<std::ffi::OsString>> =
+        FxHashMap::default();
     for p in &paths {
         let parent = p
             .parent()
@@ -1108,7 +1107,7 @@ fn run_geosite_watcher(
     info!(target = "geosite_watcher", "GeoSite watcher started");
 
     // Build a set of target filenames for quick event matching
-    let target_filenames: std::collections::HashSet<std::ffi::OsString> = dir_watches
+    let target_filenames: FxHashSet<std::ffi::OsString> = dir_watches
         .values()
         .flat_map(|v| v.iter().cloned())
         .collect();

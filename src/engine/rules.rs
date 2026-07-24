@@ -4,8 +4,7 @@ use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::rdata::TXT;
 use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
-use rustc_hash::FxHasher;
-use std::collections::HashSet;
+use rustc_hash::{FxHasher, FxHashSet};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -23,6 +22,7 @@ use crate::engine::types::EngineInner;
 use crate::engine::types::InflightMap;
 use crate::engine::upstream::UpstreamFailure;
 use crate::engine::utils::engine_helpers::{self, build_response};
+use crate::engine::utils::parse_rcode;
 use crate::matcher::RuntimeResponseMatcherWithOp;
 use crate::matcher::eval_match_chain;
 
@@ -226,18 +226,6 @@ pub fn contains_continue(actions: &[Action]) -> bool {
     actions
         .iter()
         .any(|action| matches!(action, Action::Continue))
-}
-
-fn parse_rcode(rcode: &str) -> Option<ResponseCode> {
-    match rcode.to_ascii_uppercase().as_str() {
-        "NOERROR" => Some(ResponseCode::NoError),
-        "FORMERR" => Some(ResponseCode::FormErr),
-        "SERVFAIL" => Some(ResponseCode::ServFail),
-        "NXDOMAIN" => Some(ResponseCode::NXDomain),
-        "NOTIMP" => Some(ResponseCode::NotImp),
-        "REFUSED" => Some(ResponseCode::Refused),
-        _ => None,
-    }
 }
 
 pub struct ApplyResponseActionsContext<'a> {
@@ -551,7 +539,7 @@ pub(crate) async fn process_response_jump(
         }
     }
 
-    let mut skip_rules: HashSet<Arc<str>> = HashSet::new();
+    let mut skip_rules: FxHashSet<Arc<str>> = FxHashSet::default();
     let mut reused_response: Option<ResponseContext> = None;
     let mut inflight_hashes = Vec::new();
     let mut cleanup_guards: Vec<InflightCleanupGuard> = Vec::new();
@@ -568,11 +556,10 @@ pub(crate) async fn process_response_jump(
             return Ok(resp_bytes);
         }
 
-        let Some(pipeline) = state
-            .pipeline
-            .pipelines
-            .iter()
-            .find(|p| p.id == pipeline_id)
+        let Some(pipeline) = cfg
+            .pipeline_id_index
+            .get(pipeline_id.as_ref())
+            .and_then(|&idx| cfg.pipelines.get(idx))
         else {
             let resp_bytes = engine_helpers::build_servfail_response(req)?;
             for g in &mut cleanup_guards {
@@ -621,11 +608,10 @@ pub(crate) async fn process_response_jump(
                 }
                 pipeline_id = pipeline;
                 local_jumps -= 1;
-                if let Some(next_pipeline) = state
-                    .pipeline
-                    .pipelines
-                    .iter()
-                    .find(|p| p.id == pipeline_id)
+                if let Some(next_pipeline) = cfg
+                    .pipeline_id_index
+                    .get(pipeline_id.as_ref())
+                    .and_then(|&idx| cfg.pipelines.get(idx))
                 {
                     ecs_key = next_pipeline
                         .ecs
@@ -673,7 +659,6 @@ pub(crate) async fn process_response_jump(
                 let entry = CacheEntry {
                     bytes: resp_bytes.clone(),
                     rcode,
-                    source: Arc::from("static"),
                     upstream: None, // Static responses have no upstream
                     qname: Arc::from(qname),
                     pipeline_id: pipeline_id.clone(),
@@ -929,7 +914,6 @@ pub(crate) async fn process_response_jump(
                                 let entry = CacheEntry {
                                     bytes: raw.clone(),
                                     rcode: msg.response_code(),
-                                    source: Arc::from(actual_upstream.as_str()),
                                     upstream: Some(Arc::from(actual_upstream.as_str())),
                                     qname: Arc::from(qname),
                                     pipeline_id: pipeline_id.clone(),
@@ -992,7 +976,6 @@ pub(crate) async fn process_response_jump(
                                     let entry = CacheEntry {
                                         bytes: ctx.raw.clone(),
                                         rcode: ctx.msg.response_code(),
-                                        source: ctx.upstream.clone(),
                                         upstream: Some(ctx.upstream.clone()),
                                         qname: Arc::from(qname),
                                         pipeline_id: pipeline_id.clone(),

@@ -9,7 +9,6 @@ use moka::sync::Cache;
 pub struct CacheEntry {
     pub bytes: Bytes,
     pub rcode: ResponseCode,
-    pub source: Arc<str>,
     /// Upstream that provided this response / 提供此响应的上游服务器
     pub upstream: Option<Arc<str>>,
     // Store validation fields to handle hash collisions / 存储验证字段以处理哈希冲突
@@ -24,6 +23,32 @@ pub struct CacheEntry {
     /// Original maximum TTL from upstream response / 上游响应的原始最大TTL
     /// Used for background refresh decisions / 用于后台刷新决策
     pub refresh_ttl: u32,
+}
+
+impl CacheEntry {
+    /// Derive source label from upstream field / 从 upstream 字段推导来源标签
+    pub fn source(&self) -> &str {
+        match &self.upstream {
+            Some(u) => u.as_ref(),
+            None => "static",
+        }
+    }
+
+    /// Clone entry with a refreshed `inserted_at` for serve-stale TTL reset / 克隆条目并刷新 inserted_at 用于过期缓存 TTL 重置
+    /// Sets `inserted_at` to `now - original_ttl` so the entry appears freshly expired / 将 inserted_at 设置为 now - original_ttl，使条目看上去刚刚过期
+    pub fn clone_with_refreshed_ttl(&self) -> Self {
+        Self {
+            bytes: self.bytes.clone(),
+            rcode: self.rcode,
+            upstream: self.upstream.clone(),
+            qname: self.qname.clone(),
+            pipeline_id: self.pipeline_id.clone(),
+            qtype: self.qtype,
+            inserted_at: Instant::now() - Duration::from_secs(self.original_ttl as u64),
+            original_ttl: self.original_ttl,
+            refresh_ttl: self.refresh_ttl,
+        }
+    }
 }
 
 /// Use u64 hash as key to avoid allocation during lookup / 使用 u64 哈希作为键以避免查找时的内存分配
