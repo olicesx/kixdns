@@ -693,6 +693,14 @@ async fn run_udp_worker(
 async fn run_tcp(listener: TcpListener, engine: Engine) -> anyhow::Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
+        // RFC 1035 §4.2.2: DNS-over-TCP uses a 2-byte length prefix per message.
+        // Disable Nagle's algorithm (TCP_NODELAY) to prevent the length-prefix write
+        // and body write from being coalesced, which interacts badly with the peer's
+        // delayed-ACK timer and adds ~40 ms latency per query.
+        //
+        // 禁用 Nagle 算法 (TCP_NODELAY)，避免长度前缀和包体两次写入被合并，
+        // 否则与对端的 delayed-ACK 定时器交互导致每查询约 40ms 延迟。
+        stream.set_nodelay(true).ok();
         let engine = engine.clone();
         tokio::spawn(async move {
             let _ = handle_tcp_conn(stream, peer, engine).await;
@@ -836,11 +844,15 @@ async fn handle_tcp_conn(
         };
 
         if resp.len() <= u16::MAX as usize {
+            // Single vectored write (scatter-gather): length prefix + body in one
+            // syscall, avoiding Nagle/delayed-ACK interaction on the wire even
+            // when TCP_NODELAY fails to take effect.
+            //
+            // 单次 vectored write (scatter-gather)：长度前缀 + 包体在一次 syscall 中完成，
+            // 即使 TCP_NODELAY 未生效也能避免 Nagle/delayed-ACK 交互。
             let len_bytes = (resp.len() as u16).to_be_bytes();
-            if stream.write_all(&len_bytes).await.is_err() {
-                return Ok(());
-            }
-            if stream.write_all(&resp).await.is_err() {
+            let bufs = [std::io::IoSlice::new(&len_bytes), std::io::IoSlice::new(&resp)];
+            if stream.write_vectored(&bufs).await.is_err() {
                 return Ok(());
             }
         }
