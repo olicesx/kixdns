@@ -392,17 +392,50 @@ fn spawn_ipv4_udp_workers(
 
     info!(bind_addr = %ipv4_addr, workers = worker_count, "Starting IPv4 UDP workers");
 
+    // ✅ Single shared socket: all workers compete for recvfrom() on the same
+    // fd. The kernel delivers each packet to exactly one waiting recvfrom call,
+    // giving perfect load balancing regardless of client source-port distribution.
+    // SO_REUSEPORT creates a hash over the 4-tuple; with few source ports (e.g.
+    // dnsperf -T 4 = 4 source ports), hash collisions starve some workers.
+    // A shared socket eliminates this dependency entirely.
+    //
+    // ✅ 单一共享 socket：所有 worker 在同一个 fd 上竞争 recvfrom()。
+    // 内核将每个包投递给恰好一个等待的 recvfrom 调用，
+    // 无论客户端源端口分布如何，都能完美负载均衡。
+    // SO_REUSEPORT 基于 4 元组哈希；当源端口较少时（如 dnsperf -T 4 = 4 个源端口），
+    // 哈希冲突会饿死部分 worker。共享 socket 彻底消除此依赖。
+    let std_socket = create_reuseport_udp_socket(ipv4_addr)
+        .with_context(|| "create shared ipv4 udp socket")?;
+    let socket = Arc::new(UdpSocket::from_std(std_socket)?);
+
     for worker_id in 0..worker_count {
         let engine = engine.clone();
-        let std_socket = create_reuseport_udp_socket(ipv4_addr)
-            .with_context(|| format!("create ipv4 udp socket for worker {}", worker_id))?;
-        let socket = UdpSocket::from_std(std_socket)?;
-        let handle = tokio::spawn(async move {
-            if let Err(err) = run_udp_worker(worker_id, Arc::new(socket), engine).await {
-                error!(worker_id, error = %err, "IPv4 udp worker exited");
-            }
-        });
-        all_handles.push(handle);
+        let socket = Arc::clone(&socket);
+        // ✅ Dedicated OS thread per worker for guaranteed 1:1 thread mapping.
+        // Each thread runs its own current-thread tokio runtime (separate reactor).
+        // When a packet arrives, all reactors are notified (level-triggered epoll);
+        // whichever thread calls recvfrom first wins the packet.
+        //
+        // ✅ 每个 worker 使用专用 OS 线程，保证 1:1 线程映射。
+        let handle = std::thread::Builder::new()
+            .name(format!("udp-worker-{worker_id}"))
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("create UDP worker runtime");
+                rt.block_on(async move {
+                    if let Err(err) = run_udp_worker(worker_id, socket, engine).await {
+                        error!(worker_id, error = %err, "IPv4 udp worker exited");
+                    }
+                });
+            })
+            .with_context(|| format!("spawn ipv4 udp thread {worker_id}"))?;
+        all_handles.push(
+            tokio::spawn(async move {
+                let _ = handle; // Keep thread handle alive / 保持线程句柄存活
+            })
+        );
     }
 
     Ok(())
@@ -429,17 +462,33 @@ fn spawn_ipv6_udp_workers(
 
     info!(bind_addr = %ipv6_addr, workers = worker_count, "Starting IPv6 UDP workers");
 
+    // ✅ Single shared socket (same rationale as IPv4) / 单一共享 socket（同 IPv4）
+    let std_socket = create_reuseport_udp_socket(ipv6_addr)
+        .with_context(|| "create shared ipv6 udp socket")?;
+    let socket = Arc::new(UdpSocket::from_std(std_socket)?);
+
     for worker_id in 0..worker_count {
         let engine = engine.clone();
-        let std_socket = create_reuseport_udp_socket(ipv6_addr)
-            .with_context(|| format!("create ipv6 udp socket for worker {}", worker_id))?;
-        let socket = UdpSocket::from_std(std_socket)?;
-        let handle = tokio::spawn(async move {
-            if let Err(err) = run_udp_worker(worker_id, Arc::new(socket), engine).await {
-                error!(worker_id, error = %err, "IPv6 udp worker exited");
-            }
-        });
-        all_handles.push(handle);
+        let socket = Arc::clone(&socket);
+        let handle = std::thread::Builder::new()
+            .name(format!("udp6-worker-{worker_id}"))
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("create IPv6 UDP worker runtime");
+                rt.block_on(async move {
+                    if let Err(err) = run_udp_worker(worker_id, socket, engine).await {
+                        error!(worker_id, error = %err, "IPv6 udp worker exited");
+                    }
+                });
+            })
+            .with_context(|| format!("spawn ipv6 udp thread {worker_id}"))?;
+        all_handles.push(
+            tokio::spawn(async move {
+                let _ = handle;
+            })
+        );
     }
 
     Ok(())
@@ -528,51 +577,85 @@ async fn run_udp_worker(
             buf.reserve(4096 - buf.len());
         }
 
-        // ✅ 使用 tokio 的 recv_buf_from 配合 BytesMut，实现零拷贝的高性能接收
-        // ✅ Use tokio's recv_buf_from with BytesMut for zero-copy high-performance reception
-        // 由于使用双 socket 方案（IPv4 + IPv6 分离），不会出现混合地址族的 sockaddr 问题
-        // Since we use dual-socket approach (IPv4 + IPv6 separated), no mixed address family sockaddr issues
-        match socket.recv_buf_from(&mut buf).await {
-            Ok((_len, peer)) => {
-                // 零拷贝获取 Bytes / Zero-copy obtain Bytes
-                let packet_bytes = buf.split().freeze();
-
-                // 每 100 个请求检查一次流控调整 / Check flow control adjustment every 100 requests
-                request_count += 1;
-                if request_count >= 100 {
-                    request_count = 0;
-                    engine.adjust_flow_control(); // Now synchronous with atomic CAS
+        // ✅ Hybrid recv: try non-blocking first, fall back to async on EAGAIN.
+        // Under load, this eliminates tokio reactor overhead (epoll_wait +
+        // task wake/schedule cycle) per packet. Under no load, falls back to
+        // async await so the worker yields and doesn't waste CPU.
+        //
+        // ✅ 混合接收：先尝试非阻塞，EAGAIN 时回退到异步。
+        // 高负载时消除每包的 tokio reactor 开销（epoll_wait + 任务唤醒/调度循环）。
+        // 空闲时回退到异步 await，worker 让出 CPU 不浪费。
+        let (_len, peer) = match socket.try_recv_buf_from(&mut buf) {
+            Ok(result) => result,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No packet available right now — yield to tokio / 当前无包可读 — 让出 tokio
+                match socket.recv_buf_from(&mut buf).await {
+                    Ok(result) => result,
+                    Err(_) => continue,
                 }
+            }
+            Err(_) => continue,
+        };
+        {
+            // 零拷贝获取 Bytes / Zero-copy obtain Bytes
+            let packet_bytes = buf.split().freeze();
 
-                // ✅ 优化：使用 handle_packet_fast 避免重复解析
-                // ✅ Optimization: Use handle_packet_fast to avoid re-parsing
-                // 如果缓存命中，直接返回；如果缓存未命中，返回预解析的数据
-                // If cache hit, return directly; if cache miss, return pre-parsed data
-                match engine.handle_packet_fast(&packet_bytes, peer) {
-                    Ok(Some(FastPathResponse::Direct(bytes))) => {
-                        // 已包含正确 TXID，可直接发送 / Already contains correct TXID
-                        let _ = socket.send_to(&bytes, peer).await;
-                    }
-                    Ok(Some(FastPathResponse::CacheHit {
-                        cached,
-                        tx_id,
-                        inserted_at,
-                    })) => {
-                        // 复用 send_buf：copy + patch TXID / Reuse send_buf: copy + patch TXID
+            // 每 100 个请求检查一次流控调整 / Check flow control adjustment every 100 requests
+            request_count += 1;
+            if request_count >= 100 {
+                request_count = 0;
+                engine.adjust_flow_control(); // Now synchronous with atomic CAS
+            }
+
+            // ✅ 优化：使用 handle_packet_fast 避免重复解析
+            // ✅ Optimization: Use handle_packet_fast to avoid re-parsing
+            // 如果缓存命中，直接返回；如果缓存未命中，返回预解析的数据
+            // If cache hit, return directly; if cache miss, return pre-parsed data
+            match engine.handle_packet_fast(&packet_bytes, peer) {
+                Ok(Some(FastPathResponse::Direct(bytes))) => {
+                    // 已包含正确 TXID，可直接发送 / Already contains correct TXID
+                    let _ = socket.send_to(&bytes, peer).await;
+                }
+                Ok(Some(FastPathResponse::CacheHit {
+                    cached,
+                    tx_id,
+                    inserted_at,
+                })) => {
+                    // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
+                    let elapsed = kixdns::proto_utils::saturating_u64_to_u32(
+                        inserted_at.elapsed().as_secs(),
+                    );
+
+                    if elapsed == 0 && cached.len() >= 2 {
+                        // Fast path: TTL hasn't decayed, only TXID (2 bytes) needs patching.
+                        // Copy to reusable send_buf, patch TXID only, use try_send_to
+                        // (non-blocking) to avoid tokio reactor overhead. Falls back to
+                        // async send_to on EAGAIN.
+                        //
+                        // 快速路径：TTL 未衰减，只需 patch TXID（2 字节）。
+                        // 拷贝到复用的 send_buf，仅 patch TXID，使用 try_send_to（非阻塞）
+                        // 避免 tokio reactor 开销。EAGAIN 时回退到异步 send_to。
+                        send_buf.clear();
+                        send_buf.extend_from_slice(&cached);
+                        let id_bytes = tx_id.to_be_bytes();
+                        send_buf[0] = id_bytes[0];
+                        send_buf[1] = id_bytes[1];
+                        if let Err(e) = socket.try_send_to(&send_buf, peer) {
+                            if e.kind() == std::io::ErrorKind::WouldBlock {
+                                let _ = socket.send_to(&send_buf, peer).await;
+                            }
+                        }
+                    } else {
+                        // Slow path: TTL has decayed, must patch all TTLs in-place.
+                        // 慢速路径：TTL 已衰减，必须原地 patch 所有 TTL。
                         send_buf.clear();
                         if send_buf.capacity() < cached.len() {
                             send_buf.reserve(cached.len() - send_buf.capacity());
                         }
                         send_buf.extend_from_slice(&cached);
-
-                        // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
-                        let elapsed = kixdns::proto_utils::saturating_u64_to_u32(
-                            inserted_at.elapsed().as_secs(),
-                        );
                         if elapsed > 0 {
                             kixdns::proto_utils::patch_all_ttls(&mut send_buf, elapsed);
                         }
-
                         if send_buf.len() >= 2 {
                             let id_bytes = tx_id.to_be_bytes();
                             send_buf[0] = id_bytes[0];
@@ -580,111 +663,106 @@ async fn run_udp_worker(
                         }
                         let _ = socket.send_to(&send_buf, peer).await;
                     }
-                    Ok(Some(FastPathResponse::AsyncNeeded {
-                        qname,
-                        qtype,
-                        qclass,
-                        tx_id,
-                        edns_present,
-                        pipeline_id,
-                        ecs_key,
-                    })) => {
-                        // 缓存未命中，使用预解析的数据避免重复解析
-                        // Cache miss, use pre-parsed data to avoid re-parsing
-                        let permit_mgr = Arc::clone(&engine.permit_manager);
-                        let timeout_ms = engine.get_request_timeout_ms();
-                        let timeout_dur = Duration::from_millis(timeout_ms);
+                }
+                Ok(Some(FastPathResponse::AsyncNeeded {
+                    qname,
+                    qtype,
+                    qclass,
+                    tx_id,
+                    edns_present,
+                    pipeline_id,
+                    ecs_key,
+                })) => {
+                    // 缓存未命中，使用预解析的数据避免重复解析
+                    // Cache miss, use pre-parsed data to avoid re-parsing
+                    let permit_mgr = Arc::clone(&engine.permit_manager);
+                    let timeout_ms = engine.get_request_timeout_ms();
+                    let timeout_dur = Duration::from_millis(timeout_ms);
 
-                        // 非阻塞式 try_acquire，避免在接收循环中 await / Non-blocking try_acquire to avoid await in receive loop
-                        if let Some(permit) = permit_mgr.try_acquire() {
-                            let engine = engine.clone();
-                            let socket = Arc::clone(&socket);
-                            let packet_bytes = packet_bytes.clone();
-                            tokio::spawn(async move {
-                                let _permit = permit; // 自动释放 / Auto-release on drop
+                    // 非阻塞式 try_acquire，避免在接收循环中 await / Non-blocking try_acquire to avoid await in receive loop
+                    if let Some(permit) = permit_mgr.try_acquire() {
+                        let engine = engine.clone();
+                        let socket = Arc::clone(&socket);
+                        let packet_bytes = packet_bytes.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit; // 自动释放 / Auto-release on drop
 
-                                // ✅ 传递预解析数据给 handle_packet_internal，避免重复解析
-                                // ✅ Pass pre-parsed data to handle_packet_internal to avoid re-parsing
-                                match tokio::time::timeout(
-                                    timeout_dur,
-                                    engine.handle_packet_internal_with_pre_parsed(
-                                        &packet_bytes,
-                                        peer,
-                                        false,
-                                        qname,
-                                        qtype,
-                                        qclass,
-                                        tx_id,
-                                        edns_present,
-                                        pipeline_id,
-                                        ecs_key,
-                                    ),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(resp)) => {
-                                        let _ = socket.send_to(&resp, peer).await;
-                                    }
-                                    Ok(Err(e)) => {
-                                        debug!(error = %e, "handle_packet error");
-                                    }
-                                    Err(_) => {
-                                        warn!(
-                                            timeout_ms,
-                                            upstream_timeout_ms = engine.get_upstream_timeout_ms(),
-                                            "request timeout after hedge and fallback exhausted"
-                                        );
-                                    }
+                            // ✅ 传递预解析数据给 handle_packet_internal，避免重复解析
+                            // ✅ Pass pre-parsed data to handle_packet_internal to avoid re-parsing
+                            match tokio::time::timeout(
+                                timeout_dur,
+                                engine.handle_packet_internal_with_pre_parsed(
+                                    &packet_bytes,
+                                    peer,
+                                    false,
+                                    qname,
+                                    qtype,
+                                    qclass,
+                                    tx_id,
+                                    edns_present,
+                                    pipeline_id,
+                                    ecs_key,
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(Ok(resp)) => {
+                                    let _ = socket.send_to(&resp, peer).await;
                                 }
-                            });
-                        }
-                    }
-                    Ok(None) => {
-                        // 快速解析失败，回退到完整处理
-                        // Fast parse failed, fallback to full processing
-                        let permit_mgr = Arc::clone(&engine.permit_manager);
-                        let timeout_ms = engine.get_request_timeout_ms();
-                        let timeout_dur = Duration::from_millis(timeout_ms);
-
-                        // 非阻塞式 try_acquire，避免在接收循环中 await / Non-blocking try_acquire to avoid await in receive loop
-                        if let Some(permit) = permit_mgr.try_acquire() {
-                            let engine = engine.clone();
-                            let socket = Arc::clone(&socket);
-                            let packet_bytes = packet_bytes.clone();
-                            tokio::spawn(async move {
-                                let _permit = permit; // 自动释放 / Auto-release on drop
-                                match tokio::time::timeout(
-                                    timeout_dur,
-                                    engine.handle_packet(&packet_bytes, peer),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(resp)) => {
-                                        let _ = socket.send_to(&resp, peer).await;
-                                    }
-                                    Ok(Err(e)) => {
-                                        debug!(error = %e, "handle_packet error");
-                                    }
-                                    Err(_) => {
-                                        warn!(
-                                            timeout_ms,
-                                            upstream_timeout_ms = engine.get_upstream_timeout_ms(),
-                                            "request timeout"
-                                        );
-                                    }
+                                Ok(Err(e)) => {
+                                    debug!(error = %e, "handle_packet error");
                                 }
-                            });
-                        }
-                    }
-                    Err(_) => {
-                        // 解析错误，忽略 / Parse error, ignore
+                                Err(_) => {
+                                    warn!(
+                                        timeout_ms,
+                                        upstream_timeout_ms = engine.get_upstream_timeout_ms(),
+                                        "request timeout after hedge and fallback exhausted"
+                                    );
+                                }
+                            }
+                        });
                     }
                 }
-            }
-            Err(e) => {
-                // 接收错误，清除缓冲区并继续 / Receive error, clear buffer and continue
-                debug!(error = %e, "UDP recv error");
-                buf.clear();
+                Ok(None) => {
+                    // 快速解析失败，回退到完整处理
+                    // Fast parse failed, fallback to full processing
+                    let permit_mgr = Arc::clone(&engine.permit_manager);
+                    let timeout_ms = engine.get_request_timeout_ms();
+                    let timeout_dur = Duration::from_millis(timeout_ms);
+
+                    // 非阻塞式 try_acquire，避免在接收循环中 await / Non-blocking try_acquire to avoid await in receive loop
+                    if let Some(permit) = permit_mgr.try_acquire() {
+                        let engine = engine.clone();
+                        let socket = Arc::clone(&socket);
+                        let packet_bytes = packet_bytes.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit; // 自动释放 / Auto-release on drop
+                            match tokio::time::timeout(
+                                timeout_dur,
+                                engine.handle_packet(&packet_bytes, peer),
+                            )
+                            .await
+                            {
+                                Ok(Ok(resp)) => {
+                                    let _ = socket.send_to(&resp, peer).await;
+                                }
+                                Ok(Err(e)) => {
+                                    debug!(error = %e, "handle_packet error");
+                                }
+                                Err(_) => {
+                                    warn!(
+                                        timeout_ms,
+                                        upstream_timeout_ms = engine.get_upstream_timeout_ms(),
+                                        "request timeout"
+                                    );
+                                }
+                            }
+                        });
+                    }
+                }
+                Err(_) => {
+                    // 解析错误，忽略 / Parse error, ignore
+                }
             }
         }
     }
