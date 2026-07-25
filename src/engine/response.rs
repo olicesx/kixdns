@@ -111,20 +111,108 @@ pub(crate) fn make_static_txt_answer(
 /// 从 DNS 响应中提取最大 TTL 用于后台刷新时机 / Extract maximum TTL from DNS response for background refresh timing
 #[inline]
 pub fn extract_ttl_for_refresh(msg: &Message) -> u64 {
-    msg.answers()
-        .iter()
-        .map(|r| r.ttl() as u64)
-        .max()
-        .unwrap_or(0)
+    let answer_max = msg.answers().iter().map(|r| r.ttl() as u64).max();
+    match answer_max {
+        Some(t) => t,
+        // No answers: negative response (NXDOMAIN/NODATA) — use SOA from authority
+        // per RFC 2308 §5 / 无答案：否定响应 (NXDOMAIN/NODATA) — 按 RFC 2308 §5 从 authority 的 SOA 提取
+        None => extract_soa_negative_ttl(msg),
+    }
 }
 
 /// 从 DNS 响应中提取最小 TTL 用于缓存条目 / Extract minimum TTL from DNS response for cache entry
-/// RFC 1035 §5.2 calls for using minimum TTL of the RRset
+/// RFC 1035 §5.2 calls for using minimum TTL of the RRset.
+/// RFC 2308 §5: For negative responses (NXDOMAIN/NODATA), the negative cache
+/// TTL is min(SOA.minimum, SOA.ttl) from the authority section. If no SOA is
+/// present, returns 0 (must not be cached per RFC 2308 §4).
+///
+/// RFC 2308 §5: 否定响应 (NXDOMAIN/NODATA) 的负缓存 TTL 为 authority 中 SOA 的
+/// min(SOA.minimum, SOA.ttl)。无 SOA 时返回 0（按 RFC 2308 §4 不可缓存）。
 #[inline]
 pub fn extract_ttl(msg: &Message) -> u64 {
-    msg.answers()
-        .iter()
-        .map(|r| r.ttl() as u64)
-        .min()
-        .unwrap_or(0)
+    let answer_min = msg.answers().iter().map(|r| r.ttl() as u64).min();
+    match answer_min {
+        Some(t) => t,
+        // No answers: negative response (NXDOMAIN/NODATA) — use SOA from authority
+        // per RFC 2308 §5 / 无答案：否定响应 (NXDOMAIN/NODATA) — 按 RFC 2308 §5 从 authority 的 SOA 提取
+        None => extract_soa_negative_ttl(msg),
+    }
+}
+
+/// Extract negative caching TTL from SOA in the authority section (RFC 2308 §5).
+/// Returns min(SOA.minimum_field, SOA.ttl), or 0 if no SOA present.
+///
+/// 从 authority 中的 SOA 提取负缓存 TTL (RFC 2308 §5)。
+/// 返回 min(SOA.minimum_field, SOA.ttl)，无 SOA 时返回 0。
+#[inline]
+fn extract_soa_negative_ttl(msg: &Message) -> u64 {
+    for record in msg.name_servers() {
+        if let Some(RData::SOA(soa)) = record.data() {
+            let soa_min = soa.minimum() as u64;
+            let soa_ttl = record.ttl() as u64;
+            return soa_min.min(soa_ttl);
+        }
+    }
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::rr::rdata::SOA;
+
+    #[test]
+    fn test_extract_ttl_positive_response() {
+        let mut msg = Message::new();
+        msg.set_response_code(ResponseCode::NoError);
+        let name = Name::from_str("example.com.").unwrap();
+        let rec = Record::from_rdata(name, 300, RData::A(A(std::net::Ipv4Addr::LOCALHOST)));
+        msg.add_answer(rec);
+        assert_eq!(extract_ttl(&msg), 300);
+        assert_eq!(extract_ttl_for_refresh(&msg), 300);
+    }
+
+    #[test]
+    fn test_extract_ttl_nxdomain_with_soa() {
+        // RFC 2308 §5: NXDOMAIN with SOA in authority section
+        // Negative cache TTL = min(SOA.minimum, SOA.ttl)
+        let mut msg = Message::new();
+        msg.set_response_code(ResponseCode::NXDomain);
+        let mname = Name::from_str("ns1.example.com.").unwrap();
+        let rname = Name::from_str("admin.example.com.").unwrap();
+        let soa = SOA::new(mname, rname, 1, 3600, 900, 1209600, 60); // minimum=60
+        let name = Name::from_str("example.com.").unwrap();
+        // SOA TTL = 300, minimum = 60 → min = 60
+        let rec = Record::from_rdata(name, 300, RData::SOA(soa));
+        msg.add_name_server(rec);
+
+        assert_eq!(extract_ttl(&msg), 60); // min(60, 300)
+    }
+
+    #[test]
+    fn test_extract_ttl_nxdomain_soa_ttl_lower_than_minimum() {
+        // When SOA TTL < SOA.minimum, the lower value should be used
+        let mut msg = Message::new();
+        msg.set_response_code(ResponseCode::NXDomain);
+        let mname = Name::from_str("ns1.example.com.").unwrap();
+        let rname = Name::from_str("admin.example.com.").unwrap();
+        let soa = SOA::new(mname, rname, 1, 3600, 900, 1209600, 3600); // minimum=3600
+        let name = Name::from_str("example.com.").unwrap();
+        // SOA TTL = 30, minimum = 3600 → min = 30
+        let rec = Record::from_rdata(name, 30, RData::SOA(soa));
+        msg.add_name_server(rec);
+
+        assert_eq!(extract_ttl(&msg), 30); // min(3600, 30)
+    }
+
+    #[test]
+    fn test_extract_ttl_nxdomain_no_soa() {
+        // RFC 2308 §4: NXDOMAIN without SOA must not be cached (TTL = 0)
+        let mut msg = Message::new();
+        msg.set_response_code(ResponseCode::NXDomain);
+        // No authority section records
+
+        assert_eq!(extract_ttl(&msg), 0);
+        assert_eq!(extract_ttl_for_refresh(&msg), 0);
+    }
 }
