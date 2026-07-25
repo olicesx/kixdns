@@ -970,6 +970,32 @@ impl RuntimePipelineSelectorMatcher {
         )
     }
 
+    /// Returns true if this matcher requires the GeoSite manager to evaluate.
+    /// Used to skip unnecessary RwLock acquisition in the hot path.
+    ///
+    /// 如果此匹配器需要 GeoSite 管理器才能评估则返回 true。
+    /// 用于在热路径中跳过不必要的 RwLock 获取。
+    #[inline]
+    pub const fn needs_geosite(&self) -> bool {
+        matches!(
+            self,
+            RuntimePipelineSelectorMatcher::GeoSite { .. }
+                | RuntimePipelineSelectorMatcher::GeoSiteNot { .. }
+        )
+    }
+
+    /// Returns true if this matcher requires the GeoIP manager to evaluate.
+    ///
+    /// 如果此匹配器需要 GeoIP 管理器才能评估则返回 true。
+    #[inline]
+    pub const fn needs_geoip(&self) -> bool {
+        matches!(
+            self,
+            RuntimePipelineSelectorMatcher::GeoipCountry { .. }
+                | RuntimePipelineSelectorMatcher::GeoipPrivate { .. }
+        )
+    }
+
     #[inline]
     pub fn matches_with_ready_managers(
         &self,

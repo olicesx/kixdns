@@ -33,10 +33,33 @@ pub fn select_pipeline<'a>(
     geosite_manager: Option<&Arc<RwLock<GeoSiteManager>>>,
     geoip_manager: Option<&Arc<RwLock<GeoIpManager>>>,
 ) -> (Option<&'a RuntimePipeline>, Arc<str>) {
-    // 优化：提前获取读锁，避免在循环中重复获取/释放
-    // Optimization: Acquire read locks upfront to avoid repeated acquire/release in loop
-    let geosite_guard = geosite_manager.map(|m| m.read());
-    let geoip_guard = geoip_manager.map(|m| m.read());
+    // Optimization: only acquire geosite/geoip read locks if at least one matcher
+    // actually needs them. For the common case (Any/ListenerLabel/Qtype matchers),
+    // this avoids two parking_lot RwLock read acquisitions per cache-hit query,
+    // eliminating cross-core cache-line bouncing at high QPS.
+    //
+    // 优化：仅当至少一个匹配器实际需要 geosite/geoip 时才获取读锁。
+    // 常见情况（Any/ListenerLabel/Qtype 匹配器）下，避免了每次 cache-hit 查询
+    // 获取两个 parking_lot RwLock 读锁，消除高 QPS 下的跨核 cache line 乒乓。
+    let needs_geosite = cfg
+        .pipeline_select
+        .iter()
+        .any(|r| r.matchers.iter().any(|m| m.matcher.needs_geosite()));
+    let needs_geoip = cfg
+        .pipeline_select
+        .iter()
+        .any(|r| r.matchers.iter().any(|m| m.matcher.needs_geoip()));
+
+    let geosite_guard = if needs_geosite {
+        geosite_manager.map(|m| m.read())
+    } else {
+        None
+    };
+    let geoip_guard = if needs_geoip {
+        geoip_manager.map(|m| m.read())
+    } else {
+        None
+    };
     let geosite_ref = geosite_guard.as_deref();
     let geoip_ref = geoip_guard.as_deref();
 
