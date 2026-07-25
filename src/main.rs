@@ -392,48 +392,28 @@ fn spawn_ipv4_udp_workers(
 
     info!(bind_addr = %ipv4_addr, workers = worker_count, "Starting IPv4 UDP workers");
 
-    // ✅ Single shared socket: all workers compete for recvfrom() on the same
-    // fd. The kernel delivers each packet to exactly one waiting recvfrom call,
-    // giving perfect load balancing regardless of client source-port distribution.
-    // SO_REUSEPORT creates a hash over the 4-tuple; with few source ports (e.g.
-    // dnsperf -T 4 = 4 source ports), hash collisions starve some workers.
-    // A shared socket eliminates this dependency entirely.
+    // ✅ Per-worker SO_REUSEPORT_LB sockets: each worker gets its own fd.
+    // On FreeBSD, SO_REUSEPORT_LB enables kernel hash-based packet distribution
+    // across sockets. On Linux, SO_REUSEPORT already includes this behavior.
+    // This gives perfect multi-core scaling with zero contention — each worker
+    // owns its socket, no Arc<UdpSocket> sharing, no reactor thundering herd.
     //
-    // ✅ 单一共享 socket：所有 worker 在同一个 fd 上竞争 recvfrom()。
-    // 内核将每个包投递给恰好一个等待的 recvfrom 调用，
-    // 无论客户端源端口分布如何，都能完美负载均衡。
-    // SO_REUSEPORT 基于 4 元组哈希；当源端口较少时（如 dnsperf -T 4 = 4 个源端口），
-    // 哈希冲突会饿死部分 worker。共享 socket 彻底消除此依赖。
-    let std_socket =
-        create_reuseport_udp_socket(ipv4_addr).with_context(|| "create shared ipv4 udp socket")?;
-    let socket = Arc::new(UdpSocket::from_std(std_socket)?);
-
+    // ✅ 每 worker 独立 SO_REUSEPORT_LB socket：每个 worker 拥有自己的 fd。
+    // FreeBSD 上 SO_REUSEPORT_LB 启用内核级哈希分发，
+    // Linux 上 SO_REUSEPORT 已自带此行为。
+    // 实现无竞争的多核扩展——每个 worker 独占 socket，
+    // 无 Arc<UdpSocket> 共享，无 reactor 惊群效应。
     for worker_id in 0..worker_count {
         let engine = engine.clone();
-        let socket = Arc::clone(&socket);
-        // ✅ Dedicated OS thread per worker for guaranteed 1:1 thread mapping.
-        // Each thread runs its own current-thread tokio runtime (separate reactor).
-        // When a packet arrives, all reactors are notified (level-triggered epoll);
-        // whichever thread calls recvfrom first wins the packet.
-        //
-        // ✅ 每个 worker 使用专用 OS 线程，保证 1:1 线程映射。
-        let handle = std::thread::Builder::new()
-            .name(format!("udp-worker-{worker_id}"))
-            .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("create UDP worker runtime");
-                rt.block_on(async move {
-                    if let Err(err) = run_udp_worker(worker_id, socket, engine).await {
-                        error!(worker_id, error = %err, "IPv4 udp worker exited");
-                    }
-                });
-            })
-            .with_context(|| format!("spawn ipv4 udp thread {worker_id}"))?;
-        all_handles.push(tokio::spawn(async move {
-            let _ = handle; // Keep thread handle alive / 保持线程句柄存活
-        }));
+        let std_socket = create_reuseport_udp_socket(ipv4_addr)
+            .with_context(|| format!("create ipv4 udp socket for worker {}", worker_id))?;
+        let socket = Arc::new(UdpSocket::from_std(std_socket)?);
+        let handle = tokio::spawn(async move {
+            if let Err(err) = run_udp_worker(worker_id, socket, engine).await {
+                error!(worker_id, error = %err, "IPv4 udp worker exited");
+            }
+        });
+        all_handles.push(handle);
     }
 
     Ok(())
@@ -460,31 +440,19 @@ fn spawn_ipv6_udp_workers(
 
     info!(bind_addr = %ipv6_addr, workers = worker_count, "Starting IPv6 UDP workers");
 
-    // ✅ Single shared socket (same rationale as IPv4) / 单一共享 socket（同 IPv4）
-    let std_socket =
-        create_reuseport_udp_socket(ipv6_addr).with_context(|| "create shared ipv6 udp socket")?;
-    let socket = Arc::new(UdpSocket::from_std(std_socket)?);
-
+    // ✅ Per-worker SO_REUSEPORT_LB sockets (same rationale as IPv4)
+    // ✅ 每 worker 独立 SO_REUSEPORT_LB socket（同 IPv4）
     for worker_id in 0..worker_count {
         let engine = engine.clone();
-        let socket = Arc::clone(&socket);
-        let handle = std::thread::Builder::new()
-            .name(format!("udp6-worker-{worker_id}"))
-            .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("create IPv6 UDP worker runtime");
-                rt.block_on(async move {
-                    if let Err(err) = run_udp_worker(worker_id, socket, engine).await {
-                        error!(worker_id, error = %err, "IPv6 udp worker exited");
-                    }
-                });
-            })
-            .with_context(|| format!("spawn ipv6 udp thread {worker_id}"))?;
-        all_handles.push(tokio::spawn(async move {
-            let _ = handle;
-        }));
+        let std_socket = create_reuseport_udp_socket(ipv6_addr)
+            .with_context(|| format!("create ipv6 udp socket for worker {}", worker_id))?;
+        let socket = Arc::new(UdpSocket::from_std(std_socket)?);
+        let handle = tokio::spawn(async move {
+            if let Err(err) = run_udp_worker(worker_id, socket, engine).await {
+                error!(worker_id, error = %err, "IPv6 udp worker exited");
+            }
+        });
+        all_handles.push(handle);
     }
 
     Ok(())
@@ -517,10 +485,14 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
         }
     }
 
-    // Try to set SO_REUSEPORT via safe wrapper / 尝试通过安全封装设置 SO_REUSEPORT
-    if let Err(e) = kixdns::socket_utils::set_reuseport(&socket, true) {
-        // Log warning if SO_REUSEPORT fails / SO_REUSEPORT 失败时记录警告
-        tracing::warn!("SO_REUSEPORT failed: {}, falling back to shared socket", e);
+    // Try to set SO_REUSEPORT_LB (FreeBSD) or SO_REUSEPORT (Linux) via safe wrapper
+    // 尝试通过安全封装设置 SO_REUSEPORT_LB (FreeBSD) 或 SO_REUSEPORT (Linux)
+    if let Err(e) = kixdns::socket_utils::set_reuseport_lb(&socket) {
+        // Log warning if SO_REUSEPORT_LB fails / SO_REUSEPORT_LB 失败时记录警告
+        tracing::warn!("SO_REUSEPORT_LB failed: {}, falling back to plain SO_REUSEPORT", e);
+        if let Err(e2) = kixdns::socket_utils::set_reuseport(&socket, true) {
+            tracing::warn!("SO_REUSEPORT also failed: {}", e2);
+        }
     }
 
     // Set buffer sizes to prevent packet loss under load
