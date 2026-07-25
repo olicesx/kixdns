@@ -53,7 +53,11 @@ pub mod engine_helpers {
         rcode: ResponseCode,
         answers: Vec<hickory_proto::rr::Record>,
     ) -> anyhow::Result<Bytes> {
-        let mut msg = Message::new(req.metadata.id, hickory_proto::op::MessageType::Response, req.metadata.op_code);
+        let mut msg = Message::new(
+            req.metadata.id,
+            hickory_proto::op::MessageType::Response,
+            req.metadata.op_code,
+        );
         msg.metadata.response_code = rcode;
         msg.metadata.recursion_desired = req.metadata.recursion_desired;
         msg.metadata.recursion_available = true;

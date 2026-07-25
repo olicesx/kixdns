@@ -403,10 +403,7 @@ mod tests {
 
         assert_eq!(decoded.metadata.response_code, ResponseCode::ServFail);
         assert_eq!(decoded.queries.len(), 1);
-        assert_eq!(
-            decoded.queries[0].name().to_utf8(),
-            "question.example.com."
-        );
+        assert_eq!(decoded.queries[0].name().to_utf8(), "question.example.com.");
     }
 
     // ---- error_response ----

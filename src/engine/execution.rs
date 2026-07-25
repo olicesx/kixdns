@@ -1156,15 +1156,22 @@ mod tests {
             ResponseCode::ServFail,
             "Should be ServFail"
         );
-        assert_eq!(msg.metadata.op_code, OpCode::Query, "Should be Query opcode");
-        assert!(msg.metadata.recursion_desired, "RD flag should be preserved");
+        assert_eq!(
+            msg.metadata.op_code,
+            OpCode::Query,
+            "Should be Query opcode"
+        );
+        assert!(
+            msg.metadata.recursion_desired,
+            "RD flag should be preserved"
+        );
         assert_eq!(msg.queries.len(), 1, "Should have one query");
     }
 
     #[test]
     fn test_engine_helpers_build_refused_response() {
         // Arrange: Create test request
-        let mut req = Message::new(54321, MessageType::Response, OpCode::Query);
+        let mut req = Message::new(54321, MessageType::Query, OpCode::Query);
         let query = Query::query(Name::from_str("example.com").unwrap(), RecordType::A);
         req.add_query(query);
 
@@ -1190,7 +1197,7 @@ mod tests {
     #[test]
     fn test_engine_helpers_build_servfail_vs_refused_different() {
         // Arrange: Create test request
-        let mut req = Message::new(11111, MessageType::Response, OpCode::Query);
+        let mut req = Message::new(11111, MessageType::Query, OpCode::Query);
         let query = Query::query(Name::from_str("test.com").unwrap(), RecordType::A);
         req.add_query(query);
 

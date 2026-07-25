@@ -1424,9 +1424,7 @@ impl RuntimeResponseMatcher {
                 // 检查 Answer 中是否有任意 IP 为私有 IP
                 use hickory_proto::rr::RData;
                 let mut has_private_ip = msg.answers.iter().any(|record| match &record.data {
-                    RData::A(a) => {
-                        crate::matcher::geoip::is_private_ip(std::net::IpAddr::V4(a.0))
-                    }
+                    RData::A(a) => crate::matcher::geoip::is_private_ip(std::net::IpAddr::V4(a.0)),
                     RData::AAAA(aaaa) => {
                         crate::matcher::geoip::is_private_ip(std::net::IpAddr::V6(aaaa.0))
                     }
