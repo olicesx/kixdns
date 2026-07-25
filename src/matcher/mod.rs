@@ -1256,9 +1256,7 @@ impl RuntimeResponseMatcher {
                     "REFUSED" => Some(ResponseCode::Refused),
                     _ => None, // "OTHER" 或未知码 — 回退为 catch-all / "OTHER" or unknown — fallback to catch-all
                 };
-                RuntimeResponseMatcher::ResponseRcode {
-                    value: rc,
-                }
+                RuntimeResponseMatcher::ResponseRcode { value: rc }
             }
             config::ResponseMatcher::ResponseQclass { value } => {
                 RuntimeResponseMatcher::ResponseQclass {
@@ -1357,10 +1355,15 @@ impl RuntimeResponseMatcher {
                     None => {
                         // "OTHER" fallback: match any response code that is NOT one of the 6 standard codes
                         // "OTHER" 回退：匹配不在6个标准码中的任何响应码
-                        !matches!(msg.response_code(),
-                            ResponseCode::NoError | ResponseCode::FormErr |
-                            ResponseCode::ServFail | ResponseCode::NXDomain |
-                            ResponseCode::NotImp | ResponseCode::Refused)
+                        !matches!(
+                            msg.response_code(),
+                            ResponseCode::NoError
+                                | ResponseCode::FormErr
+                                | ResponseCode::ServFail
+                                | ResponseCode::NXDomain
+                                | ResponseCode::NotImp
+                                | ResponseCode::Refused
+                        )
                     }
                 }
             }

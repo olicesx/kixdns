@@ -5,8 +5,8 @@
 
 use anyhow::{Context, Result};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use serde::{Deserialize, Serialize};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;

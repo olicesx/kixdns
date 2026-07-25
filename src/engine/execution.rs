@@ -1,4 +1,4 @@
-use rustc_hash::{FxHashMap, FxHasher, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -1591,7 +1591,9 @@ mod tests {
         let actions = [Action::Allow];
         let response_matchers = vec![RuntimeResponseMatcherWithOp {
             operator: MatchOperator::And,
-            matcher: RuntimeResponseMatcher::ResponseType { value: RecordType::A },
+            matcher: RuntimeResponseMatcher::ResponseType {
+                value: RecordType::A,
+            },
         }];
         let packet = [0u8];
         let client_ip: IpAddr = "10.0.0.1".parse().unwrap();

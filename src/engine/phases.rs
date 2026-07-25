@@ -119,8 +119,7 @@ pub fn check_cache(
                 // 重置过期计时器：通过重新插入条目并将 inserted_at 设置为"刚过期"的时间点
                 if engine.serve_stale_ttl_reset {
                     let new_entry = hit.clone_with_refreshed_ttl();
-                    engine
-                        .cache_insert(dedupe_hash, std::sync::Arc::new(new_entry));
+                    engine.cache_insert(dedupe_hash, std::sync::Arc::new(new_entry));
                 }
 
                 // Trigger background refresh to get fresh data
@@ -297,8 +296,7 @@ pub fn check_stale_cache(
                 // 重置过期计时器
                 if engine.serve_stale_ttl_reset {
                     let new_entry = hit.clone_with_refreshed_ttl();
-                    engine
-                        .cache_insert(dedupe_hash, std::sync::Arc::new(new_entry));
+                    engine.cache_insert(dedupe_hash, std::sync::Arc::new(new_entry));
                 }
 
                 debug!(
@@ -743,11 +741,7 @@ pub async fn handle_forward_decision(
                     engine.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
                     Ok(ForwardResult::Success(ctx.raw))
                 }
-                ResponseActionResult::Static {
-                    bytes,
-                    rcode,
-                    ..
-                } => {
+                ResponseActionResult::Static { bytes, rcode, .. } => {
                     if min_ttl > Duration::from_secs(0) {
                         engine.insert_dns_cache_entry(
                             dedupe_hash,
@@ -942,11 +936,7 @@ pub async fn handle_forward_decision(
                         engine.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
                         Ok(ForwardResult::Success(ctx.raw))
                     }
-                    ResponseActionResult::Static {
-                        bytes,
-                        rcode,
-                        ..
-                    } => {
+                    ResponseActionResult::Static { bytes, rcode, .. } => {
                         if min_ttl > Duration::from_secs(0) {
                             engine.insert_dns_cache_entry(
                                 dedupe_hash,

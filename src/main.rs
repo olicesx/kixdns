@@ -404,8 +404,8 @@ fn spawn_ipv4_udp_workers(
     // 无论客户端源端口分布如何，都能完美负载均衡。
     // SO_REUSEPORT 基于 4 元组哈希；当源端口较少时（如 dnsperf -T 4 = 4 个源端口），
     // 哈希冲突会饿死部分 worker。共享 socket 彻底消除此依赖。
-    let std_socket = create_reuseport_udp_socket(ipv4_addr)
-        .with_context(|| "create shared ipv4 udp socket")?;
+    let std_socket =
+        create_reuseport_udp_socket(ipv4_addr).with_context(|| "create shared ipv4 udp socket")?;
     let socket = Arc::new(UdpSocket::from_std(std_socket)?);
 
     for worker_id in 0..worker_count {
@@ -431,11 +431,9 @@ fn spawn_ipv4_udp_workers(
                 });
             })
             .with_context(|| format!("spawn ipv4 udp thread {worker_id}"))?;
-        all_handles.push(
-            tokio::spawn(async move {
-                let _ = handle; // Keep thread handle alive / 保持线程句柄存活
-            })
-        );
+        all_handles.push(tokio::spawn(async move {
+            let _ = handle; // Keep thread handle alive / 保持线程句柄存活
+        }));
     }
 
     Ok(())
@@ -463,8 +461,8 @@ fn spawn_ipv6_udp_workers(
     info!(bind_addr = %ipv6_addr, workers = worker_count, "Starting IPv6 UDP workers");
 
     // ✅ Single shared socket (same rationale as IPv4) / 单一共享 socket（同 IPv4）
-    let std_socket = create_reuseport_udp_socket(ipv6_addr)
-        .with_context(|| "create shared ipv6 udp socket")?;
+    let std_socket =
+        create_reuseport_udp_socket(ipv6_addr).with_context(|| "create shared ipv6 udp socket")?;
     let socket = Arc::new(UdpSocket::from_std(std_socket)?);
 
     for worker_id in 0..worker_count {
@@ -484,11 +482,9 @@ fn spawn_ipv6_udp_workers(
                 });
             })
             .with_context(|| format!("spawn ipv6 udp thread {worker_id}"))?;
-        all_handles.push(
-            tokio::spawn(async move {
-                let _ = handle;
-            })
-        );
+        all_handles.push(tokio::spawn(async move {
+            let _ = handle;
+        }));
     }
 
     Ok(())
@@ -622,9 +618,8 @@ async fn run_udp_worker(
                     inserted_at,
                 })) => {
                     // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
-                    let elapsed = kixdns::proto_utils::saturating_u64_to_u32(
-                        inserted_at.elapsed().as_secs(),
-                    );
+                    let elapsed =
+                        kixdns::proto_utils::saturating_u64_to_u32(inserted_at.elapsed().as_secs());
 
                     if elapsed == 0 && cached.len() >= 2 {
                         // Fast path: TTL hasn't decayed, only TXID (2 bytes) needs patching.
@@ -929,7 +924,10 @@ async fn handle_tcp_conn(
             // 单次 vectored write (scatter-gather)：长度前缀 + 包体在一次 syscall 中完成，
             // 即使 TCP_NODELAY 未生效也能避免 Nagle/delayed-ACK 交互。
             let len_bytes = (resp.len() as u16).to_be_bytes();
-            let bufs = [std::io::IoSlice::new(&len_bytes), std::io::IoSlice::new(&resp)];
+            let bufs = [
+                std::io::IoSlice::new(&len_bytes),
+                std::io::IoSlice::new(&resp),
+            ];
             if stream.write_vectored(&bufs).await.is_err() {
                 return Ok(());
             }

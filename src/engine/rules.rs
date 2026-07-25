@@ -4,7 +4,7 @@ use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::rdata::TXT;
 use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
-use rustc_hash::{FxHasher, FxHashSet};
+use rustc_hash::{FxHashSet, FxHasher};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;

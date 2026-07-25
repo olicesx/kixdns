@@ -611,7 +611,11 @@ impl Rule {
             } = action
             {
                 let action_transport = transport.unwrap_or(Transport::Udp);
-                for addr in upstream.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                for addr in upstream
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                {
                     if addr.contains("://") {
                         if addr.starts_with("tcp://") {
                             tcp_upstreams.insert(addr.to_string());
@@ -655,11 +659,31 @@ impl Rule {
         }
 
         let mut all_upstreams: Vec<std::sync::Arc<str>> = Vec::new();
-        all_upstreams.extend(tcp_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
-        all_upstreams.extend(udp_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
-        all_upstreams.extend(doh_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
-        all_upstreams.extend(dot_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
-        all_upstreams.extend(doq_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
+        all_upstreams.extend(
+            tcp_upstreams
+                .iter()
+                .map(|s| std::sync::Arc::from(s.as_str())),
+        );
+        all_upstreams.extend(
+            udp_upstreams
+                .iter()
+                .map(|s| std::sync::Arc::from(s.as_str())),
+        );
+        all_upstreams.extend(
+            doh_upstreams
+                .iter()
+                .map(|s| std::sync::Arc::from(s.as_str())),
+        );
+        all_upstreams.extend(
+            dot_upstreams
+                .iter()
+                .map(|s| std::sync::Arc::from(s.as_str())),
+        );
+        all_upstreams.extend(
+            doq_upstreams
+                .iter()
+                .map(|s| std::sync::Arc::from(s.as_str())),
+        );
 
         if all_upstreams.is_empty() {
             tracing::info!(

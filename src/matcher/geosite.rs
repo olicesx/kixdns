@@ -581,8 +581,7 @@ impl GeoSiteManager {
         }
 
         // 创建 tag 查找集合（小写）/ Create tag lookup set (lowercase)
-        let tags_set: FxHashSet<String> =
-            tags.iter().map(|s| s.to_lowercase()).collect();
+        let tags_set: FxHashSet<String> = tags.iter().map(|s| s.to_lowercase()).collect();
 
         info!(target = "geosite", requested_tags = ?tags,
              "loading GeoSite data selectively from .dat file");
@@ -1084,8 +1083,7 @@ fn run_geosite_watcher(
     // for the target filenames, properly detecting atomic replacements.
 
     // Collect unique parent directories and their target filenames
-    let mut dir_watches: FxHashMap<PathBuf, Vec<std::ffi::OsString>> =
-        FxHashMap::default();
+    let mut dir_watches: FxHashMap<PathBuf, Vec<std::ffi::OsString>> = FxHashMap::default();
     for p in &paths {
         let parent = p
             .parent()
