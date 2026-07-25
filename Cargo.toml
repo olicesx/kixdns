@@ -26,7 +26,6 @@ ipnet = "2"
 anyhow = "1"
 bytes = "1"
 regex = "1"
-num_cpus = "1.16"
 moka = { version = "0.12.12", features = ["sync"] }
 socket2 = "0.6"
 libc = "0.2"

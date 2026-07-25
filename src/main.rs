@@ -162,7 +162,9 @@ async fn run_dns_server(
     let udp_workers_final = if udp_workers_count > 0 {
         udp_workers_count
     } else {
-        num_cpus::get()
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
     };
 
     info!(bind_udp = %bind_addr, bind_tcp = %bind_tcp, udp_workers_count = udp_workers_final, "dns server started");
