@@ -53,14 +53,11 @@ pub mod engine_helpers {
         rcode: ResponseCode,
         answers: Vec<hickory_proto::rr::Record>,
     ) -> anyhow::Result<Bytes> {
-        let mut msg = Message::new();
-        msg.set_id(req.id());
-        msg.set_message_type(hickory_proto::op::MessageType::Response);
-        msg.set_op_code(req.op_code());
-        msg.set_response_code(rcode);
-        msg.set_recursion_desired(req.recursion_desired());
-        msg.set_recursion_available(true);
-        msg.add_queries(req.queries().iter().cloned());
+        let mut msg = Message::new(req.metadata.id, hickory_proto::op::MessageType::Response, req.metadata.op_code);
+        msg.metadata.response_code = rcode;
+        msg.metadata.recursion_desired = req.metadata.recursion_desired;
+        msg.metadata.recursion_available = true;
+        msg.add_queries(req.queries.iter().cloned());
         msg.insert_answers(answers);
 
         let mut buf = Vec::with_capacity(512);
@@ -86,13 +83,10 @@ pub mod engine_helpers {
         qclass: u16,
         rd: bool,
     ) -> anyhow::Result<Bytes> {
-        let mut msg = Message::new();
-        msg.set_id(tx_id);
-        msg.set_message_type(MessageType::Response);
-        msg.set_op_code(OpCode::Query);
-        msg.set_response_code(ResponseCode::ServFail);
-        msg.set_recursion_desired(rd);
-        msg.set_recursion_available(true);
+        let mut msg = Message::new(tx_id, MessageType::Response, OpCode::Query);
+        msg.metadata.response_code = ResponseCode::ServFail;
+        msg.metadata.recursion_desired = rd;
+        msg.metadata.recursion_available = true;
 
         let name = Name::from_str(qname)?;
         let mut query = Query::new();

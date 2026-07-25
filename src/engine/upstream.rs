@@ -523,7 +523,7 @@ mod tests {
     use super::*;
     use crate::config::GlobalSettings;
     use crate::matcher::RuntimePipelineConfig;
-    use hickory_proto::op::{Message, MessageType, Query};
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::{Name, RecordType};
     use rustc_hash::FxHashMap;
     use rustls::crypto::ring;
@@ -681,10 +681,8 @@ mod tests {
     }
 
     fn build_dns_query_packet(qname: &str) -> Vec<u8> {
-        let mut msg = Message::new();
-        msg.set_id(0x1234);
-        msg.set_message_type(MessageType::Query);
-        msg.set_recursion_desired(true);
+        let mut msg = Message::new(0x1234, MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
         let name = Name::from_str(qname).expect("qname");
         msg.add_query(Query::query(name, RecordType::A));
         msg.to_vec().expect("encode dns query")

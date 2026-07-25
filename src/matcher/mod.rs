@@ -127,9 +127,9 @@ mod matcher_helpers {
         use hickory_proto::rr::RData;
 
         // 先检查 Answer / Check Answer first
-        let found = msg.answers().iter().any(|record| match record.data() {
-            Some(RData::A(a)) => nets.iter().any(|net| net.contains(&IpAddr::V4(a.0))),
-            Some(RData::AAAA(aaaa)) => nets.iter().any(|net| net.contains(&IpAddr::V6(aaaa.0))),
+        let found = msg.answers.iter().any(|record| match &record.data {
+            RData::A(a) => nets.iter().any(|net| net.contains(&IpAddr::V4(a.0))),
+            RData::AAAA(aaaa) => nets.iter().any(|net| net.contains(&IpAddr::V6(aaaa.0))),
             _ => false,
         });
 
@@ -138,9 +138,9 @@ mod matcher_helpers {
         }
 
         // 再检查 Additionals / Check Additionals
-        msg.additionals().iter().any(|record| match record.data() {
-            Some(RData::A(a)) => nets.iter().any(|net| net.contains(&IpAddr::V4(a.0))),
-            Some(RData::AAAA(aaaa)) => nets.iter().any(|net| net.contains(&IpAddr::V6(aaaa.0))),
+        msg.additionals.iter().any(|record| match &record.data {
+            RData::A(a) => nets.iter().any(|net| net.contains(&IpAddr::V4(a.0))),
+            RData::AAAA(aaaa) => nets.iter().any(|net| net.contains(&IpAddr::V6(aaaa.0))),
             _ => false,
         })
     }
@@ -1343,7 +1343,7 @@ impl RuntimeResponseMatcher {
             }
             RuntimeResponseMatcher::ResponseType { value } => {
                 let rrty = msg
-                    .answers()
+                    .answers
                     .first()
                     .map(|r| r.record_type())
                     .unwrap_or(qtype);
@@ -1351,12 +1351,12 @@ impl RuntimeResponseMatcher {
             }
             RuntimeResponseMatcher::ResponseRcode { value } => {
                 match value {
-                    Some(rc) => msg.response_code() == *rc,
+                    Some(rc) => msg.metadata.response_code == *rc,
                     None => {
                         // "OTHER" fallback: match any response code that is NOT one of the 6 standard codes
                         // "OTHER" 回退：匹配不在6个标准码中的任何响应码
                         !matches!(
-                            msg.response_code(),
+                            msg.metadata.response_code,
                             ResponseCode::NoError
                                 | ResponseCode::FormErr
                                 | ResponseCode::ServFail
@@ -1369,7 +1369,7 @@ impl RuntimeResponseMatcher {
             }
             RuntimeResponseMatcher::ResponseQclass { value } => value == &qclass,
             RuntimeResponseMatcher::ResponseEdnsPresent { expect } => {
-                let edns = msg.extensions().is_some();
+                let edns = msg.edns.is_some();
                 edns == *expect
             }
             RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } => {
@@ -1380,10 +1380,10 @@ impl RuntimeResponseMatcher {
                 let mut has_ip = false;
 
                 // 检查 Answers
-                let all_match_answers = msg.answers().iter().all(|record| {
-                    let ip = match record.data() {
-                        Some(RData::A(a)) => Some(IpAddr::V4(a.0)),
-                        Some(RData::AAAA(aaaa)) => Some(IpAddr::V6(aaaa.0)),
+                let all_match_answers = msg.answers.iter().all(|record| {
+                    let ip = match &record.data {
+                        RData::A(a) => Some(IpAddr::V4(a.0)),
+                        RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
                         _ => None,
                     };
 
@@ -1423,11 +1423,11 @@ impl RuntimeResponseMatcher {
             RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { expect } => {
                 // 检查 Answer 中是否有任意 IP 为私有 IP
                 use hickory_proto::rr::RData;
-                let mut has_private_ip = msg.answers().iter().any(|record| match record.data() {
-                    Some(RData::A(a)) => {
+                let mut has_private_ip = msg.answers.iter().any(|record| match &record.data {
+                    RData::A(a) => {
                         crate::matcher::geoip::is_private_ip(std::net::IpAddr::V4(a.0))
                     }
-                    Some(RData::AAAA(aaaa)) => {
+                    RData::AAAA(aaaa) => {
                         crate::matcher::geoip::is_private_ip(std::net::IpAddr::V6(aaaa.0))
                     }
                     _ => false,
@@ -1435,11 +1435,11 @@ impl RuntimeResponseMatcher {
 
                 if !has_private_ip {
                     // 检查 additionals
-                    has_private_ip = msg.additionals().iter().any(|record| match record.data() {
-                        Some(RData::A(a)) => {
+                    has_private_ip = msg.additionals.iter().any(|record| match &record.data {
+                        RData::A(a) => {
                             crate::matcher::geoip::is_private_ip(std::net::IpAddr::V4(a.0))
                         }
-                        Some(RData::AAAA(aaaa)) => {
+                        RData::AAAA(aaaa) => {
                             crate::matcher::geoip::is_private_ip(std::net::IpAddr::V6(aaaa.0))
                         }
                         _ => false,
@@ -1461,16 +1461,16 @@ impl RuntimeResponseMatcher {
                 // 从响应中提取 TXT 记录 / Extract TXT records from response
                 use hickory_proto::rr::RData;
                 let txt_data = msg
-                    .answers()
+                    .answers
                     .iter()
                     .filter_map(|r| {
-                        if let Some(RData::TXT(txt)) = r.data() {
+                        if let RData::TXT(txt) = &r.data {
                             Some(txt)
                         } else {
                             None
                         }
                     })
-                    .flat_map(|txt| txt.iter().flat_map(|s| s.as_ref()))
+                    .flat_map(|txt| txt.txt_data.iter().flat_map(|s| s.as_ref()))
                     .copied()
                     .collect::<Vec<u8>>();
 

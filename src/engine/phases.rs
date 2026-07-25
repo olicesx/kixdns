@@ -554,14 +554,14 @@ pub async fn handle_forward_decision(
                     let ttl_cache = extract_ttl(&msg);
                     let ttl_refresh = extract_ttl_for_refresh(&msg);
                     let tc = raw.len() >= 3 && (raw[2] & 0x02) != 0;
-                    (msg.response_code(), ttl_cache, ttl_refresh, Some(msg), tc)
+                    (msg.metadata.response_code, ttl_cache, ttl_refresh, Some(msg), tc)
                 }
             } else {
                 let msg = Message::from_bytes(&raw).context("parse upstream response")?;
                 let ttl_cache = extract_ttl(&msg);
                 let ttl_refresh = extract_ttl_for_refresh(&msg);
                 let tc = raw.len() >= 3 && (raw[2] & 0x02) != 0;
-                (msg.response_code(), ttl_cache, ttl_refresh, Some(msg), tc)
+                (msg.metadata.response_code, ttl_cache, ttl_refresh, Some(msg), tc)
             };
 
             // 检查 TCP fallback 配置 / Check TCP fallback configuration
@@ -625,7 +625,7 @@ pub async fn handle_forward_decision(
                         (matched, m)
                     }
                 } else {
-                    (false, Message::new())
+                    (false, Message::new(0, hickory_proto::op::MessageType::Query, hickory_proto::op::OpCode::Query))
                 }
             };
 
@@ -684,7 +684,7 @@ pub async fn handle_forward_decision(
             let req_full = if let Ok(r) = Message::from_bytes(packet) {
                 r
             } else {
-                Message::new()
+                Message::new(0, hickory_proto::op::MessageType::Query, hickory_proto::op::OpCode::Query)
             };
             let ctx = ResponseContext {
                 raw: raw.clone(),
@@ -726,7 +726,7 @@ pub async fn handle_forward_decision(
                         engine.insert_dns_cache_entry(
                             dedupe_hash,
                             ctx.raw.clone(),
-                            ctx.msg.response_code(),
+                            ctx.msg.metadata.response_code,
                             Some(ctx.upstream.clone()),
                             qname,
                             Arc::from(pipeline_id),
@@ -921,7 +921,7 @@ pub async fn handle_forward_decision(
                             engine.insert_dns_cache_entry(
                                 dedupe_hash,
                                 ctx.raw.clone(),
-                                ctx.msg.response_code(),
+                                ctx.msg.metadata.response_code,
                                 Some(ctx.upstream.clone()),
                                 qname,
                                 Arc::from(pipeline_id),
@@ -966,7 +966,7 @@ pub async fn handle_forward_decision(
                         let req = if let Ok(r) = Message::from_bytes(packet) {
                             r
                         } else {
-                            Message::new()
+                            Message::new(0, hickory_proto::op::MessageType::Query, hickory_proto::op::OpCode::Query)
                         };
 
                         let resp_bytes = rules::process_response_jump(

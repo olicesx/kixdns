@@ -120,7 +120,7 @@ impl Engine {
         let state = self.state.load();
         let ttl = match &decision {
             Decision::Static { answers, .. } => {
-                let min_ttl = answers.iter().map(|r| r.ttl()).min();
+                let min_ttl = answers.iter().map(|r| r.ttl).min();
                 min_ttl.map(|t| Duration::from_secs(t as u64))
             }
             Decision::Forward {

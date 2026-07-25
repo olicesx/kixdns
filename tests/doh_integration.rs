@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use base64::engine::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use hickory_proto::op::{Message, OpCode, Query};
+use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{Name, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 
@@ -95,10 +95,8 @@ fn make_test_cert() -> (tempfile::TempDir, String, String) {
 
 /// Build a DNS A query in wire format.
 fn make_dns_query(domain: &str, txid: u16) -> Vec<u8> {
-    let mut msg = Message::new();
-    msg.set_id(txid);
-    msg.set_op_code(OpCode::Query);
-    msg.set_recursion_desired(true);
+    let mut msg = Message::new(txid, MessageType::Query, OpCode::Query);
+    msg.metadata.recursion_desired = true;
     msg.add_query(Query::query(Name::from_str(domain).unwrap(), RecordType::A));
     msg.to_vec().unwrap()
 }
@@ -211,24 +209,24 @@ async fn test_doh_post_static_ip() {
     let body = resp.bytes().await.expect("read body");
     // Parse the DNS response
     let msg = Message::from_bytes(&body).expect("parse DNS response");
-    assert_eq!(msg.id(), 0xBEEF, "TXID preserved");
+    assert_eq!(msg.metadata.id, 0xBEEF, "TXID preserved");
     assert_eq!(
-        msg.response_code(),
+        msg.metadata.response_code,
         hickory_proto::op::ResponseCode::NoError,
         "should be NOERROR"
     );
     // Should have at least one A record = 1.2.3.4
     let a_records: Vec<_> = msg
-        .answers()
+        .answers
         .iter()
         .filter(|r| r.record_type() == RecordType::A)
         .collect();
     assert!(!a_records.is_empty(), "should have A records");
     // Check the IP address
-    let ip = a_records[0]
-        .data()
-        .and_then(|d| d.as_a())
-        .expect("A record data");
+    let ip = match &a_records[0].data {
+        hickory_proto::rr::RData::A(a) => a,
+        _ => panic!("expected A record"),
+    };
     assert_eq!(ip.0, std::net::Ipv4Addr::new(1, 2, 3, 4));
 }
 

@@ -246,14 +246,14 @@ fn empty_dns_response(request: &[u8]) -> Bytes {
         return header_only(request);
     };
 
-    let mut response = Message::new();
-    response
-        .set_id(request_message.id())
-        .set_message_type(MessageType::Response)
-        .set_op_code(request_message.op_code())
-        .set_response_code(ResponseCode::ServFail)
-        .set_recursion_desired(request_message.recursion_desired())
-        .add_queries(request_message.queries().iter().cloned());
+    let mut response = Message::new(
+        request_message.metadata.id,
+        MessageType::Response,
+        request_message.metadata.op_code,
+    );
+    response.metadata.response_code = ResponseCode::ServFail;
+    response.metadata.recursion_desired = request_message.metadata.recursion_desired;
+    response.add_queries(request_message.queries.iter().cloned());
 
     response
         .to_vec()
@@ -401,10 +401,10 @@ mod tests {
         let response = empty_dns_response(&request);
         let decoded = Message::from_bytes(&response).expect("decode SERVFAIL response");
 
-        assert_eq!(decoded.response_code(), ResponseCode::ServFail);
-        assert_eq!(decoded.queries().len(), 1);
+        assert_eq!(decoded.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(decoded.queries.len(), 1);
         assert_eq!(
-            decoded.queries()[0].name().to_utf8(),
+            decoded.queries[0].name().to_utf8(),
             "question.example.com."
         );
     }
@@ -452,10 +452,7 @@ mod tests {
         use hickory_proto::rr::{Name, RecordType};
         use std::str::FromStr;
 
-        let mut msg = Message::new();
-        msg.set_id(txid);
-        msg.set_op_code(OpCode::Query);
-        msg.set_recursion_desired(true);
+        let mut msg = Message::new(txid, hickory_proto::op::MessageType::Query, OpCode::Query);
         msg.add_query(Query::query(Name::from_str(domain).unwrap(), RecordType::A));
         msg.to_vec().unwrap()
     }

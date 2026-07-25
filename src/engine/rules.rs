@@ -350,7 +350,7 @@ pub(crate) async fn apply_response_actions(
                 if let Some(ref resp_ctx) = ctx.ctx_opt {
                     let name = resp_ctx
                         .msg
-                        .queries()
+                        .queries
                         .first()
                         .map(|q| q.name().clone())
                         .ok_or_else(|| anyhow::anyhow!("No query name"))?;
@@ -361,7 +361,7 @@ pub(crate) async fn apply_response_actions(
 
                     // Replace TXT records in answers / 替换答案中的 TXT 记录
                     let new_answers = vec![record];
-                    let rcode = resp_ctx.msg.response_code();
+                    let rcode = resp_ctx.msg.metadata.response_code;
 
                     let bytes = build_response(ctx.req, rcode, new_answers)?;
                     return Ok(ResponseActionResult::Static {
@@ -734,7 +734,7 @@ pub(crate) async fn process_response_jump(
                                                 // Rewrite Transaction ID for followers using BytesMut
                                                 let mut resp_mut = BytesMut::from(bytes.as_ref());
                                                 if resp_mut.len() >= 2 {
-                                                    let id_bytes = req.id().to_be_bytes();
+                                                    let id_bytes = req.metadata.id.to_be_bytes();
                                                     resp_mut[0] = id_bytes[0];
                                                     resp_mut[1] = id_bytes[1];
                                                 }
@@ -811,7 +811,7 @@ pub(crate) async fn process_response_jump(
                                             // Rewrite Transaction ID for followers using BytesMut
                                             let mut resp_mut = BytesMut::from(bytes.as_ref());
                                             if resp_mut.len() >= 2 {
-                                                let id_bytes = req.id().to_be_bytes();
+                                                let id_bytes = req.metadata.id.to_be_bytes();
                                                 resp_mut[0] = id_bytes[0];
                                                 resp_mut[1] = id_bytes[1];
                                             }
@@ -913,7 +913,7 @@ pub(crate) async fn process_response_jump(
                             if resp_match_ok && effective_ttl > Duration::from_secs(0) {
                                 let entry = CacheEntry {
                                     bytes: raw.clone(),
-                                    rcode: msg.response_code(),
+                                    rcode: msg.metadata.response_code,
                                     upstream: Some(Arc::from(actual_upstream.as_str())),
                                     qname: Arc::from(qname),
                                     pipeline_id: pipeline_id.clone(),
@@ -975,7 +975,7 @@ pub(crate) async fn process_response_jump(
                                 if resp_match && effective_ttl > Duration::from_secs(0) {
                                     let entry = CacheEntry {
                                         bytes: ctx.raw.clone(),
-                                        rcode: ctx.msg.response_code(),
+                                        rcode: ctx.msg.metadata.response_code,
                                         upstream: Some(ctx.upstream.clone()),
                                         qname: Arc::from(qname),
                                         pipeline_id: pipeline_id.clone(),

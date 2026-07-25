@@ -606,15 +606,15 @@ impl Engine {
                 } else {
                     // Fallback to full parse if quick parse fails (unlikely for standard queries) / 如果快速解析失败则回退到完整解析（对于标准查询不太可能）
                     let req = Message::from_bytes(packet).context("parse request")?;
-                    let question = req.queries().first().context("empty question")?;
+                    let question = req.queries.first().context("empty question")?;
                     (
                         // Name::to_lowercase() returns Name, .to_string() converts to String
                         // Name::to_lowercase() 返回 Name，.to_string() 转换为 String
                         std::borrow::Cow::Owned(question.name().to_lowercase().to_string()),
                         question.query_type(),
                         question.query_class(),
-                        req.id(),
-                        req.extensions().is_some(),
+                        req.metadata.id,
+                        req.edns.is_some(),
                     )
                 };
 
@@ -1093,10 +1093,7 @@ impl Engine {
 
         // Build DNS query message
         // 构建 DNS 查询消息
-        let mut msg = Message::new();
-        msg.set_id(tx_id);
-        msg.set_message_type(MessageType::Query);
-        msg.set_recursion_desired(true);
+        let mut msg = Message::new(tx_id, MessageType::Query, hickory_proto::op::OpCode::Query);
 
         // Add question section
         // 添加问题部分
@@ -1122,7 +1119,7 @@ mod tests {
     use crate::engine::response::*;
     use crate::engine::rules::*;
     use crate::matcher::RuntimeResponseMatcherWithOp;
-    use hickory_proto::op::{Message, OpCode, Query};
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::RecordType;
     use hickory_proto::rr::{RData, Record};
     use std::net::IpAddr;
@@ -1135,10 +1132,8 @@ mod tests {
     #[test]
     fn test_engine_helpers_build_servfail_response() {
         // Arrange: Create test request
-        let mut req = Message::new();
-        req.set_id(12345);
-        req.set_op_code(OpCode::Query);
-        req.set_recursion_desired(true);
+        let mut req = Message::new(12345, hickory_proto::op::MessageType::Query, OpCode::Query);
+        req.metadata.recursion_desired = true;
         let query = Query::query(Name::from_str("example.com").unwrap(), RecordType::A);
         req.add_query(query);
 
@@ -1155,23 +1150,21 @@ mod tests {
 
         // Verify it's a valid DNS message
         let msg = Message::from_bytes(&bytes).unwrap();
-        assert_eq!(msg.id(), 12345, "TXID should be preserved");
+        assert_eq!(msg.metadata.id, 12345, "TXID should be preserved");
         assert_eq!(
-            msg.response_code(),
+            msg.metadata.response_code,
             ResponseCode::ServFail,
             "Should be ServFail"
         );
-        assert_eq!(msg.op_code(), OpCode::Query, "Should be Query opcode");
-        assert!(msg.recursion_desired(), "RD flag should be preserved");
-        assert_eq!(msg.queries().len(), 1, "Should have one query");
+        assert_eq!(msg.metadata.op_code, OpCode::Query, "Should be Query opcode");
+        assert!(msg.metadata.recursion_desired, "RD flag should be preserved");
+        assert_eq!(msg.queries.len(), 1, "Should have one query");
     }
 
     #[test]
     fn test_engine_helpers_build_refused_response() {
         // Arrange: Create test request
-        let mut req = Message::new();
-        req.set_id(54321);
-        req.set_op_code(OpCode::Query);
+        let mut req = Message::new(54321, MessageType::Response, OpCode::Query);
         let query = Query::query(Name::from_str("example.com").unwrap(), RecordType::A);
         req.add_query(query);
 
@@ -1185,20 +1178,19 @@ mod tests {
 
         // Verify it's a valid DNS message
         let msg = Message::from_bytes(&bytes).unwrap();
-        assert_eq!(msg.id(), 54321, "TXID should be preserved");
+        assert_eq!(msg.metadata.id, 54321, "TXID should be preserved");
         assert_eq!(
-            msg.response_code(),
+            msg.metadata.response_code,
             ResponseCode::Refused,
             "Should be Refused"
         );
-        assert_eq!(msg.queries().len(), 1, "Should have one query");
+        assert_eq!(msg.queries.len(), 1, "Should have one query");
     }
 
     #[test]
     fn test_engine_helpers_build_servfail_vs_refused_different() {
         // Arrange: Create test request
-        let mut req = Message::new();
-        req.set_id(11111);
+        let mut req = Message::new(11111, MessageType::Response, OpCode::Query);
         let query = Query::query(Name::from_str("test.com").unwrap(), RecordType::A);
         req.add_query(query);
 
@@ -1215,8 +1207,8 @@ mod tests {
         // Verify different response codes
         let sf_msg = Message::from_bytes(&servfail).unwrap();
         let ref_msg = Message::from_bytes(&refused).unwrap();
-        assert_eq!(sf_msg.response_code(), ResponseCode::ServFail);
-        assert_eq!(ref_msg.response_code(), ResponseCode::Refused);
+        assert_eq!(sf_msg.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(ref_msg.metadata.response_code, ResponseCode::Refused);
     }
 
     // ========================================================================
@@ -1569,8 +1561,8 @@ mod tests {
     }
 
     fn build_response_context() -> ResponseContext {
-        let mut msg = Message::new();
-        msg.set_response_code(ResponseCode::NoError);
+        let mut msg = Message::new(0, MessageType::Response, OpCode::Query);
+        msg.metadata.response_code = ResponseCode::NoError;
         let name = Name::from_str("example.com").expect("name");
         let record = Record::from_rdata(name, 300, RData::A(A(Ipv4Addr::new(1, 2, 3, 4))));
         msg.add_answer(record);
@@ -1587,7 +1579,7 @@ mod tests {
         // Arrange: Build test engine and response context
         let engine = build_test_engine();
         let ctx = build_response_context();
-        let req = Message::new();
+        let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [Action::Allow];
         let response_matchers = vec![RuntimeResponseMatcherWithOp {
             operator: MatchOperator::And,
@@ -1639,7 +1631,7 @@ mod tests {
         // Arrange: Build test engine and response context with non-matching response matcher
         let engine = build_test_engine();
         let ctx = build_response_context();
-        let req = Message::new();
+        let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [Action::Allow];
         let response_matchers = vec![RuntimeResponseMatcherWithOp {
             operator: MatchOperator::And,
@@ -1685,7 +1677,7 @@ mod tests {
     async fn response_actions_deny_returns_refused() {
         // Arrange: Build test engine with Deny action
         let engine = build_test_engine();
-        let req = Message::new();
+        let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [Action::Deny];
         let response_matchers: Vec<RuntimeResponseMatcherWithOp> = Vec::new();
         let packet = [0u8];

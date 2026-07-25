@@ -85,10 +85,16 @@ fn inject_ecs(packet: &[u8], addr: IpAddr, source_prefix: u8) -> Vec<u8> {
 
     let subnet = ClientSubnet::new(addr, source_prefix, 0);
 
-    // Insert or replace ECS option in the EDNS extensions
-    // 在 EDNS 扩展中插入或替换 ECS 选项
-    match msg.extensions_mut() {
+    // Insert or replace ECS option in the EDNS extensions.
+    // hickory-proto 0.26 OPT uses Vec (not HashMap): insert() always pushes,
+    // so we must explicitly remove any existing Subnet to avoid duplicates.
+    //
+    // 在 EDNS 扩展中插入或替换 ECS 选项。
+    // hickory-proto 0.26 的 OPT 使用 Vec（非 HashMap）：insert() 总是追加，
+    // 因此必须先显式移除已有的 Subnet 以避免重复。
+    match &mut msg.edns {
         Some(edns) => {
+            edns.options_mut().remove(EdnsCode::Subnet);
             edns.options_mut().insert(EdnsOption::Subnet(subnet));
         }
         None => {
@@ -97,7 +103,7 @@ fn inject_ecs(packet: &[u8], addr: IpAddr, source_prefix: u8) -> Vec<u8> {
             let mut edns = hickory_proto::op::Edns::new();
             edns.set_max_payload(1232);
             edns.options_mut().insert(EdnsOption::Subnet(subnet));
-            *msg.extensions_mut() = Some(edns);
+            msg.edns = Some(edns);
         }
     }
 
@@ -122,16 +128,16 @@ fn strip_ecs(packet: &[u8]) -> Vec<u8> {
     };
 
     let has_ecs = msg
-        .extensions()
+        .edns
         .as_ref()
-        .and_then(|e| e.options().as_ref().get(&EdnsCode::Subnet))
+        .and_then(|e| e.options().get(EdnsCode::Subnet))
         .is_some();
 
     if !has_ecs {
         return packet.to_vec();
     }
 
-    if let Some(edns) = msg.extensions_mut() {
+    if let Some(edns) = &mut msg.edns {
         edns.options_mut().remove(EdnsCode::Subnet);
     }
 
@@ -300,57 +306,26 @@ pub(crate) fn has_ecs(packet: &[u8]) -> bool {
         Ok(m) => m,
         Err(_) => return false,
     };
-    msg.extensions()
+    msg.edns
         .as_ref()
-        .and_then(|e| e.options().as_ref().get(&EdnsCode::Subnet))
+        .and_then(|e| e.options().get(EdnsCode::Subnet))
         .is_some()
 }
 
 /// Extract ECS subnet info from a wire packet (for testing).
-/// ClientSubnet fields are private in hickory-proto 0.24, so we serialize
-/// to wire bytes and parse manually.
+/// hickory-proto 0.26+ exposes ClientSubnet fields via accessors.
 ///
 /// 从 wire 包中提取 ECS 子网信息（用于测试）。
-/// hickory-proto 0.24 中 ClientSubnet 字段为私有，
-/// 因此序列化为 wire 字节后手动解析。
+/// hickory-proto 0.26+ 通过访问器暴露 ClientSubnet 字段。
 #[cfg(test)]
 pub(crate) fn extract_ecs_info(packet: &[u8]) -> Option<(IpAddr, u8, u8)> {
     let msg = Message::from_vec(packet).ok()?;
-    let edns = msg.extensions().as_ref()?;
-    let cs = match edns.options().as_ref().get(&EdnsCode::Subnet)? {
+    let edns = msg.edns.as_ref()?;
+    let cs = match edns.options().get(EdnsCode::Subnet)? {
         EdnsOption::Subnet(cs) => cs,
         _ => return None,
     };
-    // Serialize ClientSubnet to wire bytes, then parse manually
-    // 将 ClientSubnet 序列化为 wire 字节，然后手动解析
-    let wire: Vec<u8> = std::convert::TryFrom::try_from(cs).ok()?;
-    if wire.len() < 4 {
-        return None;
-    }
-    let family = u16::from_be_bytes([wire[0], wire[1]]);
-    let source_prefix = wire[2];
-    let scope_prefix = wire[3];
-    let addr_bytes_needed = ((source_prefix as usize) + 7) / 8;
-    let addr = match family {
-        1 => {
-            let mut octets = [0u8; 4];
-            let copy_len = addr_bytes_needed.min(4);
-            if wire.len() >= 4 + copy_len {
-                octets[..copy_len].copy_from_slice(&wire[4..4 + copy_len]);
-            }
-            IpAddr::V4(std::net::Ipv4Addr::from(octets))
-        }
-        2 => {
-            let mut octets = [0u8; 16];
-            let copy_len = addr_bytes_needed.min(16);
-            if wire.len() >= 4 + copy_len {
-                octets[..copy_len].copy_from_slice(&wire[4..4 + copy_len]);
-            }
-            IpAddr::V6(Ipv6Addr::from(octets))
-        }
-        _ => return None,
-    };
-    Some((addr, source_prefix, scope_prefix))
+    Some((cs.addr(), cs.source_prefix(), cs.scope_prefix()))
 }
 
 // ============================================================================
@@ -367,10 +342,7 @@ mod tests {
     /// Build a minimal DNS query wire packet for testing.
     /// 构建最小化 DNS 查询 wire 包用于测试。
     fn make_query(domain: &str, txid: u16) -> Vec<u8> {
-        let mut msg = Message::new();
-        msg.set_id(txid);
-        msg.set_op_code(OpCode::Query);
-        msg.set_recursion_desired(true);
+        let mut msg = Message::new(txid, hickory_proto::op::MessageType::Query, OpCode::Query);
         msg.add_query(Query::query(Name::from_str(domain).unwrap(), RecordType::A));
         msg.to_vec().unwrap()
     }
@@ -378,14 +350,11 @@ mod tests {
     /// Build a DNS query with an existing OPT record (no ECS).
     /// 构建带 OPT 记录（无 ECS）的 DNS 查询。
     fn make_query_with_opt(domain: &str, txid: u16) -> Vec<u8> {
-        let mut msg = Message::new();
-        msg.set_id(txid);
-        msg.set_op_code(OpCode::Query);
-        msg.set_recursion_desired(true);
+        let mut msg = Message::new(txid, hickory_proto::op::MessageType::Query, OpCode::Query);
         msg.add_query(Query::query(Name::from_str(domain).unwrap(), RecordType::A));
         let mut edns = hickory_proto::op::Edns::new();
         edns.set_max_payload(1232);
-        *msg.extensions_mut() = Some(edns);
+        msg.edns = Some(edns);
         msg.to_vec().unwrap()
     }
 
