@@ -379,6 +379,115 @@ pub struct QuickResponse {
     pub truncated: bool,
 }
 
+/// Extract negative caching TTL from SOA in the authority section at the wire level (RFC 2308 §5).
+/// Returns min(SOA.minimum, SOA.record_ttl), or None if no SOA is found or parsing fails.
+/// This avoids a full `Message::from_bytes` parse for the common negative-response path.
+///
+/// 在 wire 层级从 authority 的 SOA 记录提取负缓存 TTL (RFC 2308 §5)。
+/// 返回 min(SOA.minimum, SOA.record_ttl)，无 SOA 或解析失败时返回 None。
+/// 避免对常见的否定响应路径进行完整的 `Message::from_bytes` 解析。
+///
+/// SAFETY: Reads raw DNS wire format. All bounds are checked. Returns None on any parse error.
+/// 安全性：读取原始 DNS wire 格式。所有边界均已检查。解析错误时返回 None。
+fn extract_soa_negative_ttl_wire(packet: &[u8], qd_count: u16, ns_count: u16) -> Option<u32> {
+    let packet_len = packet.len();
+    let mut pos = 12usize; // Start after header / 从 header 之后开始
+
+    // Skip Question section / 跳过 Question 部分
+    for _ in 0..qd_count {
+        pos = skip_dns_name_wire(packet, pos)?;
+        pos += 4; // QTYPE(2) + QCLASS(2)
+        if pos > packet_len {
+            return None;
+        }
+    }
+
+    // Walk Authority section looking for SOA (type 6) / 遍历 Authority 部分查找 SOA (type 6)
+    for _ in 0..ns_count {
+        pos = skip_dns_name_wire(packet, pos)?;
+        if pos + 10 > packet_len {
+            return None;
+        }
+        let rtype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
+        let ttl = u32::from_be_bytes([
+            packet[pos + 4],
+            packet[pos + 5],
+            packet[pos + 6],
+            packet[pos + 7],
+        ]);
+        let rdlength = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
+        pos += 10; // TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2)
+
+        if rtype == 6 {
+            // SOA record found — extract MINIMUM field from rdata
+            // SOA rdata: MNAME RNAME SERIAL(4) REFRESH(4) RETRY(4) EXPIRE(4) MINIMUM(4)
+            // SOA 记录 — 从 rdata 提取 MINIMUM 字段
+            let rdata_end = pos + rdlength;
+            if rdata_end > packet_len {
+                return None;
+            }
+            // Skip MNAME (domain name in rdata, may use compression pointers)
+            // 跳过 MNAME（rdata 中的域名，可能使用压缩指针）
+            let after_mname = skip_dns_name_wire(packet, pos)?;
+            // Skip RNAME (domain name in rdata)
+            // 跳过 RNAME（rdata 中的域名）
+            let after_rname = skip_dns_name_wire(packet, after_mname)?;
+            // 5 × u32 = 20 bytes: SERIAL, REFRESH, RETRY, EXPIRE, MINIMUM
+            let fixed_fields_start = after_rname;
+            if fixed_fields_start + 20 > rdata_end {
+                return None;
+            }
+            // MINIMUM is the last 4 bytes of the fixed fields
+            // MINIMUM 是固定字段的最后 4 字节
+            let minimum = u32::from_be_bytes([
+                packet[fixed_fields_start + 16],
+                packet[fixed_fields_start + 17],
+                packet[fixed_fields_start + 18],
+                packet[fixed_fields_start + 19],
+            ]);
+            // RFC 2308 §5: negative TTL = min(SOA.minimum, SOA.ttl)
+            return Some(minimum.min(ttl));
+        }
+
+        // Skip rdata for non-SOA records / 跳过非 SOA 记录的 rdata
+        pos += rdlength;
+    }
+
+    None
+}
+
+/// Skip a DNS name at the given position, following compression pointers.
+/// Returns the position after the name, or None on parse error.
+///
+/// 跳过指定位置的 DNS 名称，处理压缩指针。
+/// 返回名称之后的位置，解析错误时返回 None。
+#[inline]
+fn skip_dns_name_wire(packet: &[u8], mut pos: usize) -> Option<usize> {
+    let packet_len = packet.len();
+    loop {
+        if pos >= packet_len {
+            return None;
+        }
+        let len = packet[pos];
+        if len == 0 {
+            return Some(pos + 1);
+        }
+        if (len & 0xC0) == 0xC0 {
+            // Compression pointer: 2 bytes total / 压缩指针：共 2 字节
+            if pos + 2 > packet_len {
+                return None;
+            }
+            return Some(pos + 2);
+        }
+        // Regular label / 常规标签
+        let jump = 1 + len as usize;
+        if pos + jump > packet_len {
+            return None;
+        }
+        pos += jump;
+    }
+}
+
 pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     if packet.len() < 12 {
         return None;
@@ -396,10 +505,27 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     // 2. Counts / 计数
     let qd_count = u16::from_be_bytes([packet[4], packet[5]]);
     let an_count = u16::from_be_bytes([packet[6], packet[7]]);
+    let ns_count = u16::from_be_bytes([packet[8], packet[9]]);
     // We don't strictly need NS and AR counts for TTL, but we iterate through them if we want to be thorough. / 对于 TTL，我们并不严格需要 NS 和 AR 计数，但如果想彻底，可以遍历它们
     // For caching, we usually care about Answer section TTLs. / 对于缓存，我们通常关心 Answer 部分的 TTL
 
     if an_count == 0 {
+        // RFC 2308 §5: For negative responses (NXDOMAIN/NODATA), the negative
+        // cache TTL is min(SOA.minimum, SOA.ttl) from the authority section.
+        // If no SOA is present, return TTL=0 (must not be cached per RFC 2308 §4).
+        //
+        // RFC 2308 §5: 对于否定响应 (NXDOMAIN/NODATA)，负缓存 TTL 为 authority 中
+        // SOA 的 min(SOA.minimum, SOA.ttl)。无 SOA 时返回 TTL=0（按 RFC 2308 §4 不可缓存）。
+        if ns_count > 0 {
+            if let Some(neg_ttl) = extract_soa_negative_ttl_wire(packet, qd_count, ns_count) {
+                return Some(QuickResponse {
+                    rcode,
+                    min_ttl: neg_ttl,
+                    max_ttl: neg_ttl,
+                    truncated,
+                });
+            }
+        }
         return Some(QuickResponse {
             rcode,
             min_ttl: 0,
