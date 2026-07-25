@@ -1093,7 +1093,12 @@ impl Engine {
 
         // Build DNS query message
         // 构建 DNS 查询消息
+        // hickory-proto 0.26: Message::new() defaults RD=false (was true in 0.24).
+        // Upstream queries MUST set RD=true for recursive resolution.
+        // hickory-proto 0.26: Message::new() 默认 RD=false（0.24 中为 true）。
+        // 上游查询必须设置 RD=true 以获得递归解析。
         let mut msg = Message::new(tx_id, MessageType::Query, hickory_proto::op::OpCode::Query);
+        msg.metadata.recursion_desired = true;
 
         // Add question section
         // 添加问题部分
