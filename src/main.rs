@@ -489,7 +489,10 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
     // 尝试通过安全封装设置 SO_REUSEPORT_LB (FreeBSD) 或 SO_REUSEPORT (Linux)
     if let Err(e) = kixdns::socket_utils::set_reuseport_lb(&socket) {
         // Log warning if SO_REUSEPORT_LB fails / SO_REUSEPORT_LB 失败时记录警告
-        tracing::warn!("SO_REUSEPORT_LB failed: {}, falling back to plain SO_REUSEPORT", e);
+        tracing::warn!(
+            "SO_REUSEPORT_LB failed: {}, falling back to plain SO_REUSEPORT",
+            e
+        );
         if let Err(e2) = kixdns::socket_utils::set_reuseport(&socket, true) {
             tracing::warn!("SO_REUSEPORT also failed: {}", e2);
         }
