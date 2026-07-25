@@ -191,6 +191,9 @@ pub struct RuntimeRule {
     pub response_matcher_operator: MatchOperator,
     pub response_actions_on_match: Vec<Action>,
     pub response_actions_on_miss: Vec<Action>,
+    /// Pre-computed merge result for multiple Forward actions (None if <=1 Forward action).
+    /// 多个 Forward action 的预计算合并结果（<=1 个 Forward 时为 None）。
+    pub merged_forward: Option<config::MergedForward>,
 }
 
 #[derive(Debug, Clone)]
@@ -384,6 +387,7 @@ impl RuntimePipelineConfig {
                     response_matcher_operator: r.response_matcher_operator,
                     response_actions_on_match: r.response_actions_on_match,
                     response_actions_on_miss: r.response_actions_on_miss,
+                    merged_forward: r.merged_forward,
                 });
             }
 
@@ -586,6 +590,7 @@ impl RuntimePipelineConfig {
                     response_matcher_operator: rule.response_matcher_operator,
                     response_actions_on_match: rule.response_actions_on_match,
                     response_actions_on_miss: rule.response_actions_on_miss,
+                    merged_forward: rule.merged_forward,
                 })
             }
             None => None, // 未配置，将在 Engine::new 中使用默认规则

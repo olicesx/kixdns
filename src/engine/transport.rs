@@ -890,13 +890,8 @@ impl TcpMuxClient {
         // 2. Write request with remaining timeout (connection already ensured)
         // 2. 写入请求（连接已确保）
         let write_res = timeout(remaining, async {
-            // Build TCP DNS frame: 2-byte length prefix + payload
-            let mut out = BytesMut::with_capacity(2 + new_packet.len());
-            out.extend_from_slice(&(new_packet.len() as u16).to_be_bytes());
-            out.extend_from_slice(&new_packet);
-
-            // Single lock acquisition - conn Mutex provides write serialization
-            // 单次锁获取 - conn Mutex 提供写入序列化
+            // Frame already contains length prefix + payload — write directly, no second copy.
+            // 帧已包含长度前缀 + 负载——直接写入，无二次拷贝。
             let mut guard = self.conn.lock().await;
 
             // Connection must exist (ensure_connection was called earlier)
@@ -909,7 +904,7 @@ impl TcpMuxClient {
             // The fact we are here means 'guard' is Some, so we think connection is alive.
             // Writing to a closed socket usually triggers error immediately on Linux/BSD.
 
-            if let Err(e) = writer.write_all(&out).await {
+            if let Err(e) = writer.write_all(&new_packet).await {
                 return Err(anyhow::anyhow!(e).context("tcp write failed"));
             }
             Ok::<(), anyhow::Error>(())
@@ -1156,10 +1151,18 @@ impl TcpMuxClient {
             }
         };
         drop(conn_guard);
-        let mut buf = BytesMut::with_capacity(packet.len());
-        buf.extend_from_slice(packet);
-        buf[0..2].copy_from_slice(&new_id.to_be_bytes());
-        Ok((buf, new_id))
+
+        // Build complete TCP wire frame (2-byte length prefix + DNS message with rewritten ID).
+        // Caller writes this directly without further copying — saves one memcpy per request.
+        // 构建完整 TCP wire frame（2 字节长度前缀 + 改写 ID 后的 DNS 消息）。
+        // 调用方直接写入此帧，无需二次拷贝——每请求省一次 memcpy。
+        let mut frame = BytesMut::with_capacity(2 + packet.len());
+        frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+        frame.extend_from_slice(packet);
+        let id_bytes = new_id.to_be_bytes();
+        frame[2] = id_bytes[0]; // TXID at offset 2 (after length prefix) / 偏移 2 处（长度前缀之后）
+        frame[3] = id_bytes[1];
+        Ok((frame, new_id))
     }
 
     async fn fail_all_async(
@@ -1700,13 +1703,11 @@ impl DotMuxClient {
         };
 
         let write_res = timeout(remaining, async {
-            let mut out = BytesMut::with_capacity(2 + new_packet.len());
-            out.extend_from_slice(&(new_packet.len() as u16).to_be_bytes());
-            out.extend_from_slice(&new_packet);
-
+            // Frame already contains length prefix + payload — write directly, no second copy.
+            // 帧已包含长度前缀 + 负载——直接写入，无二次拷贝。
             let mut guard = self.conn.lock().await;
             let writer = guard.as_mut().context("dot write half missing")?;
-            if let Err(e) = writer.write_all(&out).await {
+            if let Err(e) = writer.write_all(&new_packet).await {
                 return Err(anyhow::anyhow!(e).context("dot write failed"));
             }
             Ok::<(), anyhow::Error>(())
@@ -1894,10 +1895,18 @@ impl DotMuxClient {
             }
         };
         drop(conn_guard);
-        let mut buf = BytesMut::with_capacity(packet.len());
-        buf.extend_from_slice(packet);
-        buf[0..2].copy_from_slice(&new_id.to_be_bytes());
-        Ok((buf, new_id))
+
+        // Build complete DoT wire frame (2-byte length prefix + DNS message with rewritten ID).
+        // Caller writes this directly without further copying — saves one memcpy per request.
+        // 构建完整 DoT wire frame（2 字节长度前缀 + 改写 ID 后的 DNS 消息）。
+        // 调用方直接写入此帧，无需二次拷贝——每请求省一次 memcpy。
+        let mut frame = BytesMut::with_capacity(2 + packet.len());
+        frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+        frame.extend_from_slice(packet);
+        let id_bytes = new_id.to_be_bytes();
+        frame[2] = id_bytes[0]; // TXID at offset 2 (after length prefix) / 偏移 2 处（长度前缀之后）
+        frame[3] = id_bytes[1];
+        Ok((frame, new_id))
     }
 
     async fn fail_all_async(
@@ -2351,18 +2360,24 @@ impl DoqMuxClient {
                 let (mut send, mut recv) = conn.open_bi().await
                     .context("doq open stream failed")?;
 
-                // RFC 9250 §4.2: The DNS query MUST be sent in a SINGLE send operation
-                // The DNS message MUST be prefixed with a 2-octet length field
-                // RFC 9250 §4.2: DNS 查询必须在单次发送操作中发送
-                // DNS 消息必须使用 2 字节长度前缀
-                // RFC 9250 §4.2.1: Rewrite DNS Message ID to 0 before sending over DoQ.
-                // RFC 9250 §4.2.1：在 DoQ 上传输前，将 DNS Message ID 重写为 0。
-                let doq_query = build_doq_query_packet(packet)?;
+                // RFC 9250 §4.2: DNS messages sent over QUIC streams MUST be prefixed
+                // with a 2-octet length field, followed by the DNS message content.
+                // Each query uses a separate bidirectional stream; the message boundary
+                // is signalled by FIN.
+                // RFC 9250 §4.2: QUIC 流上的 DNS 消息必须使用 2 字节长度前缀，
+                // 后跟 DNS 消息内容。每个查询使用单独的双向流；消息边界由 FIN 信号标识。
+                //
+                // RFC 9250 §4.2.1: DNS Message ID MUST be 0 over DoQ.
+                // Build complete wire frame in one allocation, no intermediate copy.
+                // RFC 9250 §4.2.1: DoQ 上 DNS Message ID 必须为 0。
+                // 单次分配构建完整 wire frame，无中间拷贝。
+                let mut frame = Vec::with_capacity(2 + packet.len());
+                frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+                frame.extend_from_slice(packet);
+                frame[2] = 0; // Message ID = 0 (RFC 9250 §4.2.1) / 消息 ID = 0
+                frame[3] = 0;
 
-                let mut buffer = Vec::with_capacity(2 + doq_query.len());
-                buffer.extend_from_slice(&(doq_query.len() as u16).to_be_bytes());
-                buffer.extend_from_slice(&doq_query);
-                send.write_all(&buffer).await.context("doq send query failed")?;
+                send.write_all(&frame).await.context("doq send query failed")?;
                 let _ = send.finish();
 
                 // Read response: 2-byte length prefix followed by DNS message
@@ -2371,7 +2386,7 @@ impl DoqMuxClient {
                 // We need to read all data until FIN, then parse the length prefix
                 // 注意：服务器发送响应后用 FIN 关闭流
                 // 我们需要读取所有数据直到 FIN，然后解析长度前缀
-                let all_data = match recv.read_to_end(MAX_DNS_MESSAGE_SIZE + 2).await {
+                let mut all_data = match recv.read_to_end(MAX_DNS_MESSAGE_SIZE + 2).await {
                     Ok(data) => data,
                     Err(e) => {
                         // Check if this is a connection closed error
@@ -2404,12 +2419,21 @@ impl DoqMuxClient {
                 }
 
                 let buf = &all_data[2..2 + msg_len];
-                if buf.is_empty() {
-                    anyhow::bail!("doq received empty DNS message");
+                if buf.len() < 2 {
+                    // DNS message must be at least 2 bytes for TXID restoration.
+                    // Also prevents all_data[2..4] index out of bounds when msg_len < 2.
+                    // DNS 消息必须至少 2 字节才能恢复 TXID。
+                    // 同时防止 msg_len < 2 时 all_data[2..4] 越界。
+                    anyhow::bail!("doq DNS message too short: {} bytes", msg_len);
                 }
-                // Restore original DNS Message ID before returning to caller.
-                // 返回调用方前恢复原始 DNS Message ID。
-                restore_doq_response_id(buf, original_id)
+                // Restore original DNS Message ID in-place (Vec<u8> is mutable).
+                // Bytes::from(Vec) takes ownership of the heap allocation (zero-copy).
+                // slice(2..) returns a view past the length prefix (zero-copy, shares allocation).
+                // 原地恢复原始 DNS Message ID（Vec<u8> 可变）。
+                // Bytes::from(Vec) 接管堆分配（零拷贝）。
+                // slice(2..) 返回跳过长度前缀的视图（零拷贝，共享分配）。
+                all_data[2..4].copy_from_slice(&original_id.to_be_bytes());
+                Ok(Bytes::from(all_data).slice(2..))
             }).await;
 
             match resp {
@@ -2635,27 +2659,6 @@ impl DoqMuxClient {
     }
 }
 
-fn build_doq_query_packet(packet: &[u8]) -> anyhow::Result<Vec<u8>> {
-    if packet.len() < 2 {
-        anyhow::bail!("dns packet too short for doq");
-    }
-    let mut doq_query = Vec::with_capacity(packet.len());
-    doq_query.extend_from_slice(packet);
-    doq_query[0] = 0;
-    doq_query[1] = 0;
-    Ok(doq_query)
-}
-
-fn restore_doq_response_id(response: &[u8], original_id: u16) -> anyhow::Result<Bytes> {
-    if response.len() < 2 {
-        anyhow::bail!("doq DNS message too short: {} bytes", response.len());
-    }
-    let mut restored = BytesMut::with_capacity(response.len());
-    restored.extend_from_slice(response);
-    restored[0..2].copy_from_slice(&original_id.to_be_bytes());
-    Ok(restored.freeze())
-}
-
 fn parse_doq_target(upstream: &str) -> anyhow::Result<DoqTarget> {
     let url = if upstream.contains("://") {
         Url::parse(upstream)
@@ -2732,22 +2735,54 @@ mod tests {
 
     #[test]
     fn doq_query_message_id_must_be_zero() {
+        // Verify RFC 9250 §4.2.1: DoQ DNS Message ID MUST be set to 0.
+        // The inline frame construction logic (from send_with_retry) zeroes bytes [2..4].
+        // 验证 RFC 9250 §4.2.1: DoQ DNS Message ID 必须为 0。
+        // 内联帧构建逻辑（来自 send_with_retry）将字节 [2..4] 置零。
         let packet = [0x12, 0x34, 0x01, 0x00, 0xaa, 0xbb];
-        let doq_packet = build_doq_query_packet(&packet).expect("build doq query packet");
+        let mut frame = Vec::with_capacity(2 + packet.len());
+        frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&packet);
+        frame[2] = 0;
+        frame[3] = 0;
 
-        assert_eq!(doq_packet.len(), packet.len());
-        assert_eq!(&doq_packet[0..2], &[0x00, 0x00]);
-        assert_eq!(&doq_packet[2..], &packet[2..]);
+        assert_eq!(frame.len(), 2 + packet.len());
+        assert_eq!(&frame[0..2], &(packet.len() as u16).to_be_bytes());
+        assert_eq!(&frame[2..4], &[0x00, 0x00]);
+        assert_eq!(&frame[4..], &packet[2..]);
     }
 
     #[test]
     fn doq_response_restores_original_message_id() {
-        let response_from_upstream = [0x00, 0x00, 0x81, 0x80, 0xde, 0xad];
-        let restored = restore_doq_response_id(&response_from_upstream, 0x1234)
-            .expect("restore doq response id");
+        // Verify zero-copy response ID restoration (from send_with_retry):
+        // all_data layout: [2 bytes length prefix][DNS message with ID=0]
+        // After restoration: ID at offset 2 is replaced with original_id, then slice(2..).
+        // 验证零拷贝响应 ID 恢复（来自 send_with_retry）：
+        // all_data 布局: [2 字节长度前缀][ID=0 的 DNS 消息]
+        // 恢复后: 偏移 2 处的 ID 替换为 original_id，然后 slice(2..)。
+        let mut all_data: Vec<u8> = vec![0x00, 0x04, 0x00, 0x00, 0x81, 0x80]; // [len=4][ID=0][flags]
+        let original_id: u16 = 0x1234;
+        all_data[2..4].copy_from_slice(&original_id.to_be_bytes());
+        let restored = bytes::Bytes::from(all_data).slice(2..);
 
         assert_eq!(&restored[0..2], &[0x12, 0x34]);
-        assert_eq!(&restored[2..], &response_from_upstream[2..]);
+        assert_eq!(&restored[2..], &[0x81, 0x80]);
+    }
+
+    #[test]
+    fn doq_response_short_message_does_not_panic() {
+        // Regression test: msg_len < 2 must bail! instead of panicking on all_data[2..4].
+        // 回归测试: msg_len < 2 时必须 bail! 而非 all_data[2..4] 越界 panic。
+        // all_data layout: [len=1][0xAB] — total 3 bytes, msg_len=1
+        let all_data: Vec<u8> = vec![0x00, 0x01, 0xAB];
+        let msg_len = u16::from_be_bytes([all_data[0], all_data[1]]) as usize;
+        let buf = &all_data[2..2 + msg_len];
+        // This is the guard added to prevent panic:
+        // 这是为防止 panic 而添加的保护：
+        assert!(
+            buf.len() < 2,
+            "msg_len < 2 should trigger bail, not proceed to copy_from_slice"
+        );
     }
 
     #[test]

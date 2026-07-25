@@ -7,7 +7,6 @@ use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::rdata::{A, AAAA, TXT};
 use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
 use smallvec::SmallVec;
-use tracing::info;
 
 use crate::config::{Action, Transport};
 use crate::engine::utils::parse_rcode;
@@ -181,7 +180,9 @@ impl Engine {
             }
         }
 
-        let upstream_default = state.pipeline.settings.default_upstream.clone();
+        // Borrow instead of clone: state lives for the entire function, no heap alloc
+        // 借用而非克隆：state 在整个函数生命周期内存活，零堆分配
+        let upstream_default = &state.pipeline.settings.default_upstream;
 
         // 2. Candidate Selection (compiled index if available)
         // SmallVec<[usize; 32]> avoids heap allocation for typical rule sets (<= 32 candidates)
@@ -257,173 +258,22 @@ impl Engine {
             );
 
             if req_match {
-                // 检查是否有多个 forward action / Check for multiple forward actions
-                let forward_actions: Vec<_> = rule
-                    .actions
-                    .iter()
-                    .filter_map(|a| match a {
-                        Action::Forward {
-                            upstream,
-                            transport,
-                            ecs: _,
-                            pre_split_upstreams,
-                        } => Some((upstream, transport, pre_split_upstreams.clone())),
-                        _ => None,
-                    })
-                    .collect();
-
-                if forward_actions.len() > 1 {
-                    // 多个 forward action：按 transport 类型分别合并，并去重 / Multiple forward actions: merge by transport type with deduplication
-                    // FxHashSet already imported at module level / 模块级已导入 FxHashSet
-
-                    let mut tcp_upstreams: FxHashSet<String> = FxHashSet::default();
-                    let mut udp_upstreams: FxHashSet<String> = FxHashSet::default();
-                    let mut doh_upstreams: FxHashSet<String> = FxHashSet::default();
-                    let mut dot_upstreams: FxHashSet<String> = FxHashSet::default();
-                    let mut doq_upstreams: FxHashSet<String> = FxHashSet::default();
-
-                    // 收集并按 transport 分组，同时去重
-                    for (upstream_opt, transport_opt, _pre_split) in forward_actions.iter() {
-                        if let Some(upstream) = upstream_opt {
-                            // 获取这个 action 的 transport
-                            let action_transport = transport_opt.unwrap_or(Transport::Udp);
-
-                            // 分割 upstream 字符串（可能包含逗号）
-                            for addr in upstream
-                                .split(',')
-                                .map(|s| s.trim())
-                                .filter(|s| !s.is_empty())
-                            {
-                                // 跳过已有协议前缀的地址
-                                if addr.contains("://") {
-                                    if addr.starts_with("tcp://") {
-                                        tcp_upstreams.insert(addr.to_string());
-                                    } else if addr.starts_with("udp://") {
-                                        udp_upstreams.insert(addr.to_string());
-                                    } else if addr.starts_with("tcp+udp://")
-                                        || addr.starts_with("udp+tcp://")
-                                    {
-                                        tcp_upstreams.insert(addr.to_string());
-                                        udp_upstreams.insert(addr.to_string());
-                                    } else if addr.starts_with("doh://")
-                                        || addr.starts_with("https://")
-                                    {
-                                        doh_upstreams.insert(addr.to_string());
-                                    } else if addr.starts_with("dot://")
-                                        || addr.starts_with("tls://")
-                                    {
-                                        dot_upstreams.insert(addr.to_string());
-                                    } else if addr.starts_with("doq://")
-                                        || addr.starts_with("quic://")
-                                    {
-                                        doq_upstreams.insert(addr.to_string());
-                                    }
-                                } else {
-                                    // 添加协议前缀
-                                    match action_transport {
-                                        Transport::Tcp => {
-                                            tcp_upstreams.insert(format!("tcp://{}", addr));
-                                        }
-                                        Transport::Udp => {
-                                            udp_upstreams.insert(format!("udp://{}", addr));
-                                        }
-                                        Transport::TcpUdp => {
-                                            // TcpUdp uses both transports, add to both sets
-                                            tcp_upstreams.insert(format!("tcp://{}", addr));
-                                            udp_upstreams.insert(format!("udp://{}", addr));
-                                        }
-                                        Transport::Doh => {
-                                            doh_upstreams.insert(format!("doh://{}", addr));
-                                        }
-                                        Transport::Dot => {
-                                            dot_upstreams.insert(format!("dot://{}", addr));
-                                        }
-                                        Transport::Doq => {
-                                            doq_upstreams.insert(format!("doq://{}", addr));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // 合并所有 upstream（保留协议前缀）
-                    let mut all_upstreams: Vec<std::sync::Arc<str>> = Vec::new();
-                    all_upstreams.extend(
-                        tcp_upstreams
-                            .iter()
-                            .map(|s| std::sync::Arc::from(s.as_str())),
-                    );
-                    all_upstreams.extend(
-                        udp_upstreams
-                            .iter()
-                            .map(|s| std::sync::Arc::from(s.as_str())),
-                    );
-                    all_upstreams.extend(
-                        doh_upstreams
-                            .iter()
-                            .map(|s| std::sync::Arc::from(s.as_str())),
-                    );
-                    all_upstreams.extend(
-                        dot_upstreams
-                            .iter()
-                            .map(|s| std::sync::Arc::from(s.as_str())),
-                    );
-                    all_upstreams.extend(
-                        doq_upstreams
-                            .iter()
-                            .map(|s| std::sync::Arc::from(s.as_str())),
-                    );
-
-                    if all_upstreams.is_empty() {
-                        // 所有 upstream 都为空，使用默认
-                        info!(
-                            event = "multiple_forward_actions",
-                            count = forward_actions.len(),
-                            "all forward actions have empty upstream, using default"
-                        );
-                    } else {
-                        info!(
-                            event = "multiple_forward_actions",
-                            count = forward_actions.len(),
-                            tcp_count = tcp_upstreams.len(),
-                            udp_count = udp_upstreams.len(),
-                            doh_count = doh_upstreams.len(),
-                            dot_count = dot_upstreams.len(),
-                            doq_count = doq_upstreams.len(),
-                            total_upstreams = all_upstreams.len(),
-                            tcp_upstreams = ?tcp_upstreams,
-                            udp_upstreams = ?udp_upstreams,
-                            doh_upstreams = ?doh_upstreams,
-                            dot_upstreams = ?dot_upstreams,
-                            doq_upstreams = ?doq_upstreams,
-                            "merged multiple forward actions with transport-specific deduplication"
-                        );
-                    }
-
-                    let merged_str = if all_upstreams.is_empty() {
-                        String::new()
-                    } else {
-                        all_upstreams.join(",")
-                    };
-
+                // Check for multiple Forward actions using pre-computed merge result.
+                // The merge was computed at config load time (Rule::compute_merged_forward),
+                // eliminating per-request FxHashSet + format! + join overhead.
+                // 使用配置加载时预计算的合并结果检查多 Forward action。
+                // 合并在配置加载时计算（Rule::compute_merged_forward），
+                // 消除每请求的 FxHashSet + format! + join 开销。
+                if let Some(merged) = &rule.merged_forward {
                     let d = Decision::Forward {
-                        upstream: Arc::from(if merged_str.is_empty() {
-                            ""
-                        } else {
-                            merged_str.as_str()
-                        }),
-                        pre_split_upstreams: if all_upstreams.is_empty() {
-                            None
-                        } else {
-                            Some(std::sync::Arc::new(all_upstreams))
-                        },
+                        upstream: merged.upstream_str.clone(),
+                        pre_split_upstreams: Some(merged.upstream_list.clone()),
                         response_matchers: rule.response_matchers.clone(),
                         response_matcher_operator: rule.response_matcher_operator,
                         response_actions_on_match: rule.response_actions_on_match.clone(),
                         response_actions_on_miss: rule.response_actions_on_miss.clone(),
                         rule_name: rule.name.clone(),
-                        transport: None, // 让每个 upstream 自己决定 transport / Let each upstream decide its own transport
+                        transport: None, // Each upstream decides its own transport / 每个 upstream 自行决定 transport
                         ecs: None,
                         continue_on_match: false,
                         continue_on_miss: false,
@@ -442,7 +292,8 @@ impl Engine {
                     return d;
                 }
 
-                // 单个 forward 或其他 action：按原逻辑处理 / Single forward or other actions: use original logic
+                // Single Forward or other actions: use original logic
+                // 单个 Forward 或其他 action：按原逻辑处理
                 for action in &rule.actions {
                     match action {
                         Action::StaticResponse { rcode } => {

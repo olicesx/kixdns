@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -316,6 +317,20 @@ pub struct Pipeline {
     pub ecs: Option<EcsMode>,
 }
 
+/// Pre-computed merged upstream list for rules with multiple Forward actions.
+/// Computed at config load time to avoid per-request allocation of 5 FxHashSets + format!/join.
+/// 多 Forward action 规则的预计算合并上游列表。
+/// 在配置加载时计算，避免每请求分配 5 个 FxHashSet + format!/join。
+#[derive(Debug, Clone)]
+pub struct MergedForward {
+    /// Comma-joined upstream string (for Decision::Forward.upstream)
+    /// 逗号连接的上游字符串（用于 Decision::Forward.upstream）
+    pub upstream_str: Arc<str>,
+    /// Pre-split upstream list with transport prefixes (for Decision::Forward.pre_split_upstreams)
+    /// 预分割的带协议前缀的上游列表（用于 Decision::Forward.pre_split_upstreams）
+    pub upstream_list: Arc<Vec<Arc<str>>>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Rule {
     pub name: String,
@@ -336,6 +351,12 @@ pub struct Rule {
     /// 响应匹配失败后执行的动作序列。 / Action sequence to execute after failed response matching
     #[serde(default)]
     pub response_actions_on_miss: Vec<Action>,
+    /// Pre-computed merge result for multiple Forward actions (None if <=1 Forward action).
+    /// Computed at load time to eliminate per-request FxHashSet + format! + join overhead.
+    /// 多个 Forward action 的预计算合并结果（<=1 个 Forward 时为 None）。
+    /// 在加载时计算以消除每请求的 FxHashSet + format! + join 开销。
+    #[serde(skip)]
+    pub merged_forward: Option<MergedForward>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -554,6 +575,124 @@ impl Action {
     }
 }
 
+/// Rule helper functions / Rule 辅助函数
+impl Rule {
+    /// Pre-compute merged upstream list for rules with multiple Forward actions.
+    /// Extracts the transport-aware merge logic from the runtime hot path into a one-time
+    /// computation at config load, eliminating per-request FxHashSet + format! + join overhead.
+    /// 预计算多 Forward action 规则的合并上游列表。
+    /// 将传输层感知的合并逻辑从运行时热路径提取到配置加载时的一次性计算，
+    /// 消除每请求的 FxHashSet + format! + join 开销。
+    #[inline]
+    pub fn compute_merged_forward(&mut self) {
+        use rustc_hash::FxHashSet;
+
+        let forward_count = self
+            .actions
+            .iter()
+            .filter(|a| matches!(a, Action::Forward { .. }))
+            .count();
+
+        if forward_count <= 1 {
+            return;
+        }
+
+        let mut tcp_upstreams: FxHashSet<String> = FxHashSet::default();
+        let mut udp_upstreams: FxHashSet<String> = FxHashSet::default();
+        let mut doh_upstreams: FxHashSet<String> = FxHashSet::default();
+        let mut dot_upstreams: FxHashSet<String> = FxHashSet::default();
+        let mut doq_upstreams: FxHashSet<String> = FxHashSet::default();
+
+        for action in &self.actions {
+            if let Action::Forward {
+                upstream: Some(upstream),
+                transport,
+                ..
+            } = action
+            {
+                let action_transport = transport.unwrap_or(Transport::Udp);
+                for addr in upstream.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                    if addr.contains("://") {
+                        if addr.starts_with("tcp://") {
+                            tcp_upstreams.insert(addr.to_string());
+                        } else if addr.starts_with("udp://") {
+                            udp_upstreams.insert(addr.to_string());
+                        } else if addr.starts_with("tcp+udp://") || addr.starts_with("udp+tcp://") {
+                            tcp_upstreams.insert(addr.to_string());
+                            udp_upstreams.insert(addr.to_string());
+                        } else if addr.starts_with("doh://") || addr.starts_with("https://") {
+                            doh_upstreams.insert(addr.to_string());
+                        } else if addr.starts_with("dot://") || addr.starts_with("tls://") {
+                            dot_upstreams.insert(addr.to_string());
+                        } else if addr.starts_with("doq://") || addr.starts_with("quic://") {
+                            doq_upstreams.insert(addr.to_string());
+                        }
+                    } else {
+                        match action_transport {
+                            Transport::Tcp => {
+                                tcp_upstreams.insert(format!("tcp://{}", addr));
+                            }
+                            Transport::Udp => {
+                                udp_upstreams.insert(format!("udp://{}", addr));
+                            }
+                            Transport::TcpUdp => {
+                                tcp_upstreams.insert(format!("tcp://{}", addr));
+                                udp_upstreams.insert(format!("udp://{}", addr));
+                            }
+                            Transport::Doh => {
+                                doh_upstreams.insert(format!("doh://{}", addr));
+                            }
+                            Transport::Dot => {
+                                dot_upstreams.insert(format!("dot://{}", addr));
+                            }
+                            Transport::Doq => {
+                                doq_upstreams.insert(format!("doq://{}", addr));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut all_upstreams: Vec<std::sync::Arc<str>> = Vec::new();
+        all_upstreams.extend(tcp_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
+        all_upstreams.extend(udp_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
+        all_upstreams.extend(doh_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
+        all_upstreams.extend(dot_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
+        all_upstreams.extend(doq_upstreams.iter().map(|s| std::sync::Arc::from(s.as_str())));
+
+        if all_upstreams.is_empty() {
+            tracing::info!(
+                rule = %self.name,
+                forward_count,
+                "all forward actions have empty upstream, merged_forward not set"
+            );
+            self.merged_forward = None;
+        } else {
+            tracing::info!(
+                rule = %self.name,
+                forward_count,
+                tcp_count = tcp_upstreams.len(),
+                udp_count = udp_upstreams.len(),
+                doh_count = doh_upstreams.len(),
+                dot_count = dot_upstreams.len(),
+                doq_count = doq_upstreams.len(),
+                total_upstreams = all_upstreams.len(),
+                "pre-computed merged forward actions with transport-specific deduplication"
+            );
+            let merged_str: String = all_upstreams
+                .iter()
+                .map(|s| s.as_ref())
+                .collect::<Vec<_>>()
+                .join(",");
+            self.merged_forward = Some(MergedForward {
+                upstream_str: Arc::from(merged_str.as_str()),
+                upstream_list: Arc::new(all_upstreams),
+            });
+        }
+    }
+}
+
 impl GlobalSettings {
     /// 预分割默认 upstream 字符串以优化性能（在配置加载时调用）/ Pre-split default upstream string for performance (call during config loading)
     #[inline]
@@ -661,6 +800,11 @@ pub fn load_config(path: &Path) -> Result<PipelineConfig> {
             for action in &mut rule.actions {
                 action.pre_split_upstreams();
             }
+            // Pre-compute merged Forward upstreams for multi-Forward rules (performance optimization).
+            // Eliminates per-request FxHashSet + format! + join overhead on the hot path.
+            // 预计算多 Forward 规则的合并上游（性能优化）。
+            // 消除热路径上每请求的 FxHashSet + format! + join 开销。
+            rule.compute_merged_forward();
             for matcher in &rule.matchers {
                 if let Matcher::ClientIp { cidr } = &matcher.matcher {
                     let _parsed: IpNet = cidr.parse()?;
