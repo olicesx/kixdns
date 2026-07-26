@@ -22,7 +22,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
-use crate::engine::{Engine, FastPathResponse};
+use crate::engine::{Engine, FastPathResponse, PreParsedData};
 use crate::proto_utils;
 
 const MAX_DNS_MESSAGE: usize = 64 * 1024;
@@ -188,13 +188,15 @@ async fn process_dns_wire(packet: &[u8], peer: SocketAddr, engine: &Engine) -> B
                     packet,
                     peer,
                     false,
-                    qname,
-                    qtype,
-                    qclass,
-                    tx_id,
-                    edns_present,
-                    pipeline_id,
-                    ecs_key,
+                    PreParsedData::new(
+                        qname,
+                        qtype,
+                        qclass,
+                        tx_id,
+                        edns_present,
+                        pipeline_id,
+                        ecs_key,
+                    ),
                 ),
             )
             .await
@@ -319,7 +321,7 @@ mod tests {
             0x00, 0x01, // QTYPE = A
             0x00, 0x01, // QCLASS = IN
         ];
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&dns_wire);
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(dns_wire);
         let query = format!("dns={encoded}");
         let result = extract_get_dns_param(&query);
         assert!(result.is_some(), "should decode valid base64url");
@@ -341,7 +343,7 @@ mod tests {
     #[test]
     fn test_extract_get_dns_param_multiple_params() {
         let dns_wire = [0x00; 12];
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&dns_wire);
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(dns_wire);
         // dns= should be found among multiple params
         let query = format!("foo=bar&dns={encoded}&baz=qux");
         let result = extract_get_dns_param(&query);
@@ -358,7 +360,7 @@ mod tests {
     fn test_extract_get_dns_param_standard_base64url_no_pad() {
         // RFC 8484 uses base64url without padding
         let dns_wire = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x12];
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&dns_wire);
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(dns_wire);
         let result = extract_get_dns_param(&format!("dns={encoded}"));
         assert!(result.is_some());
     }

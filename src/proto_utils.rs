@@ -516,15 +516,15 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
         //
         // RFC 2308 §5: 对于否定响应 (NXDOMAIN/NODATA)，负缓存 TTL 为 authority 中
         // SOA 的 min(SOA.minimum, SOA.ttl)。无 SOA 时返回 TTL=0（按 RFC 2308 §4 不可缓存）。
-        if ns_count > 0 {
-            if let Some(neg_ttl) = extract_soa_negative_ttl_wire(packet, qd_count, ns_count) {
-                return Some(QuickResponse {
-                    rcode,
-                    min_ttl: neg_ttl,
-                    max_ttl: neg_ttl,
-                    truncated,
-                });
-            }
+        if ns_count > 0
+            && let Some(neg_ttl) = extract_soa_negative_ttl_wire(packet, qd_count, ns_count)
+        {
+            return Some(QuickResponse {
+                rcode,
+                min_ttl: neg_ttl,
+                max_ttl: neg_ttl,
+                truncated,
+            });
         }
         return Some(QuickResponse {
             rcode,

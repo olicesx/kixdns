@@ -14,7 +14,9 @@ use crate::lock::RwLock;
 use crate::matcher::advanced_rule::CompiledPipeline;
 use crate::matcher::geoip::GeoIpManager;
 use crate::matcher::geosite::GeoSiteManager;
-use crate::matcher::{RuntimePipeline, RuntimePipelineConfig, eval_match_chain};
+use crate::matcher::{
+    PipelineSelectorQuery, RuntimePipeline, RuntimePipelineConfig, eval_match_chain,
+};
 
 use super::core::Engine;
 use super::matcher_adapter::{MatcherContext, matcher_matches};
@@ -22,17 +24,30 @@ use super::rules::Decision;
 use super::rules::{RuleCacheEntry, calculate_rule_hash, contains_continue, fast_hash_str};
 use super::types::EngineInner;
 
+/// Request and manager references required to select a runtime pipeline.
+pub struct PipelineSelectionContext<'a> {
+    pub qname: &'a str,
+    pub client_ip: IpAddr,
+    pub qclass: DNSClass,
+    pub edns_present: bool,
+    pub qtype: RecordType,
+    pub listener_label: &'a str,
+    pub geosite_manager: Option<&'a Arc<RwLock<GeoSiteManager>>>,
+    pub geoip_manager: Option<&'a Arc<RwLock<GeoIpManager>>>,
+}
+
 pub fn select_pipeline<'a>(
     cfg: &'a RuntimePipelineConfig,
-    qname: &str,
-    client_ip: IpAddr,
-    qclass: DNSClass,
-    edns_present: bool,
-    qtype: RecordType,
-    listener_label: &str,
-    geosite_manager: Option<&Arc<RwLock<GeoSiteManager>>>,
-    geoip_manager: Option<&Arc<RwLock<GeoIpManager>>>,
+    request: &PipelineSelectionContext<'_>,
 ) -> (Option<&'a RuntimePipeline>, Arc<str>) {
+    let qname = request.qname;
+    let client_ip = request.client_ip;
+    let qclass = request.qclass;
+    let edns_present = request.edns_present;
+    let qtype = request.qtype;
+    let listener_label = request.listener_label;
+    let geosite_manager = request.geosite_manager;
+    let geoip_manager = request.geoip_manager;
     // Optimization: only acquire geosite/geoip read locks if at least one matcher
     // actually needs them. For the common case (Any/ListenerLabel/Qtype matchers),
     // this avoids two parking_lot RwLock read acquisitions per cache-hit query,
@@ -62,35 +77,66 @@ pub fn select_pipeline<'a>(
     };
     let geosite_ref = geosite_guard.as_deref();
     let geoip_ref = geoip_guard.as_deref();
+    let selector_query = PipelineSelectorQuery {
+        listener_label,
+        client_ip,
+        qname,
+        qclass,
+        edns_present,
+        qtype,
+    };
 
     for rule in &cfg.pipeline_select {
         let matched = eval_match_chain(
             &rule.matchers,
             |m| m.operator,
             |m| {
-                m.matcher.matches_with_ready_managers(
-                    listener_label,
-                    client_ip,
-                    qname,
-                    qclass,
-                    edns_present,
-                    qtype,
-                    geoip_ref,
-                    geosite_ref,
-                )
+                m.matcher
+                    .matches_with_ready_managers(&selector_query, geoip_ref, geosite_ref)
             },
         );
-        if matched {
-            if let Some(&idx) = cfg.pipeline_id_index.get(rule.pipeline.as_str()) {
-                let p = &cfg.pipelines[idx];
-                return (Some(p), p.id.clone());
-            }
+        if matched && let Some(&idx) = cfg.pipeline_id_index.get(rule.pipeline.as_str()) {
+            let p = &cfg.pipelines[idx];
+            return (Some(p), p.id.clone());
         }
     }
 
     match cfg.pipelines.first() {
         Some(p) => (Some(p), p.id.clone()),
         None => (None, Arc::from("default")),
+    }
+}
+
+/// Immutable request state shared across rule evaluation and rule-cache insertion.
+pub struct RuleEvaluationContext<'a> {
+    pub client_ip: IpAddr,
+    pub qname: &'a str,
+    pub qtype: RecordType,
+    pub qclass: DNSClass,
+    pub edns_present: bool,
+    pub skip_rules: Option<&'a FxHashSet<Arc<str>>>,
+    pub skip_cache: bool,
+}
+
+impl<'a> RuleEvaluationContext<'a> {
+    pub fn new(
+        client_ip: IpAddr,
+        qname: &'a str,
+        qtype: RecordType,
+        qclass: DNSClass,
+        edns_present: bool,
+        skip_rules: Option<&'a FxHashSet<Arc<str>>>,
+        skip_cache: bool,
+    ) -> Self {
+        Self {
+            client_ip,
+            qname,
+            qtype,
+            qclass,
+            edns_present,
+            skip_rules,
+            skip_cache,
+        }
     }
 }
 
@@ -110,13 +156,17 @@ impl Engine {
         &self,
         hash: u64,
         pipeline_id: Arc<str>,
-        qname: &str,
-        qtype: RecordType,
-        qclass: DNSClass,
-        client_ip: IpAddr,
+        request: &RuleEvaluationContext<'_>,
         decision: Decision,
         include_ip: bool,
     ) {
+        let RuleEvaluationContext {
+            client_ip,
+            qname,
+            qtype,
+            qclass,
+            ..
+        } = *request;
         let state = self.state.load();
         let ttl = match &decision {
             Decision::Static { answers, .. } => {
@@ -148,10 +198,10 @@ impl Engine {
         };
 
         // If TTL is 0, do not cache / 如果 TTL 为 0，则不缓存
-        if let Some(d) = ttl {
-            if d.as_secs() == 0 {
-                return;
-            }
+        if let Some(d) = ttl
+            && d.as_secs() == 0
+        {
+            return;
         }
 
         let expires_at = ttl.map(|d| Instant::now() + d);
@@ -176,14 +226,17 @@ impl Engine {
         &self,
         state: &EngineInner,
         pipeline: &RuntimePipeline,
-        client_ip: IpAddr,
-        qname: &str,
-        qtype: RecordType,
-        qclass: DNSClass,
-        edns_present: bool,
-        skip_rules: Option<&FxHashSet<Arc<str>>>,
-        skip_cache: bool,
+        request: &RuleEvaluationContext<'_>,
     ) -> Decision {
+        let RuleEvaluationContext {
+            client_ip,
+            qname,
+            qtype,
+            qclass,
+            edns_present,
+            skip_rules,
+            skip_cache,
+        } = *request;
         // 1. Check Rule Cache
         // Use hash for lookup to avoid cloning String for key on every lookup
         let include_ip = pipeline.uses_client_ip || self.cache_background_refresh;
@@ -191,15 +244,13 @@ impl Engine {
             calculate_rule_hash(&pipeline.id, qname, qtype, qclass, client_ip, include_ip);
         let allow_rule_cache_lookup = !skip_cache && skip_rules.is_none_or(|set| set.is_empty());
 
-        if allow_rule_cache_lookup {
-            if let Some(entry) = self.rule_cache.get(&rule_hash) {
-                // Check validity and clean up if expired
-                // 检查有效性，如果过期则清理
-                if !entry.is_valid() {
-                    self.rule_cache.remove(&rule_hash);
-                } else if entry.matches(&pipeline.id, qname, qtype, qclass, client_ip, include_ip) {
-                    return (*entry.decision).clone();
-                }
+        if allow_rule_cache_lookup && let Some(entry) = self.rule_cache.get(&rule_hash) {
+            // Check validity and clean up if expired
+            // 检查有效性，如果过期则清理
+            if !entry.is_valid() {
+                self.rule_cache.remove(&rule_hash);
+            } else if entry.matches(&pipeline.id, qname, qtype, qclass, client_ip, include_ip) {
+                return (*entry.decision).clone();
             }
         }
 
@@ -305,10 +356,7 @@ impl Engine {
                     self.insert_rule_cache(
                         rule_hash,
                         pipeline.id.clone(),
-                        qname,
-                        qtype,
-                        qclass,
-                        client_ip,
+                        request,
                         d.clone(),
                         include_ip,
                     );
@@ -328,39 +376,33 @@ impl Engine {
                             self.insert_rule_cache(
                                 rule_hash,
                                 pipeline.id.clone(),
-                                qname,
-                                qtype,
-                                qclass,
-                                client_ip,
+                                request,
                                 d.clone(),
                                 include_ip,
                             );
                             return d;
                         }
                         Action::StaticIpResponse { ip } => {
-                            if let Ok(ip_addr) = ip.parse::<IpAddr>() {
-                                if let Ok(name) = std::str::FromStr::from_str(qname) {
-                                    let rdata = match ip_addr {
-                                        IpAddr::V4(v4) => RData::A(A(v4)),
-                                        IpAddr::V6(v6) => RData::AAAA(AAAA(v6)),
-                                    };
-                                    let record = Record::from_rdata(name, 300, rdata);
-                                    let d = Decision::Static {
-                                        rcode: ResponseCode::NoError,
-                                        answers: vec![record],
-                                    };
-                                    self.insert_rule_cache(
-                                        rule_hash,
-                                        pipeline.id.clone(),
-                                        qname,
-                                        qtype,
-                                        qclass,
-                                        client_ip,
-                                        d.clone(),
-                                        include_ip,
-                                    );
-                                    return d;
-                                }
+                            if let Ok(ip_addr) = ip.parse::<IpAddr>()
+                                && let Ok(name) = std::str::FromStr::from_str(qname)
+                            {
+                                let rdata = match ip_addr {
+                                    IpAddr::V4(v4) => RData::A(A(v4)),
+                                    IpAddr::V6(v6) => RData::AAAA(AAAA(v6)),
+                                };
+                                let record = Record::from_rdata(name, 300, rdata);
+                                let d = Decision::Static {
+                                    rcode: ResponseCode::NoError,
+                                    answers: vec![record],
+                                };
+                                self.insert_rule_cache(
+                                    rule_hash,
+                                    pipeline.id.clone(),
+                                    request,
+                                    d.clone(),
+                                    include_ip,
+                                );
+                                return d;
                             }
                             let d = Decision::Static {
                                 rcode: ResponseCode::ServFail,
@@ -369,10 +411,7 @@ impl Engine {
                             self.insert_rule_cache(
                                 rule_hash,
                                 pipeline.id.clone(),
-                                qname,
-                                qtype,
-                                qclass,
-                                client_ip,
+                                request,
                                 d.clone(),
                                 include_ip,
                             );
@@ -385,10 +424,7 @@ impl Engine {
                             self.insert_rule_cache(
                                 rule_hash,
                                 pipeline.id.clone(),
-                                qname,
-                                qtype,
-                                qclass,
-                                client_ip,
+                                request,
                                 d.clone(),
                                 include_ip,
                             );
@@ -412,10 +448,7 @@ impl Engine {
                             self.insert_rule_cache(
                                 rule_hash,
                                 pipeline.id.clone(),
-                                qname,
-                                qtype,
-                                qclass,
-                                client_ip,
+                                request,
                                 d.clone(),
                                 include_ip,
                             );
@@ -429,10 +462,7 @@ impl Engine {
                             self.insert_rule_cache(
                                 rule_hash,
                                 pipeline.id.clone(),
-                                qname,
-                                qtype,
-                                qclass,
-                                client_ip,
+                                request,
                                 d.clone(),
                                 include_ip,
                             );
@@ -469,10 +499,7 @@ impl Engine {
                             self.insert_rule_cache(
                                 rule_hash,
                                 pipeline.id.clone(),
-                                qname,
-                                qtype,
-                                qclass,
-                                client_ip,
+                                request,
                                 d.clone(),
                                 include_ip,
                             );
@@ -498,10 +525,7 @@ impl Engine {
                                 self.insert_rule_cache(
                                     rule_hash,
                                     pipeline.id.clone(),
-                                    qname,
-                                    qtype,
-                                    qclass,
-                                    client_ip,
+                                    request,
                                     d.clone(),
                                     include_ip,
                                 );
@@ -514,10 +538,7 @@ impl Engine {
                             self.insert_rule_cache(
                                 rule_hash,
                                 pipeline.id.clone(),
-                                qname,
-                                qtype,
-                                qclass,
-                                client_ip,
+                                request,
                                 d.clone(),
                                 include_ip,
                             );
@@ -551,10 +572,7 @@ impl Engine {
         self.insert_rule_cache(
             rule_hash,
             pipeline.id.clone(),
-            qname,
-            qtype,
-            qclass,
-            client_ip,
+            request,
             d.clone(),
             include_ip,
         );

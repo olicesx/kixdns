@@ -484,11 +484,12 @@ async fn forward_udp_smart(
         match engine.udp_client.send(packet, upstream, *dur).await {
             Ok(bytes) => {
                 // RFC 1035: Check TC (Truncated) flag using quick parse - 使用快速解析检查 TC 标志
-                if let Some(qr) = crate::proto_utils::parse_response_quick(&bytes) {
-                    if qr.truncated && enable_tcp_fallback {
-                        debug!(event = "tc_flag_fallback", upstream = %upstream, "udp response truncated, retrying with tcp");
-                        return engine.tcp_mux.send(packet, upstream, timeout_dur).await;
-                    }
+                if let Some(qr) = crate::proto_utils::parse_response_quick(&bytes)
+                    && qr.truncated
+                    && enable_tcp_fallback
+                {
+                    debug!(event = "tc_flag_fallback", upstream = %upstream, "udp response truncated, retrying with tcp");
+                    return engine.tcp_mux.send(packet, upstream, timeout_dur).await;
                 }
                 return Ok(bytes);
             }
@@ -501,12 +502,10 @@ async fn forward_udp_smart(
                     error = %err,
                     "udp forward attempt failed",
                 );
-                if idx + 1 == attempts.len() {
-                    if enable_tcp_fallback {
-                        // Last UDP attempt, try TCP fallback before failing.
-                        debug!(event = "udp_forward_fallback_tcp", upstream = %upstream, "falling back to tcp");
-                        return engine.tcp_mux.send(packet, upstream, timeout_dur).await;
-                    }
+                if idx + 1 == attempts.len() && enable_tcp_fallback {
+                    // Last UDP attempt, try TCP fallback before failing.
+                    debug!(event = "udp_forward_fallback_tcp", upstream = %upstream, "falling back to tcp");
+                    return engine.tcp_mux.send(packet, upstream, timeout_dur).await;
                 }
             }
         }
@@ -666,11 +665,13 @@ mod tests {
     }
 
     fn build_test_engine(enable_tcp_fallback: bool) -> Engine {
-        let mut settings = GlobalSettings::default();
-        settings.default_upstream = "127.0.0.1:0".to_string();
-        settings.enable_tcp_fallback = enable_tcp_fallback;
-        settings.udp_pool_size = 1;
-        settings.tcp_pool_size = 1;
+        let settings = GlobalSettings {
+            default_upstream: "127.0.0.1:0".to_string(),
+            enable_tcp_fallback,
+            udp_pool_size: 1,
+            tcp_pool_size: 1,
+            ..GlobalSettings::default()
+        };
         let runtime = RuntimePipelineConfig {
             settings,
             pipeline_select: Vec::new(),

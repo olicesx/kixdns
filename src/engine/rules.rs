@@ -15,6 +15,7 @@ use crate::cache::CacheEntry;
 use crate::config::{Action, Transport};
 use crate::engine::core::Engine;
 use crate::engine::matcher_adapter::log_match;
+use crate::engine::pipeline::RuleEvaluationContext;
 use crate::engine::response::{
     extract_ttl, extract_ttl_for_refresh, make_static_ip_answer, make_static_txt_answer,
 };
@@ -152,10 +153,10 @@ impl RuleCacheEntry {
         uses_client_ip: bool,
     ) -> bool {
         // Check expiration first / 首先检查过期
-        if let Some(expires) = self.expires_at {
-            if Instant::now() > expires {
-                return false;
-            }
+        if let Some(expires) = self.expires_at
+            && Instant::now() > expires
+        {
+            return false;
         }
 
         if self.qtype != u16::from(qtype) || self.qclass != u16::from(qclass) {
@@ -493,23 +494,41 @@ pub(crate) async fn apply_response_actions(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct ResponseJumpContext<'a> {
+    pub state: &'a EngineInner,
+    pub pipeline_id: Arc<str>,
+    pub remaining_jumps: usize,
+    pub req: &'a Message,
+    pub packet: &'a [u8],
+    pub peer: SocketAddr,
+    pub qname: &'a str,
+    pub qtype: RecordType,
+    pub qclass: DNSClass,
+    pub edns_present: bool,
+    pub min_ttl: Duration,
+    pub upstream_timeout: Duration,
+    pub skip_cache: bool,
+}
+
 pub(crate) async fn process_response_jump(
     engine: &Engine,
-    state: &EngineInner,
-    mut pipeline_id: Arc<str>,
-    mut remaining_jumps: usize,
-    req: &Message,
-    packet: &[u8],
-    peer: SocketAddr,
-    qname: &str,
-    qtype: RecordType,
-    qclass: DNSClass,
-    edns_present: bool,
-    min_ttl: Duration,
-    upstream_timeout: Duration,
-    skip_cache: bool,
+    context: ResponseJumpContext<'_>,
 ) -> anyhow::Result<Bytes> {
+    let ResponseJumpContext {
+        state,
+        mut pipeline_id,
+        mut remaining_jumps,
+        req,
+        packet,
+        peer,
+        qname,
+        qtype,
+        qclass,
+        edns_present,
+        min_ttl,
+        upstream_timeout,
+        skip_cache,
+    } = context;
     let cfg = &state.pipeline;
     struct InflightCleanupGuard {
         inflight: Arc<InflightMap>,
@@ -579,17 +598,19 @@ pub(crate) async fn process_response_jump(
         let mut decision = engine.apply_rules(
             state,
             pipeline,
-            peer.ip(),
-            qname,
-            qtype,
-            qclass,
-            edns_present,
-            if skip_rules.is_empty() {
-                None
-            } else {
-                Some(&skip_rules)
-            },
-            skip_cache,
+            &RuleEvaluationContext::new(
+                peer.ip(),
+                qname,
+                qtype,
+                qclass,
+                edns_present,
+                if skip_rules.is_empty() {
+                    None
+                } else {
+                    Some(&skip_rules)
+                },
+                skip_cache,
+            ),
         );
 
         // Resolve nested rule-level jumps first
@@ -621,13 +642,15 @@ pub(crate) async fn process_response_jump(
                     decision = engine.apply_rules(
                         state,
                         next_pipeline,
-                        peer.ip(),
-                        qname,
-                        qtype,
-                        qclass,
-                        edns_present,
-                        None,
-                        skip_cache,
+                        &RuleEvaluationContext::new(
+                            peer.ip(),
+                            qname,
+                            qtype,
+                            qclass,
+                            edns_present,
+                            None,
+                            skip_cache,
+                        ),
                     );
                     continue;
                 } else {

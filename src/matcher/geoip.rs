@@ -323,6 +323,7 @@ impl GeoIpManager {
     /// - Header: 4 bytes magic (0x0D 0x0A 0x0D 0x0A)
     /// - Index section: country_code_count (2 bytes) + entries
     /// - Data section: IP ranges for each country
+    ///
     /// 从 V2Ray .dat 文件加载 GeoIP 数据
     ///
     /// V2Ray .dat 文件使用 protobuf 编码，包含国家代码和 IP 范围

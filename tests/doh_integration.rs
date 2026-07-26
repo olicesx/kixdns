@@ -359,12 +359,12 @@ async fn test_doh_concurrent_requests() {
     let urls: Vec<_> = (0..10u16)
         .map(|i| {
             let query = make_dns_query(&format!("r{i}.example.com"), i);
-            let req = client
+
+            client
                 .post(doh_url(server.port))
                 .header("content-type", "application/dns-message")
                 .body(query)
-                .send();
-            req
+                .send()
         })
         .collect();
 

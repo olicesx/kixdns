@@ -34,6 +34,29 @@ impl CacheEntry {
         }
     }
 
+    /// Build a cache entry from a DNS response and its cache/refresh TTLs.
+    pub fn from_response(
+        bytes: Bytes,
+        rcode: ResponseCode,
+        upstream: Option<Arc<str>>,
+        qname: &str,
+        pipeline_id: Arc<str>,
+        qtype: u16,
+        ttls: (u32, u32),
+    ) -> Self {
+        Self {
+            bytes,
+            rcode,
+            upstream,
+            qname: Arc::from(qname),
+            pipeline_id,
+            qtype,
+            inserted_at: Instant::now(),
+            original_ttl: ttls.0,
+            refresh_ttl: ttls.1,
+        }
+    }
+
     /// Clone entry with a refreshed `inserted_at` for serve-stale TTL reset / 克隆条目并刷新 inserted_at 用于过期缓存 TTL 重置
     /// Sets `inserted_at` to `now - original_ttl` so the entry appears freshly expired / 将 inserted_at 设置为 now - original_ttl，使条目看上去刚刚过期
     pub fn clone_with_refreshed_ttl(&self) -> Self {

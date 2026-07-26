@@ -1,5 +1,6 @@
 use super::Engine;
-use crate::config::{Action, MatchOperator, Transport};
+use crate::cache::CacheEntry;
+use crate::config::{Action, Transport};
 use crate::engine::response::{extract_ttl, extract_ttl_for_refresh};
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
 use crate::engine::upstream::UpstreamFailure;
@@ -27,17 +28,30 @@ use hickory_proto::serialize::binary::BinDecodable;
 
 /// Standard cache check logic that replicates `handle_packet_internal`'s behavior.
 /// Checks Moka cache, validates TTL, patches response, and triggers background refresh if needed.
-pub fn check_cache(
-    engine: &Engine,
-    qname_ref: &str,
-    qtype: RecordType,
-    qclass: DNSClass,
-    pipeline_id: &str,
-    dedupe_hash: u64,
-    tx_id: u16,
-    start: Instant,
-    peer: &std::net::SocketAddr,
-) -> Option<Bytes> {
+/// Immutable cache lookup data shared by normal and refresh-wait paths.
+pub struct CacheLookupContext<'a> {
+    pub qname: &'a str,
+    pub qtype: RecordType,
+    pub qclass: DNSClass,
+    pub pipeline_id: &'a str,
+    pub dedupe_hash: u64,
+    pub tx_id: u16,
+    pub start: Instant,
+    pub peer: &'a std::net::SocketAddr,
+}
+
+pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<Bytes> {
+    let CacheLookupContext {
+        qname: qname_ref,
+        qtype,
+        qclass,
+        pipeline_id,
+        dedupe_hash,
+        tx_id,
+        start,
+        peer,
+    } = *context;
+
     // moka 同步缓存自动处理过期，无需检查 expires_at / moka sync cache automatically handles expiration, no need to check expires_at
     if let Some(hit) = engine.cache_get(&dedupe_hash) {
         // Validate hit against query parameters to avoid collisions
@@ -255,115 +269,130 @@ pub fn check_stale_cache(
         return None;
     }
 
-    if let Some(hit) = engine.cache_get(&dedupe_hash) {
-        if hit.qtype == u16::from(qtype)
-            && hit.pipeline_id.as_ref() == pipeline_id
-            && hit.qname.as_ref() == qname_ref
-        {
-            let elapsed_secs = hit.inserted_at.elapsed().as_secs();
+    if let Some(hit) = engine.cache_get(&dedupe_hash)
+        && hit.qtype == u16::from(qtype)
+        && hit.pipeline_id.as_ref() == pipeline_id
+        && hit.qname.as_ref() == qname_ref
+    {
+        let elapsed_secs = hit.inserted_at.elapsed().as_secs();
 
-            // Only serve stale when TTL has actually expired
-            // 仅当 TTL 已过期时才提供 stale 数据
-            if elapsed_secs >= hit.original_ttl as u64 {
-                // Don't serve SERVFAIL/REFUSED as stale / 不提供 SERVFAIL/REFUSED 作为 stale
-                if hit.rcode == ResponseCode::ServFail || hit.rcode == ResponseCode::Refused {
-                    return None;
-                }
-
-                // Check serve_stale_expire_ttl: max stale age window
-                // 检查 serve_stale_expire_ttl：过期数据的最大可用窗口
-                let stale_age = elapsed_secs - hit.original_ttl as u64;
-                if engine.serve_stale_expire_ttl > 0 && stale_age > engine.serve_stale_expire_ttl {
-                    return None;
-                }
-
-                let stale_ttl = engine.serve_stale_ttl;
-
-                let mut resp_bytes = BytesMut::with_capacity(hit.bytes.len());
-                resp_bytes.extend_from_slice(&hit.bytes);
-
-                // RFC 8767 §4: Set all TTLs to serve_stale_ttl
-                crate::proto_utils::set_all_ttls(&mut resp_bytes, stale_ttl);
-
-                // Rewrite Transaction ID
-                if resp_bytes.len() >= 2 {
-                    let id_bytes = tx_id.to_be_bytes();
-                    resp_bytes[0] = id_bytes[0];
-                    resp_bytes[1] = id_bytes[1];
-                }
-
-                // serve_stale_ttl_reset: reset stale expiry timer
-                // 重置过期计时器
-                if engine.serve_stale_ttl_reset {
-                    let new_entry = hit.clone_with_refreshed_ttl();
-                    engine.cache_insert(dedupe_hash, std::sync::Arc::new(new_entry));
-                }
-
-                debug!(
-                    event = "serve_stale",
-                    qname = %qname_ref,
-                    qtype = ?qtype,
-                    rcode = ?hit.rcode,
-                    original_ttl = hit.original_ttl,
-                    elapsed_secs = elapsed_secs,
-                    stale_age = stale_age,
-                    stale_ttl = stale_ttl,
-                    client_ip = %peer.ip(),
-                    pipeline = %pipeline_id,
-                    "RFC 8767: serving stale cache entry on upstream failure"
-                );
-
-                // Also trigger background refresh to try to get fresh data
-                // 同时触发后台刷新以尝试获取新数据
-                if let Some(upstream_ref) = hit.upstream.as_deref() {
-                    engine.spawn_background_refresh(
-                        dedupe_hash,
-                        pipeline_id,
-                        qname_ref,
-                        qtype,
-                        qclass,
-                        peer.ip(),
-                        Some(upstream_ref),
-                    );
-                }
-
-                return Some(resp_bytes.freeze());
+        // Only serve stale when TTL has actually expired
+        // 仅当 TTL 已过期时才提供 stale 数据
+        if elapsed_secs >= hit.original_ttl as u64 {
+            // Don't serve SERVFAIL/REFUSED as stale / 不提供 SERVFAIL/REFUSED 作为 stale
+            if hit.rcode == ResponseCode::ServFail || hit.rcode == ResponseCode::Refused {
+                return None;
             }
+
+            // Check serve_stale_expire_ttl: max stale age window
+            // 检查 serve_stale_expire_ttl：过期数据的最大可用窗口
+            let stale_age = elapsed_secs - hit.original_ttl as u64;
+            if engine.serve_stale_expire_ttl > 0 && stale_age > engine.serve_stale_expire_ttl {
+                return None;
+            }
+
+            let stale_ttl = engine.serve_stale_ttl;
+
+            let mut resp_bytes = BytesMut::with_capacity(hit.bytes.len());
+            resp_bytes.extend_from_slice(&hit.bytes);
+
+            // RFC 8767 §4: Set all TTLs to serve_stale_ttl
+            crate::proto_utils::set_all_ttls(&mut resp_bytes, stale_ttl);
+
+            // Rewrite Transaction ID
+            if resp_bytes.len() >= 2 {
+                let id_bytes = tx_id.to_be_bytes();
+                resp_bytes[0] = id_bytes[0];
+                resp_bytes[1] = id_bytes[1];
+            }
+
+            // serve_stale_ttl_reset: reset stale expiry timer
+            // 重置过期计时器
+            if engine.serve_stale_ttl_reset {
+                let new_entry = hit.clone_with_refreshed_ttl();
+                engine.cache_insert(dedupe_hash, std::sync::Arc::new(new_entry));
+            }
+
+            debug!(
+                event = "serve_stale",
+                qname = %qname_ref,
+                qtype = ?qtype,
+                rcode = ?hit.rcode,
+                original_ttl = hit.original_ttl,
+                elapsed_secs = elapsed_secs,
+                stale_age = stale_age,
+                stale_ttl = stale_ttl,
+                client_ip = %peer.ip(),
+                pipeline = %pipeline_id,
+                "RFC 8767: serving stale cache entry on upstream failure"
+            );
+
+            // Also trigger background refresh to try to get fresh data
+            // 同时触发后台刷新以尝试获取新数据
+            if let Some(upstream_ref) = hit.upstream.as_deref() {
+                engine.spawn_background_refresh(
+                    dedupe_hash,
+                    pipeline_id,
+                    qname_ref,
+                    qtype,
+                    qclass,
+                    peer.ip(),
+                    Some(upstream_ref),
+                );
+            }
+
+            return Some(resp_bytes.freeze());
         }
     }
     None
+}
+/// Request data required to build and cache a static DNS response.
+pub struct StaticDecisionContext<'a> {
+    pub packet: &'a [u8],
+    pub qname: &'a str,
+    pub qtype: RecordType,
+    pub pipeline_id: &'a Arc<str>,
+    pub dedupe_hash: u64,
+    pub min_ttl: Duration,
+    pub start: Instant,
+    pub peer: &'a std::net::SocketAddr,
 }
 
 /// Handles Decision::Static.
 /// Parses request, builds response, updates cache, and returns bytes.
 pub fn handle_static_decision(
     engine: &Engine,
-    packet: &[u8],
-    qname: &str,
-    qtype: RecordType,
-    current_pipeline_id: &Arc<str>,
-    dedupe_hash: u64,
-    min_ttl: Duration,
-    start: Instant,
-    peer: &std::net::SocketAddr,
+    context: &StaticDecisionContext<'_>,
     rcode: ResponseCode,
     answers: Vec<Record>,
 ) -> anyhow::Result<Bytes> {
+    let StaticDecisionContext {
+        packet,
+        qname,
+        qtype,
+        pipeline_id: current_pipeline_id,
+        dedupe_hash,
+        min_ttl,
+        start,
+        peer,
+    } = *context;
     // Need full request for building response / 需要完整请求来构建响应
     let req = Message::from_bytes(packet).context("parse request for static")?;
     let resp_bytes = build_response(&req, rcode, answers)?;
 
     if min_ttl > Duration::from_secs(0) {
+        let ttl = crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
         engine.insert_dns_cache_entry(
             dedupe_hash,
-            resp_bytes.clone(),
-            rcode,
-            None, // Static responses have no upstream
-            qname,
-            current_pipeline_id.clone(),
-            qtype,
-            crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
-            crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
+            CacheEntry::from_response(
+                resp_bytes.clone(),
+                rcode,
+                None, // Static responses have no upstream
+                qname,
+                current_pipeline_id.clone(),
+                u16::from(qtype),
+                (ttl, ttl),
+            ),
         );
     }
 
@@ -385,34 +414,60 @@ pub fn handle_static_decision(
 
 /// Handles Decision::Forward.
 /// Manages Singleflight, upstream forwarding, response matching, and caching.
-#[allow(clippy::too_many_arguments)]
+pub struct ForwardDecisionContext<'a> {
+    pub packet: &'a [u8],
+    pub qname: &'a str,
+    pub qtype: RecordType,
+    pub qclass: DNSClass,
+    pub tx_id: u16,
+    pub pipeline_id: &'a str,
+    pub rule_name: &'a str,
+    pub dedupe_hash: u64,
+    pub min_ttl: Duration,
+    pub upstream_timeout: Duration,
+    pub start: Instant,
+    pub peer: &'a std::net::SocketAddr,
+    pub skip_cache: bool,
+    pub upstream: &'a str,
+    pub pre_split_upstreams: Option<&'a Arc<Vec<Arc<str>>>>,
+    pub response_matchers: &'a [RuntimeResponseMatcherWithOp],
+    pub response_actions_on_match: &'a [Action],
+    pub response_actions_on_miss: &'a [Action],
+    pub transport: Option<Transport>,
+    pub ecs: Option<&'a crate::config::EcsMode>,
+    pub allow_reuse: bool,
+    pub reused_response: &'a mut Option<ResponseContext>,
+}
+
 pub async fn handle_forward_decision(
     engine: &Engine,
-    packet: &[u8],
-    qname: &str,
-    qtype: RecordType,
-    qclass: DNSClass,
-    tx_id: u16,
-    pipeline_id: &str,
-    rule_name: &str,
-    dedupe_hash: u64,
-    min_ttl: Duration,
-    upstream_timeout: Duration,
-    start: Instant,
-    peer: &std::net::SocketAddr,
-    skip_cache: bool,
-    // Decision fields
-    upstream: &str,
-    pre_split_upstreams: Option<&Arc<Vec<Arc<str>>>>,
-    response_matchers: &[RuntimeResponseMatcherWithOp],
-    _response_matcher_operator: MatchOperator,
-    response_actions_on_match: &[Action],
-    response_actions_on_miss: &[Action],
-    transport: Option<Transport>,
-    ecs: Option<&crate::config::EcsMode>,
-    allow_reuse: bool,
-    reused_response: &mut Option<ResponseContext>,
+    context: ForwardDecisionContext<'_>,
 ) -> anyhow::Result<ForwardResult> {
+    let ForwardDecisionContext {
+        packet,
+        qname,
+        qtype,
+        qclass,
+        tx_id,
+        pipeline_id,
+        rule_name,
+        dedupe_hash,
+        min_ttl,
+        upstream_timeout,
+        start,
+        peer,
+        skip_cache,
+        upstream,
+        pre_split_upstreams,
+        response_matchers,
+        response_actions_on_match,
+        response_actions_on_miss,
+        transport,
+        ecs,
+        allow_reuse,
+        reused_response,
+    } = context;
+
     // ECS request rewriting (RFC 7871): modify outgoing packet before forwarding.
     // Only runs on cache-miss path — cache hits and static responses are unaffected.
     //
@@ -457,21 +512,21 @@ pub async fn handle_forward_decision(
                     }
                 };
 
-                if let Some(mut rx) = rx {
-                    if rx.changed().await.is_ok() {
-                        let result = rx.borrow().clone();
-                        match &result {
-                            Ok(bytes) => {
-                                let mut resp_mut = BytesMut::from(bytes.as_ref());
-                                if resp_mut.len() >= 2 {
-                                    let id_bytes = tx_id.to_be_bytes();
-                                    resp_mut[0] = id_bytes[0];
-                                    resp_mut[1] = id_bytes[1];
-                                }
-                                return Ok(ForwardResult::Success(resp_mut.freeze()));
+                if let Some(mut rx) = rx
+                    && rx.changed().await.is_ok()
+                {
+                    let result = rx.borrow().clone();
+                    match &result {
+                        Ok(bytes) => {
+                            let mut resp_mut = BytesMut::from(bytes.as_ref());
+                            if resp_mut.len() >= 2 {
+                                let id_bytes = tx_id.to_be_bytes();
+                                resp_mut[0] = id_bytes[0];
+                                resp_mut[1] = id_bytes[1];
                             }
-                            Err(e) => return Err(anyhow::anyhow!("{}", e)),
+                            return Ok(ForwardResult::Success(resp_mut.freeze()));
                         }
+                        Err(e) => return Err(anyhow::anyhow!("{}", e)),
                     }
                 }
             }
@@ -505,21 +560,21 @@ pub async fn handle_forward_decision(
                 }
             };
 
-            if let Some(mut rx) = rx {
-                if rx.changed().await.is_ok() {
-                    let result = rx.borrow().clone();
-                    match &result {
-                        Ok(bytes) => {
-                            let mut resp_mut = BytesMut::from(bytes.as_ref());
-                            if resp_mut.len() >= 2 {
-                                let id_bytes = tx_id.to_be_bytes();
-                                resp_mut[0] = id_bytes[0];
-                                resp_mut[1] = id_bytes[1];
-                            }
-                            return Ok(ForwardResult::Success(resp_mut.freeze()));
+            if let Some(mut rx) = rx
+                && rx.changed().await.is_ok()
+            {
+                let result = rx.borrow().clone();
+                match &result {
+                    Ok(bytes) => {
+                        let mut resp_mut = BytesMut::from(bytes.as_ref());
+                        if resp_mut.len() >= 2 {
+                            let id_bytes = tx_id.to_be_bytes();
+                            resp_mut[0] = id_bytes[0];
+                            resp_mut[1] = id_bytes[1];
                         }
-                        Err(e) => return Err(anyhow::anyhow!("{}", e)),
+                        return Ok(ForwardResult::Success(resp_mut.freeze()));
                     }
+                    Err(e) => return Err(anyhow::anyhow!("{}", e)),
                 }
             }
         }
@@ -664,16 +719,19 @@ pub async fn handle_forward_decision(
 
             if actions_to_run.is_empty() {
                 if effective_ttl > Duration::from_secs(0) {
+                    let cache_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_cache);
+                    let refresh_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_refresh);
                     engine.insert_dns_cache_entry(
                         dedupe_hash,
-                        raw.clone(),
-                        rcode,
-                        Some(Arc::from(actual_upstream.as_str())),
-                        qname,
-                        Arc::from(pipeline_id),
-                        qtype,
-                        crate::proto_utils::saturating_u64_to_u32(ttl_secs_cache),
-                        crate::proto_utils::saturating_u64_to_u32(ttl_secs_refresh),
+                        CacheEntry::from_response(
+                            raw.clone(),
+                            rcode,
+                            Some(Arc::from(actual_upstream.as_str())),
+                            qname,
+                            Arc::from(pipeline_id),
+                            u16::from(qtype),
+                            (cache_ttl, refresh_ttl),
+                        ),
                     );
                 }
                 if let Some(g) = cleanup_guard.as_mut() {
@@ -746,16 +804,19 @@ pub async fn handle_forward_decision(
                     let ttl_secs_refresh = extract_ttl_for_refresh(&ctx.msg);
                     let effective_ttl = Duration::from_secs(ttl_secs_cache.max(min_ttl.as_secs()));
                     if effective_ttl > Duration::from_secs(0) {
+                        let cache_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_cache);
+                        let refresh_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_refresh);
                         engine.insert_dns_cache_entry(
                             dedupe_hash,
-                            ctx.raw.clone(),
-                            ctx.msg.metadata.response_code,
-                            Some(ctx.upstream.clone()),
-                            qname,
-                            Arc::from(pipeline_id),
-                            qtype,
-                            crate::proto_utils::saturating_u64_to_u32(ttl_secs_cache),
-                            crate::proto_utils::saturating_u64_to_u32(ttl_secs_refresh),
+                            CacheEntry::from_response(
+                                ctx.raw.clone(),
+                                ctx.msg.metadata.response_code,
+                                Some(ctx.upstream.clone()),
+                                qname,
+                                Arc::from(pipeline_id),
+                                u16::from(qtype),
+                                (cache_ttl, refresh_ttl),
+                            ),
                         );
                     }
                     if let Some(g) = cleanup_guard.as_mut() {
@@ -766,16 +827,18 @@ pub async fn handle_forward_decision(
                 }
                 ResponseActionResult::Static { bytes, rcode, .. } => {
                     if min_ttl > Duration::from_secs(0) {
+                        let ttl = proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
                         engine.insert_dns_cache_entry(
                             dedupe_hash,
-                            bytes.clone(),
-                            rcode,
-                            None,
-                            qname,
-                            Arc::from(pipeline_id),
-                            qtype,
-                            crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
-                            crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
+                            CacheEntry::from_response(
+                                bytes.clone(),
+                                rcode,
+                                None,
+                                qname,
+                                Arc::from(pipeline_id),
+                                u16::from(qtype),
+                                (ttl, ttl),
+                            ),
                         );
                     }
                     if let Some(g) = cleanup_guard.as_mut() {
@@ -794,19 +857,21 @@ pub async fn handle_forward_decision(
 
                     let resp_bytes = rules::process_response_jump(
                         engine,
-                        &state,
-                        pipeline,
-                        remaining_jumps,
-                        &req_full,
-                        packet,
-                        *peer,
-                        qname,
-                        qtype,
-                        qclass,
-                        edns_present,
-                        min_ttl,
-                        upstream_timeout,
-                        skip_cache,
+                        rules::ResponseJumpContext {
+                            state: &state,
+                            pipeline_id: pipeline,
+                            remaining_jumps,
+                            req: &req_full,
+                            packet,
+                            peer: *peer,
+                            qname,
+                            qtype,
+                            qclass,
+                            edns_present,
+                            min_ttl,
+                            upstream_timeout,
+                            skip_cache,
+                        },
                     )
                     .await?;
 
@@ -941,16 +1006,19 @@ pub async fn handle_forward_decision(
                         let effective_ttl =
                             Duration::from_secs(ttl_secs_cache.max(min_ttl.as_secs()));
                         if effective_ttl > Duration::from_secs(0) {
+                            let cache_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_cache);
+                            let refresh_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_refresh);
                             engine.insert_dns_cache_entry(
                                 dedupe_hash,
-                                ctx.raw.clone(),
-                                ctx.msg.metadata.response_code,
-                                Some(ctx.upstream.clone()),
-                                qname,
-                                Arc::from(pipeline_id),
-                                qtype,
-                                crate::proto_utils::saturating_u64_to_u32(ttl_secs_cache),
-                                crate::proto_utils::saturating_u64_to_u32(ttl_secs_refresh),
+                                CacheEntry::from_response(
+                                    ctx.raw.clone(),
+                                    ctx.msg.metadata.response_code,
+                                    Some(ctx.upstream.clone()),
+                                    qname,
+                                    Arc::from(pipeline_id),
+                                    u16::from(qtype),
+                                    (cache_ttl, refresh_ttl),
+                                ),
                             );
                         }
                         if let Some(g) = cleanup_guard.as_mut() {
@@ -961,16 +1029,18 @@ pub async fn handle_forward_decision(
                     }
                     ResponseActionResult::Static { bytes, rcode, .. } => {
                         if min_ttl > Duration::from_secs(0) {
+                            let ttl = proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
                             engine.insert_dns_cache_entry(
                                 dedupe_hash,
-                                bytes.clone(),
-                                rcode,
-                                None,
-                                qname,
-                                Arc::from(pipeline_id),
-                                qtype,
-                                crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
-                                crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
+                                CacheEntry::from_response(
+                                    bytes.clone(),
+                                    rcode,
+                                    None,
+                                    qname,
+                                    Arc::from(pipeline_id),
+                                    u16::from(qtype),
+                                    (ttl, ttl),
+                                ),
                             );
                         }
                         if let Some(g) = cleanup_guard.as_mut() {
@@ -998,19 +1068,21 @@ pub async fn handle_forward_decision(
 
                         let resp_bytes = rules::process_response_jump(
                             engine,
-                            &state,
-                            pipeline,
-                            remaining_jumps,
-                            &req,
-                            packet,
-                            *peer,
-                            qname,
-                            qtype,
-                            qclass,
-                            edns_present,
-                            min_ttl,
-                            upstream_timeout,
-                            skip_cache,
+                            rules::ResponseJumpContext {
+                                state: &state,
+                                pipeline_id: pipeline,
+                                remaining_jumps,
+                                req: &req,
+                                packet,
+                                peer: *peer,
+                                qname,
+                                qtype,
+                                qclass,
+                                edns_present,
+                                min_ttl,
+                                upstream_timeout,
+                                skip_cache,
+                            },
                         )
                         .await?;
 

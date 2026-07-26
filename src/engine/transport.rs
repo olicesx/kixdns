@@ -1988,10 +1988,10 @@ fn parse_dot_target(upstream: &str) -> anyhow::Result<DotTarget> {
     let mut sni: Option<String> = None;
     if url.query().is_some() {
         for (k, v) in url.query_pairs() {
-            if k.eq_ignore_ascii_case("sni") || k.eq_ignore_ascii_case("servername") {
-                if !v.is_empty() {
-                    sni = Some(v.to_string());
-                }
+            if (k.eq_ignore_ascii_case("sni") || k.eq_ignore_ascii_case("servername"))
+                && !v.is_empty()
+            {
+                sni = Some(v.to_string());
             }
         }
     }

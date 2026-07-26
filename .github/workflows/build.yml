@@ -251,4 +251,4 @@ jobs:
         run: cargo fmt --check
 
       - name: Run Clippy
-        run: cargo clippy --lib -- -D clippy::all -A clippy::too_many_arguments -A clippy::collapsible_if -A clippy::doc_lazy_continuation -A clippy::manual_div_ceil -A clippy::is_multiple_of_variant
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings

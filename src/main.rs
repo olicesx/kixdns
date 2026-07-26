@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use kixdns::config::load_config;
-use kixdns::engine::{Engine, FastPathResponse};
+use kixdns::engine::{Engine, FastPathResponse, PreParsedData};
 use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::watcher;
 
@@ -612,10 +612,10 @@ async fn run_udp_worker(
                         let id_bytes = tx_id.to_be_bytes();
                         send_buf[0] = id_bytes[0];
                         send_buf[1] = id_bytes[1];
-                        if let Err(e) = socket.try_send_to(&send_buf, peer) {
-                            if e.kind() == std::io::ErrorKind::WouldBlock {
-                                let _ = socket.send_to(&send_buf, peer).await;
-                            }
+                        if let Err(e) = socket.try_send_to(&send_buf, peer)
+                            && e.kind() == std::io::ErrorKind::WouldBlock
+                        {
+                            let _ = socket.send_to(&send_buf, peer).await;
                         }
                     } else {
                         // Slow path: TTL has decayed, must patch all TTLs in-place.
@@ -667,13 +667,15 @@ async fn run_udp_worker(
                                     &packet_bytes,
                                     peer,
                                     false,
-                                    qname,
-                                    qtype,
-                                    qclass,
-                                    tx_id,
-                                    edns_present,
-                                    pipeline_id,
-                                    ecs_key,
+                                    PreParsedData::new(
+                                        qname,
+                                        qtype,
+                                        qclass,
+                                        tx_id,
+                                        edns_present,
+                                        pipeline_id,
+                                        ecs_key,
+                                    ),
                                 ),
                             )
                             .await
@@ -846,13 +848,15 @@ async fn handle_tcp_conn(
                         &packet_bytes,
                         peer,
                         false,
-                        qname,
-                        qtype,
-                        qclass,
-                        tx_id,
-                        edns_present,
-                        pipeline_id,
-                        ecs_key,
+                        PreParsedData::new(
+                            qname,
+                            qtype,
+                            qclass,
+                            tx_id,
+                            edns_present,
+                            pipeline_id,
+                            ecs_key,
+                        ),
                     ),
                 )
                 .await

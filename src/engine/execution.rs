@@ -45,13 +45,34 @@ pub struct PreParsedData {
     /// 快速路径预计算的 ECS 缓存键（避免重算）
     ecs_key: Option<crate::ecs::EcsKey>,
 }
+impl PreParsedData {
+    pub fn new(
+        qname: String,
+        qtype: u16,
+        qclass: u16,
+        tx_id: u16,
+        edns_present: bool,
+        pipeline_id: Arc<str>,
+        ecs_key: Option<crate::ecs::EcsKey>,
+    ) -> Self {
+        Self {
+            qname,
+            qtype: hickory_proto::rr::RecordType::from(qtype),
+            qclass: DNSClass::from(qclass),
+            tx_id,
+            edns_present,
+            pipeline_id,
+            ecs_key,
+        }
+    }
+}
 
 // ============================================================================
 // Constants / 常量
 // ============================================================================
 
 use super::core::Engine;
-use super::pipeline::select_pipeline;
+use super::pipeline::{PipelineSelectionContext, RuleEvaluationContext, select_pipeline};
 
 // ============================================================================
 // Refreshing Bitmap Helpers / 刷新位图辅助函数
@@ -219,29 +240,7 @@ impl Engine {
     /// Helper: create and insert DNS cache entry / 辅助函数：创建并插入 DNS 缓存条目
     /// Eliminate duplicate CacheEntry construction code / 消除重复的 CacheEntry 构造代码
     #[inline]
-    pub(crate) fn insert_dns_cache_entry(
-        &self,
-        cache_hash: u64,
-        bytes: Bytes,
-        rcode: ResponseCode,
-        upstream: Option<Arc<str>>,
-        qname: &str,
-        pipeline_id: Arc<str>,
-        qtype: hickory_proto::rr::RecordType,
-        original_ttl: u32,
-        refresh_ttl: u32,
-    ) {
-        let entry = CacheEntry {
-            bytes,
-            rcode,
-            upstream,
-            qname: Arc::from(qname), // 一次 Arc::from，避免多次
-            pipeline_id,
-            qtype: u16::from(qtype),
-            inserted_at: Instant::now(),
-            original_ttl,
-            refresh_ttl,
-        };
+    pub(crate) fn insert_dns_cache_entry(&self, cache_hash: u64, entry: CacheEntry) {
         self.cache.insert(cache_hash, Arc::new(entry));
     }
 
@@ -298,14 +297,16 @@ impl Engine {
         let qname_str = q.qname_str_unchecked();
         let (pipeline_opt, pipeline_id) = select_pipeline(
             cfg,
-            qname_str,
-            peer.ip(),
-            qclass,
-            q.edns_present,
-            qtype,
-            &self.listener_label,
-            Some(&self.geosite_manager),
-            Some(&self.geoip_manager),
+            &PipelineSelectionContext {
+                qname: qname_str,
+                client_ip: peer.ip(),
+                qclass,
+                edns_present: q.edns_present,
+                qtype,
+                listener_label: &self.listener_label,
+                geosite_manager: Some(&self.geosite_manager),
+                geoip_manager: Some(&self.geoip_manager),
+            },
         );
 
         // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
@@ -464,14 +465,13 @@ impl Engine {
                     qclass,
                     peer.ip(),
                     include_ip_in_hash,
-                ) {
-                    if let Decision::Static { rcode, answers } = entry.decision.as_ref() {
-                        let resp = build_fast_static_response(
-                            q.tx_id, qname_str, q.qtype, q.qclass, *rcode, answers,
-                        )?;
-                        self.incr_fastpath_hits();
-                        return Ok(Some(FastPathResponse::Direct(resp)));
-                    }
+                ) && let Decision::Static { rcode, answers } = entry.decision.as_ref()
+                {
+                    let resp = build_fast_static_response(
+                        q.tx_id, qname_str, q.qtype, q.qclass, *rcode, answers,
+                    )?;
+                    self.incr_fastpath_hits();
+                    return Ok(Some(FastPathResponse::Direct(resp)));
                 }
             }
         }
@@ -505,23 +505,8 @@ impl Engine {
         packet: &[u8],
         peer: SocketAddr,
         skip_cache: bool,
-        qname: String,
-        qtype: u16,
-        qclass: u16,
-        tx_id: u16,
-        edns_present: bool,
-        pipeline_id: Arc<str>,
-        ecs_key: Option<crate::ecs::EcsKey>,
+        pre_parsed: PreParsedData,
     ) -> anyhow::Result<Bytes> {
-        let pre_parsed = PreParsedData {
-            qname,
-            qtype: hickory_proto::rr::RecordType::from(qtype),
-            qclass: DNSClass::from(qclass),
-            tx_id,
-            edns_present,
-            pipeline_id,
-            ecs_key,
-        };
         self.handle_packet_internal(packet, peer, skip_cache, Some(pre_parsed), None)
             .await
     }
@@ -625,14 +610,16 @@ impl Engine {
                     // GeoSiteManager 现在使用 DashMap，无需 Mutex 锁
                     let (_, pipeline_id) = select_pipeline(
                         cfg,
-                        &qname_cow,
-                        peer.ip(),
-                        qclass,
-                        edns_present,
-                        qtype,
-                        &self.listener_label,
-                        Some(&self.geosite_manager),
-                        Some(&self.geoip_manager),
+                        &PipelineSelectionContext {
+                            qname: &qname_cow,
+                            client_ip: peer.ip(),
+                            qclass,
+                            edns_present,
+                            qtype,
+                            listener_label: &self.listener_label,
+                            geosite_manager: Some(&self.geosite_manager),
+                            geoip_manager: Some(&self.geoip_manager),
+                        },
                     );
                     pipeline_id
                 }; // geosite_mgr 在这里释放 / geosite_mgr released here
@@ -687,20 +674,22 @@ impl Engine {
 
         // Background refresh: Skip cache lookup when skip_cache=true
         // 后台刷新：当 skip_cache=true 时跳过缓存查找
-        if !skip_cache {
-            if let Some(resp_bytes) = phases::check_cache(
+        if !skip_cache
+            && let Some(resp_bytes) = phases::check_cache(
                 self,
-                qname_ref,
-                qtype,
-                qclass,
-                &pipeline_id,
-                dedupe_hash,
-                tx_id,
-                start,
-                &peer,
-            ) {
-                return Ok(resp_bytes);
-            }
+                &phases::CacheLookupContext {
+                    qname: qname_ref,
+                    qtype,
+                    qclass,
+                    pipeline_id: &pipeline_id,
+                    dedupe_hash,
+                    tx_id,
+                    start,
+                    peer: &peer,
+                },
+            )
+        {
+            return Ok(resp_bytes);
         }
 
         // RFC 8767 Client Timeout: When serve_stale is enabled with client_timeout > 0,
@@ -746,14 +735,16 @@ impl Engine {
                         // Fresh data available! Serve it.
                         if let Some(fresh_bytes) = phases::check_cache(
                             self,
-                            qname_ref,
-                            qtype,
-                            qclass,
-                            &pipeline_id,
-                            dedupe_hash,
-                            tx_id,
-                            start,
-                            &peer,
+                            &phases::CacheLookupContext {
+                                qname: qname_ref,
+                                qtype,
+                                qclass,
+                                pipeline_id: &pipeline_id,
+                                dedupe_hash,
+                                tx_id,
+                                start,
+                                peer: &peer,
+                            },
                         ) {
                             tracing::debug!(
                                 event = "serve_fresh_after_client_wait",
@@ -811,13 +802,15 @@ impl Engine {
             Some(p) => self.apply_rules(
                 &state,
                 p,
-                peer.ip(),
-                &qname,
-                qtype,
-                qclass,
-                edns_present,
-                None,
-                skip_cache,
+                &RuleEvaluationContext::new(
+                    peer.ip(),
+                    &qname,
+                    qtype,
+                    qclass,
+                    edns_present,
+                    None,
+                    skip_cache,
+                ),
             ),
             None => {
                 // 使用预分割的默认 upstream 以支持并发查询 / Use pre-split default upstream for concurrent queries
@@ -905,13 +898,15 @@ impl Engine {
                     decision = self.apply_rules(
                         &state,
                         p,
-                        peer.ip(),
-                        &qname,
-                        qtype,
-                        qclass,
-                        edns_present,
-                        None,
-                        skip_cache,
+                        &RuleEvaluationContext::new(
+                            peer.ip(),
+                            &qname,
+                            qtype,
+                            qclass,
+                            edns_present,
+                            None,
+                            skip_cache,
+                        ),
                     );
                 } else {
                     warn!("jump target pipeline not found: {}", pipeline);
@@ -930,14 +925,16 @@ impl Engine {
                 Decision::Static { rcode, answers } => {
                     return phases::handle_static_decision(
                         self,
-                        packet,
-                        &qname,
-                        qtype,
-                        &current_pipeline_id,
-                        dedupe_hash,
-                        min_ttl,
-                        start,
-                        &peer,
+                        &phases::StaticDecisionContext {
+                            packet,
+                            qname: &qname,
+                            qtype,
+                            pipeline_id: &current_pipeline_id,
+                            dedupe_hash,
+                            min_ttl,
+                            start,
+                            peer: &peer,
+                        },
                         rcode,
                         answers,
                     );
@@ -946,7 +943,7 @@ impl Engine {
                     upstream,
                     pre_split_upstreams,
                     response_matchers,
-                    response_matcher_operator,
+                    response_matcher_operator: _,
                     response_actions_on_match,
                     response_actions_on_miss,
                     rule_name,
@@ -958,29 +955,30 @@ impl Engine {
                 } => {
                     let res = phases::handle_forward_decision(
                         self,
-                        packet,
-                        &qname,
-                        qtype,
-                        qclass,
-                        tx_id,
-                        &current_pipeline_id,
-                        &rule_name,
-                        dedupe_hash,
-                        min_ttl,
-                        upstream_timeout,
-                        start,
-                        &peer,
-                        skip_cache,
-                        &upstream,
-                        pre_split_upstreams.as_ref(),
-                        &response_matchers,
-                        response_matcher_operator,
-                        &response_actions_on_match,
-                        &response_actions_on_miss,
-                        transport,
-                        ecs.as_ref(),
-                        allow_reuse,
-                        &mut reused_response,
+                        phases::ForwardDecisionContext {
+                            packet,
+                            qname: &qname,
+                            qtype,
+                            qclass,
+                            tx_id,
+                            pipeline_id: &current_pipeline_id,
+                            rule_name: &rule_name,
+                            dedupe_hash,
+                            min_ttl,
+                            upstream_timeout,
+                            start,
+                            peer: &peer,
+                            skip_cache,
+                            upstream: &upstream,
+                            pre_split_upstreams: pre_split_upstreams.as_ref(),
+                            response_matchers: &response_matchers,
+                            response_actions_on_match: &response_actions_on_match,
+                            response_actions_on_miss: &response_actions_on_miss,
+                            transport,
+                            ecs: ecs.as_ref(),
+                            allow_reuse,
+                            reused_response: &mut reused_response,
+                        },
                     )
                     .await;
 
@@ -1008,13 +1006,15 @@ impl Engine {
                             decision = self.apply_rules(
                                 &state,
                                 pipeline,
-                                peer.ip(),
-                                &qname,
-                                qtype,
-                                qclass,
-                                edns_present,
-                                skip_ref,
-                                skip_cache,
+                                &RuleEvaluationContext::new(
+                                    peer.ip(),
+                                    &qname,
+                                    qtype,
+                                    qclass,
+                                    edns_present,
+                                    skip_ref,
+                                    skip_cache,
+                                ),
                             );
                             continue 'decision_loop;
                         }
@@ -1314,14 +1314,16 @@ mod tests {
         // Act: Select pipeline for edge listener
         let (opt, id) = select_pipeline(
             &runtime,
-            "any.example.com",
-            "127.0.0.1".parse().unwrap(),
-            hickory_proto::rr::DNSClass::IN,
-            false,
-            hickory_proto::rr::RecordType::A,
-            "edge",
-            None,
-            None,
+            &PipelineSelectionContext {
+                qname: "any.example.com",
+                client_ip: "127.0.0.1".parse().unwrap(),
+                qclass: hickory_proto::rr::DNSClass::IN,
+                edns_present: false,
+                qtype: hickory_proto::rr::RecordType::A,
+                listener_label: "edge",
+                geosite_manager: None,
+                geoip_manager: None,
+            },
         );
 
         // Assert: Verify correct pipeline was selected
@@ -1360,14 +1362,16 @@ mod tests {
         // Act: Select pipeline for edge listener
         let (opt, id) = select_pipeline(
             &runtime,
-            "example.com",
-            "127.0.0.1".parse().unwrap(),
-            hickory_proto::rr::DNSClass::IN,
-            false,
-            hickory_proto::rr::RecordType::A,
-            "edge",
-            None,
-            None,
+            &PipelineSelectionContext {
+                qname: "example.com",
+                client_ip: "127.0.0.1".parse().unwrap(),
+                qclass: hickory_proto::rr::DNSClass::IN,
+                edns_present: false,
+                qtype: hickory_proto::rr::RecordType::A,
+                listener_label: "edge",
+                geosite_manager: None,
+                geoip_manager: None,
+            },
         );
 
         // Assert: Verify correct pipeline was selected
@@ -1409,13 +1413,15 @@ mod tests {
         let decision = engine.apply_rules(
             &state,
             &state.pipeline.pipelines[0],
-            "127.0.0.1".parse().unwrap(),
-            "a.example.com",
-            hickory_proto::rr::RecordType::A,
-            hickory_proto::rr::DNSClass::IN,
-            false,
-            None,
-            false, // skip_cache
+            &RuleEvaluationContext::new(
+                "127.0.0.1".parse().unwrap(),
+                "a.example.com",
+                hickory_proto::rr::RecordType::A,
+                hickory_proto::rr::DNSClass::IN,
+                false,
+                None,
+                false, // skip_cache
+            ),
         );
 
         // Assert: Verify StaticResponse returns NXDOMAIN
@@ -1455,13 +1461,15 @@ mod tests {
         let decision2 = engine2.apply_rules(
             &state2,
             &state2.pipeline.pipelines[0],
-            "127.0.0.1".parse().unwrap(),
-            "x.example.com",
-            hickory_proto::rr::RecordType::A,
-            hickory_proto::rr::DNSClass::IN,
-            false,
-            None,
-            false, // skip_cache
+            &RuleEvaluationContext::new(
+                "127.0.0.1".parse().unwrap(),
+                "x.example.com",
+                hickory_proto::rr::RecordType::A,
+                hickory_proto::rr::DNSClass::IN,
+                false,
+                None,
+                false, // skip_cache
+            ),
         );
 
         // Assert: Verify Forward action returns correct upstream and matchers
@@ -1505,13 +1513,15 @@ mod tests {
         let decision3 = engine3.apply_rules(
             &state3,
             &state3.pipeline.pipelines[0],
-            "127.0.0.1".parse().unwrap(),
-            "y.example.com",
-            hickory_proto::rr::RecordType::A,
-            hickory_proto::rr::DNSClass::IN,
-            false,
-            None,
-            false, // skip_cache
+            &RuleEvaluationContext::new(
+                "127.0.0.1".parse().unwrap(),
+                "y.example.com",
+                hickory_proto::rr::RecordType::A,
+                hickory_proto::rr::DNSClass::IN,
+                false,
+                None,
+                false, // skip_cache
+            ),
         );
 
         // Assert: Verify Allow action forwards to default upstream
@@ -1537,13 +1547,15 @@ mod tests {
         let decision4 = engine4.apply_rules(
             &state4,
             &state4.pipeline.pipelines[0],
-            "127.0.0.1".parse().unwrap(),
-            "z.example.com",
-            hickory_proto::rr::RecordType::A,
-            hickory_proto::rr::DNSClass::IN,
-            false,
-            None,
-            false, // skip_cache
+            &RuleEvaluationContext::new(
+                "127.0.0.1".parse().unwrap(),
+                "z.example.com",
+                hickory_proto::rr::RecordType::A,
+                hickory_proto::rr::DNSClass::IN,
+                false,
+                None,
+                false, // skip_cache
+            ),
         );
 
         // Assert: Verify JumpToPipeline returns correct target pipeline

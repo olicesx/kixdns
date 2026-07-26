@@ -835,10 +835,10 @@ pub fn load_config(path: &Path) -> Result<PipelineConfig> {
                 }
             }
             for matcher in &rule.response_matchers {
-                if let ResponseMatcher::RequestDomainSuffix { value } = &matcher.matcher {
-                    if value.is_empty() {
-                        anyhow::bail!("response_matcher request_domain_suffix empty");
-                    }
+                if let ResponseMatcher::RequestDomainSuffix { value } = &matcher.matcher
+                    && value.is_empty()
+                {
+                    anyhow::bail!("response_matcher request_domain_suffix empty");
                 }
                 if let ResponseMatcher::ResponseUpstreamIp { cidr } = &matcher.matcher {
                     for part in cidr.split(',') {

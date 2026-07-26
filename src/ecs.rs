@@ -208,6 +208,7 @@ impl EcsKey {
     /// Returns `None` when ECS should NOT be part of the cache key:
     /// - `Clear` mode (no isolation needed)
     /// - `FromClientIp` with private/loopback IP (privacy protection)
+    ///
     /// 以下情况返回 `None`（ECS 不进入 cache key）：
     /// - `Clear` 模式（无需隔离）
     /// - `FromClientIp` 但 peer IP 为私有/回环地址（隐私保护）
@@ -245,7 +246,7 @@ impl EcsKey {
                 addr[..4].copy_from_slice(&v4.octets());
                 let p = prefix_v4.min(32);
                 mask_address(&mut addr, p, 32);
-                let bytes_used = ((p as usize) + 7) / 8;
+                let bytes_used = (p as usize).div_ceil(8);
                 Self {
                     family: 1,
                     source_prefix: p,
@@ -257,7 +258,7 @@ impl EcsKey {
                 let mut addr = v6.octets();
                 let p = prefix_v6.min(128);
                 mask_address(&mut addr, p, 128);
-                let bytes_used = ((p as usize) + 7) / 8;
+                let bytes_used = (p as usize).div_ceil(8);
                 Self {
                     family: 2,
                     source_prefix: p,
@@ -285,7 +286,7 @@ fn mask_address(addr: &mut [u8], prefix: u8, total_bits: u8) {
         return;
     }
     let p = prefix as usize;
-    let bytes_used = (p + 7) / 8;
+    let bytes_used = p.div_ceil(8);
     let bit = p % 8;
     if bit > 0 && bytes_used > 0 {
         addr[bytes_used - 1] &= 0xFF << (8 - bit);

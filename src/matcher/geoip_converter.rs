@@ -578,11 +578,11 @@ pub fn convert_dat_to_mmdb(
     }
 
     // Apply filter if provided
-    if let Some(filter) = filter {
-        if !filter.is_empty() {
-            info!("Applying country filter: {:?}", filter);
-            converter.filter_countries(filter);
-        }
+    if let Some(filter) = filter
+        && !filter.is_empty()
+    {
+        info!("Applying country filter: {:?}", filter);
+        converter.filter_countries(filter);
     }
 
     // Merge CIDRs

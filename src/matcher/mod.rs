@@ -640,13 +640,12 @@ impl RuntimePipelineConfig {
                     } = action
                     {
                         let transport = transport.unwrap_or(Transport::Udp);
-                        if matches!(transport, Transport::Tcp | Transport::TcpUdp) {
-                            if let Some(u) = upstream {
-                                // Handle comma-separated upstreams / 处理逗号分隔的 upstreams
-                                for addr in u.split(',').map(|s| s.trim()).filter(|s| !s.is_empty())
-                                {
-                                    upstreams.insert(normalize_upstream_addr(addr));
-                                }
+                        if matches!(transport, Transport::Tcp | Transport::TcpUdp)
+                            && let Some(u) = upstream
+                        {
+                            // Handle comma-separated upstreams / 处理逗号分隔的 upstreams
+                            for addr in u.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                                upstreams.insert(normalize_upstream_addr(addr));
                             }
                         }
                     }
@@ -660,12 +659,11 @@ impl RuntimePipelineConfig {
                     } = action
                     {
                         let transport = transport.unwrap_or(Transport::Udp);
-                        if matches!(transport, Transport::Tcp | Transport::TcpUdp) {
-                            if let Some(u) = upstream {
-                                for addr in u.split(',').map(|s| s.trim()).filter(|s| !s.is_empty())
-                                {
-                                    upstreams.insert(normalize_upstream_addr(addr));
-                                }
+                        if matches!(transport, Transport::Tcp | Transport::TcpUdp)
+                            && let Some(u) = upstream
+                        {
+                            for addr in u.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                                upstreams.insert(normalize_upstream_addr(addr));
                             }
                         }
                     }
@@ -678,12 +676,11 @@ impl RuntimePipelineConfig {
                     } = action
                     {
                         let transport = transport.unwrap_or(Transport::Udp);
-                        if matches!(transport, Transport::Tcp | Transport::TcpUdp) {
-                            if let Some(u) = upstream {
-                                for addr in u.split(',').map(|s| s.trim()).filter(|s| !s.is_empty())
-                                {
-                                    upstreams.insert(normalize_upstream_addr(addr));
-                                }
+                        if matches!(transport, Transport::Tcp | Transport::TcpUdp)
+                            && let Some(u) = upstream
+                        {
+                            for addr in u.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                                upstreams.insert(normalize_upstream_addr(addr));
                             }
                         }
                     }
@@ -884,6 +881,16 @@ impl RuntimeMatcher {
     }
 }
 
+/// Immutable DNS request fields used by pipeline selector matchers.
+pub struct PipelineSelectorQuery<'a> {
+    pub listener_label: &'a str,
+    pub client_ip: IpAddr,
+    pub qname: &'a str,
+    pub qclass: DNSClass,
+    pub edns_present: bool,
+    pub qtype: RecordType,
+}
+
 impl RuntimePipelineSelectorMatcher {
     fn from_config(m: config::PipelineSelectorMatcher) -> anyhow::Result<Self> {
         Ok(match m {
@@ -958,16 +965,15 @@ impl RuntimePipelineSelectorMatcher {
             &std::sync::Arc<crate::lock::RwLock<crate::matcher::geosite::GeoSiteManager>>,
         >,
     ) -> bool {
-        self.matches_with_qtype(
+        let query = PipelineSelectorQuery {
             listener_label,
             client_ip,
             qname,
             qclass,
             edns_present,
-            hickory_proto::rr::RecordType::A,
-            geoip_manager,
-            geosite_manager,
-        )
+            qtype: hickory_proto::rr::RecordType::A,
+        };
+        self.matches_with_qtype(&query, geoip_manager, geosite_manager)
     }
 
     /// Returns true if this matcher requires the GeoSite manager to evaluate.
@@ -999,15 +1005,19 @@ impl RuntimePipelineSelectorMatcher {
     #[inline]
     pub fn matches_with_ready_managers(
         &self,
-        listener_label: &str,
-        client_ip: IpAddr,
-        qname: &str,
-        qclass: DNSClass,
-        edns_present: bool,
-        qtype: RecordType,
+        query: &PipelineSelectorQuery<'_>,
         geoip_ready: Option<&crate::matcher::geoip::GeoIpManager>,
         geosite_ready: Option<&crate::matcher::geosite::GeoSiteManager>,
     ) -> bool {
+        let PipelineSelectorQuery {
+            listener_label,
+            client_ip,
+            qname,
+            qclass,
+            edns_present,
+            qtype,
+        } = *query;
+
         match self {
             RuntimePipelineSelectorMatcher::ListenerLabel { value } => {
                 value.eq_ignore_ascii_case(listener_label)
@@ -1058,12 +1068,7 @@ impl RuntimePipelineSelectorMatcher {
     #[inline]
     pub fn matches_with_qtype(
         &self,
-        listener_label: &str,
-        client_ip: IpAddr,
-        qname: &str,
-        qclass: DNSClass,
-        edns_present: bool,
-        qtype: RecordType,
+        query: &PipelineSelectorQuery<'_>,
         geoip_manager: Option<
             &std::sync::Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>,
         >,
@@ -1071,6 +1076,15 @@ impl RuntimePipelineSelectorMatcher {
             &std::sync::Arc<crate::lock::RwLock<crate::matcher::geosite::GeoSiteManager>>,
         >,
     ) -> bool {
+        let PipelineSelectorQuery {
+            listener_label,
+            client_ip,
+            qname,
+            qclass,
+            edns_present,
+            qtype,
+        } = *query;
+
         match self {
             RuntimePipelineSelectorMatcher::ListenerLabel { value } => {
                 value.eq_ignore_ascii_case(listener_label)

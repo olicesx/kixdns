@@ -14,6 +14,7 @@ pub mod utils;
 
 pub use concurrency::PermitManager;
 pub use core::Engine;
+pub use execution::PreParsedData;
 pub use matcher_adapter::*;
 pub use pipeline::select_pipeline;
 pub use types::{EngineInner, FastPathResponse};

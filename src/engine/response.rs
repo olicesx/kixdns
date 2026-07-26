@@ -46,15 +46,15 @@ pub(crate) fn build_fast_static_response(
 }
 
 pub(crate) fn make_static_ip_answer(qname: &str, ip: &str) -> (ResponseCode, Vec<Record>) {
-    if let Ok(ip_addr) = ip.parse::<IpAddr>() {
-        if let Ok(name) = Name::from_str(qname) {
-            let rdata = match ip_addr {
-                IpAddr::V4(v4) => RData::A(A(v4)),
-                IpAddr::V6(v6) => RData::AAAA(AAAA(v6)),
-            };
-            let record = Record::from_rdata(name, 300, rdata);
-            return (ResponseCode::NoError, vec![record]);
-        }
+    if let Ok(ip_addr) = ip.parse::<IpAddr>()
+        && let Ok(name) = Name::from_str(qname)
+    {
+        let rdata = match ip_addr {
+            IpAddr::V4(v4) => RData::A(A(v4)),
+            IpAddr::V6(v6) => RData::AAAA(AAAA(v6)),
+        };
+        let record = Record::from_rdata(name, 300, rdata);
+        return (ResponseCode::NoError, vec![record]);
     }
     (ResponseCode::ServFail, Vec::new())
 }
