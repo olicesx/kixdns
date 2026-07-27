@@ -6,6 +6,29 @@
 
 tools/config_editor.html 是一个静态 HTML 配置编辑器。它使用 Vue 3、Bootstrap 5 和 Mermaid CDN 资源，因此打开时浏览器需要访问对应公共 CDN。
 
+## 功能特性
+
+### 核心功能
+
+- ✅ **可视化配置编辑**：通过表单编辑 settings、Pipeline、规则、匹配器和动作，无需手写完整 JSON。
+- ✅ **实时预览**：左侧编辑，右侧实时显示序列化后的 JSON。
+- ✅ **流程图生成**：根据 Pipeline 和规则生成 Mermaid 流程图。
+- ✅ **导入/导出**：导入现有 JSON，编辑后下载配置文件。
+
+### GeoIP 与 GeoSite
+
+- **MMDB 与 .dat 路径**：配置 MaxMind MMDB 和 V2Ray GeoIP `.dat`/JSON 文件路径。
+- **多文件支持**：`geosite_data_paths` 支持多个 GeoSite 数据文件。
+- **GeoIP 匹配器**：支持 `geoip_country` 和 `geoip_private`。
+- **GeoSite 匹配器**：支持 `geosite` 和 `geosite_not`，以及响应阶段的请求域名 GeoSite 匹配器。
+- **调用语法**：界面识别 `geosite:cn`、`geoip:CN` 和 `geoip:CN,US`，并将其写入服务端字段。
+
+编辑器中的 `geoip_auto_convert`、`geoip_filter_countries` 和顶层 `background_refresh_rule` 会被界面维护或输出，但当前运行引擎不会读取它们。GeoIP 转换时的国家过滤请使用主程序命令：
+
+~~~bash
+kixdns convert-geo-ip --input geoip.dat --output GeoIP.mmdb --filter CN,US,JP
+~~~
+
 编辑器提供：
 
 - settings 全局配置表单；
@@ -156,14 +179,24 @@ Forward 的 transport 值为 udp、tcp、tcp_udp、doh、dot、doq。upstream �
 
 支持的前缀为 udp://、tcp://、tcp+udp://、udp+tcp://、doh://、https://、dot://、tls://、doq:// 和 quic://。DoQ 使用 IP 地址时必须设置 sni；单个 DoQ 上游还可以通过 0rtt=true/false 覆盖全局设置。
 
-### ECS
+### DoQ 0-RTT
 
-ECS 有两层配置：
+- `doq_enable_0rtt` 控制全局默认值，默认启用。
+- DoQ upstream 可以使用 `0rtt=true` 或 `0rtt=false` 覆盖全局设置。
+- 服务器拒绝或请求超时后，该上游在本次进程生命周期内会禁用 0-RTT，重启后重新尝试。
+- `sni` 或 `servername` 用于设置 TLS 名称；DoQ 使用 IP literal 时必须显式设置 SNI。
 
-- Pipeline.ecs：参与缓存键，按客户端子网隔离缓存；
-- Forward.ecs：改写发往上游的 DNS 请求。
+### RFC 8767 过期缓存
 
-可用模式是 clear、from_client_ip 和 static。from_client_ip 默认使用 IPv4 /24、IPv6 /56；static 需要 ip 和 prefix。
+配置编辑器包含 `serve_stale`、`serve_stale_ttl`、`serve_stale_expire_ttl`、`serve_stale_ttl_reset` 和 `serve_stale_client_timeout_ms`。
+
+- `serve_stale` 默认关闭。
+- `serve_stale_client_timeout_ms=0` 时立即返回过期缓存；正值会先尝试上游指定的毫秒数。
+- 过期响应使用 `serve_stale_ttl`，并受 `serve_stale_expire_ttl` 限制。
+
+### 缓存后台刷新
+
+编辑器包含 `cache_background_refresh`、`cache_refresh_threshold_percent` 和 `cache_refresh_min_ttl`。后台刷新失败不会替换现有缓存条目。
 
 ### 缓存相关设置
 
@@ -182,6 +215,35 @@ ECS 有两层配置：
 - serve_stale_client_timeout_ms
 
 这些字段的默认值和运行语义以根目录 README 与 src/config.rs 为准。
+
+### ECS（RFC 7871）
+
+ECS 有两层配置：
+
+| 层级 | JSON 位置 | 作用 |
+|---|---|---|
+| Pipeline 级 | `pipeline.ecs` | 将客户端子网加入缓存键，隔离不同子网的响应 |
+| Action 级 | `forward.ecs` | 改写发往上游的 DNS 请求 |
+
+> ⚠ **约束**：同一 Pipeline 内的 Forward action 与 Pipeline 级 ECS 模式应保持一致；需要不同 ECS 行为时请拆分 Pipeline。
+
+可用模式为 `clear`、`from_client_ip` 和 `static`。`from_client_ip` 默认使用 IPv4 `/24`、IPv6 `/56`；`static` 需要配置 IP 和前缀。
+
+~~~json
+{
+  "id": "ecs-pipeline",
+  "ecs": { "mode": "from_client_ip", "prefix_v4": 24, "prefix_v6": 56 },
+  "rules": [{
+    "name": "forward",
+    "matchers": [{ "type": "any" }],
+    "actions": [{
+      "type": "forward",
+      "upstream": "8.8.8.8:53",
+      "ecs": { "mode": "from_client_ip", "prefix_v4": 24, "prefix_v6": 56 }
+    }]
+  }]
+}
+~~~
 
 ## diagnose.html
 

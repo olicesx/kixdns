@@ -2,9 +2,52 @@
 
 **[English](./README.md)** | **[简体中文](./README.zh-CN.md)**
 
+> **注意：本项目完全由 AI 构建（内容、文档与初始实现均由 AI 生成）。**
+
 KixDNS 是使用 Rust 编写的异步、非递归 DNS 转发服务器。它接收 UDP/TCP 查询，也可以启用入站 DoH，然后按照有序的 Pipeline 规则进行转发或直接构造响应。
 
 本文档以当前 main 分支代码为准。配置类型可以反序列化但运行引擎尚未读取的字段会明确标注。
+
+## 特性
+
+### 🚀 高性能
+
+- **零拷贝 UDP 处理** — 基于 `BytesMut` 的数据包处理，尽量减少内存复制。
+- **延迟请求解析** — 不需要匹配解析字段时，转发路径可以避免完整反序列化。
+- **轻量响应扫描** — 提取缓存和响应规则所需的响应元数据。
+- **快速哈希** — 适用的内部数据结构使用 `rustc-hash`（FxHash）。
+- **异步 I/O** — 基于 `tokio`，并使用 `DashMap` 与 `moka` 管理并发状态。
+- **按 worker 管理 UDP socket** — Unix worker 使用平台 reuse-port 能力；非 Unix 构建共享一个 UDP socket。
+
+### 🔧 灵活路由
+
+- **Pipeline 选择规则** — 支持按监听器标签、客户端 IP、域名、QCLASS、EDNS、GeoIP、GeoSite 和查询类型路由。
+- **匹配器逻辑运算** — 使用 `and`、`or`、`and_not`、`or_not`、`not` 组合有序匹配链。
+- **两阶段处理** — 请求匹配之后可以继续进行响应匹配和响应动作处理。
+- **监听器标签** — 同一服务实例可以选择不同 Pipeline。
+- **多种上游传输** — UDP、TCP、TCP+UDP、DoH（RFC 8484）、DoT 和 DoQ（RFC 9250）。
+- **URL 协议前缀** — 使用 `udp://`、`tcp://`、`doh://`、`dot://` 和 `doq://` 选择传输方式。
+- **EDNS Client Subnet（RFC 7871）** — Pipeline 级缓存隔离与 Forward action 级请求改写。
+
+### 💾 缓存与可靠性
+
+- **内存缓存** — 支持配置容量、最大生存时间、最小 TTL 和过期缓存服务行为。
+- **并发未命中去重** — 相同的进行中缓存未命中共享一次上游操作。
+- **后台刷新** — 接近过期的条目可以异步刷新。
+- **Serve Stale（RFC 8767）** — 可选在上游访问失败时返回过期缓存条目。
+
+### 🌍 GeoIP、GeoSite 与 DoQ
+
+- **MaxMind GeoIP** — 支持 MMDB 查询以及国家和私有 IP 匹配器。
+- **V2Ray GeoSite** — 加载 `.dat` 或支持的 JSON 文件，用于域名分类匹配。
+- **数据库重载** — 配置的 GeoSite 文件和 GeoIP `.dat` 文件会被监控并重载。
+- **DoQ 0-RTT 处理** — 支持全局和单上游配置；拒绝或超时后会回退，直到进程重启。
+
+### 📊 运维
+
+- **配置热重载** — 有效 JSON 变更会通过文件 watcher 重载；无效变更保留之前的配置。
+- **结构化 tracing** — 默认输出文本，过滤级别由 `--debug` 和 `RUST_LOG` 控制。
+- **GeoIP 转换** — 可通过命令行将 V2Ray GeoIP `.dat` 转换为 MMDB。
 
 ## 当前实现
 
@@ -23,6 +66,10 @@ KixDNS 是使用 Rust 编写的异步、非递归 DNS 转发服务器。它接�
 Unix 构建会为 UDP worker 创建独立 socket，并使用平台提供的 reuse-port 能力；非 Unix 构建使用由多个 worker 共享的 UDP socket。这是实现细节，不代表固定吞吐承诺。
 
 ## 快速开始
+
+> 💡 **第一次配置 KixDNS？** 可以使用 **[可视化配置编辑器](#配置编辑器)**，在浏览器中生成 `pipeline.json`。
+
+![配置编辑器预览](docs/images/config-editor.png)
 
 ### 构建和运行
 
@@ -454,6 +501,20 @@ DNS 响应缓存使用上游响应的最小 TTL；配置 min_ttl 时会将其提
 主配置 watcher 会重载有效 JSON 并清空规则缓存。无效的重载会保留旧配置。监听地址、UDP worker 数量、TLS DoH 监听器、连接池构造、缓存构造和其他 Engine 初始化参数均在启动时创建；修改这些设置后应重启服务。
 
 geosite_data_paths 中的 GeoSite 文件会被监控并重载。geoip_dat_path 指定的 GeoIP 文件会被监控并重载。geoip_db_path 指定的 MMDB 在启动时加载；当前 watcher 监控的是 geoip_dat_path，不是 MMDB 路径。
+
+## 技术栈
+
+- **tokio** — 异步运行时
+- **hickory-proto** — DNS 协议和 wire message
+- **serde / serde_json** — 配置序列化
+- **moka / dashmap** — 并发缓存和映射
+- **rustc-hash** — 快速哈希
+- **quinn** — QUIC/DoQ 传输
+- **reqwest / hyper** — HTTP 和 DoH 客户端/服务端
+- **tokio-rustls / rustls** — DoT、DoQ 和入站 DoH 的 TLS
+- **maxminddb / maxminddb-writer** — GeoIP MMDB 查询和转换
+- **arc-swap / notify** — 配置状态和文件监控
+- **clap / tracing** — CLI 解析和日志
 
 ## 工具
 
