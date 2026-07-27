@@ -478,13 +478,13 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
     // With dual-socket approach, IPv6 socket only handles IPv6 traffic, ensuring address family consistency
     // 这使得我们可以安全地使用零拷贝的 recv_buf_from
     // This allows us to safely use zero-copy recv_buf_from
-    if domain == Domain::IPV6 {
-        if let Err(e) = kixdns::socket_utils::set_ipv6_v6only(&socket, true) {
-            tracing::warn!(
-                "Failed to set IPV6_V6ONLY=1: {}, this may cause issues on OpenBSD",
-                e
-            );
-        }
+    if domain == Domain::IPV6
+        && let Err(e) = kixdns::socket_utils::set_ipv6_v6only(&socket, true)
+    {
+        tracing::warn!(
+            "Failed to set IPV6_V6ONLY=1: {}, this may cause issues on OpenBSD",
+            e
+        );
     }
 
     // Try to set SO_REUSEPORT_LB (FreeBSD) or SO_REUSEPORT (Linux) via safe wrapper
