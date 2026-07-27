@@ -2,113 +2,81 @@
 
 **[English](./README.md)** | **[简体中文](./README.zh-CN.md)**
 
-A high-performance, non-recursive DNS forwarding server written in Rust, designed for low-latency, high-concurrency environments with flexible pipeline-based routing rules and hot-reloadable configuration.
+KixDNS is an asynchronous, non-recursive DNS forwarding server written in Rust. It accepts DNS queries over UDP and TCP, optionally over inbound DoH, then applies ordered pipeline rules before forwarding or constructing a response.
 
-## Features
+This document describes the implementation currently on the main branch. Configuration fields that are accepted by deserialization but are not used by the running engine are called out explicitly.
 
-### Performance
-- **Zero-copy UDP processing** — `BytesMut`-based packet handling minimizes memory copies
-- **Lazy request parsing** — transparent forwarding without full deserialization when possible
-- **Lightweight response scanning** — zero-alloc extraction of RCODE and minimum TTL from upstream responses
-- **Fast hashing** — `rustc-hash` (FxHash) for all internal data structures
-- **Async I/O** — built on `tokio` with `DashMap` / `moka` concurrent state management
-- **Adaptive flow control** — `PermitManager` dynamically adjusts concurrency based on upstream latency
-- **SO_REUSEPORT** — multi-worker port sharing on Unix for full multi-core utilization
-- **Dual-socket architecture** — separate IPv4/IPv6 sockets for OpenBSD compatibility
+## What Is Implemented
 
-### Flexible Routing
-- **Pipeline selection rules** — route by listener label, client IP, domain, QCLASS, EDNS, GeoSite, and more
-- **Logical matcher operators** — AND, OR, AND_NOT, OR_NOT, NOT for complex rule composition
-- **Two-phase processing** — request matching + response matching with secondary decisions
-- **Listener labels** — serve different pipelines from the same instance
-- **Multiple upstream transports** — UDP / TCP / DoH (RFC 8484) / DoT / DoQ (RFC 9250)
-- **URL protocol prefixes** — `udp://`, `tcp://`, `doh://`, `dot://`, `doq://` auto-detection
-- **EDNS Client Subnet (RFC 7871)** — two-tier ECS: Pipeline-level cache isolation + Action-level injection (Clear / FromClientIp / Static)
+- Inbound DNS over UDP and TCP.
+- Optional inbound DNS over HTTPS (DoH, RFC 8484) with a PEM certificate and private key.
+- Outbound UDP, TCP, TCP+UDP hedged requests, DoH, DoT, and DoQ.
+- Ordered pipeline selection and ordered request rules.
+- Request matchers for listener label, client address, domain, query type/class, EDNS, GeoIP, and GeoSite.
+- Response matchers and response actions for upstream fallback, filtering, response replacement, and response-based pipeline jumps.
+- An in-memory DNS cache with configurable capacity, maximum lifetime, minimum TTL floor, concurrent miss deduplication, background refresh, and optional RFC 8767 stale serving.
+- ECS request rewriting (RFC 7871) at Forward-action level, with optional pipeline-level ECS cache isolation.
+- MaxMind MMDB GeoIP lookup and V2Ray GeoIP/GeoSite data loading.
+- File watchers for the main JSON configuration, configured GeoSite files, and the configured GeoIP .dat/JSON file.
+- A command-line GeoIP .dat to MMDB converter.
 
-### Cache & Reliability
-- **In-memory cache** — high-performance `moka` cache with configurable capacity and max TTL
-- **Smart TTL handling** — honors upstream TTL with configurable minimum floor
-- **Singleflight deduplication** — `tokio::watch`-based zero-alloc concurrent request deduplication
-- **Background refresh** — automatic stale-while-revalidate with hybrid bloom filter + DashSet dedup
-- **Serve Stale (RFC 8767)** — return expired cache when upstream is unavailable
-
-### GeoIP & GeoSite
-- **MaxMind GeoIP integration** — MMDB format support with country code matching
-- **Private IP detection** — automatic private/internal network identification
-- **V2Ray GeoSite support** — domain category routing (cn, google, category-ads, etc.)
-- **Hot-reloadable databases** — automatic reload on file change, lazy loading
-
-### DNS-over-QUIC (DoQ)
-- **0-RTT auto-detection** — tries 0-RTT first, auto-disables on server rejection
-- **Zero-overhead caching** — `AtomicBool`-based detection result cache
-- **RFC 9250 compliant** — forced message-id=0 with client transaction ID restoration
-
-### DNS Pollution Filtering
-- **Response-stage IP matching** — detect polluted answers via `response_answer_ip` matcher
-- **Automatic upstream failover** — switch to backup upstream on pollution detection
-- **Flexible fallback strategies** — TCP fallback, multi-level upstream chaining
-
-### Operations
-- **Hot configuration reload** — lock-free `ArcSwap`-based reload via `notify` file watching
-- **Structured logging** — `tracing`-based JSON log output
-- **Configurable flow control** — tune permit ranges and latency thresholds per deployment
+Unix builds create separate UDP sockets for workers with the platform's reuse-port support. Non-Unix builds use one UDP socket shared by the workers. This is an implementation detail, not a throughput guarantee.
 
 ## Quick Start
 
-> 💡 **New to KixDNS config?** Try the **[Visual Config Editor](#config-editor)** — a browser-based GUI that generates `pipeline.json` for you. No JSON hand-writing required.
+### Build and run
 
-![Config Editor Preview](docs/images/config-editor.png)
+The repository uses Rust edition 2024. The project does not declare an MSRV; use a toolchain that supports edition 2024.
 
-### Build
-
-```bash
+~~~bash
 cargo build --release
-```
 
-### Run
-
-```bash
-# Default config: config/pipeline.json
+# No subcommand: uses config/pipeline.json and the default listener label
 ./target/release/kixdns
 
-# Custom config
-./target/release/kixdns run -c /etc/kixdns/pipeline.json
+# Explicit run command
+./target/release/kixdns run -c config/pipeline.json
+~~~
 
-# With listener label
-./target/release/kixdns run --listener-label edge-internal
+The default listener addresses are UDP and TCP on 0.0.0.0:5353. The default upstream is 1.1.1.1:53. All paths are passed to the filesystem as written; relative paths are relative to the process working directory.
 
-# Debug logging
-./target/release/kixdns run --debug
+### CLI
 
-# Show help
-./target/release/kixdns --help
-./target/release/kixdns run --help
-```
-
-### Command Line Options
-
-```
+~~~text
 kixdns [COMMAND]
 
 COMMANDS:
-  run              Run DNS server (default if no subcommand given)
-  convert-geo-ip   Convert GeoIP .dat to MMDB format
+  run              Run the DNS server
+  convert-geo-ip   Convert a GeoIP .dat file to MMDB
   help             Print help
+~~~
 
-run OPTIONS:
-  -c, --config <FILE>          Configuration file path [default: config/pipeline.json]
-      --listener-label <LABEL> Listener label for pipeline selection [default: default]
-      --debug                  Enable debug logging
-      --udp-workers <NUM>      Number of UDP workers [default: CPU core count]
-  -h, --help                   Show help
-  -V, --version                Show version
-```
+Run options:
 
-### systemd Service
+~~~text
+-c, --config <FILE>             Configuration path (default: config/pipeline.json)
+    --listener-label <LABEL>    Listener label used by pipeline selectors (default: default)
+    --debug                     Enable debug-level logging
+    --udp-workers <NUM>         UDP worker count (0 selects available CPU parallelism)
+-h, --help                      Show help
+-V, --version                   Show version
+~~~
 
-Create `/etc/systemd/system/kixdns.service`:
+GeoIP conversion options:
 
-```ini
+~~~text
+-i, --input <FILE>              Input V2Ray GeoIP .dat file
+-o, --output <FILE>             Output MMDB file
+-f, --filter <CODES>            Comma-separated country codes, for example CN,US,JP
+~~~
+
+The logging subscriber is text formatted by default. The default filter is error unless --debug or the RUST_LOG environment variable changes it. The code does not configure JSON log output.
+
+### systemd
+
+Create /etc/systemd/system/kixdns.service:
+
+~~~ini
 [Unit]
 Description=KixDNS
 After=network.target
@@ -121,354 +89,401 @@ LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
-```
+~~~
 
-```bash
+~~~bash
 sudo install -m 0755 target/release/kixdns /usr/local/bin/kixdns
 sudo mkdir -p /etc/kixdns
 sudo cp config/pipeline.json /etc/kixdns/
 sudo systemctl daemon-reload
 sudo systemctl enable --now kixdns
-```
+~~~
+
+## Network Protocols
+
+### Inbound
+
+UDP and TCP listeners are always created from settings.bind_udp and settings.bind_tcp.
+
+Inbound DoH is disabled unless settings.bind_doh is set. When it is set, settings.doh_tls_cert and settings.doh_tls_key are required and must point to PEM files. The path defaults to /dns-query and can be changed with settings.doh_path.
+
+The inbound DoH handler:
+
+- accepts POST requests at the configured path and reads a DNS wire message body;
+- accepts GET requests at the configured path with a dns base64url-without-padding query parameter;
+- rejects DNS bodies larger than 64 KiB;
+- returns application/dns-message for a successful DNS response.
+
+DoT and DoQ are implemented as outbound transports. There are no inbound DoT or DoQ listeners.
+
+### Outbound
+
+The Forward action has an optional transport field:
+
+| Value | Transport |
+|---|---|
+| udp | DNS over UDP |
+| tcp | DNS over TCP |
+| tcp_udp | Sends TCP and UDP concurrently and uses the first accepted response |
+| doh | DNS over HTTPS |
+| dot | DNS over TLS |
+| doq | DNS over QUIC |
+
+The upstream field accepts a string, a comma-separated string, or a JSON string array. Multiple upstreams are queried concurrently and the first accepted response is returned. A response with SERVFAIL or REFUSED is not accepted when choosing among multiple upstreams.
+
+The following prefixes override the transport field:
+
+| Prefix | Transport | Alias |
+|---|---|---|
+| udp:// | UDP | |
+| tcp:// | TCP | |
+| tcp+udp://, udp+tcp:// | TCP+UDP | |
+| doh:// | DoH | https:// |
+| dot:// | DoT | tls:// |
+| doq:// | DoQ | quic:// |
+
+Without a prefix, an omitted transport means UDP. DoH URLs without a path use /dns-query. DoH supports a host query parameter as an HTTP Host override; that parameter is removed before the request is sent.
+
+DoT uses port 853 when no port is supplied. Its optional TLS name is supplied with sni or servername and it must not contain a DNS path.
+
+DoQ uses port 853 when no port is supplied. Its optional query parameters are sni/servername and 0rtt/enable_0rtt. A DoQ upstream written with an IP literal requires an explicit SNI. 0-RTT is enabled globally by default, can be overridden per upstream, and is disabled for that upstream after a rejection or timeout until the process restarts.
+
+When UDP forwarding fails, or when an upstream UDP response is truncated, TCP fallback is enabled by default and can be disabled with settings.enable_tcp_fallback. The fallback is applied by the forwarding path; it is not an additional listener.
 
 ## Configuration
 
-Configuration uses JSON format with the following top-level structure:
+The configuration is JSON:
 
-```json
+~~~json
 {
   "version": "1.0",
-  "settings": { ... },
-  "pipeline_select": [ ... ],
-  "pipelines": [ ... ]
+  "settings": {},
+  "pipeline_select": [],
+  "pipelines": []
 }
-```
+~~~
 
-### Global Settings
+version is optional. settings, pipeline_select, and pipelines default to an empty/default value when omitted. If no pipeline selector matches, the first pipeline is used. If there is no pipeline, the request uses the global default upstream.
 
-- `min_ttl` — Minimum TTL in seconds (default: 0)
-- `bind_udp` — UDP listen address (default: `0.0.0.0:5353`)
-- `bind_tcp` — TCP listen address (default: `0.0.0.0:5353`)
-- `bind_doh` — DoH (DNS over HTTPS) listen address, null = disabled (default: null)
-- `doh_tls_cert` — TLS certificate path (PEM) for DoH, required when `bind_doh` is set
-- `doh_tls_key` — TLS private key path (PEM) for DoH, required when `bind_doh` is set
-- `cache_capacity` — Max cache entries (default: 10000)
-- `cache_max_ttl` — Max cache TTL in seconds (default: 86400)
-- `default_upstream` — Default upstream DNS (default: `1.1.1.1:53`)
-- `upstream_timeout_ms` — Upstream timeout (default: 2000)
-- `response_jump_limit` — Max pipeline jumps in response phase (default: 10)
-- `udp_pool_size` — UDP upstream pool size (default: 64)
-- `tcp_pool_size` — TCP upstream pool size (default: 64)
-- `doh_pool_size` — DoH max idle connections per upstream (default: 8)
-- `dot_pool_size` — DoT pool size (default: 64)
-- `doq_pool_size` — DoQ pool size (default: 16)
-- `doq_connection_idle_timeout_seconds` — DoQ idle timeout (default: 60)
-- `doq_keepalive_interval_ms` — DoQ keepalive interval (default: 15000)
-- `doq_enable_0rtt` — Enable DoQ 0-RTT with auto-detection (default: true)
-- `flow_control_initial_permits` — Initial flow control permits (default: 500)
-- `flow_control_min_permits` — Minimum permits (default: 100)
-- `flow_control_max_permits` — Maximum permits (default: 800)
-- `flow_control_latency_threshold_ms` — Latency alarm threshold (default: 100)
-- `flow_control_adjustment_interval_secs` — Adjustment interval (default: 5)
-- `cache_background_refresh` — Enable background cache refresh (default: false)
-- `cache_refresh_threshold_percent` — Refresh threshold as % of remaining TTL (default: 10)
-- `cache_refresh_min_ttl` — Minimum TTL for background refresh (default: 5)
-- `serve_stale` — Enable RFC 8767 stale cache (default: false)
-- `serve_stale_ttl` — TTL for stale responses (default: 30)
-- `serve_stale_expire_ttl` — Max stale window in seconds (default: 86400)
-- `serve_stale_ttl_reset` — Reset stale timer on each serve (default: true)
-- `serve_stale_client_timeout_ms` — Try upstream before serving stale (default: 0)
-- `geoip_db_path` — Path to GeoIP MMDB database
-- `geoip_cache_capacity` — GeoIP lookup cache capacity (default: 10000)
-- `geoip_cache_ttl` — GeoIP cache TTL in seconds (default: 3600)
-- `geosite_data_paths` — Array of V2Ray GeoSite data file paths
+### Global settings
 
-### Matcher Types
+| Field | Default | Meaning |
+|---|---:|---|
+| min_ttl | 0 | Minimum upstream/cache TTL in seconds. |
+| bind_udp | 0.0.0.0:5353 | UDP listen address. |
+| bind_tcp | 0.0.0.0:5353 | TCP listen address. |
+| bind_doh | null | Inbound DoH listen address; null disables it. |
+| doh_tls_cert | null | PEM certificate path; required with bind_doh. |
+| doh_tls_key | null | PEM private-key path; required with bind_doh. |
+| doh_path | /dns-query | Inbound DoH request path. |
+| default_upstream | 1.1.1.1:53 | Default upstream. A comma-separated list is accepted. |
+| upstream_timeout_ms | 9000 | Timeout for one upstream operation. |
+| request_timeout_ms | null | Overall request timeout. When null, it is upstream_timeout_ms * 2.5. It must be at least upstream_timeout_ms. |
+| response_jump_limit | 10 | Maximum response-phase pipeline jumps. |
+| udp_pool_size | 64 | Outbound UDP socket-pool size. |
+| tcp_pool_size | 64 | TCP connections per upstream pool. |
+| doh_pool_size | 8 | Maximum idle DoH connections per upstream. |
+| dot_pool_size | 64 | DoT connections per upstream pool. |
+| doq_pool_size | 16 | DoQ connections per upstream pool. |
+| tcp_health_check_error_threshold | 3 | Reset a TCP/DoT connection after this many consecutive errors; 0 disables this check. |
+| tcp_connection_max_age_seconds | 300 | Maximum TCP/DoT connection age; 0 disables aging. |
+| tcp_connection_idle_timeout_seconds | 60 | TCP/DoT idle timeout; 0 disables it. |
+| doq_connection_idle_timeout_seconds | 60 | DoQ idle timeout; 0 disables it. |
+| doq_keepalive_interval_ms | 15000 | DoQ keepalive interval; 0 disables keepalive. |
+| doq_enable_0rtt | true | Global DoQ 0-RTT setting. |
+| enable_tcp_fallback | true | Retry UDP failure or truncation with TCP. |
+| flow_control_enabled | false | Enable adaptive permit-based flow control. |
+| flow_control_initial_permits | 500 | Initial permits when flow control is enabled. |
+| flow_control_min_permits | 100 | Minimum permits when flow control is enabled. |
+| flow_control_max_permits | 800 | Maximum permits when flow control is enabled. |
+| flow_control_latency_threshold_ms | 100 | Latency threshold used by adaptive flow control. |
+| flow_control_adjustment_interval_secs | 5 | Permit adjustment interval. |
+| cache_capacity | 10000 | Maximum entries in the DNS response cache; must be greater than zero. |
+| cache_max_ttl | 86400 | Maximum lifetime of a DNS cache entry in seconds. |
+| dashmap_shards | 0 | Internal shard setting; 0 uses the DashMap default, otherwise the value must be a power of two. |
+| cache_background_refresh | false | Refresh entries before their TTL expires. |
+| cache_refresh_threshold_percent | 10 | Refresh threshold based on remaining TTL percentage. |
+| cache_refresh_min_ttl | 5 | Minimum refresh TTL considered for background refresh. |
+| serve_stale | false | Keep and serve expired entries according to RFC 8767 behavior. |
+| serve_stale_ttl | 30 | TTL written into a stale response. |
+| serve_stale_expire_ttl | 86400 | Maximum stale age in seconds; 0 means no stale-age limit. |
+| serve_stale_ttl_reset | true | Reset the stale-age window when stale data is served. |
+| serve_stale_client_timeout_ms | 0 | 0 serves stale immediately; a positive value tries the upstream for this many milliseconds first. |
+| geoip_db_path | null | MaxMind MMDB path. |
+| geoip_dat_path | null | V2Ray GeoIP .dat or supported V2Ray JSON path. The current range loaders use IPv4 ranges. |
+| geosite_data_paths | [] | V2Ray GeoSite .dat or JSON paths; multiple files are accepted. |
 
-#### Pipeline Select Matchers
+The following fields are deserialized by the current config type but are not read by the running engine: geoip_auto_convert and geoip_filter_countries. Use convert-geo-ip with --filter for conversion-time filtering. The top-level background_refresh_rule is also currently ignored by runtime configuration compilation.
 
-| Type | Parameter | Description |
-|------|-----------|-------------|
-| `listener_label` | `value` | Match listener label |
-| `client_ip` | `cidr` | Match client IP CIDR |
-| `domain_suffix` | `value` | Match domain suffix |
-| `domain_regex` | `value` | Match domain regex |
-| `qclass` | `value` | Match QCLASS (IN/CH/HS) |
-| `edns_present` | `expect` | Check EDNS presence (true/false) |
-| `geosite` | `value` | Match GeoSite category |
-| `geosite_not` | `value` | Negative GeoSite match |
-| `any` | — | Match anything |
+### Pipeline selection
 
-#### Request Matchers
+Each item in pipeline_select has a pipeline id, an optional matcher list, and an optional matcher_operator. Items are evaluated in array order. The first matching item whose pipeline id exists selects that pipeline.
 
-Same as Pipeline Select, plus:
+### Pipelines and rules
 
-| Type | Parameter | Description |
-|------|-----------|-------------|
-| `geoip_country` | `country_codes` | Match client IP country (CN, US, etc.) |
-| `geoip_private` | `expect` | Match private/internal IPs |
+Each pipeline has an id, an optional rules array, and an optional pipeline-level ecs object. Rules are evaluated in configuration order. An empty matcher list matches. Within a rule, matchers form a left-to-right chain; each matcher can carry its own operator, or the rule-level matcher_operator can set the operator for a list whose item operators are all omitted.
 
-#### Response Matchers
+The same structure is used for response_matchers, response_matcher_operator, response_actions_on_match, and response_actions_on_miss. Response actions run after a Forward response, or on the miss path after upstream attempts fail when miss actions are configured.
 
-| Type | Parameter | Description |
-|------|-----------|-------------|
-| `upstream_equals` | `value` | Exact upstream string match |
-| `request_domain_suffix` | `value` | Request domain suffix match |
-| `request_domain_regex` | `value` | Request domain regex match |
-| `response_upstream_ip` | `cidr` | Upstream IP CIDR match |
-| `response_answer_ip` | `cidr` | Answer section IP CIDR match |
-| `response_type` | `value` | Record type match (A/AAAA/CNAME) |
-| `response_rcode` | `value` | RCODE match (NOERROR/NXDOMAIN) |
-| `response_qclass` | `value` | QCLASS match |
-| `response_edns_present` | `expect` | EDNS presence check |
+### Pipeline selector and request matchers
 
-### Action Types
+| Type | Fields |
+|---|---|
+| any | none |
+| listener_label | value |
+| client_ip | cidr |
+| domain_suffix | value |
+| domain_regex | value |
+| qclass | value: IN, CH/CHAOS, or HS |
+| edns_present | expect: boolean |
+| geosite | value: GeoSite tag |
+| geosite_not | value: GeoSite tag |
+| geoip_country | country_codes: string array |
+| geoip_private | expect: boolean |
+| qtype | value: A, AAAA, CNAME, MX, TXT, NS, PTR, SOA, SRV, or OPT |
 
-| Type | Parameters | Description |
-|------|------------|-------------|
-| `log` | `level`, `message` | Log message |
-| `static_response` | `rcode` | Return static RCODE |
-| `static_ip_response` | `rcode`, `ips` | Return static IP response |
-| `jump_to_pipeline` | `pipeline` | Jump to another pipeline |
-| `allow` | — | Accept current response |
-| `deny` | — | Return REFUSED |
-| `forward` | `upstream`, `transport` | Forward to upstream |
-| `continue` | — | Continue to next rule |
+Pipeline selectors support all of the rows above. Request rules support all rows except listener_label.
 
-**Transport options**: `udp`, `tcp`, `tcp_udp`, `doh`, `dot`, `doq` (can be omitted when upstream URL has protocol prefix)
+Domain suffix matching and GeoSite matching are case-insensitive. domain_regex and request_domain_regex use Rust regular-expression syntax.
 
-**URL prefixes**: `udp://`, `tcp://`, `tcp+udp://`, `doh://`, `https://`, `dot://`, `tls://`, `doq://`, `quic://`
+### Response matchers
 
-### Logical Operators
+| Type | Fields |
+|---|---|
+| upstream_equals | value; compares the runtime upstream label literally |
+| request_domain_suffix | value |
+| request_domain_regex | value |
+| response_upstream_ip | cidr; comma-separated CIDRs are accepted |
+| response_answer_ip | cidr; comma-separated CIDRs are accepted |
+| response_type | value; the first answer record type, or the query type if there is no answer |
+| response_rcode | value: NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED; an unknown value acts as the OTHER fallback |
+| response_qclass | value |
+| response_edns_present | expect: boolean |
+| response_answer_ip_geoip_country | country_codes: string array |
+| response_answer_ip_geoip_private | expect: boolean |
+| response_request_domain_geosite | value: GeoSite tag |
+| response_request_domain_geosite_not | value: GeoSite tag |
+| response_txt_content | mode: exact, prefix, or regex; value is the text/pattern |
 
-Matchers support logical composition:
+The successful upstream label currently includes the transport prefix, for example udp:1.1.1.1:53 or tcp:1.1.1.1:53. Therefore upstream_equals values must include that prefix. response_upstream_ip currently parses a raw IP or host:port value; it does not strip the transport prefix.
 
-| Operator | Description |
-|----------|-------------|
-| `and` | Logical AND (default) |
-| `or` | Logical OR |
-| `and_not` | AND NOT |
-| `or_not` | OR NOT |
-| `not` | NOT |
+### Logical operators
 
-## Examples
+Operators are evaluated left to right. The first matcher seeds the result.
 
-### Basic GeoIP Routing
+| Operator | Meaning |
+|---|---|
+| and | The next matcher must be true. This is the default. |
+| or | The next matcher is used when the accumulated result is false. |
+| and_not | The next matcher must be false when the accumulated result is true. |
+| or_not | The next matcher must be false when the accumulated result is false. |
+| not | Accepted as a deserialization alias for and_not. |
 
-```json
+The aliases and-not, andnot, or-not, and ornot are also accepted.
+
+### Actions
+
+| Type | Fields | Behavior |
+|---|---|---|
+| log | level (optional) | Emits a tracing event for the matched rule. Supported levels are trace, debug, info, warn, and error. |
+| static_response | rcode | Returns NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, or REFUSED. |
+| static_ip_response | ip | Returns an A or AAAA response based on the IP address. |
+| static_txt_response | text, ttl (optional) | Returns a TXT response. text accepts a string or string array; ttl defaults to 300. |
+| jump_to_pipeline | pipeline | Starts processing the referenced pipeline. |
+| allow | none | Request phase: forward with the global default UDP upstream. Response phase: keep the current upstream response. |
+| deny | none | Returns REFUSED. |
+| forward | upstream (optional), transport (optional), ecs (optional) | Forwards to the selected upstream. A missing upstream uses default_upstream. |
+| continue | none | Continues with the next request rule, or the next pipeline decision in the response flow. |
+| replace_txt_response | text | Response-phase action that replaces TXT records in the current response. In the request phase it does not produce a response. |
+
+### ECS
+
+ECS is configured on a Forward action:
+
+~~~json
 {
-  "version": "1.0",
-  "settings": {
-    "min_ttl": 30,
-    "bind_udp": "0.0.0.0:5353",
-    "default_upstream": "1.1.1.1:53",
-    "geoip_db_path": "data/GeoLite2-Country.mmdb"
-  },
-  "pipelines": [
-    {
-      "id": "china-domestic",
-      "rules": [{
-        "name": "china-clients",
-        "matchers": [{ "type": "geoip_country", "country_codes": ["CN"] }],
-        "actions": [
-          { "type": "log", "level": "info" },
-          { "type": "forward", "upstream": "223.5.5.5:53" }
-        ]
-      }]
-    },
-    {
-      "id": "international",
-      "rules": [{
-        "name": "non-china",
-        "matchers": [{ "type": "geoip_country", "country_codes": ["US", "JP", "KR"] }],
-        "actions": [{ "type": "forward", "upstream": "8.8.8.8:53" }]
-      }]
-    }
-  ]
-}
-```
-
-### GeoSite Domain Routing
-
-```json
-{
-  "version": "1.0",
-  "settings": {
-    "geosite_data_paths": ["data/geosite-cn.json", "data/geosite-google.json"]
-  },
-  "pipelines": [
-    {
-      "id": "cn-domains",
-      "rules": [{
-        "name": "china-domains",
-        "matchers": [{ "type": "geosite", "value": "cn" }],
-        "actions": [{ "type": "forward", "upstream": "223.5.5.5:53" }]
-      }]
-    },
-    {
-      "id": "block-ads",
-      "rules": [{
-        "name": "ad-block",
-        "matchers": [{ "type": "geosite", "value": "category-ads" }],
-        "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
-      }]
-    }
-  ]
-}
-```
-
-### DNS Pollution Filtering
-
-```json
-{
-  "version": "1.0",
-  "settings": {
-    "default_upstream": "223.5.5.5:53",
-    "upstream_timeout_ms": 1500
-  },
-  "pipelines": [{
-    "id": "filter",
-    "rules": [
-      {
-        "name": "check-pollution",
-        "matchers": [{ "type": "any" }],
-        "actions": [{ "type": "forward", "upstream": "223.5.5.5:53", "transport": "udp" }],
-        "response_matchers": [{ "type": "response_answer_ip", "cidr": "127.0.0.0/8,0.0.0.0/8" }],
-        "response_actions_on_match": [{ "type": "continue" }],
-        "response_actions_on_miss": [{ "type": "allow" }]
-      },
-      {
-        "name": "fallback",
-        "matchers": [{ "type": "any" }],
-        "actions": [{ "type": "forward", "upstream": "8.8.4.4:53", "transport": "tcp" }]
-      }
-    ]
-  }]
-}
-```
-
-### Serve Stale (RFC 8767)
-
-```json
-{
-  "settings": {
-    "serve_stale": true,
-    "serve_stale_ttl": 30,
-    "serve_stale_expire_ttl": 86400,
-    "serve_stale_ttl_reset": true,
-    "serve_stale_client_timeout_ms": 0
+  "type": "forward",
+  "upstream": "8.8.8.8:53",
+  "ecs": {
+    "mode": "from_client_ip",
+    "prefix_v4": 24,
+    "prefix_v6": 56
   }
 }
-```
+~~~
 
-### DoQ with 0-RTT
+The supported modes are:
 
-```json
+- clear: remove the request ECS option;
+- from_client_ip: derive the subnet from the client address, defaulting to /24 for IPv4 and /56 for IPv6; private, loopback, and ULA addresses are not injected;
+- static: inject a configured IP and prefix.
+
+A pipeline-level ecs object changes the cache key so responses can be isolated by client subnet. It does not replace the Forward action's ECS rewrite setting. The engine warns when an action uses ECS without a pipeline-level ecs setting.
+
+## Configuration examples
+
+### Basic routing and static response
+
+~~~json
+{
+  "version": "1.0",
+  "settings": {
+    "bind_udp": "0.0.0.0:5353",
+    "bind_tcp": "0.0.0.0:5353",
+    "default_upstream": "1.1.1.1:53"
+  },
+  "pipeline_select": [
+    {
+      "pipeline": "internal",
+      "matchers": [
+        { "type": "listener_label", "value": "edge-internal" }
+      ]
+    }
+  ],
+  "pipelines": [
+    {
+      "id": "internal",
+      "rules": [
+        {
+          "name": "internal-dns",
+          "matchers": [
+            { "type": "domain_suffix", "value": ".internal" }
+          ],
+          "actions": [
+            { "type": "forward", "upstream": "10.0.0.53:53", "transport": "tcp" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "default",
+      "rules": [
+        {
+          "name": "block-example",
+          "matchers": [
+            { "type": "domain_suffix", "value": ".blocked.example" }
+          ],
+          "actions": [
+            { "type": "static_response", "rcode": "NXDOMAIN" }
+          ]
+        },
+        {
+          "name": "default-forward",
+          "matchers": [ { "type": "any" } ],
+          "actions": [
+            { "type": "forward", "upstream": null }
+          ]
+        }
+      ]
+    }
+  ]
+}
+~~~
+
+### Response-based fallback
+
+~~~json
 {
   "settings": {
-    "doq_enable_0rtt": true,
-    "doq_pool_size": 8
+    "default_upstream": "223.5.5.5:53"
   },
-  "pipelines": [{
-    "id": "doq-upstream",
-    "rules": [{
-      "name": "alidns-doq",
-      "matchers": [{ "type": "any" }],
-      "actions": [{
-        "type": "forward",
-        "upstream": "doq://223.5.5.5:853?sni=dns.alidns.com&0rtt=false"
-      }]
-    }]
-  }]
+  "pipelines": [
+    {
+      "id": "fallback",
+      "rules": [
+        {
+          "name": "reject-polluted-answer",
+          "matchers": [ { "type": "any" } ],
+          "actions": [
+            { "type": "forward", "upstream": "223.5.5.5:53", "transport": "udp" }
+          ],
+          "response_matchers": [
+            { "type": "response_answer_ip", "cidr": "127.0.0.0/8,0.0.0.0/8" }
+          ],
+          "response_actions_on_match": [
+            { "type": "continue" }
+          ],
+          "response_actions_on_miss": [
+            { "type": "allow" }
+          ]
+        },
+        {
+          "name": "backup",
+          "matchers": [ { "type": "any" } ],
+          "actions": [
+            { "type": "forward", "upstream": "8.8.4.4:53", "transport": "tcp" }
+          ]
+        }
+      ]
+    }
+  ]
 }
-```
+~~~
 
-## Tech Stack
+### Inbound DoH
 
-- **tokio** — async runtime
-- **hickory-proto** — DNS protocol
-- **moka** — high-performance cache
-- **dashmap** — concurrent hashmap
-- **rustc-hash** — fast hashing (FxHash)
-- **quinn** — QUIC/DoQ transport
-- **reqwest** — HTTP/DoH client
-- **tokio-rustls** — TLS for DoT/DoQ
-- **maxminddb** — GeoIP MMDB lookups
-- **arc-swap** — lock-free config hot-reload
-- **notify** — filesystem change detection
-- **clap** — CLI argument parsing
-- **tracing** — structured logging
+~~~json
+{
+  "settings": {
+    "bind_doh": "0.0.0.0:8443",
+    "doh_tls_cert": "/etc/kixdns/cert.pem",
+    "doh_tls_key": "/etc/kixdns/key.pem",
+    "doh_path": "/dns-query"
+  },
+  "pipelines": [
+    {
+      "id": "default",
+      "rules": [
+        {
+          "name": "forward-all",
+          "matchers": [ { "type": "any" } ],
+          "actions": [ { "type": "forward", "upstream": "1.1.1.1:53" } ]
+        }
+      ]
+    }
+  ]
+}
+~~~
+
+## Cache and reload behavior
+
+The DNS response cache uses the upstream response's minimum TTL, raised to min_ttl when configured, and is capped by cache_max_ttl and cache_capacity. Negative responses use the SOA negative-cache TTL when an SOA is present. Identical in-flight cache misses share one upstream operation.
+
+When cache_background_refresh is enabled, entries near expiry can trigger an asynchronous refresh. A failed refresh leaves the existing entry in place. When serve_stale is enabled, an expired entry can be returned with serve_stale_ttl, subject to serve_stale_expire_ttl and serve_stale_client_timeout_ms.
+
+The main configuration watcher reloads a valid JSON file and clears the rule cache. Invalid reloads leave the previous configuration active. The listener addresses, UDP worker count, TLS DoH listener, connection-pool construction, cache construction, and other Engine initialization settings are created at startup; changing those settings should be followed by a restart.
+
+GeoSite files in geosite_data_paths are watched and reloaded. GeoIP files supplied through geoip_dat_path are watched and reloaded. A GeoIP MMDB supplied through geoip_db_path is loaded at startup; the current watcher is for geoip_dat_path, not the MMDB path.
 
 ## Tools
 
-KixDNS ships with browser-based tools — no installation required, just open the `.html` file directly.
+### Config editor
 
-### Config Editor
+tools/config_editor.html is a browser-based editor for settings, pipeline selectors, pipelines, rules, matchers, actions, ECS fields, TXT actions, and response rules. It provides JSON import, JSON preview, JSON download, and a Mermaid flowchart view.
 
-**File**: `tools/config_editor.html`
+The file loads Vue, Bootstrap, and Mermaid from public CDNs, so the browser needs access to those URLs. Open the file directly, import or edit a configuration, download the JSON, then validate it by starting KixDNS:
 
-A visual editor for `pipeline.json` — no need to hand-write JSON. Just open the HTML file in any browser.
+~~~text
+tools/config_editor.html
+~~~
 
-![Config Editor](docs/images/config-editor.png)
+See [tools/README.md](tools/README.md) for the tool-specific notes.
 
-**Features**:
+tools/diagnose.html is a small browser smoke-check page for the editor's Vue/TXT/matcher code. It is not a DNS query service and does not provide a WebSocket API.
 
-- **Visual form editor** — configure all settings (global, pipelines, matchers, actions) through a form UI
-- **Live JSON preview** — left side edits, right side shows generated JSON in real time
-- **Mermaid flowchart** — auto-generates a visual pipeline flowchart from your config
-- **Import / Export** — load existing `pipeline.json` to edit, export to download the result
-- **GeoIP & GeoSite** — configure MMDB paths, GeoSite `.dat` files, cache capacity/TTL
-- **All upstream transports** — UDP / TCP / DoH / DoT / DoQ with URL prefix auto-detection
-- **Serve Stale (RFC 8767)** — configure stale cache TTL, expiry window, client timeout
-- **DoQ 0-RTT** — per-upstream 0-RTT toggle via URL query parameter
+tools/check_geosite_tags.rs is a standalone source file in the repository. Cargo.toml does not declare it as a bin or example target.
 
-**Usage**:
+## Build and test
 
-```bash
-# Clone the repo and open the editor in your browser
-git clone https://github.com/olicesx/kixdns.git
-open kixdns/tools/config_editor.html    # macOS
-xdg-open kixdns/tools/config_editor.html  # Linux
-
-# Or download just the file:
-curl -O https://raw.githubusercontent.com/olicesx/kixdns/main/tools/config_editor.html
-```
-
-Edit in the browser → click **Download JSON** → save as `pipeline.json` → run with:
-
-```bash
-kixdns run -c pipeline.json
-```
-
-Full documentation: [`tools/README.md`](tools/README.md)
-
-### Diagnostic Tool
-
-**File**: `tools/diagnose.html`
-
-A WebSocket-based DNS query diagnostic tool for testing KixDNS instances in real time.
-
-### GeoSite Tag Checker
-
-**File**: `tools/check_geosite_tags.rs`
-
-A standalone Rust utility to inspect available tags in a GeoSite `.dat` file:
-
-```bash
-cargo run --bin check_geosite_tags -- geosite.dat
-```
-
-## Building from Source
-
-**Requirements**: Rust 1.82+ (edition 2024)
-
-```bash
-git clone https://github.com/olicesx/kixdns.git
-cd kixdns
+~~~bash
 cargo build --release
-```
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+~~~
 
-Release profile uses `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, and `strip = true` for maximum performance.
+The release profile sets opt-level = 3, lto = fat, codegen-units = 1, panic = abort, and strip = true.
+
+The main dependencies include tokio, hickory-proto, serde, moka, dashmap, reqwest, tokio-rustls, quinn, maxminddb, notify, clap, and tracing. The exact versions are defined by Cargo.toml and Cargo.lock.
 
 ## License
 

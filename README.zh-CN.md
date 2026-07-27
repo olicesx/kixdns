@@ -2,403 +2,488 @@
 
 **[English](./README.md)** | **[简体中文](./README.zh-CN.md)**
 
-高性能、非递归 DNS 转发服务器，使用 Rust 开发，面向低延迟、高并发场景，支持灵活的 Pipeline 路由规则和热重载配置。
+KixDNS 是使用 Rust 编写的异步、非递归 DNS 转发服务器。它接收 UDP/TCP 查询，也可以启用入站 DoH，然后按照有序的 Pipeline 规则进行转发或直接构造响应。
 
-## 特性
+本文档以当前 main 分支代码为准。配置类型可以反序列化但运行引擎尚未读取的字段会明确标注。
 
-### 🚀 高性能
-- **零拷贝 UDP 处理** — 基于 `BytesMut` 的收包处理，最小化内存复制
-- **延迟请求解析** — 普通转发场景无需完整反序列化，直接透传
-- **轻量响应扫描** — 零分配提取上游响应的 RCODE 与最小 TTL
-- **快速哈希** — 内部数据结构采用 `rustc-hash` (FxHash)
-- **异步 I/O** — 基于 `tokio`，使用 `DashMap` / `moka` 并发状态管理
-- **自适应流控** — `PermitManager` 根据上游延迟动态调整并发
-- **SO_REUSEPORT** — Unix 多 worker 共享端口，充分利用多核
-- **双 Socket 架构** — IPv4/IPv6 分离 Socket，兼容 OpenBSD
+## 当前实现
 
-### 🔧 灵活路由
-- **Pipeline 选择规则** — 按监听器标签、客户端 IP、域名、QCLASS、EDNS、GeoSite 等多维路由
-- **匹配器逻辑运算** — AND、OR、AND_NOT、OR_NOT、NOT 组合
-- **两阶段处理** — 请求匹配 + 响应匹配，支持二次决策
-- **监听器标签** — 同一实例为不同标签提供不同 Pipeline
-- **多种上游传输** — UDP / TCP / DoH (RFC 8484) / DoT / DoQ (RFC 9250)
-- **URL 协议前缀** — `udp://`、`tcp://`、`doh://`、`dot://`、`doq://` 自动识别
-- **EDNS Client Subnet (RFC 7871)** — 两层 ECS 配置：Pipeline 级缓存隔离 + Action 级发包注入（Clear / FromClientIp / Static）
+- 入站 DNS over UDP 和 TCP。
+- 可选的入站 DNS over HTTPS（DoH，RFC 8484），使用 PEM 证书和私钥。
+- 出站 UDP、TCP、TCP+UDP 对冲请求、DoH、DoT 和 DoQ。
+- 按顺序进行 Pipeline 选择和请求规则匹配。
+- 支持监听器标签、客户端地址、域名、查询类型/类别、EDNS、GeoIP 和 GeoSite 的请求匹配器。
+- 支持响应匹配器，以及上游回退、响应过滤、响应替换和响应阶段 Pipeline 跳转。
+- 内存 DNS 缓存：容量、最大生存时间、最小 TTL、并发未命中去重、后台刷新和可选的 RFC 8767 过期缓存。
+- ECS 请求改写（RFC 7871），以及可选的 Pipeline 级 ECS 缓存隔离。
+- MaxMind MMDB GeoIP 查询，以及 V2Ray GeoIP/GeoSite 数据加载。
+- 主 JSON 配置、GeoSite 文件和配置的 GeoIP .dat/JSON 文件的文件监控。
+- GeoIP .dat 转 MMDB 的命令行工具。
 
-### 💾 缓存与可靠性
-- **内存缓存** — 高性能 `moka` 缓存，可配置容量和最大 TTL
-- **智能 TTL** — 遵循上游 TTL，支持可配置的最小 TTL 下限
-- **Singleflight 去重** — 基于 `tokio::watch` 的零分配并发去重，防止缓存击穿
-- **后台刷新** — TTL 即将过期时自动后台刷新，Hybrid Bloom Filter + DashSet 去重
-- **Serve Stale (RFC 8767)** — 上游不可用时返回过期缓存，提升弹性
-
-### 🌍 GeoIP 与 GeoSite
-- **MaxMind GeoIP 集成** — 支持 MMDB 格式 GeoIP2/GeoLite2 数据库
-- **私有 IP 检测** — 自动识别内网/私有 IP 地址段
-- **V2Ray GeoSite 支持** — 域名分类路由（cn、google、category-ads 等）
-- **数据库热重载** — 文件变化自动重新加载，懒加载机制
-
-### 🔌 DNS-over-QUIC (DoQ)
-- **0-RTT 自动检测** — 首次尝试 0-RTT，服务器拒绝时自动禁用并缓存
-- **零开销缓存** — `AtomicBool` 检测结果缓存
-- **RFC 9250 合规** — 强制 message-id=0 并恢复客户端 transaction ID
-
-### 🛡️ DNS 污染过滤
-- **响应阶段 IP 匹配** — `response_answer_ip` 检测污染响应
-- **自动上游切换** — 检测到污染时自动切换备用上游
-- **灵活降级策略** — TCP 回退、多级上游兜底
-
-### 📊 运维
-- **配置热重载** — `ArcSwap` 无锁热重载，`notify` 监控文件变化
-- **结构化日志** — 基于 `tracing` 的 JSON 日志输出
-- **可配置流控** — 按 deployment 调整 permit 范围和延迟阈值
+Unix 构建会为 UDP worker 创建独立 socket，并使用平台提供的 reuse-port 能力；非 Unix 构建使用由多个 worker 共享的 UDP socket。这是实现细节，不代表固定吞吐承诺。
 
 ## 快速开始
 
-### 构建
+### 构建和运行
 
-```bash
+仓库使用 Rust edition 2024。项目没有声明 MSRV，请使用支持 edition 2024 的工具链。
+
+~~~bash
 cargo build --release
-```
 
-### 运行
-
-```bash
-# 默认配置: config/pipeline.json
+# 不带子命令：使用 config/pipeline.json 和默认 listener label
 ./target/release/kixdns
 
-# 指定配置文件
-./target/release/kixdns --config /etc/kixdns/pipeline.json
+# 显式使用 run 子命令
+./target/release/kixdns run -c config/pipeline.json
+~~~
 
-# 使用监听器标签
-./target/release/kixdns --listener-label edge-internal
+UDP 和 TCP 默认监听 0.0.0.0:5353，默认上游是 1.1.1.1:53。所有路径都会按原样传给文件系统；相对路径相对于进程工作目录。
 
-# 调试模式
-./target/release/kixdns --debug
-```
+### CLI
 
-### 命令行参数
+~~~text
+kixdns [COMMAND]
 
-```
-kixdns [OPTIONS]
+COMMANDS:
+  run              运行 DNS 服务器
+  convert-geo-ip   将 GeoIP .dat 转换为 MMDB
+  help             显示帮助
+~~~
 
-OPTIONS:
-  -c, --config <FILE>          配置文件路径 [默认: config/pipeline.json]
-      --listener-label <LABEL> 监听器标签 [默认: default]
-      --debug                  启用调试日志
-      --udp-workers <NUM>      UDP worker 数量 [默认: CPU 核心数]
-  -h, --help                   显示帮助
-  -V, --version                显示版本
-```
+run 选项：
 
-### systemd 服务
+~~~text
+-c, --config <FILE>             配置路径（默认：config/pipeline.json）
+    --listener-label <LABEL>    Pipeline 选择使用的监听器标签（默认：default）
+    --debug                     启用 debug 级别日志
+    --udp-workers <NUM>         UDP worker 数量（0 表示使用可用 CPU 并行度）
+-h, --help                      显示帮助
+-V, --version                   显示版本
+~~~
 
-创建 `/etc/systemd/system/kixdns.service`：
+GeoIP 转换选项：
 
-```ini
+~~~text
+-i, --input <FILE>              输入 V2Ray GeoIP .dat 文件
+-o, --output <FILE>             输出 MMDB 文件
+-f, --filter <CODES>            逗号分隔的国家代码，例如 CN,US,JP
+~~~
+
+日志订阅器默认输出文本。默认过滤级别是 error；--debug 或 RUST_LOG 环境变量可以改变它。代码没有配置 JSON 日志输出。
+
+### systemd
+
+创建 /etc/systemd/system/kixdns.service：
+
+~~~ini
 [Unit]
 Description=KixDNS
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/kixdns --config /etc/kixdns/pipeline.json
+ExecStart=/usr/local/bin/kixdns run -c /etc/kixdns/pipeline.json
 Restart=on-failure
 LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
-```
+~~~
 
-```bash
+~~~bash
 sudo install -m 0755 target/release/kixdns /usr/local/bin/kixdns
 sudo mkdir -p /etc/kixdns
 sudo cp config/pipeline.json /etc/kixdns/
 sudo systemctl daemon-reload
 sudo systemctl enable --now kixdns
-```
+~~~
+
+## 网络协议
+
+### 入站
+
+UDP 和 TCP 监听器分别由 settings.bind_udp 和 settings.bind_tcp 创建。
+
+只有设置 settings.bind_doh 后才会启用入站 DoH。启用时必须同时设置 settings.doh_tls_cert 和 settings.doh_tls_key，且路径指向 PEM 文件。路径默认为 /dns-query，可通过 settings.doh_path 修改。
+
+入站 DoH 处理器：
+
+- 接收配置路径上的 POST 请求，并读取 DNS wire message 请求体；
+- 接收配置路径上的 GET 请求，并读取 dns 查询参数中的无填充 base64url 数据；
+- 拒绝大于 64 KiB 的 DNS 请求体；
+- 成功处理后返回 application/dns-message。
+
+DoT 和 DoQ 只作为出站传输实现，代码没有入站 DoT/DoQ 监听器。
+
+### 出站
+
+Forward 动作的 transport 字段可选以下值：
+
+| 值 | 传输 |
+|---|---|
+| udp | DNS over UDP |
+| tcp | DNS over TCP |
+| tcp_udp | 同时发送 TCP 和 UDP，使用第一个可接受的响应 |
+| doh | DNS over HTTPS |
+| dot | DNS over TLS |
+| doq | DNS over QUIC |
+
+upstream 支持字符串、逗号分隔字符串或 JSON 字符串数组。多个上游会并发查询并返回第一个可接受的响应；在多个上游选择时，SERVFAIL 和 REFUSED 响应不会被接受。
+
+以下协议前缀会覆盖 transport 字段：
+
+| 前缀 | 传输 | 别名 |
+|---|---|---|
+| udp:// | UDP | |
+| tcp:// | TCP | |
+| tcp+udp://、udp+tcp:// | TCP+UDP | |
+| doh:// | DoH | https:// |
+| dot:// | DoT | tls:// |
+| doq:// | DoQ | quic:// |
+
+没有协议前缀时，省略 transport 默认为 UDP。没有路径的 DoH URL 使用 /dns-query。DoH 支持使用 host 查询参数覆盖 HTTP Host；该参数不会继续发送给上游。
+
+DoT 未提供端口时使用 853。可通过 sni 或 servername 查询参数设置 TLS 名称，且 DoT 上游不能包含 DNS path。
+
+DoQ 未提供端口时使用 853。可通过 sni/servername 和 0rtt/enable_0rtt 查询参数配置。使用 IP 字面量的 DoQ 上游必须显式设置 SNI。0-RTT 默认全局启用，也可以按上游覆盖；某个上游被拒绝或超时后，会在进程重启前对该上游禁用 0-RTT。
+
+UDP 转发失败或 UDP 响应被截断时，TCP fallback 默认启用，可通过 settings.enable_tcp_fallback 禁用。该 fallback 属于转发路径，不是额外监听器。
 
 ## 配置
 
-配置采用 JSON 格式，顶层结构如下：
+配置格式为 JSON：
 
-```json
+~~~json
 {
   "version": "1.0",
-  "settings": { ... },
-  "pipeline_select": [ ... ],
-  "pipelines": [ ... ]
+  "settings": {},
+  "pipeline_select": [],
+  "pipelines": []
 }
-```
+~~~
+
+version 可省略。settings、pipeline_select 和 pipelines 省略时分别使用默认/空值。没有 Pipeline selector 匹配时使用第一个 Pipeline；没有 Pipeline 时使用全局默认上游。
 
 ### 全局设置
 
-- `min_ttl` — 最小 TTL，秒（默认: 0）
-- `bind_udp` — UDP 监听地址（默认: `0.0.0.0:5353`）
-- `bind_tcp` — TCP 监听地址（默认: `0.0.0.0:5353`）
-- `cache_capacity` — 缓存最大条目数（默认: 10000）
-- `cache_max_ttl` — 缓存最大 TTL，秒（默认: 86400）
-- `default_upstream` — 默认上游 DNS（默认: `1.1.1.1:53`）
-- `upstream_timeout_ms` — 上游超时（默认: 2000）
-- `response_jump_limit` — 响应阶段 Pipeline 跳转上限（默认: 10）
-- `udp_pool_size` — UDP 上游连接池大小（默认: 64）
-- `tcp_pool_size` — TCP 上游连接池大小（默认: 64）
-- `doh_pool_size` — DoH 每上游最大空闲连接（默认: 8）
-- `dot_pool_size` — DoT 连接池大小（默认: 64）
-- `doq_pool_size` — DoQ 连接池大小（默认: 16）
-- `doq_connection_idle_timeout_seconds` — DoQ 空闲超时（默认: 60）
-- `doq_keepalive_interval_ms` — DoQ keepalive 间隔（默认: 15000）
-- `doq_enable_0rtt` — 启用 DoQ 0-RTT 自动检测（默认: true）
-- `flow_control_initial_permits` — 流控初始 permits（默认: 500）
-- `flow_control_min_permits` — 最小 permits（默认: 100）
-- `flow_control_max_permits` — 最大 permits（默认: 800）
-- `flow_control_latency_threshold_ms` — 延迟告急阈值（默认: 100）
-- `flow_control_adjustment_interval_secs` — 流控调整间隔（默认: 5）
-- `cache_background_refresh` — 启用后台缓存刷新（默认: false）
-- `cache_refresh_threshold_percent` — 刷新阈值，剩余 TTL 百分比（默认: 10）
-- `cache_refresh_min_ttl` — 后台刷新最小 TTL（默认: 5）
-- `serve_stale` — 启用 RFC 8767 过期缓存（默认: false）
-- `serve_stale_ttl` — 过期缓存响应 TTL（默认: 30）
-- `serve_stale_expire_ttl` — 过期缓存最大时间窗口，秒（默认: 86400）
-- `serve_stale_ttl_reset` — 每次返回过期数据时重置计时器（默认: true）
-- `serve_stale_client_timeout_ms` — 返回过期数据前尝试上游的时间（默认: 0）
-- `geoip_db_path` — GeoIP MMDB 数据库路径
-- `geoip_cache_capacity` — GeoIP 查询缓存容量（默认: 10000）
-- `geoip_cache_ttl` — GeoIP 缓存 TTL，秒（默认: 3600）
-- `geosite_data_paths` — V2Ray GeoSite 数据文件路径列表
+| 字段 | 默认值 | 说明 |
+|---|---:|---|
+| min_ttl | 0 | 上游/缓存 TTL 下限，单位秒。 |
+| bind_udp | 0.0.0.0:5353 | UDP 监听地址。 |
+| bind_tcp | 0.0.0.0:5353 | TCP 监听地址。 |
+| bind_doh | null | 入站 DoH 监听地址；null 表示禁用。 |
+| doh_tls_cert | null | PEM 证书路径；设置 bind_doh 时必需。 |
+| doh_tls_key | null | PEM 私钥路径；设置 bind_doh 时必需。 |
+| doh_path | /dns-query | 入站 DoH 请求路径。 |
+| default_upstream | 1.1.1.1:53 | 默认上游；支持逗号分隔列表。 |
+| upstream_timeout_ms | 9000 | 单次上游操作超时。 |
+| request_timeout_ms | null | 整体请求超时；为 null 时使用 upstream_timeout_ms * 2.5，且不能小于 upstream_timeout_ms。 |
+| response_jump_limit | 10 | 响应阶段 Pipeline 跳转上限。 |
+| udp_pool_size | 64 | 出站 UDP socket 池大小。 |
+| tcp_pool_size | 64 | 每个上游的 TCP 连接池大小。 |
+| doh_pool_size | 8 | 每个上游最多保留的 DoH 空闲连接数。 |
+| dot_pool_size | 64 | 每个上游的 DoT 连接池大小。 |
+| doq_pool_size | 16 | 每个上游的 DoQ 连接池大小。 |
+| tcp_health_check_error_threshold | 3 | 连续错误达到该次数后重置 TCP/DoT 连接；0 禁用。 |
+| tcp_connection_max_age_seconds | 300 | TCP/DoT 连接最大存活时间；0 禁用。 |
+| tcp_connection_idle_timeout_seconds | 60 | TCP/DoT 空闲超时；0 禁用。 |
+| doq_connection_idle_timeout_seconds | 60 | DoQ 空闲超时；0 禁用。 |
+| doq_keepalive_interval_ms | 15000 | DoQ keepalive 间隔；0 禁用。 |
+| doq_enable_0rtt | true | 全局 DoQ 0-RTT 设置。 |
+| enable_tcp_fallback | true | UDP 失败或截断时用 TCP 重试。 |
+| flow_control_enabled | false | 启用基于 permits 的自适应流控。 |
+| flow_control_initial_permits | 500 | 启用流控时的初始 permits。 |
+| flow_control_min_permits | 100 | 启用流控时的最小 permits。 |
+| flow_control_max_permits | 800 | 启用流控时的最大 permits。 |
+| flow_control_latency_threshold_ms | 100 | 自适应流控使用的延迟阈值。 |
+| flow_control_adjustment_interval_secs | 5 | permits 调整间隔。 |
+| cache_capacity | 10000 | DNS 响应缓存最大条目数；必须大于 0。 |
+| cache_max_ttl | 86400 | DNS 缓存条目的最大生存时间，单位秒。 |
+| dashmap_shards | 0 | 内部分片设置；0 使用 DashMap 默认值，否则必须是 2 的幂。 |
+| cache_background_refresh | false | 在 TTL 过期前刷新条目。 |
+| cache_refresh_threshold_percent | 10 | 按剩余 TTL 百分比触发刷新。 |
+| cache_refresh_min_ttl | 5 | 参与后台刷新的最小 TTL。 |
+| serve_stale | false | 按 RFC 8767 行为保留并返回过期条目。 |
+| serve_stale_ttl | 30 | 过期响应中写入的 TTL。 |
+| serve_stale_expire_ttl | 86400 | 允许返回过期条目的最大时间，单位秒；0 表示不限制过期时间。 |
+| serve_stale_ttl_reset | true | 返回过期数据时重置过期时间窗口。 |
+| serve_stale_client_timeout_ms | 0 | 0 表示立即返回过期数据；大于 0 时先尝试上游指定毫秒数。 |
+| geoip_db_path | null | MaxMind MMDB 路径。 |
+| geoip_dat_path | null | V2Ray GeoIP .dat 或支持的 V2Ray JSON 路径；当前范围加载器使用 IPv4 范围。 |
+| geosite_data_paths | [] | V2Ray GeoSite .dat 或 JSON 路径列表；支持多个文件。 |
 
-### 匹配器类型
+当前配置类型会反序列化 geoip_auto_convert 和 geoip_filter_countries，但运行引擎没有读取它们，因此它们不会改变运行行为。转换时的国家过滤请使用 convert-geo-ip 的 --filter。顶层 background_refresh_rule 也会被读取，但当前运行时配置编译会忽略它。
 
-#### Pipeline 选择匹配器
+### Pipeline 选择
 
-| 类型 | 参数 | 说明 |
-|------|------|------|
-| `listener_label` | `value` | 监听器标签匹配 |
-| `client_ip` | `cidr` | 客户端 IP CIDR 匹配 |
-| `domain_suffix` | `value` | 域名后缀匹配 |
-| `domain_regex` | `value` | 域名正则匹配 |
-| `qclass` | `value` | QCLASS 匹配 (IN/CH/HS) |
-| `edns_present` | `expect` | EDNS 存在性检查 |
-| `geosite` | `value` | GeoSite 域名分类匹配 |
-| `geosite_not` | `value` | GeoSite 否定匹配 |
-| `any` | — | 任意匹配 |
+pipeline_select 的每项包含 Pipeline id、可选的匹配器列表和可选的 matcher_operator。数组按顺序评估；第一个匹配且 id 存在的项选择对应 Pipeline。
 
-#### 请求匹配器
+### Pipeline 和规则
 
-与 Pipeline 选择匹配器相同，额外支持：
+每个 Pipeline 包含 id、可选的 rules 数组和可选的 Pipeline 级 ecs。规则按配置顺序处理。空匹配器列表视为匹配。规则内的匹配器按从左到右形成链；每个匹配器可以携带自己的 operator，或者在所有匹配器都省略 operator 时由规则级 matcher_operator 设置。
 
-| 类型 | 参数 | 说明 |
-|------|------|------|
-| `geoip_country` | `country_codes` | 客户端 IP 国家代码 (CN、US 等) |
-| `geoip_private` | `expect` | 私有/内网 IP 检测 |
+响应阶段使用同样的 response_matchers、response_matcher_operator、response_actions_on_match 和 response_actions_on_miss。Forward 得到响应后执行响应动作；配置了 miss 动作时，上游尝试全部失败后也会进入 miss 路径。
 
-#### 响应匹配器
+### Pipeline selector 和请求匹配器
 
-| 类型 | 参数 | 说明 |
-|------|------|------|
-| `upstream_equals` | `value` | 上游字符串精确匹配 |
-| `request_domain_suffix` | `value` | 请求域名后缀匹配 |
-| `request_domain_regex` | `value` | 请求域名正则匹配 |
-| `response_upstream_ip` | `cidr` | 上游 IP CIDR 匹配 |
-| `response_answer_ip` | `cidr` | Answer 段 IP CIDR 匹配 |
-| `response_type` | `value` | 记录类型匹配 (A/AAAA/CNAME) |
-| `response_rcode` | `value` | RCODE 匹配 (NOERROR/NXDOMAIN) |
-| `response_qclass` | `value` | QCLASS 匹配 |
-| `response_edns_present` | `expect` | EDNS 存在性检查 |
+| 类型 | 字段 |
+|---|---|
+| any | 无 |
+| listener_label | value |
+| client_ip | cidr |
+| domain_suffix | value |
+| domain_regex | value |
+| qclass | value：IN、CH/CHAOS 或 HS |
+| edns_present | expect：布尔值 |
+| geosite | value：GeoSite tag |
+| geosite_not | value：GeoSite tag |
+| geoip_country | country_codes：字符串数组 |
+| geoip_private | expect：布尔值 |
+| qtype | value：A、AAAA、CNAME、MX、TXT、NS、PTR、SOA、SRV 或 OPT |
 
-### 动作类型
+Pipeline selector 支持上表全部类型；请求规则支持除 listener_label 之外的全部类型。
 
-| 类型 | 参数 | 说明 |
-|------|------|------|
-| `log` | `level`, `message` | 记录日志 |
-| `static_response` | `rcode` | 返回静态 RCODE |
-| `static_ip_response` | `rcode`, `ips` | 返回静态 IP 响应 |
-| `jump_to_pipeline` | `pipeline` | 跳转到指定 Pipeline |
-| `allow` | — | 接受当前响应 |
-| `deny` | — | 返回 REFUSED |
-| `forward` | `upstream`, `transport` | 转发到上游 |
-| `continue` | — | 继续匹配下一条规则 |
+域名后缀和 GeoSite 匹配不区分大小写。domain_regex 和 request_domain_regex 使用 Rust 正则语法。
 
-**传输选项**: `udp`、`tcp`、`tcp_udp`、`doh`、`dot`、`doq`（上游 URL 含协议前缀时可省略）
+### 响应匹配器
 
-**URL 前缀**: `udp://`、`tcp://`、`tcp+udp://`、`doh://`、`https://`、`dot://`、`tls://`、`doq://`、`quic://`
+| 类型 | 字段 |
+|---|---|
+| upstream_equals | value；按运行时上游标签做字符串精确比较 |
+| request_domain_suffix | value |
+| request_domain_regex | value |
+| response_upstream_ip | cidr；支持逗号分隔 CIDR |
+| response_answer_ip | cidr；支持逗号分隔 CIDR |
+| response_type | value；优先检查第一个 Answer 记录，没有 Answer 时使用查询类型 |
+| response_rcode | value：NOERROR、FORMERR、SERVFAIL、NXDOMAIN、NOTIMP、REFUSED；未知值作为 OTHER 回退匹配 |
+| response_qclass | value |
+| response_edns_present | expect：布尔值 |
+| response_answer_ip_geoip_country | country_codes：字符串数组 |
+| response_answer_ip_geoip_private | expect：布尔值 |
+| response_request_domain_geosite | value：GeoSite tag |
+| response_request_domain_geosite_not | value：GeoSite tag |
+| response_txt_content | mode：exact、prefix 或 regex；value 为文本/模式 |
+
+当前成功上游标签包含传输前缀，例如 udp:1.1.1.1:53 或 tcp:1.1.1.1:53。因此 upstream_equals 的 value 必须包含该前缀。response_upstream_ip 当前解析原始 IP 或 host:port，不会剥离传输前缀。
 
 ### 逻辑运算符
 
-匹配器支持逻辑组合：
+运算符从左到右计算，第一个匹配器作为初始结果。
 
-| 运算符 | 说明 |
-|--------|------|
-| `and` | 逻辑与（默认） |
-| `or` | 逻辑或 |
-| `and_not` | 逻辑与非 |
-| `or_not` | 逻辑或非 |
-| `not` | 逻辑非 |
+| 运算符 | 含义 |
+|---|---|
+| and | 下一个匹配器必须为 true，默认值。 |
+| or | 累积结果为 false 时，使用下一个匹配器结果。 |
+| and_not | 累积结果为 true 时，下一个匹配器必须为 false。 |
+| or_not | 累积结果为 false 时，下一个匹配器必须为 false。 |
+| not | 反序列化时作为 and_not 的别名。 |
+
+同时接受 and-not、andnot、or-not 和 ornot 别名。
+
+### 动作
+
+| 类型 | 字段 | 行为 |
+|---|---|---|
+| log | level（可选） | 输出匹配规则的 tracing 事件；支持 trace、debug、info、warn、error。 |
+| static_response | rcode | 返回 NOERROR、FORMERR、SERVFAIL、NXDOMAIN、NOTIMP 或 REFUSED。 |
+| static_ip_response | ip | 根据 IP 地址返回 A 或 AAAA 响应。 |
+| static_txt_response | text、ttl（可选） | 返回 TXT 响应；text 支持字符串或字符串数组，ttl 默认 300。 |
+| jump_to_pipeline | pipeline | 开始处理指定 Pipeline。 |
+| allow | 无 | 请求阶段：使用全局默认 UDP 上游；响应阶段：保留当前上游响应。 |
+| deny | 无 | 返回 REFUSED。 |
+| forward | upstream（可选）、transport（可选）、ecs（可选） | 转发到指定上游；缺少 upstream 时使用 default_upstream。 |
+| continue | 无 | 继续处理下一个请求规则，或继续响应流程中的下一个 Pipeline 决策。 |
+| replace_txt_response | text | 响应阶段替换当前响应中的 TXT 记录；请求阶段不会产生响应。 |
+
+### ECS
+
+ECS 配置在 Forward 动作中：
+
+~~~json
+{
+  "type": "forward",
+  "upstream": "8.8.8.8:53",
+  "ecs": {
+    "mode": "from_client_ip",
+    "prefix_v4": 24,
+    "prefix_v6": 56
+  }
+}
+~~~
+
+支持的模式：
+
+- clear：移除请求中的 ECS 选项；
+- from_client_ip：根据客户端地址生成子网，IPv4 默认 /24、IPv6 默认 /56；私有地址、回环地址和 ULA 地址不会注入；
+- static：使用配置的 IP 和前缀注入。
+
+Pipeline 级 ecs 会改变缓存键，使不同客户端子网的响应可以隔离；它不会替代 Forward 动作的 ECS 改写设置。当 action 使用 ECS 但 Pipeline 没有 ecs 时，运行引擎会发出警告。
 
 ## 配置示例
 
-### GeoIP 按国家路由
+### 基本路由和静态响应
 
-```json
+~~~json
 {
   "version": "1.0",
   "settings": {
-    "min_ttl": 30,
     "bind_udp": "0.0.0.0:5353",
-    "default_upstream": "1.1.1.1:53",
-    "geoip_db_path": "data/GeoLite2-Country.mmdb"
+    "bind_tcp": "0.0.0.0:5353",
+    "default_upstream": "1.1.1.1:53"
   },
+  "pipeline_select": [
+    {
+      "pipeline": "internal",
+      "matchers": [
+        { "type": "listener_label", "value": "edge-internal" }
+      ]
+    }
+  ],
   "pipelines": [
     {
-      "id": "china-domestic",
-      "rules": [{
-        "name": "china-clients",
-        "matchers": [{ "type": "geoip_country", "country_codes": ["CN"] }],
-        "actions": [
-          { "type": "log", "level": "info" },
-          { "type": "forward", "upstream": "223.5.5.5:53" }
-        ]
-      }]
+      "id": "internal",
+      "rules": [
+        {
+          "name": "internal-dns",
+          "matchers": [
+            { "type": "domain_suffix", "value": ".internal" }
+          ],
+          "actions": [
+            { "type": "forward", "upstream": "10.0.0.53:53", "transport": "tcp" }
+          ]
+        }
+      ]
     },
     {
-      "id": "international",
-      "rules": [{
-        "name": "non-china",
-        "matchers": [{ "type": "geoip_country", "country_codes": ["US", "JP", "KR"] }],
-        "actions": [{ "type": "forward", "upstream": "8.8.8.8:53" }]
-      }]
+      "id": "default",
+      "rules": [
+        {
+          "name": "block-example",
+          "matchers": [
+            { "type": "domain_suffix", "value": ".blocked.example" }
+          ],
+          "actions": [
+            { "type": "static_response", "rcode": "NXDOMAIN" }
+          ]
+        },
+        {
+          "name": "default-forward",
+          "matchers": [ { "type": "any" } ],
+          "actions": [
+            { "type": "forward", "upstream": null }
+          ]
+        }
+      ]
     }
   ]
 }
-```
+~~~
 
-### GeoSite 域名分类路由
+### 响应阶段回退
 
-```json
+~~~json
 {
-  "version": "1.0",
   "settings": {
-    "geosite_data_paths": ["data/geosite-cn.json", "data/geosite-google.json"]
+    "default_upstream": "223.5.5.5:53"
   },
   "pipelines": [
     {
-      "id": "cn-domains",
-      "rules": [{
-        "name": "china-domains",
-        "matchers": [{ "type": "geosite", "value": "cn" }],
-        "actions": [{ "type": "forward", "upstream": "223.5.5.5:53" }]
-      }]
-    },
-    {
-      "id": "block-ads",
-      "rules": [{
-        "name": "ad-block",
-        "matchers": [{ "type": "geosite", "value": "category-ads" }],
-        "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
-      }]
+      "id": "fallback",
+      "rules": [
+        {
+          "name": "reject-polluted-answer",
+          "matchers": [ { "type": "any" } ],
+          "actions": [
+            { "type": "forward", "upstream": "223.5.5.5:53", "transport": "udp" }
+          ],
+          "response_matchers": [
+            { "type": "response_answer_ip", "cidr": "127.0.0.0/8,0.0.0.0/8" }
+          ],
+          "response_actions_on_match": [
+            { "type": "continue" }
+          ],
+          "response_actions_on_miss": [
+            { "type": "allow" }
+          ]
+        },
+        {
+          "name": "backup",
+          "matchers": [ { "type": "any" } ],
+          "actions": [
+            { "type": "forward", "upstream": "8.8.4.4:53", "transport": "tcp" }
+          ]
+        }
+      ]
     }
   ]
 }
-```
+~~~
 
-### DNS 污染过滤
+### 入站 DoH
 
-```json
+~~~json
 {
-  "version": "1.0",
   "settings": {
-    "default_upstream": "223.5.5.5:53",
-    "upstream_timeout_ms": 1500
+    "bind_doh": "0.0.0.0:8443",
+    "doh_tls_cert": "/etc/kixdns/cert.pem",
+    "doh_tls_key": "/etc/kixdns/key.pem",
+    "doh_path": "/dns-query"
   },
-  "pipelines": [{
-    "id": "filter",
-    "rules": [
-      {
-        "name": "check-pollution",
-        "matchers": [{ "type": "any" }],
-        "actions": [{ "type": "forward", "upstream": "223.5.5.5:53", "transport": "udp" }],
-        "response_matchers": [{ "type": "response_answer_ip", "cidr": "127.0.0.0/8,0.0.0.0/8" }],
-        "response_actions_on_match": [{ "type": "continue" }],
-        "response_actions_on_miss": [{ "type": "allow" }]
-      },
-      {
-        "name": "fallback",
-        "matchers": [{ "type": "any" }],
-        "actions": [{ "type": "forward", "upstream": "8.8.4.4:53", "transport": "tcp" }]
-      }
-    ]
-  }]
+  "pipelines": [
+    {
+      "id": "default",
+      "rules": [
+        {
+          "name": "forward-all",
+          "matchers": [ { "type": "any" } ],
+          "actions": [ { "type": "forward", "upstream": "1.1.1.1:53" } ]
+        }
+      ]
+    }
+  ]
 }
-```
+~~~
 
-### Serve Stale (RFC 8767)
+## 缓存和重载行为
 
-```json
-{
-  "settings": {
-    "serve_stale": true,
-    "serve_stale_ttl": 30,
-    "serve_stale_expire_ttl": 86400,
-    "serve_stale_ttl_reset": true,
-    "serve_stale_client_timeout_ms": 0
-  }
-}
-```
+DNS 响应缓存使用上游响应的最小 TTL；配置 min_ttl 时会将其提高到该下限，并受 cache_max_ttl 和 cache_capacity 限制。否定响应在存在 SOA 时使用 SOA 负缓存 TTL。相同的进行中缓存未命中会共享一次上游操作。
 
-### DoQ 与 0-RTT
+启用 cache_background_refresh 后，接近过期的条目可以触发异步刷新；刷新失败会保留现有条目。启用 serve_stale 后，可以返回过期条目，并使用 serve_stale_ttl 作为响应 TTL，同时受 serve_stale_expire_ttl 和 serve_stale_client_timeout_ms 限制。
 
-```json
-{
-  "settings": {
-    "doq_enable_0rtt": true,
-    "doq_pool_size": 8
-  },
-  "pipelines": [{
-    "id": "doq-upstream",
-    "rules": [{
-      "name": "alidns-doq",
-      "matchers": [{ "type": "any" }],
-      "actions": [{
-        "type": "forward",
-        "upstream": "doq://223.5.5.5:853?sni=dns.alidns.com&0rtt=false"
-      }]
-    }]
-  }]
-}
-```
+主配置 watcher 会重载有效 JSON 并清空规则缓存。无效的重载会保留旧配置。监听地址、UDP worker 数量、TLS DoH 监听器、连接池构造、缓存构造和其他 Engine 初始化参数均在启动时创建；修改这些设置后应重启服务。
 
-## 技术栈
-
-- **tokio** — 异步运行时
-- **hickory-proto** — DNS 协议
-- **moka** — 高性能缓存
-- **dashmap** — 并发哈希映射
-- **rustc-hash** — 快速哈希 (FxHash)
-- **quinn** — QUIC/DoQ 传输
-- **reqwest** — HTTP/DoH 客户端
-- **tokio-rustls** — TLS (DoT/DoQ)
-- **maxminddb** — GeoIP MMDB 查询
-- **arc-swap** — 无锁配置热重载
-- **notify** — 文件变化检测
-- **clap** — 命令行参数解析
-- **tracing** — 结构化日志
+geosite_data_paths 中的 GeoSite 文件会被监控并重载。geoip_dat_path 指定的 GeoIP 文件会被监控并重载。geoip_db_path 指定的 MMDB 在启动时加载；当前 watcher 监控的是 geoip_dat_path，不是 MMDB 路径。
 
 ## 工具
 
-- `tools/config_editor.html` — 浏览器端 Pipeline 配置编辑器
-- `tools/diagnose.html` — 基于 WebSocket 的 DNS 查询诊断工具
+### 配置编辑器
 
-## 从源码构建
+tools/config_editor.html 是浏览器端配置编辑器，可以编辑 settings、Pipeline selector、Pipeline、规则、匹配器、动作、ECS、TXT 动作和响应规则，支持导入 JSON、预览 JSON、下载 JSON 以及 Mermaid 流程图。
 
-**依赖**: Rust 1.82+ (edition 2024)
+该文件从公共 CDN 加载 Vue、Bootstrap 和 Mermaid，因此浏览器需要能访问这些 URL。可以直接打开文件，导入或编辑配置，下载 JSON，然后通过启动 KixDNS 验证：
 
-```bash
-git clone https://github.com/olicesx/kixdns.git
-cd kixdns
+~~~text
+tools/config_editor.html
+~~~
+
+工具专用说明见 [tools/README.md](tools/README.md)。
+
+tools/diagnose.html 是用于检查编辑器 Vue/TXT/匹配器代码的浏览器 smoke-check 页面，不是 DNS 查询服务，也不提供 WebSocket API。
+
+tools/check_geosite_tags.rs 是仓库中的独立源码文件。Cargo.toml 没有将它声明为 bin 或 example target。
+
+## 构建和测试
+
+~~~bash
 cargo build --release
-```
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+~~~
 
-Release profile 使用 `opt-level = 3`、`lto = "fat"`、`codegen-units = 1`、`strip = true` 以获得最佳性能。
+Release profile 设置 opt-level = 3、lto = fat、codegen-units = 1、panic = abort 和 strip = true。
+
+主要依赖包括 tokio、hickory-proto、serde、moka、dashmap、reqwest、tokio-rustls、quinn、maxminddb、notify、clap 和 tracing；具体版本以 Cargo.toml 和 Cargo.lock 为准。
 
 ## 许可证
 
