@@ -117,7 +117,7 @@ GeoIP 转换选项：
 -f, --filter <CODES>            逗号分隔的国家代码，例如 CN,US,JP
 ~~~
 
-日志订阅器默认输出文本。默认过滤级别是 error；--debug 或 RUST_LOG 环境变量可以改变它。代码没有配置 JSON 日志输出。
+日志订阅器默认输出文本，时间戳使用 RFC 3339 格式并跟随系统本地时区。默认过滤级别是 error；--debug 或 RUST_LOG 环境变量可以改变它。代码没有配置 JSON 日志输出。
 
 ### systemd
 

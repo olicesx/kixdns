@@ -118,7 +118,7 @@ GeoIP conversion options:
 -f, --filter <CODES>            Comma-separated country codes, for example CN,US,JP
 ~~~
 
-The logging subscriber is text formatted by default. The default filter is error unless --debug or the RUST_LOG environment variable changes it. The code does not configure JSON log output.
+The logging subscriber is text formatted by default, with RFC 3339 timestamps following the system's local timezone. The default filter is error unless --debug or the RUST_LOG environment variable changes it. The code does not configure JSON log output.
 
 ### systemd
 

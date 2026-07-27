@@ -361,6 +361,7 @@ fn init_tracing(debug: bool) {
     // 默认仅保留错误日志以平衡性能与可观测性，除非显式指定
     // Default to error-level logging to balance performance with observability unless explicitly enabled
     let fmt_layer = fmt::layer()
+        .with_timer(fmt::time::LocalTime::rfc_3339())
         .with_target(false)
         .with_ansi(false)
         .with_level(debug);
