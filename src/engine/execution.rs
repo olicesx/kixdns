@@ -1035,7 +1035,7 @@ impl Engine {
                             );
                             let req = Message::from_bytes(packet)
                                 .context("parse request for SERVFAIL")?;
-                            return Ok(engine_helpers::build_servfail_response(&req)?);
+                            return engine_helpers::build_servfail_response(&req);
                         }
                     }
                 }
