@@ -1018,7 +1018,25 @@ impl Engine {
                             );
                             continue 'decision_loop;
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            // A rule continued (response_actions_on_match: [continue])
+                            // and the next Forward attempt failed. The client must
+                            // receive a definitive answer, never silence: DNS clients
+                            // treat a missing reply as TIMEOUT. Return SERVFAIL so the
+                            // stub resolver can retry (RFC 1035).
+                            // 规则 continue 后，下一条 Forward 查询失败。必须给客户端
+                            // 一个确定性的响应而非静默：DNS 客户端会把无响应视为
+                            // TIMEOUT。返回 SERVFAIL 以便 stub resolver 重试。
+                            warn!(
+                                event = "continue_reforward_failed",
+                                error = %e,
+                                rule = %rule_name,
+                                "continue re-forward failed, returning SERVFAIL"
+                            );
+                            let req = Message::from_bytes(packet)
+                                .context("parse request for SERVFAIL")?;
+                            return Ok(engine_helpers::build_servfail_response(&req)?);
+                        }
                     }
                 }
             }
@@ -1647,6 +1665,50 @@ mod tests {
                 );
             }
             _ => panic!("expected upstream result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_actions_continue_returns_continue_with_context() {
+        // Arrange: Build test engine, response context, and Continue action
+        let engine = build_test_engine();
+        let ctx = build_response_context();
+        let req = Message::new(0, MessageType::Query, OpCode::Query);
+        let actions = [Action::Continue];
+        let packet = [0u8];
+        let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Act: Apply response actions with Continue action
+        let ctx = crate::engine::rules::ApplyResponseActionsContext {
+            engine: &engine,
+            actions: &actions,
+            ctx_opt: Some(ctx),
+            req: &req,
+            packet: &packet,
+            upstream_timeout: Duration::from_secs(1),
+            response_matchers: &[],
+            qname: "example.com",
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            client_ip,
+            upstream_default: TEST_UPSTREAM,
+            pipeline_id: "pipeline",
+            rule_name: "rule",
+            remaining_jumps: 10,
+        };
+        let result = apply_response_actions(ctx)
+            .await
+            .expect("response actions continue should succeed");
+
+        // Assert: Verify Continue action returns Continue with the response context
+        match result {
+            ResponseActionResult::Continue { ctx } => {
+                assert!(
+                    ctx.is_some(),
+                    "Continue must carry the received response context for reuse"
+                );
+            }
+            _ => panic!("expected continue result"),
         }
     }
 

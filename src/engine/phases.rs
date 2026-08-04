@@ -884,8 +884,28 @@ pub async fn handle_forward_decision(
                     Ok(ForwardResult::Success(resp_bytes))
                 }
                 ResponseActionResult::Continue { ctx } => {
-                    if let Some(g) = cleanup_guard.as_mut() {
-                        g.defuse();
+                    // Defusing here would leave the inflight entry (dedupe_hash)
+                    // in the map without ever notifying it: concurrent same-hash
+                    // requests wait on rx.changed() forever, and — worse — the
+                    // re-evaluated next rule (execution.rs re-applies rules and
+                    // forwards again with the same dedupe_hash) finds the entry
+                    // Occupied and hangs until the outer timeout, which surfaces
+                    // as a client TIMEOUT instead of a fallback answer.
+                    // 此处 defuse 会让 inflight 条目（dedupe_hash）留在 map 中且
+                    // 永远不通知：并发同 hash 请求会永久等待 rx.changed()，更糟的
+                    // 是——continue 后重新评估的下一条规则（execution.rs 重新
+                    // apply_rules 并以相同 dedupe_hash 再次转发）会看到 Occupied
+                    // 条目并挂起直到外层超时，表现为客户端 TIMEOUT 而非 fallback。
+                    //
+                    // So: notify waiters with the response received so far, and
+                    // let the cleanup guard (kept active) remove the entry on
+                    // return, so the next Forward attempt starts fresh.
+                    // 因此：先以已收到的响应通知等待者，并让清理守卫（保持 active）
+                    // 在返回时移除条目，使下一次 Forward 尝试从全新条目开始。
+                    if let Some(ctx_ref) = ctx.as_ref() {
+                        engine
+                            .notify_inflight_waiters(dedupe_hash, &ctx_ref.raw)
+                            .await;
                     }
                     Ok(ForwardResult::Continue(Box::new(ctx)))
                 }
