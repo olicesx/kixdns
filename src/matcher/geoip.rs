@@ -60,6 +60,25 @@ impl IpRange {
     }
 }
 
+/// IPv6 段（用于快速匹配）/ IPv6 range for fast matching
+#[derive(Debug, Clone)]
+pub struct IpRangeV6 {
+    /// 起始 IP 地址（u128 大端序）/ Start IP address (u128 big-endian)
+    pub start: u128,
+    /// 结束 IP 地址（u128 大端序）/ End IP address (u128 big-endian)
+    pub end: u128,
+    /// 国家代码 / Country code
+    pub country_code: String,
+}
+
+impl IpRangeV6 {
+    /// 检查 IPv6 是否在范围内 / Check if IPv6 is in range
+    #[inline]
+    pub fn contains(&self, ip: u128) -> bool {
+        ip >= self.start && ip <= self.end
+    }
+}
+
 /// V2Ray .dat 文件使用 protobuf 格式
 /// MaxMind GeoIP 数据库管理器 / MaxMind GeoIP database manager
 pub struct GeoIpManager {
@@ -71,6 +90,8 @@ pub struct GeoIpManager {
     db_path: Option<String>,
     /// IP 范围列表（从 .dat 文件加载）/ IP range list (loaded from .dat file)
     ip_ranges: Vec<IpRange>,
+    /// IPv6 范围列表（从 .dat 文件加载）/ IPv6 range list (loaded from .dat file)
+    ipv6_ranges: Vec<IpRangeV6>,
     /// 查询结果缓存（IP -> GeoIP 结果） / Query result cache (IP -> GeoIP result)
     cache: MokaCache<IpAddr, GeoIpResult>,
 }
@@ -122,6 +143,7 @@ impl GeoIpManager {
             reader: Arc::new(reader),
             db_path,
             ip_ranges: Vec::new(),
+            ipv6_ranges: Vec::new(),
             cache,
         })
     }
@@ -209,68 +231,83 @@ impl GeoIpManager {
 
     /// 从 .dat 文件的 IP 范围查询 / Lookup from .dat file IP ranges
     fn lookup_dat(&self, ip: IpAddr) -> GeoIpResult {
-        let ip_u32 = match ip {
+        match ip {
             IpAddr::V4(ipv4) => {
                 let octets = ipv4.octets();
-                (octets[0] as u32) << 24
+                let ip_u32 = (octets[0] as u32) << 24
                     | (octets[1] as u32) << 16
                     | (octets[2] as u32) << 8
-                    | (octets[3] as u32)
+                    | (octets[3] as u32);
+
+                // 使用二分查找 / Use binary search
+                match self
+                    .ip_ranges
+                    .binary_search_by_key(&ip_u32, |range| range.start)
+                {
+                    Ok(idx) => {
+                        // 完全匹配起始 IP / Exact match on start IP
+                        let range = &self.ip_ranges[idx];
+                        if ip_u32 <= range.end {
+                            return GeoIpResult {
+                                country_code: Some(Arc::from(range.country_code.as_str())),
+                                is_private: crate::matcher::geoip::is_private_ip(ip),
+                            };
+                        }
+                    }
+                    Err(idx) => {
+                        // 检查相邻的范围 / Check adjacent ranges
+                        if idx > 0 {
+                            let range = &self.ip_ranges[idx - 1];
+                            if ip_u32 >= range.start && ip_u32 <= range.end {
+                                return GeoIpResult {
+                                    country_code: Some(Arc::from(range.country_code.as_str())),
+                                    is_private: crate::matcher::geoip::is_private_ip(ip),
+                                };
+                            }
+                        }
+                    }
+                }
+                GeoIpResult {
+                    country_code: None,
+                    is_private: crate::matcher::geoip::is_private_ip(ip),
+                }
             }
             IpAddr::V6(ipv6) => {
-                // 简化：只取前 4 个字节 / Simplification: only use first 4 bytes
-                let segments = ipv6.segments();
-                (segments[0] as u32) << 24
-                    | (segments[1] as u32) << 16
-                    | (segments[2] as u32) << 8
-                    | (segments[3] as u32)
-            }
-        };
+                let ip_u128 = u128::from(ipv6);
 
-        // 使用二分查找 / Use binary search
-        match self
-            .ip_ranges
-            .binary_search_by_key(&ip_u32, |range| range.start)
-        {
-            Ok(idx) => {
-                // 完全匹配起始 IP / Exact match on start IP
-                let range = &self.ip_ranges[idx];
-                if ip_u32 <= range.end {
-                    return GeoIpResult {
-                        // 零拷贝优化：将 String 转为 Arc<str> 以便后续 clone 无需分配
-                        // Zero-copy: convert String to Arc<str> for clone without allocation
-                        country_code: Some(Arc::from(range.country_code.as_str())),
-                        is_private: crate::matcher::geoip::is_private_ip(ip),
-                    };
-                }
-            }
-            Err(idx) => {
-                // 检查相邻的范围 / Check adjacent ranges
-                if idx > 0 {
-                    let range = &self.ip_ranges[idx - 1];
-                    if ip_u32 >= range.start && ip_u32 <= range.end {
-                        return GeoIpResult {
-                            country_code: Some(Arc::from(range.country_code.as_str())),
-                            is_private: crate::matcher::geoip::is_private_ip(ip),
-                        };
+                // 使用二分查找 / Use binary search
+                match self
+                    .ipv6_ranges
+                    .binary_search_by_key(&ip_u128, |range| range.start)
+                {
+                    Ok(idx) => {
+                        // 完全匹配起始 IP / Exact match on start IP
+                        let range = &self.ipv6_ranges[idx];
+                        if ip_u128 <= range.end {
+                            return GeoIpResult {
+                                country_code: Some(Arc::from(range.country_code.as_str())),
+                                is_private: crate::matcher::geoip::is_private_ip(ip),
+                            };
+                        }
+                    }
+                    Err(idx) => {
+                        // 检查相邻的范围 / Check adjacent ranges
+                        if idx > 0 {
+                            let range = &self.ipv6_ranges[idx - 1];
+                            if ip_u128 >= range.start && ip_u128 <= range.end {
+                                return GeoIpResult {
+                                    country_code: Some(Arc::from(range.country_code.as_str())),
+                                    is_private: crate::matcher::geoip::is_private_ip(ip),
+                                };
+                            }
+                        }
                     }
                 }
-                if idx < self.ip_ranges.len() {
-                    let range = &self.ip_ranges[idx];
-                    if ip_u32 >= range.start && ip_u32 <= range.end {
-                        return GeoIpResult {
-                            country_code: Some(Arc::from(range.country_code.as_str())),
-                            is_private: crate::matcher::geoip::is_private_ip(ip),
-                        };
-                    }
+                GeoIpResult {
+                    country_code: None,
+                    is_private: crate::matcher::geoip::is_private_ip(ip),
                 }
             }
-        }
-
-        // 未找到匹配 / No match found
-        GeoIpResult {
-            country_code: None,
-            is_private: crate::matcher::geoip::is_private_ip(ip),
         }
     }
 
@@ -410,17 +447,17 @@ impl GeoIpManager {
                                 cidr_pos += 1; // skip 0x0A
 
                                 let ip_len = parse_varint(&data, &mut cidr_pos)?;
-                                if ip_len != 4 || cidr_pos + 4 > cidr_end {
+                                if (ip_len != 4 && ip_len != 16)
+                                    || cidr_pos + ip_len as usize > cidr_end
+                                {
+                                    // 只支持 IPv4 (4字节) 和 IPv6 (16字节) / Only IPv4 (4B) and IPv6 (16B) supported
                                     break;
                                 }
 
-                                let ip_bytes = [
-                                    data[cidr_pos],
-                                    data[cidr_pos + 1],
-                                    data[cidr_pos + 2],
-                                    data[cidr_pos + 3],
-                                ];
-                                cidr_pos += 4;
+                                let mut ip_bytes = [0u8; 16];
+                                ip_bytes[..ip_len as usize]
+                                    .copy_from_slice(&data[cidr_pos..cidr_pos + ip_len as usize]);
+                                cidr_pos += ip_len as usize;
 
                                 // 读取 prefix (field 2, tag 0x10)
                                 if cidr_pos >= cidr_end || data[cidr_pos] != 0x10 {
@@ -430,41 +467,81 @@ impl GeoIpManager {
 
                                 let prefix = parse_varint(&data, &mut cidr_pos)?;
 
-                                // 根据 IP 和前缀长度计算范围
-                                let start = u32::from_be_bytes(ip_bytes);
+                                if ip_len == 4 {
+                                    // 根据 IP 和前缀长度计算范围
+                                    let start = u32::from_be_bytes([
+                                        ip_bytes[0],
+                                        ip_bytes[1],
+                                        ip_bytes[2],
+                                        ip_bytes[3],
+                                    ]);
 
-                                // 计算 end IP
-                                let end = if prefix >= 32 {
-                                    // /32 表示单个 IP
-                                    start
-                                } else {
-                                    // start + (2^(32-prefix) - 1)
-                                    // 使用 saturating_add 防止溢出
-                                    let shift = (32 - prefix) as u32;
-                                    let host_count = 1u32.wrapping_shl(shift);
-                                    if prefix == 0 {
-                                        // /0 表示整个 IPv4 空间
-                                        u32::MAX
+                                    // 计算 end IP
+                                    let end = if prefix >= 32 {
+                                        // /32 表示单个 IP
+                                        start
                                     } else {
-                                        start.saturating_add(host_count).saturating_sub(1)
-                                    }
-                                };
+                                        // start + (2^(32-prefix) - 1)
+                                        // 使用 saturating_add 防止溢出
+                                        let shift = (32 - prefix) as u32;
+                                        let host_count = 1u32.wrapping_shl(shift);
+                                        if prefix == 0 {
+                                            // /0 表示整个 IPv4 空间
+                                            u32::MAX
+                                        } else {
+                                            start.saturating_add(host_count).saturating_sub(1)
+                                        }
+                                    };
 
-                                tracing::debug!(target = "geoip",
-                                    country = %country_code,
-                                    ip = %std::net::Ipv4Addr::from(start),
-                                    prefix = prefix,
-                                    start = start,
-                                    end = end,
-                                    "parsed CIDR"
-                                );
+                                    tracing::debug!(target = "geoip",
+                                        country = %country_code,
+                                        ip = %std::net::Ipv4Addr::from(start),
+                                        prefix = prefix,
+                                        start = start,
+                                        end = end,
+                                        "parsed CIDR"
+                                    );
 
-                                self.ip_ranges.push(IpRange {
-                                    start,
-                                    end,
-                                    country_code: country_code.clone(),
-                                });
-                                count += 1;
+                                    self.ip_ranges.push(IpRange {
+                                        start,
+                                        end,
+                                        country_code: country_code.clone(),
+                                    });
+                                    count += 1;
+                                } else {
+                                    // IPv6：u128 大端序范围 / IPv6: u128 big-endian range
+                                    let mut start_be = [0u8; 16];
+                                    start_be.copy_from_slice(&ip_bytes);
+                                    let start = u128::from_be_bytes(start_be);
+
+                                    let end = if prefix >= 128 {
+                                        start
+                                    } else {
+                                        let shift = 128 - prefix;
+                                        if shift >= 128 {
+                                            u128::MAX
+                                        } else {
+                                            let host_count = 1u128.wrapping_shl(shift as u32);
+                                            start.saturating_add(host_count).saturating_sub(1)
+                                        }
+                                    };
+
+                                    tracing::debug!(target = "geoip",
+                                        country = %country_code,
+                                        ip = %std::net::Ipv6Addr::from(start_be),
+                                        prefix = prefix,
+                                        start = start,
+                                        end = end,
+                                        "parsed IPv6 CIDR"
+                                    );
+
+                                    self.ipv6_ranges.push(IpRangeV6 {
+                                        start,
+                                        end,
+                                        country_code: country_code.clone(),
+                                    });
+                                    count += 1;
+                                }
                             }
 
                             // 更新 pos
@@ -482,7 +559,12 @@ impl GeoIpManager {
             }
         }
 
-        tracing::info!("loaded {} GeoIP entries from .dat file", count);
+        tracing::info!(
+            "loaded {} GeoIP entries from .dat file (IPv4: {}, IPv6: {})",
+            count,
+            self.ip_ranges.len(),
+            self.ipv6_ranges.len()
+        );
 
         // 排序 IP 范围以支持二分查找 / Sort IP ranges to support binary search
         if !self.ip_ranges.is_empty() {
@@ -494,6 +576,20 @@ impl GeoIpManager {
                     i,
                     range.start,
                     range.end,
+                    range.country_code
+                );
+            }
+        }
+        // IPv6 范围同样排序以支持二分查找 / Sort IPv6 ranges for binary search
+        if !self.ipv6_ranges.is_empty() {
+            self.ipv6_ranges.sort_by_key(|r| r.start);
+            tracing::debug!("First 3 IPv6 ranges (after sorting):");
+            for (i, range) in self.ipv6_ranges.iter().take(3).enumerate() {
+                tracing::debug!(
+                    "  {}: {} - {} -> {}",
+                    i,
+                    std::net::Ipv6Addr::from(range.start),
+                    std::net::Ipv6Addr::from(range.end),
                     range.country_code
                 );
             }
@@ -511,30 +607,53 @@ impl GeoIpManager {
         let list: V2RayGeoIPList = serde_json::from_str(&data)?;
 
         self.ip_ranges.clear();
+        self.ipv6_ranges.clear();
 
         for geoip in list.entries {
             for ip_str in &geoip.ips {
-                if let Ok(ipnet::IpNet::V4(v4net)) = ip_str.parse::<ipnet::IpNet>() {
-                    let start = u32::from(v4net.network());
-                    let prefix_len = v4net.prefix_len() as u32;
-                    let end = start + (1u32 << (32 - prefix_len)) - 1;
+                match ip_str.parse::<ipnet::IpNet>() {
+                    Ok(ipnet::IpNet::V4(v4net)) => {
+                        let start = u32::from(v4net.network());
+                        let prefix_len = v4net.prefix_len() as u32;
+                        let end = start + (1u32 << (32 - prefix_len)) - 1;
 
-                    self.ip_ranges.push(IpRange {
-                        start,
-                        end,
-                        country_code: geoip.country_code.clone(),
-                    });
+                        self.ip_ranges.push(IpRange {
+                            start,
+                            end,
+                            country_code: geoip.country_code.clone(),
+                        });
+                    }
+                    Ok(ipnet::IpNet::V6(v6net)) => {
+                        let start = u128::from(v6net.network());
+                        let prefix_len = v6net.prefix_len() as u32;
+                        let end = if prefix_len >= 128 {
+                            start
+                        } else {
+                            start + (1u128 << (128 - prefix_len)) - 1
+                        };
+
+                        self.ipv6_ranges.push(IpRangeV6 {
+                            start,
+                            end,
+                            country_code: geoip.country_code.clone(),
+                        });
+                    }
+                    Err(_) => {
+                        // 无法解析的 IP 段，跳过 / Skip unparseable CIDR
+                        continue;
+                    }
                 }
             }
         }
 
         // 排序 IP 范围以支持二分查找 / Sort IP ranges to support binary search
         self.ip_ranges.sort_by_key(|r| r.start);
+        self.ipv6_ranges.sort_by_key(|r| r.start);
 
         // 根据实际加载的条数重建缓存
         self.rebuild_cache();
 
-        Ok(self.ip_ranges.len())
+        Ok(self.ip_ranges.len() + self.ipv6_ranges.len())
     }
 
     /// 转换 .dat 为 MMDB 格式
@@ -754,4 +873,104 @@ fn run_geoip_watcher(path: PathBuf, manager: Arc<RwLock<GeoIpManager>>) -> notif
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造 V2Ray .dat 格式的 protobuf 字节（含 v4 和/或 v6 CIDR）
+    /// Build V2Ray .dat protobuf bytes (with v4 and/or v6 CIDRs)
+    fn build_dat(country: &str, v4: Option<([u8; 4], u8)>, v6: Option<([u8; 16], u8)>) -> Vec<u8> {
+        let mut entry = Vec::new();
+        // country_code (field 1, tag 0x0A)
+        entry.push(0x0A);
+        entry.push(country.len() as u8);
+        entry.extend_from_slice(country.as_bytes());
+        // cidr (field 2, tag 0x12) —— 一个 CIDR message
+        let mut cidr_msg = Vec::new();
+        if let Some((ip, prefix)) = v4 {
+            cidr_msg.push(0x0A); // field 1: ip (bytes)
+            cidr_msg.push(4);
+            cidr_msg.extend_from_slice(&ip);
+            cidr_msg.push(0x10); // field 2: prefix (varint)
+            cidr_msg.push(prefix);
+        }
+        if let Some((ip, prefix)) = v6 {
+            cidr_msg.push(0x0A);
+            cidr_msg.push(16);
+            cidr_msg.extend_from_slice(&ip);
+            cidr_msg.push(0x10);
+            cidr_msg.push(prefix);
+        }
+        entry.push(0x12);
+        entry.push(cidr_msg.len() as u8);
+        entry.extend_from_slice(&cidr_msg);
+
+        let mut dat = Vec::new();
+        dat.push(0x0A); // outer field: GeoIP entry
+        dat.push(entry.len() as u8);
+        dat.extend_from_slice(&entry);
+        dat
+    }
+
+    #[test]
+    fn test_load_dat_includes_ipv6() {
+        // 2001:db8::/32 (v6) + 1.2.3.0/24 (v4)
+        let v6: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let v4: [u8; 4] = [1, 2, 3, 0];
+        let dat = build_dat("CN", Some((v4, 24)), Some((v6, 32)));
+
+        let mut path = std::env::temp_dir();
+        path.push("geoip_test_v6.dat");
+        std::fs::write(&path, &dat).unwrap();
+
+        let mut mgr = GeoIpManager::new(None).unwrap();
+        let count = mgr.load_from_dat_file(&path).unwrap();
+        assert_eq!(count, 2, "应加载 2 条（v4 + v6）");
+        assert_eq!(mgr.ip_ranges.len(), 1, "IPv4 段");
+        assert_eq!(mgr.ipv6_ranges.len(), 1, "IPv6 段不应被丢弃");
+
+        // IPv6 查询应匹配国家 / IPv6 lookup should match the country
+        let ip: std::net::IpAddr = "2001:db8::1".parse().unwrap();
+        let res = mgr.lookup(ip);
+        assert_eq!(res.country_code.as_deref(), Some("CN"));
+
+        // 不在段内的 IPv6 不应误匹配 / IPv6 outside the range must not match
+        let miss: std::net::IpAddr = "2001:db9::1".parse().unwrap();
+        assert_eq!(mgr.lookup(miss).country_code, None);
+
+        // IPv4 查询仍然正常 / IPv4 lookup still works
+        let v4ip: std::net::IpAddr = "1.2.3.5".parse().unwrap();
+        assert_eq!(mgr.lookup(v4ip).country_code.as_deref(), Some("CN"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_json_includes_ipv6() {
+        let json = r#"{
+            "entries": [
+                {
+                    "country_code": "JP",
+                    "ips": ["2001:db8:1::/48", "198.51.100.0/24"]
+                }
+            ]
+        }"#;
+        let mut path = std::env::temp_dir();
+        path.push("geoip_test_v6.json");
+        std::fs::write(&path, json).unwrap();
+
+        let mut mgr = GeoIpManager::new(None).unwrap();
+        let count = mgr.load_from_v2ray_file(&path).unwrap();
+        assert_eq!(count, 2, "JSON 应加载 v4 + v6");
+        assert_eq!(mgr.ip_ranges.len(), 1);
+        assert_eq!(mgr.ipv6_ranges.len(), 1, "JSON IPv6 段不应被丢弃");
+
+        let ip: std::net::IpAddr = "2001:db8:1::1234".parse().unwrap();
+        let res = mgr.lookup(ip);
+        assert_eq!(res.country_code.as_deref(), Some("JP"));
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

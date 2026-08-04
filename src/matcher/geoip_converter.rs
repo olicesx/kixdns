@@ -169,18 +169,17 @@ impl GeoIpConverter {
                                 cidr_pos += 1;
 
                                 let ip_len = parse_varint(&data, &mut cidr_pos)?;
-                                if ip_len != 4 || cidr_pos + 4 > cidr_end {
-                                    // Only support IPv4 for now
+                                if (ip_len != 4 && ip_len != 16)
+                                    || cidr_pos + ip_len as usize > cidr_end
+                                {
+                                    // 只支持 IPv4 (4B) 和 IPv6 (16B) / Only IPv4 (4B) and IPv6 (16B) supported
                                     break;
                                 }
 
-                                let ip_bytes = [
-                                    data[cidr_pos],
-                                    data[cidr_pos + 1],
-                                    data[cidr_pos + 2],
-                                    data[cidr_pos + 3],
-                                ];
-                                cidr_pos += 4;
+                                let mut ip_bytes = [0u8; 16];
+                                ip_bytes[..ip_len as usize]
+                                    .copy_from_slice(&data[cidr_pos..cidr_pos + ip_len as usize]);
+                                cidr_pos += ip_len as usize;
 
                                 // Parse prefix (field 2, tag 0x10)
                                 if cidr_pos >= cidr_end || data[cidr_pos] != 0x10 {
@@ -190,15 +189,25 @@ impl GeoIpConverter {
 
                                 let prefix = parse_varint(&data, &mut cidr_pos)?;
 
-                                // Create IPv4 network
-                                let ipv4 = std::net::Ipv4Addr::new(
-                                    ip_bytes[0],
-                                    ip_bytes[1],
-                                    ip_bytes[2],
-                                    ip_bytes[3],
-                                );
-                                if let Ok(net) = Ipv4Net::new(ipv4, prefix as u8) {
-                                    cidr_list.push(IpNet::V4(net));
+                                if ip_len == 4 {
+                                    // Create IPv4 network
+                                    let ipv4 = std::net::Ipv4Addr::new(
+                                        ip_bytes[0],
+                                        ip_bytes[1],
+                                        ip_bytes[2],
+                                        ip_bytes[3],
+                                    );
+                                    if let Ok(net) = Ipv4Net::new(ipv4, prefix as u8) {
+                                        cidr_list.push(IpNet::V4(net));
+                                    }
+                                } else {
+                                    // Create IPv6 network
+                                    let mut ipv6_bytes = [0u8; 16];
+                                    ipv6_bytes.copy_from_slice(&ip_bytes);
+                                    let ipv6 = std::net::Ipv6Addr::from(ipv6_bytes);
+                                    if let Ok(net) = Ipv6Net::new(ipv6, prefix as u8) {
+                                        cidr_list.push(IpNet::V6(net));
+                                    }
                                 }
                             }
 
