@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bytes::Bytes;
-use hickory_proto::op::{Message, MessageType, ResponseCode};
+#[cfg(test)]
+use hickory_proto::op::{Message, ResponseCode};
+#[cfg(test)]
 use hickory_proto::serialize::binary::BinDecodable;
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
@@ -22,7 +24,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
-use crate::engine::{Engine, FastPathResponse, PreParsedData};
+use crate::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers};
 use crate::proto_utils;
 
 const MAX_DNS_MESSAGE: usize = 64 * 1024;
@@ -232,35 +234,7 @@ async fn process_dns_wire(packet: &[u8], peer: SocketAddr, engine: &Engine) -> B
 
 /// 构造空 DNS 响应（SERVFAIL） / Build empty SERVFAIL response
 fn empty_dns_response(request: &[u8]) -> Bytes {
-    fn header_only(request: &[u8]) -> Bytes {
-        if request.len() < 2 {
-            return Bytes::new();
-        }
-        let mut response = vec![0u8; 12];
-        response[0] = request[0];
-        response[1] = request[1];
-        response[2] = 0x80;
-        response[3] = 0x02;
-        Bytes::from(response)
-    }
-
-    let Ok(request_message) = Message::from_bytes(request) else {
-        return header_only(request);
-    };
-
-    let mut response = Message::new(
-        request_message.metadata.id,
-        MessageType::Response,
-        request_message.metadata.op_code,
-    );
-    response.metadata.response_code = ResponseCode::ServFail;
-    response.metadata.recursion_desired = request_message.metadata.recursion_desired;
-    response.add_queries(request_message.queries.iter().cloned());
-
-    response
-        .to_vec()
-        .map(Bytes::from)
-        .unwrap_or_else(|_| header_only(request))
+    engine_helpers::build_servfail_response_from_wire(request)
 }
 
 fn error_response(status: StatusCode) -> Response<Full<Bytes>> {
@@ -385,8 +359,8 @@ mod tests {
         assert_eq!(resp.len(), 12);
         // Byte 2: QR=1, Opcode=0, AA=0, TC=0, RD=0 → 0x80
         assert_eq!(resp[2], 0x80, "QR should be 1");
-        // Byte 3: RA=0, Z=0, RCODE=2 (SERVFAIL) → 0x02
-        assert_eq!(resp[3], 0x02, "RCODE should be SERVFAIL (2)");
+        // Byte 3: RA=1, Z=0, RCODE=2 (SERVFAIL) → 0x82
+        assert_eq!(resp[3], 0x82, "RA and SERVFAIL should be set");
     }
 
     #[test]

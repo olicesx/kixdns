@@ -4,7 +4,7 @@ use bytes::Bytes;
 use dashmap::DashSet;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RecordType};
-use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
+use hickory_proto::serialize::binary::{BinDecodable, BinEncodable, BinEncoder};
 use rustc_hash::FxHashSet;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -75,6 +75,64 @@ pub mod engine_helpers {
     #[inline]
     pub fn build_servfail_response(req: &Message) -> anyhow::Result<Bytes> {
         build_response(req, ResponseCode::ServFail, Vec::new())
+    }
+
+    /// Build a SERVFAIL response for a validated, standard DNS query.
+    ///
+    /// Listener code must use this strict variant so malformed packets and DNS
+    /// responses cannot trigger reflection traffic.
+    pub fn try_build_servfail_response_from_wire(request: &[u8]) -> Option<Bytes> {
+        if request.len() < 12
+            || request[2] & 0x80 != 0
+            || request[2] & 0x78 != 0
+            || u16::from_be_bytes([request[4], request[5]]) != 1
+            || u16::from_be_bytes([request[6], request[7]]) != 0
+            || u16::from_be_bytes([request[8], request[9]]) != 0
+        {
+            return None;
+        }
+
+        let request_message = Message::from_bytes(request).ok()?;
+        if request_message.metadata.message_type != MessageType::Query
+            || request_message.metadata.op_code != OpCode::Query
+            || request_message.queries.len() != 1
+        {
+            return None;
+        }
+
+        build_servfail_response(&request_message).ok()
+    }
+
+    /// Build a SERVFAIL response directly from a DNS wire request.
+    ///
+    /// Valid requests preserve TXID, opcode, RD, and the Question section. The
+    /// header-only fallback is intentionally allocation-bounded and is used only
+    /// by request/response transports such as DoH, never by a UDP listener.
+    pub fn build_servfail_response_from_wire(request: &[u8]) -> Bytes {
+        fn header_only(request: &[u8]) -> Bytes {
+            if request.len() < 2 {
+                return Bytes::new();
+            }
+
+            let mut response = vec![0u8; 12];
+            response[0] = request[0];
+            response[1] = request[1];
+            if request.len() >= 4 {
+                // Preserve opcode, RD, and CD while setting QR=1, RA=1, SERVFAIL.
+                response[2] = 0x80 | (request[2] & 0x79);
+                response[3] = 0x82 | (request[3] & 0x10);
+            } else {
+                response[2] = 0x80;
+                response[3] = 0x82;
+            }
+            Bytes::from(response)
+        }
+
+        let Ok(request_message) = Message::from_bytes(request) else {
+            return header_only(request);
+        };
+
+        build_servfail_response(&request_message).unwrap_or_else(|_| header_only(request))
     }
 
     /// 快速构建错误响应（ServFail），避免解析完整请求
