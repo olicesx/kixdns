@@ -9,11 +9,28 @@ pub struct QuickQuery<'a> {
     pub edns_present: bool,
 }
 
+/// Check the fixed DNS header fields required by KixDNS's standard query path.
+/// This cheap ingress guard must run before cache/static fast paths so response
+/// packets cannot be reflected as normal answers.
+#[inline]
+pub fn is_standard_query_header(packet: &[u8]) -> bool {
+    if packet.len() < 12 {
+        return false;
+    }
+
+    let flags = u16::from_be_bytes([packet[2], packet[3]]);
+    let qd_count = u16::from_be_bytes([packet[4], packet[5]]);
+    let an_count = u16::from_be_bytes([packet[6], packet[7]]);
+    let ns_count = u16::from_be_bytes([packet[8], packet[9]]);
+
+    flags & 0x8000 == 0 && flags & 0x7800 == 0 && qd_count == 1 && an_count == 0 && ns_count == 0
+}
+
 /// 仅解析 DNS 头部和第一个 Query，用于快速缓存查找 / Parse only DNS header and first query for quick cache lookup
 /// 避免 hickory-proto Message::from_bytes 的全量解析和分配开销 / Avoid full parsing and allocation overhead of hickory-proto Message::from_bytes
 /// buf: 用于存储归一化（小写）域名的缓冲区，建议至少 256 字节 / buf: buffer for storing normalized (lowercase) domain name, recommend at least 256 bytes
 pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a>> {
-    if packet.len() < 12 {
+    if !is_standard_query_header(packet) {
         return None;
     }
 
@@ -21,14 +38,7 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     let tx_id = u16::from_be_bytes([packet[0], packet[1]]);
 
     // 2. Counts / 计数
-    let qd_count = u16::from_be_bytes([packet[4], packet[5]]);
-    let an_count = u16::from_be_bytes([packet[6], packet[7]]);
-    let ns_count = u16::from_be_bytes([packet[8], packet[9]]);
     let ar_count = u16::from_be_bytes([packet[10], packet[11]]);
-
-    if qd_count == 0 {
-        return None;
-    }
 
     // 3. Parse QName (start at offset 12) / 解析查询名称（从偏移量 12 开始）
     let mut pos = 12;
@@ -69,6 +79,9 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
                 return None; // Loop detection / 循环检测
             }
             continue;
+        }
+        if len & 0xC0 != 0 {
+            return None;
         }
 
         // Label / 标签
@@ -146,48 +159,37 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     let qclass = u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]);
     pos += 4;
 
-    // 5. Check for EDNS in Additional section / 在附加部分检查 EDNS
+    // 5. Validate every declared Additional record and detect EDNS.
+    // Fail closed before cache/static fast paths on any malformed wire structure.
     let mut edns_present = false;
-    if ar_count > 0 && an_count == 0 && ns_count == 0 {
-        // Fast-path optimization: for standard query messages, AN and NS are expected to be 0.
-        // We only scan the Additional section in this common case to keep parsing fast, which may miss EDNS
-        // in non-standard messages (e.g., UPDATE, or responses mistakenly treated as queries).
-        // 快速路径优化：对于标准查询消息，AN 和 NS 通常为 0。仅在这种常见情况下扫描 Additional 以提升性能，
-        // 这在非标准消息（例如 UPDATE，或被误当作查询处理的响应）中可能漏检 EDNS。
-        let mut ar_pos = pos;
-        for _ in 0..ar_count {
-            if ar_pos >= packet.len() {
-                break;
-            }
-            let name_byte = packet[ar_pos];
-            let next_pos = if name_byte == 0 {
-                ar_pos + 1
-            } else {
-                skip_name(packet, ar_pos).unwrap_or(packet.len())
-            };
-
-            if next_pos + 10 > packet.len() {
-                break;
-            }
-            let rr_type = u16::from_be_bytes([packet[next_pos], packet[next_pos + 1]]);
-            if rr_type == 41 {
-                // OPT
-                edns_present = true;
-                break;
-            }
-            let rd_len = u16::from_be_bytes([packet[next_pos + 8], packet[next_pos + 9]]);
-
-            // Validate arithmetic to prevent overflow and ensure entire record fits in packet
-            let rd_len_usize = rd_len as usize;
-            // Check packet length first to avoid underflow in subsequent arithmetic
-            if packet.len() < 10 + rd_len_usize {
-                break;
-            }
-            if next_pos > packet.len() - 10 - rd_len_usize {
-                break;
-            }
-            ar_pos = next_pos + 10 + rd_len_usize;
+    let mut ar_pos = pos;
+    for _ in 0..ar_count {
+        let owner_start = ar_pos;
+        let next_pos = skip_name(packet, ar_pos)?;
+        let fixed_end = next_pos.checked_add(10)?;
+        if fixed_end > packet.len() {
+            return None;
         }
+
+        let rr_type = u16::from_be_bytes([packet[next_pos], packet[next_pos + 1]]);
+        let rd_len = u16::from_be_bytes([packet[next_pos + 8], packet[next_pos + 9]]) as usize;
+        let rdata_end = fixed_end.checked_add(rd_len)?;
+        if rdata_end > packet.len() {
+            return None;
+        }
+
+        if rr_type == 41 {
+            // RFC 6891: OPT owner name must be the root and only one OPT is valid.
+            if edns_present || packet.get(owner_start) != Some(&0) {
+                return None;
+            }
+            validate_edns_options(packet, fixed_end, rdata_end)?;
+            edns_present = true;
+        }
+        ar_pos = rdata_end;
+    }
+    if ar_pos != packet.len() {
+        return None;
     }
 
     // Return slice of buf as zero-copy reference
@@ -213,22 +215,56 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
 #[inline]
 fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
     let packet_len = packet.len();
+    let mut encoded_end = None;
+    let mut jumps = 0usize;
+
     loop {
-        if pos >= packet_len {
-            return None;
-        }
-        let len = packet[pos];
+        let len = *packet.get(pos)?;
         if len == 0 {
-            return Some(pos + 1);
+            return Some(encoded_end.unwrap_or(pos + 1));
         }
         if (len & 0xC0) == 0xC0 {
-            if pos + 2 > packet_len {
+            let pointer_end = pos.checked_add(2)?;
+            if pointer_end > packet_len {
                 return None;
             }
-            return Some(pos + 2);
+            encoded_end.get_or_insert(pointer_end);
+            let offset = (((len & 0x3F) as usize) << 8) | packet[pos + 1] as usize;
+            if offset >= packet_len {
+                return None;
+            }
+            jumps += 1;
+            if jumps > 16 {
+                return None;
+            }
+            pos = offset;
+            continue;
         }
-        pos += 1 + len as usize;
+        if len & 0xC0 != 0 || len > 63 {
+            return None;
+        }
+
+        let next = pos.checked_add(1 + len as usize)?;
+        if next > packet_len {
+            return None;
+        }
+        pos = next;
     }
+}
+
+fn validate_edns_options(packet: &[u8], mut pos: usize, end: usize) -> Option<()> {
+    while pos < end {
+        let header_end = pos.checked_add(4)?;
+        if header_end > end {
+            return None;
+        }
+        let option_len = u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]) as usize;
+        pos = header_end.checked_add(option_len)?;
+        if pos > end {
+            return None;
+        }
+    }
+    (pos == end).then_some(())
 }
 
 impl QuickQuery<'_> {
@@ -807,6 +843,42 @@ mod tests {
         let mut qname = [0u8; 256];
 
         assert!(parse_quick(&packet, &mut qname).is_some());
+    }
+
+    fn query_with_additional(additional: &[u8]) -> Vec<u8> {
+        let mut packet = query_with_label(b"example");
+        packet[10..12].copy_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(additional);
+        packet
+    }
+
+    #[test]
+    fn parse_quick_rejects_missing_declared_additional_record() {
+        let packet = query_with_additional(&[]);
+        let mut qname = [0u8; 256];
+        assert!(parse_quick(&packet, &mut qname).is_none());
+    }
+
+    #[test]
+    fn parse_quick_rejects_truncated_edns_rdata() {
+        let packet = query_with_additional(&[0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0, 0, 4, 0, 1]);
+        let mut qname = [0u8; 256];
+        assert!(parse_quick(&packet, &mut qname).is_none());
+    }
+
+    #[test]
+    fn parse_quick_rejects_invalid_additional_compression_pointer() {
+        let packet = query_with_additional(&[0xC0, 0xFF, 0, 16, 0, 1, 0, 0, 0, 0, 0, 0]);
+        let mut qname = [0u8; 256];
+        assert!(parse_quick(&packet, &mut qname).is_none());
+    }
+
+    #[test]
+    fn parse_quick_accepts_valid_empty_edns_record() {
+        let packet = query_with_additional(&[0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0, 0, 0]);
+        let mut qname = [0u8; 256];
+        let query = parse_quick(&packet, &mut qname).expect("valid EDNS query");
+        assert!(query.edns_present);
     }
 
     #[test]

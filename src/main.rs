@@ -13,6 +13,7 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 use kixdns::config::load_config;
 use kixdns::engine::{Engine, FastPathResponse, PreParsedData};
 use kixdns::matcher::RuntimePipelineConfig;
+use kixdns::proto_utils::is_standard_query_header;
 use kixdns::watcher;
 
 #[derive(Parser, Debug)]
@@ -573,6 +574,9 @@ async fn run_udp_worker(
         {
             // 零拷贝获取 Bytes / Zero-copy obtain Bytes
             let packet_bytes = buf.split().freeze();
+            if !is_standard_query_header(&packet_bytes) {
+                continue;
+            }
 
             // 每 100 个请求检查一次流控调整 / Check flow control adjustment every 100 requests
             request_count += 1;
@@ -802,6 +806,9 @@ async fn handle_tcp_conn(
         // 统一 UDP 和 TCP 的行为，避免重复解析
         // Unify UDP and TCP behavior to avoid re-parsing
         let packet_bytes = buf.split().freeze();
+        if !is_standard_query_header(&packet_bytes) {
+            return Ok(());
+        }
         let timeout_dur = Duration::from_millis(timeout_ms);
 
         let resp = match engine.handle_packet_fast(&packet_bytes, peer) {
@@ -914,5 +921,90 @@ async fn handle_tcp_conn(
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::{Name, RecordType};
+    use std::str::FromStr;
+
+    #[ctor::ctor]
+    fn init_crypto() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
+    fn static_engine() -> Engine {
+        use kixdns::config::PipelineConfig;
+
+        let config: PipelineConfig = serde_json::from_value(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{
+                "id": "p",
+                "rules": [{
+                    "name": "static",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "static_ip_response", "ip": "192.0.2.1" }]
+                }]
+            }]
+        }))
+        .expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(config).expect("build runtime config");
+        Engine::new(runtime, "test".to_string()).expect("initialize engine")
+    }
+
+    fn dns_query() -> Vec<u8> {
+        let mut message = Message::new(0xCAFE, MessageType::Query, OpCode::Query);
+        message.metadata.recursion_desired = true;
+        message.add_query(Query::query(
+            Name::from_str("data.xiaoheihe.cn").unwrap(),
+            RecordType::A,
+        ));
+        message.to_vec().unwrap()
+    }
+
+    #[tokio::test]
+    async fn udp_static_fast_path_rejects_non_query_and_malformed_additional_records() {
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let worker = tokio::spawn(run_udp_worker(0, Arc::clone(&server), static_engine()));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let mut qr_response = dns_query();
+        qr_response[2] |= 0x80;
+
+        let mut missing_additional = dns_query();
+        missing_additional[11] = 1;
+
+        let mut truncated_edns = dns_query();
+        truncated_edns[11] = 1;
+        truncated_edns.extend_from_slice(&[0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0, 0, 4, 0, 1]);
+
+        let mut invalid_pointer = dns_query();
+        invalid_pointer[11] = 1;
+        invalid_pointer.extend_from_slice(&[0xC0, 0xFF, 0, 16, 0, 1, 0, 0, 0, 0, 0, 0]);
+
+        let mut response_buf = [0u8; 512];
+        for (case, packet) in [
+            ("QR=1", qr_response),
+            ("missing Additional RR", missing_additional),
+            ("truncated EDNS RDATA", truncated_edns),
+            ("invalid Additional compression pointer", invalid_pointer),
+        ] {
+            client.send_to(&packet, server_addr).await.unwrap();
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    client.recv_from(&mut response_buf),
+                )
+                .await
+                .is_err(),
+                "{case} must be rejected before static/cache fast paths"
+            );
+        }
+
+        worker.abort();
     }
 }
