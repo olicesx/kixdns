@@ -701,9 +701,7 @@ impl GeoSiteManager {
                     }
                     // 0x0A: tag/country_code (string, field 1)
                     if inner_tag == 0x0A {
-                        if let Ok(tag_str) =
-                            std::str::from_utf8(&content[pos..pos + inner_len])
-                        {
+                        if let Ok(tag_str) = std::str::from_utf8(&content[pos..pos + inner_len]) {
                             tag = tag_str.to_string();
                             let tag_lower = tag.to_lowercase();
                             // Match against base tags (supports `@attr` split)
@@ -871,7 +869,10 @@ impl GeoSiteManager {
     /// Each Domain message contains: type (field 1, varint) and value (field 2, string)
     /// Returns (DomainMatcher, attribute_keys) pairs — attribute keys enable `@attr` filtering
     #[allow(clippy::regex_creation_in_loops)]
-    fn parse_v2ray_domains(&self, data: &[u8]) -> anyhow::Result<Vec<(DomainMatcher, Vec<String>)>> {
+    fn parse_v2ray_domains(
+        &self,
+        data: &[u8],
+    ) -> anyhow::Result<Vec<(DomainMatcher, Vec<String>)>> {
         let mut results = Vec::new();
         let mut pos = 0;
 
@@ -1282,7 +1283,8 @@ mod tests {
     }
 
     fn encode_varint_field(field_number: u8, value: usize) -> Vec<u8> {
-        let mut result = vec![(field_number << 3) | 0];
+        // wire_type 0 (varint): (field_number << 3) | wire_type
+        let mut result = vec![field_number << 3];
         result.extend(encode_varint(value));
         result
     }
