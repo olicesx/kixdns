@@ -264,6 +264,42 @@ fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
     }
 }
 
+/// Byte length of the last complete record, or `None` on malformed structure.
+///
+/// hickory's bounded encoder rolls back its write offset but not the backing
+/// buffer when a record does not fit, so truncated output can carry partial
+/// bytes from the failed record past the (corrected) header counts. Re-walking
+/// the emitted sections yields the exact valid boundary so the response stays
+/// within RFC 1035 §4.2.1 record boundaries.
+fn valid_message_len(packet: &[u8]) -> Option<usize> {
+    if packet.len() < 12 {
+        return None;
+    }
+
+    let qd_count = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+    let an_count = u16::from_be_bytes([packet[6], packet[7]]) as usize;
+    let ns_count = u16::from_be_bytes([packet[8], packet[9]]) as usize;
+    let ar_count = u16::from_be_bytes([packet[10], packet[11]]) as usize;
+
+    let mut pos = 12usize;
+    // Questions: NAME + QTYPE + QCLASS.
+    for _ in 0..qd_count {
+        pos = skip_name(packet, pos)?;
+        pos = pos.checked_add(4)?;
+    }
+    // Resource records: NAME + TYPE/CLASS/TTL/RDLENGTH + RDATA.
+    for _ in 0..an_count + ns_count + ar_count {
+        pos = skip_name(packet, pos)?;
+        let fixed_end = pos.checked_add(10)?;
+        if fixed_end > packet.len() {
+            return None;
+        }
+        let rd_len = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
+        pos = fixed_end.checked_add(rd_len)?;
+    }
+    (pos <= packet.len()).then_some(pos)
+}
+
 fn validate_edns_options(packet: &[u8], mut pos: usize, end: usize) -> Option<()> {
     while pos < end {
         let header_end = pos.checked_add(4)?;
@@ -740,6 +776,13 @@ pub fn truncate_udp_response(request_packet: &[u8], response_packet: &[u8]) -> O
             response.emit(&mut encoder)
         };
         if encoded.is_ok() && out.len() <= max_payload {
+            // hickory's rollback does not shrink the backing buffer, so the
+            // output can carry partial bytes from the record that did not fit.
+            // Trim to the last complete record boundary from the corrected
+            // header counts; fall back to the raw output if the walk fails.
+            if let Some(valid_len) = valid_message_len(&out) {
+                out.truncate(valid_len);
+            }
             return Some(Bytes::from(out));
         }
     }
@@ -1041,6 +1084,42 @@ mod tests {
         assert!(decoded.metadata.truncation);
         assert_eq!(decoded.metadata.id, 0x1234);
         assert_eq!(decoded.queries.len(), 1);
+    }
+
+    #[test]
+    fn truncate_udp_response_has_no_trailing_bytes() {
+        use hickory_proto::op::{MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RData, Record, RecordType, rdata::TXT};
+        use std::str::FromStr;
+
+        let request = txt_query(None);
+        // No EDNS in the response: the failed answer's partial bytes are not
+        // overwritten by a later OPT record, so hickory's bounded encoder
+        // leaves them as trailing garbage past the last complete record.
+        let name = Name::from_str("cloudflare.com.").unwrap();
+        let mut response = Message::new(0x1234, MessageType::Response, OpCode::Query);
+        response.metadata.recursion_desired = true;
+        response.metadata.recursion_available = true;
+        response.add_query(Query::query(name.clone(), RecordType::TXT));
+        for index in 0..20 {
+            let text = format!("verification-{index:02}-{}", "x".repeat(180));
+            response.add_answer(Record::from_rdata(
+                name.clone(),
+                300,
+                RData::TXT(TXT::new(vec![text])),
+            ));
+        }
+        let response = encode_message(&response);
+        assert!(response.len() > 512);
+
+        let truncated = truncate_udp_response(&request, &response).expect("must truncate");
+        // Truncation must respect RFC 1035 §4.2.1 record boundaries with no
+        // trailing data beyond the last complete record.
+        assert_eq!(
+            valid_message_len(&truncated),
+            Some(truncated.len()),
+            "truncated response must end exactly at a record boundary"
+        );
     }
 
     #[test]

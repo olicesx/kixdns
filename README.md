@@ -153,6 +153,12 @@ sudo systemctl enable --now kixdns
 
 UDP and TCP listeners are always created from settings.bind_udp and settings.bind_tcp.
 
+Inbound listener behavior:
+
+- Only standard single-question QUERY messages are processed. Malformed packets, non-QUERY opcodes, and DNS response packets are silently dropped.
+- A listener processing error, an overall request timeout, or an exhausted flow-control permit returns SERVFAIL to the client for a valid query.
+- UDP responses larger than the client's advertised size (the EDNS payload size, or 512 bytes without EDNS) are truncated at record boundaries with the TC bit set, so the client can retry over TCP.
+
 Inbound DoH is disabled unless settings.bind_doh is set. When it is set, settings.doh_tls_cert and settings.doh_tls_key are required and must point to PEM files. The path defaults to /dns-query and can be changed with settings.doh_path.
 
 The inbound DoH handler:

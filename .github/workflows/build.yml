@@ -232,6 +232,9 @@ jobs:
       - name: Run unit tests
         run: cargo test --lib
 
+      - name: Run listener integration tests
+        run: cargo test --bin kixdns
+
       - name: Run DoH integration tests
         run: cargo test --test doh_integration
 

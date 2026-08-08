@@ -940,7 +940,9 @@ async fn handle_tcp_conn(
                     Ok(Ok(r)) => r,
                     Ok(Err(error)) => {
                         debug!(%error, "TCP request processing error, returning SERVFAIL");
-                        let Some(response) = engine_helpers::try_build_servfail_response_from_wire(&packet_bytes) else {
+                        let Some(response) =
+                            engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
+                        else {
                             return Ok(());
                         };
                         response
@@ -951,7 +953,9 @@ async fn handle_tcp_conn(
                             upstream_timeout_ms = engine.get_upstream_timeout_ms(),
                             "TCP request timeout after hedge and fallback exhausted"
                         );
-                        let Some(response) = engine_helpers::try_build_servfail_response_from_wire(&packet_bytes) else {
+                        let Some(response) =
+                            engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
+                        else {
                             return Ok(());
                         };
                         response
@@ -967,7 +971,9 @@ async fn handle_tcp_conn(
                     Ok(Ok(r)) => r,
                     Ok(Err(error)) => {
                         debug!(%error, "TCP request processing error, returning SERVFAIL");
-                        let Some(response) = engine_helpers::try_build_servfail_response_from_wire(&packet_bytes) else {
+                        let Some(response) =
+                            engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
+                        else {
                             return Ok(());
                         };
                         response
@@ -978,7 +984,9 @@ async fn handle_tcp_conn(
                             upstream_timeout_ms = engine.get_upstream_timeout_ms(),
                             "TCP request timeout"
                         );
-                        let Some(response) = engine_helpers::try_build_servfail_response_from_wire(&packet_bytes) else {
+                        let Some(response) =
+                            engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
+                        else {
                             return Ok(());
                         };
                         response
@@ -987,7 +995,9 @@ async fn handle_tcp_conn(
             }
             Err(error) => {
                 debug!(%error, "TCP fast-path error, returning SERVFAIL for valid query");
-                let Some(response) = engine_helpers::try_build_servfail_response_from_wire(&packet_bytes) else {
+                let Some(response) =
+                    engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
+                else {
                     return Ok(());
                 };
                 response
@@ -1019,11 +1029,11 @@ async fn handle_tcp_conn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
     use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
     use hickory_proto::rr::{Name, RecordType};
     use hickory_proto::serialize::binary::BinDecodable;
     use std::str::FromStr;
+    use tokio::io::AsyncWriteExt;
 
     #[ctor::ctor]
     fn init_crypto() {
@@ -1196,6 +1206,21 @@ mod tests {
             .await
             .is_err(),
             "malformed UDP packets must not receive a reflected response"
+        );
+
+        // A packet that passes the header gate but fails parse_quick (trailing
+        // data) still reaches the overload branch; it must stay silent there.
+        let mut trailing = dns_query();
+        trailing.extend_from_slice(&[0x00]);
+        client.send_to(&trailing, server_addr).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                client.recv_from(&mut response_buf),
+            )
+            .await
+            .is_err(),
+            "overload branch must drop packets that failed parse_quick"
         );
 
         worker.abort();
