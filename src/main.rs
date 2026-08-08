@@ -812,8 +812,12 @@ async fn run_udp_worker(
                             }
                         });
                     } else {
-                        // 过载保护：permit 耗尽，非阻塞 SERVFAIL（背压丢弃，不阻塞接收循环）
-                        // Overload: permit exhausted, non-blocking SERVFAIL with backpressure drop
+                        // 过载保护：permit 耗尽。此路径无预解析数据（parse_quick 已失败），
+                        // 需完整解析请求才能构造严格 SERVFAIL 并回显 question。
+                        // 解析成本有界（≤4096B 报文），发送为非阻塞（背压丢弃），不阻塞接收循环。
+                        // Overload: no pre-parsed data here (parse_quick failed), so the strict
+                        // SERVFAIL needs a full parse. Cost is bounded by packet size and the
+                        // send is non-blocking (backpressure drop), so the receive loop is safe.
                         try_send_udp_servfail(&socket, &packet_bytes, peer);
                     }
                 }
