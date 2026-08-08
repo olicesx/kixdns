@@ -327,6 +327,70 @@ struct DatIndexEntry {
     length: u32,
 }
 
+/// Split a GeoSite tag with optional `@attr` filter into (base, Option<attr>)
+/// `category-games@cn` → (`category-games`, Some(`cn`))
+/// `category-games`    → (`category-games`, None)
+fn split_tag_attr(tag: &str) -> (&str, Option<&str>) {
+    match tag.split_once('@') {
+        Some((base, attr)) if !base.is_empty() && !attr.is_empty() => (base, Some(attr)),
+        _ => (tag, None),
+    }
+}
+
+/// Check if a domain's attributes satisfy the `@attr` filter
+/// `cn`   → domain must have attribute `cn`
+/// `!cn`  → domain must NOT have attribute `cn`
+///
+/// Note: `!` negation is a kixdns extension. V2Ray matches `@!cn` as a literal
+/// attribute key (not negation), so configs ported from V2Ray behave differently.
+fn attr_filter_matches(attrs: &[String], filter: &str) -> bool {
+    if let Some(neg) = filter.strip_prefix('!') {
+        !attrs.iter().any(|a| a.eq_ignore_ascii_case(neg))
+    } else {
+        attrs.iter().any(|a| a.eq_ignore_ascii_case(filter))
+    }
+}
+
+/// Parse a V2Ray Domain.Attribute protobuf message to extract the key field
+/// Attribute { string key = 1; oneof typed_value { ... } }
+fn parse_attribute_key(data: &[u8]) -> Option<String> {
+    let mut pos = 0;
+    while pos < data.len() {
+        let field_tag = data[pos] >> 3;
+        let wire_type = data[pos] & 0x07;
+        pos += 1;
+
+        match field_tag {
+            1 => {
+                let len = parse_varint(data, &mut pos).ok()?;
+                if pos + len > data.len() {
+                    return None;
+                }
+                return std::str::from_utf8(&data[pos..pos + len])
+                    .ok()
+                    .map(|s| s.to_ascii_lowercase());
+            }
+            _ => match wire_type {
+                0 => {
+                    parse_varint(data, &mut pos).ok()?;
+                }
+                1 => {
+                    pos += 8;
+                }
+                5 => {
+                    pos += 4;
+                }
+                2 => {
+                    let len = parse_varint(data, &mut pos).ok()?;
+                    pos += len;
+                }
+                _ => return None,
+            },
+        }
+    }
+    None
+}
+
 /// 解析 varint / Parse varint
 fn parse_varint(data: &[u8], pos: &mut usize) -> anyhow::Result<usize> {
     let mut result = 0usize;
@@ -484,9 +548,9 @@ impl GeoSiteManager {
                             // Each Domain message contains: type (field 1) and value (field 2)
                             let domains_data = &content[pos..pos + inner_len];
                             match self.parse_v2ray_domains(domains_data) {
-                                Ok(parsed_matchers) => {
-                                    let count = parsed_matchers.len();
-                                    matchers.extend(parsed_matchers);
+                                Ok(parsed) => {
+                                    let count = parsed.len();
+                                    matchers.extend(parsed.into_iter().map(|(m, _)| m));
                                     tracing::debug!(target = "geosite", tag = %tag,
                                                  count = count,
                                                  "parsed domains from V2Ray protobuf format");
@@ -580,8 +644,17 @@ impl GeoSiteManager {
             return Ok(0);
         }
 
-        // 创建 tag 查找集合（小写）/ Create tag lookup set (lowercase)
-        let tags_set: FxHashSet<String> = tags.iter().map(|s| s.to_lowercase()).collect();
+        // Pre-process tags: split `tag@attr` syntax into (base, attr_filter)
+        // Map: base_tag_lower → Vec<(store_tag_lower, Option<attr_filter>)>
+        let mut tag_requests: FxHashMap<String, Vec<(String, Option<String>)>> =
+            FxHashMap::default();
+        for tag in tags {
+            let (base, attr) = split_tag_attr(tag);
+            tag_requests
+                .entry(base.to_lowercase())
+                .or_default()
+                .push((tag.to_lowercase(), attr.map(|a| a.to_lowercase())));
+        }
 
         info!(target = "geosite", requested_tags = ?tags,
              "loading GeoSite data selectively from .dat file");
@@ -594,7 +667,6 @@ impl GeoSiteManager {
         let mut loaded_count = 0;
 
         while pos < content.len() {
-            // 读取外层字段标签 / Read outer field tag
             if pos >= content.len() {
                 break;
             }
@@ -602,10 +674,8 @@ impl GeoSiteManager {
             let field_tag = content[pos];
             pos += 1;
 
-            // 解析 varint 长度 / Parse varint length
             let entry_len = parse_varint(&content, &mut pos)?;
 
-            // 检查是否有足够的数据 / Check if we have enough data
             if pos + entry_len > content.len() {
                 break;
             }
@@ -615,112 +685,106 @@ impl GeoSiteManager {
             // field_tag = 0x0A 表示 GeoSite 条目
             if field_tag == 0x0A {
                 let mut tag = String::new();
-                let mut tag_found = false;
 
                 // 先解析 tag，判断是否需要加载 / Parse tag first to check if we need to load it
                 let temp_pos = pos;
-                while pos < entry_end {
+                // Clone matching requests out of the map to release the borrow before mutating self
+                let matching_requests: Option<Vec<(String, Option<String>)>> = loop {
+                    if pos >= entry_end {
+                        break None;
+                    }
                     let inner_tag = content[pos];
                     pos += 1;
-
                     let inner_len = parse_varint(&content, &mut pos)?;
-
                     if pos + inner_len > entry_end {
-                        break;
+                        break None;
                     }
-
                     // 0x0A: tag/country_code (string, field 1)
                     if inner_tag == 0x0A {
-                        if let Ok(tag_str) = std::str::from_utf8(&content[pos..pos + inner_len]) {
+                        if let Ok(tag_str) =
+                            std::str::from_utf8(&content[pos..pos + inner_len])
+                        {
                             tag = tag_str.to_string();
                             let tag_lower = tag.to_lowercase();
-
-                            // 检查是否在需要的列表中 / Check if in requested list
-                            tag_found = tags_set.contains(&tag_lower);
-
-                            if tag_found {
+                            // Match against base tags (supports `@attr` split)
+                            if let Some(reqs) = tag_requests.get(&tag_lower) {
                                 debug!(target = "geosite", tag = %tag_str,
                                       "loading requested tag");
+                                break Some(reqs.clone());
                             } else {
                                 debug!(target = "geosite", tag = %tag_str,
                                        "skipping unwanted tag");
                             }
                         }
-                        // Skip remaining tag field data and break
-                        // pos += inner_len is implicitly handled by break
-                        break; // tag 字段后直接跳过，不再继续解析 / Skip after tag field
+                        break None;
                     }
-
-                    // 跳过非 tag 字段 / Skip non-tag fields
                     pos += inner_len;
-                }
+                };
 
-                // 如果 tag 在需要列表中，重新解析整个条目 / If tag is requested, re-parse entire entry
-                if tag_found {
-                    // 重置位置到条目开始 / Reset position to entry start
+                if let Some(requests) = matching_requests {
+                    // 重新解析整个条目，提取 domains + attributes
                     pos = temp_pos;
-                    let mut matchers: Vec<DomainMatcher> = Vec::new();
+                    let mut all_domains: Vec<(DomainMatcher, Vec<String>)> = Vec::new();
 
                     while pos < entry_end {
                         let inner_tag = content[pos];
                         pos += 1;
-
                         let inner_len = parse_varint(&content, &mut pos)?;
-
                         if pos + inner_len > entry_end {
                             break;
                         }
-
                         match inner_tag {
-                            // 0x0A: tag (string, field 1)
                             0x0A => {
-                                if let Ok(tag_str) =
-                                    std::str::from_utf8(&content[pos..pos + inner_len])
-                                {
-                                    tag = tag_str.to_string();
-                                }
                                 pos += inner_len;
                             }
-                            // 0x12: domain (repeated Domain message, field 2)
                             0x12 => {
                                 let domains_data = &content[pos..pos + inner_len];
                                 match self.parse_v2ray_domains(domains_data) {
-                                    Ok(parsed_matchers) => {
-                                        let count = parsed_matchers.len();
-                                        matchers.extend(parsed_matchers);
-                                        debug!(target = "geosite", tag = %tag,
-                                             count = count,
-                                             "parsed domains from V2Ray protobuf format");
+                                    Ok(parsed) => {
+                                        all_domains.extend(parsed);
                                     }
                                     Err(err) => {
                                         warn!(target = "geosite", tag = %tag, error = %err,
-                                             "failed to parse V2Ray domains, skipping tag");
+                                             "failed to parse V2Ray domains, skipping domain entry");
                                     }
                                 }
                                 pos += inner_len;
                             }
                             _ => {
-                                // 跳过未知字段 / Skip unknown field
                                 pos += inner_len;
                             }
                         }
                     }
 
-                    // 添加到 database / Add to database
-                    if !tag.is_empty() && !matchers.is_empty() {
-                        info!(target = "geosite", tag = %tag,
-                              domain_count = matchers.len(),
-                              "loaded GeoSite tag with domains");
-                        let tag_lower = tag.to_lowercase();
-                        self.database.insert(tag_lower, matchers);
-                        loaded_count += 1;
+                    // For each request, apply attribute filter and store under original tag
+                    for (store_tag, attr_filter) in &requests {
+                        let matchers: Vec<DomainMatcher> = all_domains
+                            .iter()
+                            .filter(|(_, attrs)| match attr_filter {
+                                None => true,
+                                Some(f) => attr_filter_matches(attrs, f),
+                            })
+                            .cloned()
+                            .map(|(m, _)| m)
+                            .collect();
+
+                        if !matchers.is_empty() {
+                            info!(target = "geosite", tag = %store_tag,
+                                  domain_count = matchers.len(),
+                                  attr_filter = ?attr_filter,
+                                  "loaded GeoSite tag with domains");
+                            self.database.insert(store_tag.clone(), matchers);
+                            loaded_count += 1;
+                        } else {
+                            warn!(target = "geosite", tag = %store_tag,
+                                  attr_filter = ?attr_filter,
+                                  "no domains matched attribute filter");
+                        }
                     }
                 } else {
-                    // tag 不在需要列表中，跳过此条目 / Tag not in requested list, skip this entry
                     pos = entry_end;
                 }
             } else {
-                // 跳过非 GeoSite 条目 / Skip non-GeoSite entries
                 pos = entry_end;
             }
         }
@@ -805,25 +869,20 @@ impl GeoSiteManager {
     /// The domains field in V2Ray .dat file is repeated Domain messages
     /// 每个 Domain 消息包含: type (field 1, varint) 和 value (field 2, string)
     /// Each Domain message contains: type (field 1, varint) and value (field 2, string)
+    /// Returns (DomainMatcher, attribute_keys) pairs — attribute keys enable `@attr` filtering
     #[allow(clippy::regex_creation_in_loops)]
-    fn parse_v2ray_domains(&self, data: &[u8]) -> anyhow::Result<Vec<DomainMatcher>> {
-        let mut matchers = Vec::new();
+    fn parse_v2ray_domains(&self, data: &[u8]) -> anyhow::Result<Vec<(DomainMatcher, Vec<String>)>> {
+        let mut results = Vec::new();
         let mut pos = 0;
+
+        let mut current_matcher: Option<DomainMatcher> = None;
+        let mut current_attrs: Vec<String> = Vec::new();
 
         tracing::debug!(
             target = "geosite",
             data_len = data.len(),
             "starting to parse V2Ray domains"
         );
-
-        // 打印前 20 字节的十六进制数据 / Print first 20 bytes in hex
-        let hex_data: String = data
-            .iter()
-            .take(20)
-            .map(|b| format!("{:02x}", b))
-            .collect::<Vec<_>>()
-            .join(" ");
-        tracing::debug!(target = "geosite", hex_data = %hex_data, "first 20 bytes of data");
 
         while pos < data.len() {
             // 读取 field tag 和 wire type / Read field tag and wire type
@@ -837,14 +896,7 @@ impl GeoSiteManager {
                     if wire_type != 0 {
                         anyhow::bail!("invalid wire type for type field");
                     }
-                    // 对于 varint,直接读取值 / For varint, read value directly
                     let domain_type = parse_varint(data, &mut pos)?;
-
-                    tracing::debug!(
-                        target = "geosite",
-                        domain_type = domain_type,
-                        "parsed domain type"
-                    );
 
                     // 读取 field 2: value (string, wire_type 2)
                     if pos >= data.len() || data[pos] >> 3 != 2 {
@@ -854,12 +906,6 @@ impl GeoSiteManager {
 
                     let value_len = parse_varint(data, &mut pos)?;
 
-                    tracing::debug!(
-                        target = "geosite",
-                        value_len = value_len,
-                        "parsed value length"
-                    );
-
                     if pos + value_len > data.len() {
                         anyhow::bail!("invalid domain data: incomplete value string");
                     }
@@ -867,8 +913,6 @@ impl GeoSiteManager {
                     let domain_value =
                         String::from_utf8_lossy(&data[pos..pos + value_len]).to_string();
                     pos += value_len;
-
-                    tracing::debug!(target = "geosite", domain_value = %domain_value, "parsed domain value");
 
                     // 根据 V2Ray Domain.Type 创建匹配器 / Create matcher based on V2Ray Domain.Type
                     let matcher = match domain_type {
@@ -899,41 +943,53 @@ impl GeoSiteManager {
                             DomainMatcher::Full(domain_value)
                         }
                     };
-
-                    matchers.push(matcher);
+                    current_matcher = Some(matcher);
                 }
                 2 => {
-                    // field 2: value (string, wire_type 2)
+                    // field 2: value (string, wire_type 2) — standalone, skip
                     if wire_type != 2 {
                         anyhow::bail!("invalid wire type for value field");
                     }
-                    // 读取长度 / Read length
                     let value_len = parse_varint(data, &mut pos)?;
-
                     if pos + value_len > data.len() {
                         anyhow::bail!("invalid domain data: incomplete value string");
                     }
-
-                    // 跳过 value 数据 (这种情况不应该发生,因为 value 应该跟在 type 后面)
-                    // Skip value data (this shouldn't happen as value should follow type)
                     pos += value_len;
+                }
+                3 => {
+                    // field 3: attribute (repeated Attribute message, wire_type 2)
+                    // Domain.Attribute { string key = 1; oneof typed_value { ... } }
+                    if wire_type != 2 {
+                        anyhow::bail!("invalid wire type for attribute field");
+                    }
+                    let attr_len = parse_varint(data, &mut pos)?;
+                    if pos + attr_len > data.len() {
+                        anyhow::bail!("invalid domain data: incomplete attribute");
+                    }
+                    if let Some(key) = parse_attribute_key(&data[pos..pos + attr_len]) {
+                        current_attrs.push(key);
+                    }
+                    pos += attr_len;
                 }
                 _ => {
                     // 跳过未知字段 / Skip unknown field
                     match wire_type {
                         0 => {
-                            // varint, 读取并跳过 / varint, read and skip
                             parse_varint(data, &mut pos)?;
                         }
-                        1 | 5 => {
-                            // 64-bit fixed, 跳过 8 字节 / 64-bit fixed, skip 8 bytes
+                        1 => {
                             if pos + 8 > data.len() {
                                 anyhow::bail!("invalid domain data: incomplete fixed64");
                             }
                             pos += 8;
                         }
+                        5 => {
+                            if pos + 4 > data.len() {
+                                anyhow::bail!("invalid domain data: incomplete fixed32");
+                            }
+                            pos += 4;
+                        }
                         2 => {
-                            // length-delimited, 读取长度并跳过 / length-delimited, read length and skip
                             let len = parse_varint(data, &mut pos)?;
                             if pos + len > data.len() {
                                 anyhow::bail!("invalid domain data: incomplete length-delimited");
@@ -948,13 +1004,17 @@ impl GeoSiteManager {
             }
         }
 
+        if let Some(matcher) = current_matcher.take() {
+            results.push((matcher, std::mem::take(&mut current_attrs)));
+        }
+
         tracing::debug!(
             target = "geosite",
-            matcher_count = matchers.len(),
+            result_count = results.len(),
             "parsed V2Ray domains"
         );
 
-        Ok(matchers)
+        Ok(results)
     }
 
     /// 从 V2Ray 格式字符串加载 GeoSite 数据 / Load GeoSite data from V2Ray format string
@@ -1201,4 +1261,176 @@ fn run_geosite_watcher(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_varint(mut value: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        loop {
+            let byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value == 0 {
+                bytes.push(byte);
+                break;
+            }
+            bytes.push(byte | 0x80);
+        }
+        bytes
+    }
+
+    fn encode_varint_field(field_number: u8, value: usize) -> Vec<u8> {
+        let mut result = vec![(field_number << 3) | 0];
+        result.extend(encode_varint(value));
+        result
+    }
+
+    fn encode_ld(field_number: u8, data: &[u8]) -> Vec<u8> {
+        let mut result = vec![(field_number << 3) | 2];
+        result.extend(encode_varint(data.len()));
+        result.extend_from_slice(data);
+        result
+    }
+
+    fn encode_str(field_number: u8, s: &str) -> Vec<u8> {
+        encode_ld(field_number, s.as_bytes())
+    }
+
+    /// Build a Domain protobuf message
+    fn build_domain(domain_type: usize, value: &str, attrs: &[&str]) -> Vec<u8> {
+        let mut msg = encode_varint_field(1, domain_type);
+        msg.extend(encode_str(2, value));
+        for attr in attrs {
+            let attr_msg = encode_str(1, attr); // Attribute.key
+            msg.extend(encode_ld(3, &attr_msg)); // repeated attribute
+        }
+        msg
+    }
+
+    /// Build a GeoSite entry
+    fn build_geosite(tag: &str, domains: &[Vec<u8>]) -> Vec<u8> {
+        let mut msg = encode_str(1, tag);
+        for d in domains {
+            msg.extend(encode_ld(2, d));
+        }
+        msg
+    }
+
+    /// Build a GeoSiteList (.dat file content)
+    fn build_dat(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut result = Vec::new();
+        for entry in entries {
+            result.extend(encode_ld(1, entry));
+        }
+        result
+    }
+
+    #[test]
+    fn test_split_tag_attr() {
+        assert_eq!(split_tag_attr("category-games"), ("category-games", None));
+        assert_eq!(
+            split_tag_attr("category-games@cn"),
+            ("category-games", Some("cn"))
+        );
+        assert_eq!(
+            split_tag_attr("category-games@!cn"),
+            ("category-games", Some("!cn"))
+        );
+        // Edge: empty parts → no split
+        assert_eq!(split_tag_attr("tag@"), ("tag@", None));
+        assert_eq!(split_tag_attr("@cn"), ("@cn", None));
+    }
+
+    #[test]
+    fn test_attr_filter_matches() {
+        let cn = vec!["cn".to_string()];
+        assert!(attr_filter_matches(&cn, "cn"));
+        assert!(!attr_filter_matches(&cn, "!cn"));
+        assert!(!attr_filter_matches(&[], "cn"));
+        assert!(attr_filter_matches(&[], "!cn"));
+        // case insensitive
+        assert!(attr_filter_matches(&["CN".to_string()], "cn"));
+    }
+
+    #[test]
+    fn test_parse_attribute_key() {
+        // Attribute { key = "cn" }
+        let attr = encode_str(1, "cn");
+        assert_eq!(parse_attribute_key(&attr), Some("cn".to_string()));
+
+        // Attribute with extra fields (bool_value)
+        let mut attr = encode_str(1, "geolocation");
+        attr.extend(encode_varint_field(2, 1)); // bool_value = true
+        assert_eq!(parse_attribute_key(&attr), Some("geolocation".to_string()));
+
+        // Empty message
+        assert_eq!(parse_attribute_key(&[]), None);
+    }
+
+    #[test]
+    fn test_geosite_attr_filter_end_to_end() {
+        let domains = vec![
+            build_domain(3, "example.com", &["cn"]), // Full match, has @cn
+            build_domain(3, "other.com", &[]),       // Full match, no attrs
+        ];
+        let entry = build_geosite("TEST", &domains);
+        let dat = build_dat(&[entry]);
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("kixdns_test_attr.dat");
+        std::fs::write(&path, &dat).unwrap();
+
+        // @cn: only example.com
+        let mut m1 = GeoSiteManager::new();
+        m1.load_from_dat_file_selective(&path, &["test@cn".to_string()])
+            .unwrap();
+        assert!(m1.matches("test@cn", "example.com"));
+        assert!(!m1.matches("test@cn", "other.com"));
+
+        // no filter: both
+        let mut m2 = GeoSiteManager::new();
+        m2.load_from_dat_file_selective(&path, &["test".to_string()])
+            .unwrap();
+        assert!(m2.matches("test", "example.com"));
+        assert!(m2.matches("test", "other.com"));
+
+        // @!cn: only other.com
+        let mut m3 = GeoSiteManager::new();
+        m3.load_from_dat_file_selective(&path, &["test@!cn".to_string()])
+            .unwrap();
+        assert!(!m3.matches("test@!cn", "example.com"));
+        assert!(m3.matches("test@!cn", "other.com"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_geosite_attr_and_plain_same_base() {
+        // Request both `test` and `test@cn` — both should load from same .dat entry
+        let domains = vec![
+            build_domain(3, "a.com", &["cn"]),
+            build_domain(3, "b.com", &[]),
+        ];
+        let entry = build_geosite("DUAL", &domains);
+        let dat = build_dat(&[entry]);
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("kixdns_test_dual.dat");
+        std::fs::write(&path, &dat).unwrap();
+
+        let mut m = GeoSiteManager::new();
+        let count = m
+            .load_from_dat_file_selective(&path, &["dual".to_string(), "dual@cn".to_string()])
+            .unwrap();
+        assert_eq!(count, 2); // both loaded
+
+        assert!(m.matches("dual", "a.com"));
+        assert!(m.matches("dual", "b.com"));
+        assert!(m.matches("dual@cn", "a.com"));
+        assert!(!m.matches("dual@cn", "b.com"));
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
