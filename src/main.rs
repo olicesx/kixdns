@@ -13,6 +13,7 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 use kixdns::config::load_config;
 use kixdns::engine::{Engine, FastPathResponse, PreParsedData};
 use kixdns::matcher::RuntimePipelineConfig;
+use kixdns::proto_utils::truncate_udp_response;
 use kixdns::watcher;
 
 #[derive(Parser, Debug)]
@@ -588,7 +589,9 @@ async fn run_udp_worker(
             match engine.handle_packet_fast(&packet_bytes, peer) {
                 Ok(Some(FastPathResponse::Direct(bytes))) => {
                     // 已包含正确 TXID，可直接发送 / Already contains correct TXID
-                    let _ = socket.send_to(&bytes, peer).await;
+                    let truncated = truncate_udp_response(&packet_bytes, &bytes);
+                    let response = truncated.as_deref().unwrap_or(&bytes);
+                    let _ = socket.send_to(response, peer).await;
                 }
                 Ok(Some(FastPathResponse::CacheHit {
                     cached,
@@ -613,7 +616,9 @@ async fn run_udp_worker(
                         let id_bytes = tx_id.to_be_bytes();
                         send_buf[0] = id_bytes[0];
                         send_buf[1] = id_bytes[1];
-                        if let Err(e) = socket.try_send_to(&send_buf, peer)
+                        if let Some(truncated) = truncate_udp_response(&packet_bytes, &send_buf) {
+                            let _ = socket.send_to(&truncated, peer).await;
+                        } else if let Err(e) = socket.try_send_to(&send_buf, peer)
                             && e.kind() == std::io::ErrorKind::WouldBlock
                         {
                             let _ = socket.send_to(&send_buf, peer).await;
@@ -634,7 +639,11 @@ async fn run_udp_worker(
                             send_buf[0] = id_bytes[0];
                             send_buf[1] = id_bytes[1];
                         }
-                        let _ = socket.send_to(&send_buf, peer).await;
+                        if let Some(truncated) = truncate_udp_response(&packet_bytes, &send_buf) {
+                            let _ = socket.send_to(&truncated, peer).await;
+                        } else {
+                            let _ = socket.send_to(&send_buf, peer).await;
+                        }
                     }
                 }
                 Ok(Some(FastPathResponse::AsyncNeeded {
@@ -682,7 +691,9 @@ async fn run_udp_worker(
                             .await
                             {
                                 Ok(Ok(resp)) => {
-                                    let _ = socket.send_to(&resp, peer).await;
+                                    let truncated = truncate_udp_response(&packet_bytes, &resp);
+                                    let response = truncated.as_deref().unwrap_or(&resp);
+                                    let _ = socket.send_to(response, peer).await;
                                 }
                                 Ok(Err(e)) => {
                                     debug!(error = %e, "handle_packet error");
@@ -719,7 +730,9 @@ async fn run_udp_worker(
                             .await
                             {
                                 Ok(Ok(resp)) => {
-                                    let _ = socket.send_to(&resp, peer).await;
+                                    let truncated = truncate_udp_response(&packet_bytes, &resp);
+                                    let response = truncated.as_deref().unwrap_or(&resp);
+                                    let _ = socket.send_to(response, peer).await;
                                 }
                                 Ok(Err(e)) => {
                                     debug!(error = %e, "handle_packet error");
