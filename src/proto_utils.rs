@@ -1,5 +1,9 @@
 use std::hash::Hasher;
 
+use bytes::Bytes;
+use hickory_proto::op::Message;
+use hickory_proto::serialize::binary::{BinDecodable, BinEncodable, BinEncoder};
+
 /// 快速解析结果，零拷贝实现 / Quick parse result with zero-copy implementation
 pub struct QuickQuery<'a> {
     pub tx_id: u16,
@@ -9,11 +13,28 @@ pub struct QuickQuery<'a> {
     pub edns_present: bool,
 }
 
+/// Check the fixed DNS header fields required by KixDNS's standard query path.
+/// This cheap ingress guard must run before cache/static fast paths so response
+/// packets cannot be reflected as normal answers.
+#[inline]
+pub fn is_standard_query_header(packet: &[u8]) -> bool {
+    if packet.len() < 12 {
+        return false;
+    }
+
+    let flags = u16::from_be_bytes([packet[2], packet[3]]);
+    let qd_count = u16::from_be_bytes([packet[4], packet[5]]);
+    let an_count = u16::from_be_bytes([packet[6], packet[7]]);
+    let ns_count = u16::from_be_bytes([packet[8], packet[9]]);
+
+    flags & 0x8000 == 0 && flags & 0x7800 == 0 && qd_count == 1 && an_count == 0 && ns_count == 0
+}
+
 /// 仅解析 DNS 头部和第一个 Query，用于快速缓存查找 / Parse only DNS header and first query for quick cache lookup
 /// 避免 hickory-proto Message::from_bytes 的全量解析和分配开销 / Avoid full parsing and allocation overhead of hickory-proto Message::from_bytes
 /// buf: 用于存储归一化（小写）域名的缓冲区，建议至少 256 字节 / buf: buffer for storing normalized (lowercase) domain name, recommend at least 256 bytes
 pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a>> {
-    if packet.len() < 12 {
+    if !is_standard_query_header(packet) {
         return None;
     }
 
@@ -21,14 +42,7 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     let tx_id = u16::from_be_bytes([packet[0], packet[1]]);
 
     // 2. Counts / 计数
-    let qd_count = u16::from_be_bytes([packet[4], packet[5]]);
-    let an_count = u16::from_be_bytes([packet[6], packet[7]]);
-    let ns_count = u16::from_be_bytes([packet[8], packet[9]]);
     let ar_count = u16::from_be_bytes([packet[10], packet[11]]);
-
-    if qd_count == 0 {
-        return None;
-    }
 
     // 3. Parse QName (start at offset 12) / 解析查询名称（从偏移量 12 开始）
     let mut pos = 12;
@@ -69,6 +83,9 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
                 return None; // Loop detection / 循环检测
             }
             continue;
+        }
+        if len & 0xC0 != 0 {
+            return None;
         }
 
         // Label / 标签
@@ -146,48 +163,45 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     let qclass = u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]);
     pos += 4;
 
-    // 5. Check for EDNS in Additional section / 在附加部分检查 EDNS
+    // 5. Validate every declared Additional record and detect EDNS.
+    // Fail closed before cache/static fast paths on any malformed wire structure.
+    //
+    // Trade-off vs the old fast-path scan: this always walks the full Additional
+    // section and rejects trailing data, where the old code broke early on OPT and
+    // tolerated truncation. Full validation is required so malformed packets cannot
+    // reach cache/static paths; the cost is bounded by ARCOUNT records.
+    //
+    // 权衡：总是遍历完整 Additional 段并拒绝尾随数据（旧代码找到 OPT 即提前退出、容忍截断）。
+    // 完整校验是为了让畸形包无法到达 cache/static 路径；成本以 ARCOUNT 记录数为界。
     let mut edns_present = false;
-    if ar_count > 0 && an_count == 0 && ns_count == 0 {
-        // Fast-path optimization: for standard query messages, AN and NS are expected to be 0.
-        // We only scan the Additional section in this common case to keep parsing fast, which may miss EDNS
-        // in non-standard messages (e.g., UPDATE, or responses mistakenly treated as queries).
-        // 快速路径优化：对于标准查询消息，AN 和 NS 通常为 0。仅在这种常见情况下扫描 Additional 以提升性能，
-        // 这在非标准消息（例如 UPDATE，或被误当作查询处理的响应）中可能漏检 EDNS。
-        let mut ar_pos = pos;
-        for _ in 0..ar_count {
-            if ar_pos >= packet.len() {
-                break;
-            }
-            let name_byte = packet[ar_pos];
-            let next_pos = if name_byte == 0 {
-                ar_pos + 1
-            } else {
-                skip_name(packet, ar_pos).unwrap_or(packet.len())
-            };
-
-            if next_pos + 10 > packet.len() {
-                break;
-            }
-            let rr_type = u16::from_be_bytes([packet[next_pos], packet[next_pos + 1]]);
-            if rr_type == 41 {
-                // OPT
-                edns_present = true;
-                break;
-            }
-            let rd_len = u16::from_be_bytes([packet[next_pos + 8], packet[next_pos + 9]]);
-
-            // Validate arithmetic to prevent overflow and ensure entire record fits in packet
-            let rd_len_usize = rd_len as usize;
-            // Check packet length first to avoid underflow in subsequent arithmetic
-            if packet.len() < 10 + rd_len_usize {
-                break;
-            }
-            if next_pos > packet.len() - 10 - rd_len_usize {
-                break;
-            }
-            ar_pos = next_pos + 10 + rd_len_usize;
+    let mut ar_pos = pos;
+    for _ in 0..ar_count {
+        let owner_start = ar_pos;
+        let next_pos = skip_name(packet, ar_pos)?;
+        let fixed_end = next_pos.checked_add(10)?;
+        if fixed_end > packet.len() {
+            return None;
         }
+
+        let rr_type = u16::from_be_bytes([packet[next_pos], packet[next_pos + 1]]);
+        let rd_len = u16::from_be_bytes([packet[next_pos + 8], packet[next_pos + 9]]) as usize;
+        let rdata_end = fixed_end.checked_add(rd_len)?;
+        if rdata_end > packet.len() {
+            return None;
+        }
+
+        if rr_type == 41 {
+            // RFC 6891: OPT owner name must be the root and only one OPT is valid.
+            if edns_present || packet.get(owner_start) != Some(&0) {
+                return None;
+            }
+            validate_edns_options(packet, fixed_end, rdata_end)?;
+            edns_present = true;
+        }
+        ar_pos = rdata_end;
+    }
+    if ar_pos != packet.len() {
+        return None;
     }
 
     // Return slice of buf as zero-copy reference
@@ -213,22 +227,92 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
 #[inline]
 fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
     let packet_len = packet.len();
+    let mut encoded_end = None;
+    let mut jumps = 0usize;
+
     loop {
-        if pos >= packet_len {
-            return None;
-        }
-        let len = packet[pos];
+        let len = *packet.get(pos)?;
         if len == 0 {
-            return Some(pos + 1);
+            return Some(encoded_end.unwrap_or(pos + 1));
         }
         if (len & 0xC0) == 0xC0 {
-            if pos + 2 > packet_len {
+            let pointer_end = pos.checked_add(2)?;
+            if pointer_end > packet_len {
                 return None;
             }
-            return Some(pos + 2);
+            encoded_end.get_or_insert(pointer_end);
+            let offset = (((len & 0x3F) as usize) << 8) | packet[pos + 1] as usize;
+            if offset >= packet_len {
+                return None;
+            }
+            jumps += 1;
+            if jumps > 16 {
+                return None;
+            }
+            pos = offset;
+            continue;
         }
-        pos += 1 + len as usize;
+        if len & 0xC0 != 0 || len > 63 {
+            return None;
+        }
+
+        let next = pos.checked_add(1 + len as usize)?;
+        if next > packet_len {
+            return None;
+        }
+        pos = next;
     }
+}
+
+/// Byte length of the last complete record, or `None` on malformed structure.
+///
+/// hickory's bounded encoder rolls back its write offset but not the backing
+/// buffer when a record does not fit, so truncated output can carry partial
+/// bytes from the failed record past the (corrected) header counts. Re-walking
+/// the emitted sections yields the exact valid boundary so the response stays
+/// within RFC 1035 §4.2.1 record boundaries.
+fn valid_message_len(packet: &[u8]) -> Option<usize> {
+    if packet.len() < 12 {
+        return None;
+    }
+
+    let qd_count = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+    let an_count = u16::from_be_bytes([packet[6], packet[7]]) as usize;
+    let ns_count = u16::from_be_bytes([packet[8], packet[9]]) as usize;
+    let ar_count = u16::from_be_bytes([packet[10], packet[11]]) as usize;
+
+    let mut pos = 12usize;
+    // Questions: NAME + QTYPE + QCLASS.
+    for _ in 0..qd_count {
+        pos = skip_name(packet, pos)?;
+        pos = pos.checked_add(4)?;
+    }
+    // Resource records: NAME + TYPE/CLASS/TTL/RDLENGTH + RDATA.
+    for _ in 0..an_count + ns_count + ar_count {
+        pos = skip_name(packet, pos)?;
+        let fixed_end = pos.checked_add(10)?;
+        if fixed_end > packet.len() {
+            return None;
+        }
+        let rd_len = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
+        pos = fixed_end.checked_add(rd_len)?;
+    }
+    (pos <= packet.len()).then_some(pos)
+}
+
+fn validate_edns_options(packet: &[u8], mut pos: usize, end: usize) -> Option<()> {
+    while pos < end {
+        let header_end = pos.checked_add(4)?;
+        if header_end > end {
+            return None;
+        }
+        let option_len = u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]) as usize;
+        pos = header_end.checked_add(option_len)?;
+        if pos > end {
+            return None;
+        }
+    }
+    (pos == end).then_some(())
 }
 
 impl QuickQuery<'_> {
@@ -640,6 +724,135 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     })
 }
 
+/// Re-encode an oversized downstream UDP response so it respects the payload size
+/// advertised by the client (RFC 6891). Queries without EDNS are limited to the
+/// classic 512-byte DNS/UDP payload.
+///
+/// Hickory's bounded encoder emits as many complete records as fit, fixes the
+/// section counts, and sets TC=1 when records are omitted. `None` means the
+/// original response already fits and can be sent without allocation.
+///
+/// Trade-off: oversized responses (>512B, or > the client EDNS payload) are
+/// re-parsed and re-encoded on every send. This is intentional — truncation
+/// must happen at DNS record boundaries (RFC 1035 §4.2.1) and the correct TC
+/// bit + counts can only be produced by a full re-encode. The overwhelmingly
+/// common small-response path returns `None` before any parsing, so the cost
+/// only applies to responses that would otherwise break the UDP size limit.
+///
+/// 权衡：超限响应（>512B 或超过客户端 EDNS 载荷）每次发送都会重新解析并重编码。
+/// 这是有意的——截断必须发生在 DNS 记录边界（RFC 1035 §4.2.1），且正确的 TC 位
+/// 和计数只能由完整重编码产生。绝大多数小响应路径在解析前就返回 None，因此该
+/// 开销只作用于那些会突破 UDP 大小限制的响应。
+pub fn truncate_udp_response(request_packet: &[u8], response_packet: &[u8]) -> Option<Bytes> {
+    const CLASSIC_DNS_UDP_PAYLOAD: usize = 512;
+
+    // Avoid parsing the request on the overwhelmingly common small-response path.
+    if response_packet.len() <= CLASSIC_DNS_UDP_PAYLOAD {
+        return None;
+    }
+
+    // hickory's Message::max_payload() already clamps to >= 512, so the extra
+    // max() below is defensive only.
+    let max_payload = Message::from_bytes(request_packet)
+        .map(|request| request.max_payload() as usize)
+        .unwrap_or(CLASSIC_DNS_UDP_PAYLOAD)
+        .max(CLASSIC_DNS_UDP_PAYLOAD);
+
+    if response_packet.len() <= max_payload {
+        return None;
+    }
+
+    if let Ok(mut response) = Message::from_bytes(response_packet) {
+        // Do not advertise a larger UDP payload in the response than the client
+        // offered in its request.
+        if let Some(edns) = response.edns.as_mut() {
+            edns.set_max_payload(max_payload as u16);
+        }
+
+        let mut out = Vec::with_capacity(max_payload);
+        let encoded = {
+            let mut encoder = BinEncoder::new(&mut out);
+            encoder.set_max_size(max_payload as u16);
+            response.emit(&mut encoder)
+        };
+        if encoded.is_ok() && out.len() <= max_payload {
+            // hickory's rollback does not shrink the backing buffer, so the
+            // output can carry partial bytes from the record that did not fit.
+            // Trim to the last complete record boundary from the corrected
+            // header counts; fall back to the raw output if the walk fails.
+            if let Some(valid_len) = valid_message_len(&out) {
+                out.truncate(valid_len);
+            }
+            return Some(Bytes::from(out));
+        }
+    }
+
+    // Internal responses should always parse, but never send an oversized UDP
+    // datagram if a malformed response reaches this boundary. Fall back to a
+    // minimal TC=1 response containing the original Question section.
+    Some(build_minimal_truncated_response(
+        request_packet,
+        response_packet,
+        max_payload,
+    ))
+}
+
+fn build_minimal_truncated_response(
+    request_packet: &[u8],
+    response_packet: &[u8],
+    max_payload: usize,
+) -> Bytes {
+    let mut question_end = 12usize;
+    let mut copied_questions = false;
+
+    if request_packet.len() >= 12 {
+        let qd_count = u16::from_be_bytes([request_packet[4], request_packet[5]]);
+        let mut pos = 12usize;
+        let mut valid = true;
+        for _ in 0..qd_count {
+            let Some(name_end) = skip_name(request_packet, pos) else {
+                valid = false;
+                break;
+            };
+            let Some(next) = name_end.checked_add(4) else {
+                valid = false;
+                break;
+            };
+            if next > request_packet.len() {
+                valid = false;
+                break;
+            }
+            pos = next;
+        }
+        if valid && pos <= max_payload {
+            question_end = pos;
+            copied_questions = true;
+        }
+    }
+
+    let header_source = if response_packet.len() >= 12 {
+        response_packet
+    } else {
+        request_packet
+    };
+    let mut out = if header_source.len() >= 12 {
+        header_source[..12].to_vec()
+    } else {
+        vec![0u8; 12]
+    };
+
+    // QR=1 and TC=1; preserve the remaining response flags and RCODE.
+    out[2] |= 0x82;
+    if copied_questions {
+        out[4..6].copy_from_slice(&request_packet[4..6]);
+        out.extend_from_slice(&request_packet[12..question_end]);
+    } else {
+        out[4..6].copy_from_slice(&0u16.to_be_bytes());
+    }
+    out[6..12].fill(0);
+    Bytes::from(out)
+}
+
 /// Saturating conversion for DNS TTLs and elapsed seconds.
 /// DNS TTL fields are u32, while Duration and configuration calculations use u64.
 #[inline]
@@ -807,6 +1020,175 @@ mod tests {
         let mut qname = [0u8; 256];
 
         assert!(parse_quick(&packet, &mut qname).is_some());
+    }
+
+    fn encode_message(message: &Message) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut encoder = BinEncoder::new(&mut bytes);
+        message.emit(&mut encoder).expect("encode DNS message");
+        bytes
+    }
+
+    fn txt_query(max_payload: Option<u16>) -> Vec<u8> {
+        use hickory_proto::op::{Edns, MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RecordType};
+        use std::str::FromStr;
+
+        let mut message = Message::new(0x1234, MessageType::Query, OpCode::Query);
+        message.add_query(Query::query(
+            Name::from_str("cloudflare.com.").unwrap(),
+            RecordType::TXT,
+        ));
+        if let Some(max_payload) = max_payload {
+            let mut edns = Edns::new();
+            edns.set_max_payload(max_payload);
+            message.set_edns(edns);
+        }
+        encode_message(&message)
+    }
+
+    fn large_txt_response(answer_count: usize) -> Vec<u8> {
+        use hickory_proto::op::{Edns, MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RData, Record, RecordType, rdata::TXT};
+        use std::str::FromStr;
+
+        let name = Name::from_str("cloudflare.com.").unwrap();
+        let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
+        message.metadata.recursion_desired = true;
+        message.metadata.recursion_available = true;
+        message.add_query(Query::query(name.clone(), RecordType::TXT));
+        for index in 0..answer_count {
+            let text = format!("verification-{index:02}-{}", "x".repeat(180));
+            message.add_answer(Record::from_rdata(
+                name.clone(),
+                300,
+                RData::TXT(TXT::new(vec![text])),
+            ));
+        }
+        let mut edns = Edns::new();
+        edns.set_max_payload(4096);
+        message.set_edns(edns);
+        encode_message(&message)
+    }
+
+    #[test]
+    fn truncate_udp_response_uses_512_without_edns() {
+        let request = txt_query(None);
+        let response = large_txt_response(20);
+        assert!(response.len() > 512);
+
+        let truncated = truncate_udp_response(&request, &response).expect("must truncate");
+        assert!(truncated.len() <= 512);
+
+        let decoded = Message::from_bytes(&truncated).expect("valid truncated response");
+        assert!(decoded.metadata.truncation);
+        assert_eq!(decoded.metadata.id, 0x1234);
+        assert_eq!(decoded.queries.len(), 1);
+    }
+
+    #[test]
+    fn truncate_udp_response_has_no_trailing_bytes() {
+        use hickory_proto::op::{MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RData, Record, RecordType, rdata::TXT};
+        use std::str::FromStr;
+
+        let request = txt_query(None);
+        // No EDNS in the response: the failed answer's partial bytes are not
+        // overwritten by a later OPT record, so hickory's bounded encoder
+        // leaves them as trailing garbage past the last complete record.
+        let name = Name::from_str("cloudflare.com.").unwrap();
+        let mut response = Message::new(0x1234, MessageType::Response, OpCode::Query);
+        response.metadata.recursion_desired = true;
+        response.metadata.recursion_available = true;
+        response.add_query(Query::query(name.clone(), RecordType::TXT));
+        for index in 0..20 {
+            let text = format!("verification-{index:02}-{}", "x".repeat(180));
+            response.add_answer(Record::from_rdata(
+                name.clone(),
+                300,
+                RData::TXT(TXT::new(vec![text])),
+            ));
+        }
+        let response = encode_message(&response);
+        assert!(response.len() > 512);
+
+        let truncated = truncate_udp_response(&request, &response).expect("must truncate");
+        // Truncation must respect RFC 1035 §4.2.1 record boundaries with no
+        // trailing data beyond the last complete record.
+        assert_eq!(
+            valid_message_len(&truncated),
+            Some(truncated.len()),
+            "truncated response must end exactly at a record boundary"
+        );
+    }
+
+    #[test]
+    fn truncate_udp_response_respects_edns_payload_size() {
+        let request = txt_query(Some(1232));
+        let response = large_txt_response(20);
+        assert!(response.len() > 1232);
+
+        let truncated = truncate_udp_response(&request, &response).expect("must truncate");
+        assert!(truncated.len() <= 1232);
+
+        let decoded = Message::from_bytes(&truncated).expect("valid truncated response");
+        assert!(decoded.metadata.truncation);
+        assert_eq!(decoded.queries.len(), 1);
+        if let Some(edns) = decoded.edns {
+            assert_eq!(edns.max_payload(), 1232);
+        }
+    }
+
+    #[test]
+    fn truncate_udp_response_keeps_response_that_fits_client_limit() {
+        let request = txt_query(Some(4096));
+        let response = large_txt_response(8);
+        assert!(response.len() > 512);
+        assert!(response.len() <= 4096);
+
+        assert!(truncate_udp_response(&request, &response).is_none());
+    }
+
+    #[test]
+    fn truncate_udp_response_skips_small_responses_without_parsing_request() {
+        let response = vec![0u8; 128];
+        assert!(truncate_udp_response(b"not a dns request", &response).is_none());
+    }
+
+    fn query_with_additional(additional: &[u8]) -> Vec<u8> {
+        let mut packet = query_with_label(b"example");
+        packet[10..12].copy_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(additional);
+        packet
+    }
+
+    #[test]
+    fn parse_quick_rejects_missing_declared_additional_record() {
+        let packet = query_with_additional(&[]);
+        let mut qname = [0u8; 256];
+        assert!(parse_quick(&packet, &mut qname).is_none());
+    }
+
+    #[test]
+    fn parse_quick_rejects_truncated_edns_rdata() {
+        let packet = query_with_additional(&[0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0, 0, 4, 0, 1]);
+        let mut qname = [0u8; 256];
+        assert!(parse_quick(&packet, &mut qname).is_none());
+    }
+
+    #[test]
+    fn parse_quick_rejects_invalid_additional_compression_pointer() {
+        let packet = query_with_additional(&[0xC0, 0xFF, 0, 16, 0, 1, 0, 0, 0, 0, 0, 0]);
+        let mut qname = [0u8; 256];
+        assert!(parse_quick(&packet, &mut qname).is_none());
+    }
+
+    #[test]
+    fn parse_quick_accepts_valid_empty_edns_record() {
+        let packet = query_with_additional(&[0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0, 0, 0]);
+        let mut qname = [0u8; 256];
+        let query = parse_quick(&packet, &mut qname).expect("valid EDNS query");
+        assert!(query.edns_present);
     }
 
     #[test]

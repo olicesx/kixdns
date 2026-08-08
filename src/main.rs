@@ -5,14 +5,15 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use kixdns::config::load_config;
-use kixdns::engine::{Engine, FastPathResponse, PreParsedData};
+use kixdns::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers};
 use kixdns::matcher::RuntimePipelineConfig;
+use kixdns::proto_utils::{is_standard_query_header, truncate_udp_response};
 use kixdns::watcher;
 
 #[derive(Parser, Debug)]
@@ -526,6 +527,54 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
     Ok(socket.into())
 }
 
+/// 发送 UDP 数据报：try_send_to 优先（避免 reactor 开销），WouldBlock 回退异步
+/// Send UDP datagram: try non-blocking first, async fallback on WouldBlock
+async fn send_udp_datagram(
+    socket: &UdpSocket,
+    data: &[u8],
+    peer: SocketAddr,
+) -> std::io::Result<usize> {
+    match socket.try_send_to(data, peer) {
+        Ok(sent) => Ok(sent),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            socket.send_to(data, peer).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// 发送 UDP 响应：超限响应截断（RFC 6891）+ try_send_to 优先，WouldBlock 回退异步
+/// Send UDP response: truncate oversized (RFC 6891), try non-blocking first, async fallback on WouldBlock
+async fn send_udp_response(socket: &UdpSocket, request: &[u8], response: &[u8], peer: SocketAddr) {
+    // 截断超限响应，避免 UDP 报文超过客户端声明上限 / Truncate to the client's advertised UDP limit
+    let truncated = truncate_udp_response(request, response);
+    let response = truncated.as_deref().unwrap_or(response);
+    if let Err(error) = send_udp_datagram(socket, response, peer).await {
+        debug!(%peer, %error, response_len = response.len(), "failed to send UDP response");
+    }
+}
+
+/// 非阻塞发送 UDP 响应（过载保护路径）：截断 + 纯 try_send_to，WouldBlock 背压丢弃
+/// Non-blocking UDP send for overload paths: truncate + try_send_to only; drop on WouldBlock
+fn try_send_udp_response(socket: &UdpSocket, request: &[u8], response: &[u8], peer: SocketAddr) {
+    let truncated = truncate_udp_response(request, response);
+    let response = truncated.as_deref().unwrap_or(response);
+    if let Err(error) = socket.try_send_to(response, peer)
+        && error.kind() != std::io::ErrorKind::WouldBlock
+    {
+        debug!(%peer, %error, response_len = response.len(), "failed to send UDP response");
+    }
+    // WouldBlock: 发送缓冲满，丢弃（背压）/ send buffer full, drop (backpressure)
+}
+
+/// 异步发送 SERVFAIL（处理失败/超时路径）
+async fn send_udp_servfail(socket: &UdpSocket, request: &[u8], peer: SocketAddr) {
+    let Some(response) = engine_helpers::try_build_servfail_response_from_wire(request) else {
+        return;
+    };
+    send_udp_response(socket, request, &response, peer).await;
+}
+
 /// 高性能 UDP worker：直接在接收循环中处理请求，避免 spawn 开销 / High-performance UDP worker: process requests directly in receive loop, avoiding spawn overhead
 async fn run_udp_worker(
     worker_id: usize,
@@ -573,6 +622,9 @@ async fn run_udp_worker(
         {
             // 零拷贝获取 Bytes / Zero-copy obtain Bytes
             let packet_bytes = buf.split().freeze();
+            if !is_standard_query_header(&packet_bytes) {
+                continue;
+            }
 
             // 每 100 个请求检查一次流控调整 / Check flow control adjustment every 100 requests
             request_count += 1;
@@ -588,7 +640,7 @@ async fn run_udp_worker(
             match engine.handle_packet_fast(&packet_bytes, peer) {
                 Ok(Some(FastPathResponse::Direct(bytes))) => {
                     // 已包含正确 TXID，可直接发送 / Already contains correct TXID
-                    let _ = socket.send_to(&bytes, peer).await;
+                    send_udp_response(&socket, &packet_bytes, &bytes, peer).await;
                 }
                 Ok(Some(FastPathResponse::CacheHit {
                     cached,
@@ -613,11 +665,7 @@ async fn run_udp_worker(
                         let id_bytes = tx_id.to_be_bytes();
                         send_buf[0] = id_bytes[0];
                         send_buf[1] = id_bytes[1];
-                        if let Err(e) = socket.try_send_to(&send_buf, peer)
-                            && e.kind() == std::io::ErrorKind::WouldBlock
-                        {
-                            let _ = socket.send_to(&send_buf, peer).await;
-                        }
+                        send_udp_response(&socket, &packet_bytes, &send_buf, peer).await;
                     } else {
                         // Slow path: TTL has decayed, must patch all TTLs in-place.
                         // 慢速路径：TTL 已衰减，必须原地 patch 所有 TTL。
@@ -634,7 +682,7 @@ async fn run_udp_worker(
                             send_buf[0] = id_bytes[0];
                             send_buf[1] = id_bytes[1];
                         }
-                        let _ = socket.send_to(&send_buf, peer).await;
+                        send_udp_response(&socket, &packet_bytes, &send_buf, peer).await;
                     }
                 }
                 Ok(Some(FastPathResponse::AsyncNeeded {
@@ -682,10 +730,11 @@ async fn run_udp_worker(
                             .await
                             {
                                 Ok(Ok(resp)) => {
-                                    let _ = socket.send_to(&resp, peer).await;
+                                    send_udp_response(&socket, &packet_bytes, &resp, peer).await;
                                 }
                                 Ok(Err(e)) => {
-                                    debug!(error = %e, "handle_packet error");
+                                    debug!(error = %e, "handle_packet error, returning SERVFAIL");
+                                    send_udp_servfail(&socket, &packet_bytes, peer).await;
                                 }
                                 Err(_) => {
                                     warn!(
@@ -693,9 +742,22 @@ async fn run_udp_worker(
                                         upstream_timeout_ms = engine.get_upstream_timeout_ms(),
                                         "request timeout after hedge and fallback exhausted"
                                     );
+                                    send_udp_servfail(&socket, &packet_bytes, peer).await;
                                 }
                             }
                         });
+                    } else {
+                        // 过载保护：permit 耗尽，用预解析数据快速构造 SERVFAIL 并非阻塞发送（背压丢弃）
+                        // Overload: permit exhausted, fast SERVFAIL from pre-parsed data with non-blocking send
+                        if let Ok(resp) = engine_helpers::build_servfail_response_fast(
+                            tx_id,
+                            &qname,
+                            qtype,
+                            qclass,
+                            packet_bytes[2] & 0x01 != 0,
+                        ) {
+                            try_send_udp_response(&socket, &packet_bytes, &resp, peer);
+                        }
                     }
                 }
                 Ok(None) => {
@@ -719,10 +781,11 @@ async fn run_udp_worker(
                             .await
                             {
                                 Ok(Ok(resp)) => {
-                                    let _ = socket.send_to(&resp, peer).await;
+                                    send_udp_response(&socket, &packet_bytes, &resp, peer).await;
                                 }
                                 Ok(Err(e)) => {
-                                    debug!(error = %e, "handle_packet error");
+                                    debug!(error = %e, "handle_packet error, returning SERVFAIL");
+                                    send_udp_servfail(&socket, &packet_bytes, peer).await;
                                 }
                                 Err(_) => {
                                     warn!(
@@ -730,13 +793,22 @@ async fn run_udp_worker(
                                         upstream_timeout_ms = engine.get_upstream_timeout_ms(),
                                         "request timeout"
                                     );
+                                    send_udp_servfail(&socket, &packet_bytes, peer).await;
                                 }
                             }
                         });
+                    } else {
+                        // 过载保护：permit 耗尽且 parse_quick 已失败（大概率畸形/非标准包）。
+                        // 直接静默丢弃——过载时应做最便宜的拒绝，对已失败包做完整解析
+                        // 只会加剧过载，且 hickory 大概率同样失败（解析白做）。
+                        // Overload: permit exhausted and parse_quick already failed (likely
+                        // malformed/non-standard). Drop silently — overload rejection must be
+                        // cheap, and a full parse of an already-failed packet wastes CPU.
                     }
                 }
-                Err(_) => {
-                    // 解析错误，忽略 / Parse error, ignore
+                Err(error) => {
+                    debug!(%error, "UDP fast-path error, returning SERVFAIL for valid query");
+                    send_udp_servfail(&socket, &packet_bytes, peer).await;
                 }
             }
         }
@@ -802,6 +874,9 @@ async fn handle_tcp_conn(
         // 统一 UDP 和 TCP 的行为，避免重复解析
         // Unify UDP and TCP behavior to avoid re-parsing
         let packet_bytes = buf.split().freeze();
+        if !is_standard_query_header(&packet_bytes) {
+            return Ok(());
+        }
         let timeout_dur = Duration::from_millis(timeout_ms);
 
         let resp = match engine.handle_packet_fast(&packet_bytes, peer) {
@@ -863,14 +938,27 @@ async fn handle_tcp_conn(
                 .await
                 {
                     Ok(Ok(r)) => r,
-                    Ok(Err(_)) => return Ok(()),
+                    Ok(Err(error)) => {
+                        debug!(%error, "TCP request processing error, returning SERVFAIL");
+                        let Some(response) =
+                            engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
+                        else {
+                            return Ok(());
+                        };
+                        response
+                    }
                     Err(_) => {
                         warn!(
                             timeout_ms,
                             upstream_timeout_ms = engine.get_upstream_timeout_ms(),
                             "TCP request timeout after hedge and fallback exhausted"
                         );
-                        return Ok(()); // 关闭连接 / Close connection
+                        let Some(response) =
+                            engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
+                        else {
+                            return Ok(());
+                        };
+                        response
                     }
                 }
             }
@@ -881,38 +969,387 @@ async fn handle_tcp_conn(
                     .await
                 {
                     Ok(Ok(r)) => r,
-                    Ok(Err(_)) => return Ok(()),
+                    Ok(Err(error)) => {
+                        debug!(%error, "TCP request processing error, returning SERVFAIL");
+                        let Some(response) =
+                            engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
+                        else {
+                            return Ok(());
+                        };
+                        response
+                    }
                     Err(_) => {
                         warn!(
                             timeout_ms,
                             upstream_timeout_ms = engine.get_upstream_timeout_ms(),
                             "TCP request timeout"
                         );
-                        return Ok(()); // 关闭连接 / Close connection
+                        let Some(response) =
+                            engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
+                        else {
+                            return Ok(());
+                        };
+                        response
                     }
                 }
             }
-            Err(_) => {
-                // 解析错误，关闭连接 / Parse error, close connection
-                return Ok(());
+            Err(error) => {
+                debug!(%error, "TCP fast-path error, returning SERVFAIL for valid query");
+                let Some(response) =
+                    engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
+                else {
+                    return Ok(());
+                };
+                response
             }
         };
 
         if resp.len() <= u16::MAX as usize {
-            // Single vectored write (scatter-gather): length prefix + body in one
-            // syscall, avoiding Nagle/delayed-ACK interaction on the wire even
-            // when TCP_NODELAY fails to take effect.
+            // DNS-over-TCP framing must be written completely; write_vectored may be
+            // partial, so use write_all_vectored: scatter-gather single syscall with
+            // no frame allocation (write_all would copy prefix+body into a new Vec).
             //
-            // 单次 vectored write (scatter-gather)：长度前缀 + 包体在一次 syscall 中完成，
-            // 即使 TCP_NODELAY 未生效也能避免 Nagle/delayed-ACK 交互。
+            // 长度前缀 + 包体用 write_all_vectored 保证完整写入，保持单 syscall 零分配；
+            // write_all 需要拼帧（一次堆分配 + 拷贝）。
             let len_bytes = (resp.len() as u16).to_be_bytes();
-            let bufs = [
+            let mut bufs = [
                 std::io::IoSlice::new(&len_bytes),
                 std::io::IoSlice::new(&resp),
             ];
-            if stream.write_vectored(&bufs).await.is_err() {
+            if tokio_util::io::write_all_vectored(&mut stream, &mut bufs)
+                .await
+                .is_err()
+            {
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+    use hickory_proto::rr::{Name, RecordType};
+    use hickory_proto::serialize::binary::BinDecodable;
+    use std::str::FromStr;
+    use tokio::io::AsyncWriteExt;
+
+    #[ctor::ctor]
+    fn init_crypto() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
+    fn static_engine() -> Engine {
+        use kixdns::config::PipelineConfig;
+
+        let config: PipelineConfig = serde_json::from_value(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{
+                "id": "p",
+                "rules": [{
+                    "name": "static",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "static_ip_response", "ip": "192.0.2.1" }]
+                }]
+            }]
+        }))
+        .expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(config).expect("build runtime config");
+        Engine::new(runtime, "test".to_string()).expect("initialize engine")
+    }
+
+    fn dns_query() -> Vec<u8> {
+        let mut message = Message::new(0xCAFE, MessageType::Query, OpCode::Query);
+        message.metadata.recursion_desired = true;
+        message.add_query(Query::query(
+            Name::from_str("data.xiaoheihe.cn").unwrap(),
+            RecordType::A,
+        ));
+        message.to_vec().unwrap()
+    }
+
+    #[tokio::test]
+    async fn udp_static_fast_path_rejects_non_query_and_malformed_additional_records() {
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let worker = tokio::spawn(run_udp_worker(0, Arc::clone(&server), static_engine()));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let mut qr_response = dns_query();
+        qr_response[2] |= 0x80;
+
+        let mut missing_additional = dns_query();
+        missing_additional[11] = 1;
+
+        let mut truncated_edns = dns_query();
+        truncated_edns[11] = 1;
+        truncated_edns.extend_from_slice(&[0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0, 0, 4, 0, 1]);
+
+        let mut invalid_pointer = dns_query();
+        invalid_pointer[11] = 1;
+        invalid_pointer.extend_from_slice(&[0xC0, 0xFF, 0, 16, 0, 1, 0, 0, 0, 0, 0, 0]);
+
+        let mut response_buf = [0u8; 512];
+        for (case, packet) in [
+            ("QR=1", qr_response),
+            ("missing Additional RR", missing_additional),
+            ("truncated EDNS RDATA", truncated_edns),
+            ("invalid Additional compression pointer", invalid_pointer),
+        ] {
+            client.send_to(&packet, server_addr).await.unwrap();
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    client.recv_from(&mut response_buf),
+                )
+                .await
+                .is_err(),
+                "{case} must be rejected before static/cache fast paths"
+            );
+        }
+
+        worker.abort();
+    }
+
+    fn forwarding_engine() -> Engine {
+        use kixdns::config::PipelineConfig;
+
+        let config: PipelineConfig = serde_json::from_value(serde_json::json!({
+            "settings": {
+                "default_upstream": "127.0.0.1:9",
+                "flow_control_enabled": true,
+                "flow_control_initial_permits": 1,
+                "flow_control_min_permits": 1,
+                "flow_control_max_permits": 1
+            },
+            "pipelines": [{
+                "id": "p",
+                "rules": [{
+                    "name": "forward",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{
+                        "type": "forward",
+                        "upstream": "127.0.0.1:9",
+                        "transport": "udp"
+                    }]
+                }]
+            }]
+        }))
+        .expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(config).expect("build runtime config");
+        Engine::new(runtime, "test".to_string()).expect("initialize engine")
+    }
+
+    fn doh_timeout_engine(upstream: &str) -> Engine {
+        use kixdns::config::PipelineConfig;
+
+        let config: PipelineConfig = serde_json::from_value(serde_json::json!({
+            "settings": {
+                "default_upstream": upstream,
+                "upstream_timeout_ms": 50,
+                "request_timeout_ms": 50
+            },
+            "pipelines": [{
+                "id": "p",
+                "rules": [{
+                    "name": "forward",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{
+                        "type": "forward",
+                        "upstream": upstream,
+                        "transport": "doh"
+                    }]
+                }]
+            }]
+        }))
+        .expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(config).expect("build runtime config");
+        Engine::new(runtime, "test".to_string()).expect("initialize engine")
+    }
+
+    #[tokio::test]
+    async fn udp_send_datagram_surfaces_socket_errors() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ipv6_peer: SocketAddr = "[::1]:53".parse().unwrap();
+        assert!(send_udp_datagram(&socket, b"dns", ipv6_peer).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn udp_permit_exhaustion_returns_servfail_but_malformed_packet_is_silent() {
+        let engine = forwarding_engine();
+        engine.permit_manager.set_max_permits(0);
+
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let worker = tokio::spawn(run_udp_worker(0, Arc::clone(&server), engine));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        client.send_to(&dns_query(), server_addr).await.unwrap();
+        let mut response_buf = [0u8; 512];
+        let (response_len, _) =
+            tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut response_buf))
+                .await
+                .expect("valid query should receive a response")
+                .unwrap();
+        let response = Message::from_bytes(&response_buf[..response_len]).unwrap();
+        assert_eq!(response.metadata.id, 0xCAFE);
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(response.queries.len(), 1);
+
+        client.send_to(&[0x12, 0x34], server_addr).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                client.recv_from(&mut response_buf),
+            )
+            .await
+            .is_err(),
+            "malformed UDP packets must not receive a reflected response"
+        );
+
+        // A packet that passes the header gate but fails parse_quick (trailing
+        // data) still reaches the overload branch; it must stay silent there.
+        let mut trailing = dns_query();
+        trailing.extend_from_slice(&[0x00]);
+        client.send_to(&trailing, server_addr).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                client.recv_from(&mut response_buf),
+            )
+            .await
+            .is_err(),
+            "overload branch must drop packets that failed parse_quick"
+        );
+
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_hanging_doh_returns_servfail() {
+        let blackhole = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let blackhole_addr = blackhole.local_addr().unwrap();
+        let blackhole_task = tokio::spawn(async move {
+            if let Ok((_stream, _)) = blackhole.accept().await {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+
+        let upstream = format!("https://{blackhole_addr}/dns-query");
+        let engine = doh_timeout_engine(&upstream);
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let worker = tokio::spawn(run_udp_worker(0, Arc::clone(&server), engine));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        client.send_to(&dns_query(), server_addr).await.unwrap();
+        let mut response_buf = [0u8; 512];
+        let (response_len, _) =
+            tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut response_buf))
+                .await
+                .expect("timed-out query should receive SERVFAIL")
+                .unwrap();
+        let response = Message::from_bytes(&response_buf[..response_len]).unwrap();
+        assert_eq!(response.metadata.id, 0xCAFE);
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(response.queries.len(), 1);
+
+        worker.abort();
+        blackhole_task.abort();
+    }
+
+    #[tokio::test]
+    async fn tcp_hanging_doh_returns_complete_servfail_frame() {
+        let blackhole = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let blackhole_addr = blackhole.local_addr().unwrap();
+        let blackhole_task = tokio::spawn(async move {
+            if let Ok((_stream, _)) = blackhole.accept().await {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+
+        let upstream = format!("https://{blackhole_addr}/dns-query");
+        let engine = doh_timeout_engine(&upstream);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let client_task = tokio::spawn(async move {
+            let mut client = TcpStream::connect(listener_addr).await.unwrap();
+            let query = dns_query();
+            let mut frame = Vec::with_capacity(2 + query.len());
+            frame.extend_from_slice(&(query.len() as u16).to_be_bytes());
+            frame.extend_from_slice(&query);
+            client.write_all(&frame).await.unwrap();
+
+            let mut len_buf = [0u8; 2];
+            tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut len_buf))
+                .await
+                .expect("TCP query should receive a length prefix")
+                .unwrap();
+            let response_len = u16::from_be_bytes(len_buf) as usize;
+            let mut response = vec![0u8; response_len];
+            tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut response))
+                .await
+                .expect("TCP query should receive the complete DNS frame")
+                .unwrap();
+            response
+        });
+
+        let (server_stream, peer) = listener.accept().await.unwrap();
+        let server_task = tokio::spawn(handle_tcp_conn(server_stream, peer, engine));
+        let response_bytes = client_task.await.unwrap();
+        let response = Message::from_bytes(&response_bytes).unwrap();
+        assert_eq!(response.metadata.id, 0xCAFE);
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(response.queries.len(), 1);
+
+        server_task.abort();
+        blackhole_task.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_response_truncates_oversized_payload() {
+        use hickory_proto::rr::{RData, Record, rdata::TXT};
+
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // 客户端无 EDNS → 512 字节限制 / Client without EDNS → 512-byte limit
+        let request = dns_query();
+        // 构造 >512 字节的大 TXT 响应 / Build a large TXT response (>512 bytes)
+        let name = Name::from_str("data.xiaoheihe.cn.").unwrap();
+        let mut big = Message::new(0xCAFE, MessageType::Response, OpCode::Query);
+        big.metadata.recursion_desired = true;
+        big.metadata.recursion_available = true;
+        big.add_query(Query::query(name.clone(), RecordType::TXT));
+        for i in 0..20 {
+            let text = format!("verification-{i:02}-{}", "x".repeat(180));
+            big.add_answer(Record::from_rdata(
+                name.clone(),
+                300,
+                RData::TXT(TXT::new(vec![text])),
+            ));
+        }
+        let big_response = big.to_vec().unwrap();
+        assert!(big_response.len() > 512);
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let (len, peer) = server.recv_from(&mut buf).await.unwrap();
+            send_udp_response(&server, &buf[..len], &big_response, peer).await;
+        });
+
+        client.send_to(&request, server_addr).await.unwrap();
+        let mut buf = [0u8; 4096];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+            .await
+            .expect("client should receive a truncated response")
+            .unwrap();
+        let resp = Message::from_bytes(&buf[..len]).unwrap();
+        assert!(len <= 512, "response must fit the 512-byte UDP limit");
+        assert!(resp.metadata.truncation, "TC bit must be set");
+        assert_eq!(resp.queries.len(), 1);
+        assert_eq!(resp.metadata.id, 0xCAFE);
     }
 }
