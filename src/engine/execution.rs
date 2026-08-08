@@ -1192,6 +1192,70 @@ mod tests {
     }
 
     #[test]
+    fn test_engine_helpers_build_servfail_response_from_wire() {
+        let mut req = Message::new(0xBEEF, MessageType::Query, OpCode::Query);
+        req.metadata.recursion_desired = true;
+        req.add_query(Query::query(
+            Name::from_str("data.xiaoheihe.cn").unwrap(),
+            RecordType::AAAA,
+        ));
+        let request = req.to_vec().unwrap();
+
+        let response = engine_helpers::build_servfail_response_from_wire(&request);
+        let decoded = Message::from_bytes(&response).unwrap();
+
+        assert_eq!(decoded.metadata.id, 0xBEEF);
+        assert_eq!(decoded.metadata.response_code, ResponseCode::ServFail);
+        assert!(decoded.metadata.recursion_desired);
+        assert!(decoded.metadata.recursion_available);
+        assert_eq!(decoded.queries.len(), 1);
+        assert_eq!(decoded.queries[0].name().to_utf8(), "data.xiaoheihe.cn.");
+        assert_eq!(decoded.queries[0].query_type(), RecordType::AAAA);
+    }
+
+    #[test]
+    fn test_engine_helpers_build_servfail_response_from_malformed_wire() {
+        let response = engine_helpers::build_servfail_response_from_wire(&[0x12, 0x34, 0x01, 0x10]);
+
+        assert_eq!(response.len(), 12);
+        assert_eq!(&response[..2], &[0x12, 0x34]);
+        assert_ne!(response[2] & 0x80, 0, "QR must be set");
+        assert_ne!(response[3] & 0x80, 0, "RA must be set");
+        assert_eq!(response[3] & 0x0F, 2, "RCODE must be SERVFAIL");
+        assert_ne!(response[2] & 0x01, 0, "RD must be preserved");
+        assert_ne!(response[3] & 0x10, 0, "CD must be preserved");
+    }
+
+    #[test]
+    fn test_listener_servfail_rejects_non_queries_and_malformed_packets() {
+        assert!(engine_helpers::try_build_servfail_response_from_wire(&[0x12, 0x34]).is_none());
+
+        let mut no_question = vec![0u8; 12];
+        no_question[..2].copy_from_slice(&0x1234u16.to_be_bytes());
+        assert!(
+            engine_helpers::try_build_servfail_response_from_wire(&no_question).is_none(),
+            "QDCOUNT=0 must not receive a response"
+        );
+
+        let mut response_packet = vec![0u8; 12];
+        response_packet[2] = 0x80;
+        response_packet[5] = 1;
+        response_packet.extend_from_slice(&[0, 0, 1, 0, 1]);
+        assert!(
+            engine_helpers::try_build_servfail_response_from_wire(&response_packet).is_none(),
+            "QR=1 packets must not receive a response"
+        );
+
+        let mut invalid_name = vec![0u8; 12];
+        invalid_name[5] = 1;
+        invalid_name.extend_from_slice(&[0x3f, b'a', 0, 0, 1, 0, 1]);
+        assert!(
+            engine_helpers::try_build_servfail_response_from_wire(&invalid_name).is_none(),
+            "malformed names must not receive a response"
+        );
+    }
+
+    #[test]
     fn test_engine_helpers_build_refused_response() {
         // Arrange: Create test request
         let mut req = Message::new(54321, MessageType::Query, OpCode::Query);
