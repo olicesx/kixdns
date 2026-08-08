@@ -165,6 +165,14 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
 
     // 5. Validate every declared Additional record and detect EDNS.
     // Fail closed before cache/static fast paths on any malformed wire structure.
+    //
+    // Trade-off vs the old fast-path scan: this always walks the full Additional
+    // section and rejects trailing data, where the old code broke early on OPT and
+    // tolerated truncation. Full validation is required so malformed packets cannot
+    // reach cache/static paths; the cost is bounded by ARCOUNT records.
+    //
+    // 权衡：总是遍历完整 Additional 段并拒绝尾随数据（旧代码找到 OPT 即提前退出、容忍截断）。
+    // 完整校验是为了让畸形包无法到达 cache/static 路径；成本以 ARCOUNT 记录数为界。
     let mut edns_present = false;
     let mut ar_pos = pos;
     for _ in 0..ar_count {

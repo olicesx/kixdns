@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -527,12 +527,6 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
     Ok(socket.into())
 }
 
-/// 构造严格校验的 SERVFAIL（仅合法标准查询；畸形/响应包返回 None 静默）
-/// Build strict SERVFAIL for validated standard queries only (malformed/response packets stay silent)
-fn listener_servfail(request: &[u8]) -> Option<bytes::Bytes> {
-    engine_helpers::try_build_servfail_response_from_wire(request)
-}
-
 /// 发送 UDP 数据报：try_send_to 优先（避免 reactor 开销），WouldBlock 回退异步
 /// Send UDP datagram: try non-blocking first, async fallback on WouldBlock
 async fn send_udp_datagram(
@@ -575,18 +569,10 @@ fn try_send_udp_response(socket: &UdpSocket, request: &[u8], response: &[u8], pe
 
 /// 异步发送 SERVFAIL（处理失败/超时路径）
 async fn send_udp_servfail(socket: &UdpSocket, request: &[u8], peer: SocketAddr) {
-    let Some(response) = listener_servfail(request) else {
+    let Some(response) = engine_helpers::try_build_servfail_response_from_wire(request) else {
         return;
     };
     send_udp_response(socket, request, &response, peer).await;
-}
-
-/// 非阻塞发送 SERVFAIL（permit 耗尽路径，避免阻塞接收循环）
-fn try_send_udp_servfail(socket: &UdpSocket, request: &[u8], peer: SocketAddr) {
-    let Some(response) = listener_servfail(request) else {
-        return;
-    };
-    try_send_udp_response(socket, request, &response, peer);
 }
 
 /// 高性能 UDP worker：直接在接收循环中处理请求，避免 spawn 开销 / High-performance UDP worker: process requests directly in receive loop, avoiding spawn overhead
@@ -812,13 +798,12 @@ async fn run_udp_worker(
                             }
                         });
                     } else {
-                        // 过载保护：permit 耗尽。此路径无预解析数据（parse_quick 已失败），
-                        // 需完整解析请求才能构造严格 SERVFAIL 并回显 question。
-                        // 解析成本有界（≤4096B 报文），发送为非阻塞（背压丢弃），不阻塞接收循环。
-                        // Overload: no pre-parsed data here (parse_quick failed), so the strict
-                        // SERVFAIL needs a full parse. Cost is bounded by packet size and the
-                        // send is non-blocking (backpressure drop), so the receive loop is safe.
-                        try_send_udp_servfail(&socket, &packet_bytes, peer);
+                        // 过载保护：permit 耗尽且 parse_quick 已失败（大概率畸形/非标准包）。
+                        // 直接静默丢弃——过载时应做最便宜的拒绝，对已失败包做完整解析
+                        // 只会加剧过载，且 hickory 大概率同样失败（解析白做）。
+                        // Overload: permit exhausted and parse_quick already failed (likely
+                        // malformed/non-standard). Drop silently — overload rejection must be
+                        // cheap, and a full parse of an already-failed packet wastes CPU.
                     }
                 }
                 Err(error) => {
@@ -955,7 +940,7 @@ async fn handle_tcp_conn(
                     Ok(Ok(r)) => r,
                     Ok(Err(error)) => {
                         debug!(%error, "TCP request processing error, returning SERVFAIL");
-                        let Some(response) = listener_servfail(&packet_bytes) else {
+                        let Some(response) = engine_helpers::try_build_servfail_response_from_wire(&packet_bytes) else {
                             return Ok(());
                         };
                         response
@@ -966,7 +951,7 @@ async fn handle_tcp_conn(
                             upstream_timeout_ms = engine.get_upstream_timeout_ms(),
                             "TCP request timeout after hedge and fallback exhausted"
                         );
-                        let Some(response) = listener_servfail(&packet_bytes) else {
+                        let Some(response) = engine_helpers::try_build_servfail_response_from_wire(&packet_bytes) else {
                             return Ok(());
                         };
                         response
@@ -982,7 +967,7 @@ async fn handle_tcp_conn(
                     Ok(Ok(r)) => r,
                     Ok(Err(error)) => {
                         debug!(%error, "TCP request processing error, returning SERVFAIL");
-                        let Some(response) = listener_servfail(&packet_bytes) else {
+                        let Some(response) = engine_helpers::try_build_servfail_response_from_wire(&packet_bytes) else {
                             return Ok(());
                         };
                         response
@@ -993,7 +978,7 @@ async fn handle_tcp_conn(
                             upstream_timeout_ms = engine.get_upstream_timeout_ms(),
                             "TCP request timeout"
                         );
-                        let Some(response) = listener_servfail(&packet_bytes) else {
+                        let Some(response) = engine_helpers::try_build_servfail_response_from_wire(&packet_bytes) else {
                             return Ok(());
                         };
                         response
@@ -1002,7 +987,7 @@ async fn handle_tcp_conn(
             }
             Err(error) => {
                 debug!(%error, "TCP fast-path error, returning SERVFAIL for valid query");
-                let Some(response) = listener_servfail(&packet_bytes) else {
+                let Some(response) = engine_helpers::try_build_servfail_response_from_wire(&packet_bytes) else {
                     return Ok(());
                 };
                 response
@@ -1010,13 +995,21 @@ async fn handle_tcp_conn(
         };
 
         if resp.len() <= u16::MAX as usize {
-            // DNS-over-TCP framing must be written completely; a successful
-            // write_vectored call may still be partial.
-            // write_vectored 可能部分写入，必须用 write_all 保证完整帧。
-            let mut frame = Vec::with_capacity(2 + resp.len());
-            frame.extend_from_slice(&(resp.len() as u16).to_be_bytes());
-            frame.extend_from_slice(&resp);
-            if stream.write_all(&frame).await.is_err() {
+            // DNS-over-TCP framing must be written completely; write_vectored may be
+            // partial, so use write_all_vectored: scatter-gather single syscall with
+            // no frame allocation (write_all would copy prefix+body into a new Vec).
+            //
+            // 长度前缀 + 包体用 write_all_vectored 保证完整写入，保持单 syscall 零分配；
+            // write_all 需要拼帧（一次堆分配 + 拷贝）。
+            let len_bytes = (resp.len() as u16).to_be_bytes();
+            let mut bufs = [
+                std::io::IoSlice::new(&len_bytes),
+                std::io::IoSlice::new(&resp),
+            ];
+            if tokio_util::io::write_all_vectored(&mut stream, &mut bufs)
+                .await
+                .is_err()
+            {
                 return Ok(());
             }
         }
@@ -1026,6 +1019,7 @@ async fn handle_tcp_conn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
     use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
     use hickory_proto::rr::{Name, RecordType};
     use hickory_proto::serialize::binary::BinDecodable;

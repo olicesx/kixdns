@@ -82,13 +82,10 @@ pub mod engine_helpers {
     /// Listener code must use this strict variant so malformed packets and DNS
     /// responses cannot trigger reflection traffic.
     pub fn try_build_servfail_response_from_wire(request: &[u8]) -> Option<Bytes> {
-        if request.len() < 12
-            || request[2] & 0x80 != 0
-            || request[2] & 0x78 != 0
-            || u16::from_be_bytes([request[4], request[5]]) != 1
-            || u16::from_be_bytes([request[6], request[7]]) != 0
-            || u16::from_be_bytes([request[8], request[9]]) != 0
-        {
+        // Reuse the shared standard-query header guard so listener and fast-path
+        // validation cannot drift apart.
+        // 复用共享的标准查询头守卫，避免监听器与快速路径的校验漂移。
+        if !crate::proto_utils::is_standard_query_header(request) {
             return None;
         }
 
