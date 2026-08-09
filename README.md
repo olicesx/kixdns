@@ -264,7 +264,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | serve_stale_ttl_reset | true | Reset the stale-age window when stale data is served. |
 | serve_stale_client_timeout_ms | 0 | 0 serves stale immediately; a positive value tries the upstream for this many milliseconds first. |
 | geoip_db_path | null | MaxMind MMDB path. |
-| geoip_dat_path | null | V2Ray GeoIP .dat or supported V2Ray JSON path. The current range loaders use IPv4 ranges. |
+| geoip_dat_path | null | V2Ray GeoIP .dat or supported V2Ray JSON path. IPv4 and IPv6 ranges are indexed independently for each GeoIP tag. |
 | geosite_data_paths | [] | V2Ray GeoSite .dat or JSON paths; multiple files are accepted. |
 
 The following fields are deserialized by the current config type but are not read by the running engine: geoip_auto_convert and geoip_filter_countries. Use convert-geo-ip with --filter for conversion-time filtering. The top-level background_refresh_rule is also currently ignored by runtime configuration compilation.
@@ -298,7 +298,7 @@ The same structure is used for response_matchers, response_matcher_operator, res
 
 Pipeline selectors support all of the rows above. Request rules support all rows except listener_label.
 
-Domain suffix matching and GeoSite matching are case-insensitive. domain_regex and request_domain_regex use Rust regular-expression syntax.
+Domain suffix matching, GeoSite tags, and GeoIP tags are case-insensitive. `geoip_country.country_codes` accepts both ISO country codes and named V2Ray GeoIP tags such as `cloudflare`, `netflix`, or `telegram`. GeoIP `.dat`/JSON indexes preserve overlapping memberships, so one IP may match both a country code and one or more named tags. `domain_regex` and `request_domain_regex` use Rust regular-expression syntax.
 
 ### Response matchers
 

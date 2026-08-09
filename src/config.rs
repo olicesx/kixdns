@@ -375,7 +375,7 @@ pub enum Matcher {
     ClientIp {
         cidr: String,
     },
-    /// 匹配客户端IP的GeoIP国家代码（大小写不敏感）。 / Match client IP GeoIP country code (case insensitive)
+    /// 匹配客户端 IP 的 GeoIP 国家代码或命名标签（大小写不敏感）。 / Match client IP GeoIP country code or named tag (case insensitive)
     GeoipCountry {
         country_codes: Vec<String>,
     },
@@ -426,7 +426,7 @@ pub enum PipelineSelectorMatcher {
     GeoSite { value: String },
     /// GeoSite 否定匹配（匹配不在该分类的域名）。 / GeoSite negation matching (match domains NOT in category)
     GeoSiteNot { value: String },
-    /// 匹配客户端IP的GeoIP国家代码（大小写不敏感）。 / Match client IP GeoIP country code (case insensitive)
+    /// 匹配客户端 IP 的 GeoIP 国家代码或命名标签（大小写不敏感）。 / Match client IP GeoIP country code or named tag (case insensitive)
     GeoipCountry { country_codes: Vec<String> },
     /// 匹配客户端IP是否为私有IP（内网）。 / Match whether client IP is private (internal network)
     GeoipPrivate { expect: bool },
@@ -488,7 +488,7 @@ pub enum ResponseMatcher {
     ResponseQclass { value: String },
     /// 响应是否携带 EDNS。 / Whether response carries EDNS
     ResponseEdnsPresent { expect: bool },
-    /// 匹配响应中 IP 的 GeoIP 国家代码（大小写不敏感）/ Match GeoIP country code of IPs in response (case insensitive)
+    /// 匹配响应中 IP 的 GeoIP 国家代码或命名标签（大小写不敏感）/ Match GeoIP country code or named tag of response IPs (case insensitive)
     ResponseAnswerIpGeoipCountry { country_codes: Vec<String> },
     /// 匹配响应中 IP 是否为私有 IP / Match whether IPs in response are private IPs
     ResponseAnswerIpGeoipPrivate { expect: bool },

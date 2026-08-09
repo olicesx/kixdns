@@ -141,7 +141,7 @@ Pipeline selector 支持：
 - response_request_domain_geosite_not
 - response_txt_content
 
-GeoSite 和 GeoIP 的输入值在编辑器中可以使用普通字段。编辑器还会识别 geosite:tag 和 geoip:COUNTRY 形式并将参数写入对应字段；服务端最终仍按 Rust 配置枚举解析。
+GeoSite 和 GeoIP 的输入值在编辑器中可以使用普通字段。编辑器还会识别 geosite:tag 和 geoip:COUNTRY 形式并将参数写入对应字段；`COUNTRY` 也可以是 `cloudflare`、`netflix` 等 V2Ray GeoIP 标签。GeoIP 标签大小写不敏感，且同一 IP 可以同时匹配国家代码和命名标签；服务端最终仍按 Rust 配置枚举解析。
 
 ### 动作
 

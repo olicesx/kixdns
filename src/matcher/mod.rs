@@ -58,13 +58,13 @@ impl TxtMatchMode {
 mod matcher_helpers {
     use super::*;
 
-    /// 检查 IP 的 GeoIP 国家代码是否匹配指定的国家代码列表（大小写不敏感）
-    /// Check if IP's GeoIP country code matches the specified list (case insensitive)
+    /// 检查 IP 是否匹配指定的 GeoIP 标签列表（大小写不敏感）
+    /// Check whether an IP matches the specified GeoIP tags (case insensitive)
     ///
     /// # 参数 / Parameters
     /// - `manager`: GeoIpManager 引用 / GeoIpManager reference
     /// - `ip`: 要检查的 IP 地址 / IP address to check
-    /// - `country_codes`: 允许的国家代码列表（使用 Arc<str> 零拷贝）/ Allowed country codes (Arc<str> for zero-copy)
+    /// - `country_codes`: 允许的国家代码或命名标签 / Allowed country codes or named tags
     ///
     /// # 返回 / Returns
     /// - `true`: IP 属于指定的国家之一 / IP belongs to one of the specified countries
@@ -75,23 +75,7 @@ mod matcher_helpers {
         ip: IpAddr,
         country_codes: &[Arc<str>],
     ) -> bool {
-        let result = manager.lookup(ip);
-
-        // ✅ 优化：提前返回，避免闭包分配
-        // ✅ Optimization: Early return to avoid closure allocation
-        let country_code = match result.country_code.as_ref() {
-            Some(code) => code,
-            None => return false,
-        };
-
-        // ✅ 优化：直接迭代，避免 any() 的闭包开销
-        // ✅ Optimization: Direct iteration to avoid closure overhead of any()
-        for code in country_codes {
-            if code.eq_ignore_ascii_case(country_code.as_ref()) {
-                return true;
-            }
-        }
-        false
+        manager.matches_any_tag(ip, country_codes)
     }
 
     /// 检查域名是否属于指定的 GeoSite 分类
@@ -283,7 +267,7 @@ pub enum RuntimeResponseMatcher {
     ResponseEdnsPresent {
         expect: bool,
     },
-    /// 匹配响应中 IP 的 GeoIP 国家代码 / Match GeoIP country code of IPs in response
+    /// 匹配响应中 IP 的 GeoIP 国家代码或命名标签 / Match GeoIP country codes or named tags of response IPs
     ResponseAnswerIpGeoipCountry {
         country_codes: Vec<Arc<str>>,
     },
@@ -728,7 +712,10 @@ impl RuntimeMatcher {
                     .build()?,
             },
             config::Matcher::GeoipCountry { country_codes } => RuntimeMatcher::GeoipCountry {
-                country_codes: country_codes.into_iter().map(Arc::from).collect(),
+                country_codes: country_codes
+                    .into_iter()
+                    .map(|code| Arc::from(code.to_ascii_uppercase()))
+                    .collect(),
             },
             config::Matcher::GeoipPrivate { expect } => RuntimeMatcher::GeoipPrivate { expect },
             config::Matcher::Qclass { value } => RuntimeMatcher::Qclass {
@@ -788,15 +775,7 @@ impl RuntimeMatcher {
                 })
             }
             RuntimeMatcher::GeoipPrivate { expect } => {
-                // 按需获取锁：只在GeoIP matcher时才获取
-                if let Some(manager) = geoip_manager {
-                    let guard = manager.read();
-                    let result = guard.lookup(client_ip);
-                    result.is_private == *expect
-                } else {
-                    // Fallback to basic private IP check
-                    crate::matcher::geoip::is_private_ip(client_ip) == *expect
-                }
+                crate::matcher::geoip::is_private_ip(client_ip) == *expect
             }
             RuntimeMatcher::Qclass { value } => &qclass == value,
             RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
@@ -850,15 +829,7 @@ impl RuntimeMatcher {
                 })
             }
             RuntimeMatcher::GeoipPrivate { expect } => {
-                // 按需获取锁：只在GeoIP matcher时才获取
-                if let Some(manager) = geoip_manager {
-                    let guard = manager.read();
-                    let result = guard.lookup(client_ip);
-                    result.is_private == *expect
-                } else {
-                    // Fallback to basic private IP check
-                    crate::matcher::geoip::is_private_ip(client_ip) == *expect
-                }
+                crate::matcher::geoip::is_private_ip(client_ip) == *expect
             }
             RuntimeMatcher::Qclass { value } => &qclass == value,
             RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
@@ -937,7 +908,10 @@ impl RuntimePipelineSelectorMatcher {
             }
             config::PipelineSelectorMatcher::GeoipCountry { country_codes } => {
                 RuntimePipelineSelectorMatcher::GeoipCountry {
-                    country_codes: country_codes.into_iter().map(Arc::from).collect(),
+                    country_codes: country_codes
+                        .into_iter()
+                        .map(|code| Arc::from(code.to_ascii_uppercase()))
+                        .collect(),
                 }
             }
             config::PipelineSelectorMatcher::GeoipPrivate { expect } => {
@@ -996,11 +970,7 @@ impl RuntimePipelineSelectorMatcher {
     /// 如果此匹配器需要 GeoIP 管理器才能评估则返回 true。
     #[inline]
     pub const fn needs_geoip(&self) -> bool {
-        matches!(
-            self,
-            RuntimePipelineSelectorMatcher::GeoipCountry { .. }
-                | RuntimePipelineSelectorMatcher::GeoipPrivate { .. }
-        )
+        matches!(self, RuntimePipelineSelectorMatcher::GeoipCountry { .. })
     }
 
     #[inline]
@@ -1042,25 +1012,10 @@ impl RuntimePipelineSelectorMatcher {
                 }
             }
             RuntimePipelineSelectorMatcher::GeoipCountry { country_codes } => {
-                if let Some(mgr) = geoip_ready {
-                    let result = mgr.lookup(client_ip);
-                    if let Some(cc) = result.country_code {
-                        country_codes.iter().any(|c| c.eq_ignore_ascii_case(&cc))
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
+                geoip_ready.is_some_and(|mgr| mgr.matches_any_tag(client_ip, country_codes))
             }
             RuntimePipelineSelectorMatcher::GeoipPrivate { expect } => {
-                if let Some(mgr) = geoip_ready {
-                    let result = mgr.lookup(client_ip);
-                    result.is_private == *expect
-                } else {
-                    // Fallback to basic private IP check
-                    crate::matcher::geoip::is_private_ip(client_ip) == *expect
-                }
+                crate::matcher::geoip::is_private_ip(client_ip) == *expect
             }
             RuntimePipelineSelectorMatcher::Qtype { value } => *value == qtype,
         }
@@ -1115,25 +1070,12 @@ impl RuntimePipelineSelectorMatcher {
             }
             RuntimePipelineSelectorMatcher::GeoipCountry { country_codes } => {
                 // 按需获取锁：只在GeoIP matcher时才获取 / On-demand lock: only acquire for GeoIP matcher
-                geoip_manager.map(|mgr| mgr.read()).is_some_and(|guard| {
-                    let result = guard.lookup(client_ip);
-                    if let Some(cc) = result.country_code {
-                        country_codes.iter().any(|c| c.eq_ignore_ascii_case(&cc))
-                    } else {
-                        false
-                    }
-                })
+                geoip_manager
+                    .map(|mgr| mgr.read())
+                    .is_some_and(|guard| guard.matches_any_tag(client_ip, country_codes))
             }
             RuntimePipelineSelectorMatcher::GeoipPrivate { expect } => {
-                // 按需获取锁：只在GeoIP matcher时才获取
-                if let Some(manager) = geoip_manager {
-                    let guard = manager.read();
-                    let result = guard.lookup(client_ip);
-                    result.is_private == *expect
-                } else {
-                    // Fallback to basic private IP check
-                    crate::matcher::geoip::is_private_ip(client_ip) == *expect
-                }
+                crate::matcher::geoip::is_private_ip(client_ip) == *expect
             }
             RuntimePipelineSelectorMatcher::Qtype { value } => *value == qtype,
         }
@@ -1283,7 +1225,10 @@ impl RuntimeResponseMatcher {
             }
             config::ResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } => {
                 RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry {
-                    country_codes: country_codes.into_iter().map(Arc::from).collect(),
+                    country_codes: country_codes
+                        .into_iter()
+                        .map(|code| Arc::from(code.to_ascii_uppercase()))
+                        .collect(),
                 }
             }
             config::ResponseMatcher::ResponseAnswerIpGeoipPrivate { expect } => {
@@ -1532,4 +1477,81 @@ fn parse_dns_type(v: &str) -> anyhow::Result<RecordType> {
         _ => anyhow::bail!("unsupported qtype: {upper}"),
     };
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::{
+        op::{MessageType, OpCode},
+        rr::{Name, RData, Record, rdata::A},
+    };
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn overlapping_geoip_tag_reaches_all_runtime_matchers() {
+        let json = r#"{
+            "entries": [
+                { "country_code": "US", "ips": ["104.16.0.0/12"] },
+                { "country_code": "cloudflare", "ips": ["104.16.0.0/12"] }
+            ]
+        }"#;
+        let path = std::env::temp_dir().join("geoip_runtime_matchers.json");
+        std::fs::write(&path, json).unwrap();
+
+        let mut manager = geoip::GeoIpManager::new(None).unwrap();
+        manager.load_from_v2ray_file(&path).unwrap();
+        let manager = Arc::new(crate::lock::RwLock::new(manager));
+        let ip: IpAddr = "104.16.0.1".parse().unwrap();
+        let tags = vec![Arc::from("cloudflare")];
+
+        let request = RuntimeMatcher::GeoipCountry {
+            country_codes: tags.clone(),
+        };
+        assert!(request.matches_with_qtype(
+            "example.com",
+            DNSClass::IN,
+            ip,
+            false,
+            RecordType::A,
+            Some(&manager),
+            None,
+        ));
+
+        let pipeline = RuntimePipelineSelectorMatcher::GeoipCountry {
+            country_codes: tags.clone(),
+        };
+        let query = PipelineSelectorQuery {
+            listener_label: "test",
+            client_ip: ip,
+            qname: "example.com",
+            qclass: DNSClass::IN,
+            edns_present: false,
+            qtype: RecordType::A,
+        };
+        let guard = manager.read();
+        assert!(pipeline.matches_with_ready_managers(&query, Some(&guard), None));
+
+        let response = RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry {
+            country_codes: tags,
+        };
+        let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+        message.add_answer(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            300,
+            RData::A(A(Ipv4Addr::new(104, 16, 0, 1))),
+        ));
+        assert!(response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::A,
+            DNSClass::IN,
+            &message,
+            Some(&guard),
+            None,
+        ));
+
+        drop(guard);
+        let _ = std::fs::remove_file(path);
+    }
 }
