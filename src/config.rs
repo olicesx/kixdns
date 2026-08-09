@@ -512,7 +512,7 @@ pub enum Action {
     Log { level: Option<String> },
     /// 固定响应rcode（如 NXDOMAIN/NOERROR）。 / Static response rcode (e.g., NXDOMAIN/NOERROR)
     StaticResponse { rcode: String },
-    /// 返回固定 IP (A/AAAA)。 / Return static IP (A/AAAA)
+    /// 返回一个或逗号分隔的多个固定 IPv4/IPv6 地址。 / Return one or more comma-separated static IPv4/IPv6 addresses.
     StaticIpResponse { ip: String },
     /// 返回固定 TXT 记录。支持单个字符串或字符串数组。 / Return static TXT record. Supports single string or string array.
     StaticTxtResponse {

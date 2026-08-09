@@ -582,7 +582,7 @@
                 </select>
 
                 <!-- Static IP -->
-                <input v-if="a.type === 'static_ip_response'" type="text" class="form-control" v-model="a.ip" placeholder="IP Address">
+                <input v-if="a.type === 'static_ip_response'" type="text" class="form-control" v-model="a.ip" placeholder="IP address(es), comma-separated">
 
                 <!-- Jump -->
                 <select v-if="a.type === 'jump_to_pipeline'" class="form-select" v-model="a.pipeline">

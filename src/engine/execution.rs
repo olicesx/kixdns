@@ -1359,21 +1359,37 @@ mod tests {
     }
 
     #[test]
-    fn make_static_ip_answer_rejects_invalid_input() {
-        // Arrange: Define test domain and invalid IP
-        let domain = "example.com";
-        let invalid_ip = "not-an-ip";
+    fn make_static_ip_answer_returns_comma_separated_ipv4_and_ipv6_records() {
+        let (rcode, answers) =
+            make_static_ip_answer("example.com", " 192.0.2.1, 2001:db8::1,192.0.2.2 ");
 
-        // Act: Generate static IP answer with invalid input
-        let (rcode, answers) = make_static_ip_answer(domain, invalid_ip);
+        assert_eq!(rcode, ResponseCode::NoError);
+        assert_eq!(answers.len(), 3);
+        assert_eq!(answers[0].record_type(), RecordType::A);
+        assert_eq!(answers[1].record_type(), RecordType::AAAA);
+        assert_eq!(answers[2].record_type(), RecordType::A);
+    }
 
-        // Assert: Verify ServFail response and empty answers
+    #[test]
+    fn make_static_ip_answer_rejects_invalid_input_atomically() {
+        let (rcode, answers) =
+            make_static_ip_answer("example.com", "192.0.2.1,not-an-ip,2001:db8::1");
+
         assert_eq!(
             rcode,
             ResponseCode::ServFail,
-            "Should return ServFail for invalid IP"
+            "Should return ServFail when any IP is invalid"
         );
-        assert!(answers.is_empty(), "Should have no answers for invalid IP");
+        assert!(answers.is_empty(), "Should not return a partial answer");
+    }
+
+    #[test]
+    fn make_static_ip_answer_rejects_empty_entries() {
+        for ips in ["", "192.0.2.1,", ",192.0.2.1", "192.0.2.1,,2001:db8::1"] {
+            let (rcode, answers) = make_static_ip_answer("example.com", ips);
+            assert_eq!(rcode, ResponseCode::ServFail, "input: {ips:?}");
+            assert!(answers.is_empty(), "input: {ips:?}");
+        }
     }
 
     #[test]

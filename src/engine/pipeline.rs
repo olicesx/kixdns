@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hickory_proto::op::ResponseCode;
-use hickory_proto::rr::rdata::{A, AAAA, TXT};
+use hickory_proto::rr::rdata::TXT;
 use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
 use smallvec::SmallVec;
 
@@ -19,6 +19,7 @@ use crate::matcher::{
 };
 
 use super::core::Engine;
+use super::make_static_ip_answer;
 use super::matcher_adapter::{MatcherContext, matcher_matches};
 use super::rules::Decision;
 use super::rules::{RuleCacheEntry, calculate_rule_hash, contains_continue, fast_hash_str};
@@ -383,31 +384,8 @@ impl Engine {
                             return d;
                         }
                         Action::StaticIpResponse { ip } => {
-                            if let Ok(ip_addr) = ip.parse::<IpAddr>()
-                                && let Ok(name) = std::str::FromStr::from_str(qname)
-                            {
-                                let rdata = match ip_addr {
-                                    IpAddr::V4(v4) => RData::A(A(v4)),
-                                    IpAddr::V6(v6) => RData::AAAA(AAAA(v6)),
-                                };
-                                let record = Record::from_rdata(name, 300, rdata);
-                                let d = Decision::Static {
-                                    rcode: ResponseCode::NoError,
-                                    answers: vec![record],
-                                };
-                                self.insert_rule_cache(
-                                    rule_hash,
-                                    pipeline.id.clone(),
-                                    request,
-                                    d.clone(),
-                                    include_ip,
-                                );
-                                return d;
-                            }
-                            let d = Decision::Static {
-                                rcode: ResponseCode::ServFail,
-                                answers: Vec::new(),
-                            };
+                            let (rcode, answers) = make_static_ip_answer(qname, ip);
+                            let d = Decision::Static { rcode, answers };
                             self.insert_rule_cache(
                                 rule_hash,
                                 pipeline.id.clone(),

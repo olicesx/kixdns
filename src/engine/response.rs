@@ -45,18 +45,25 @@ pub(crate) fn build_fast_static_response(
     Ok(Bytes::from(out))
 }
 
-pub(crate) fn make_static_ip_answer(qname: &str, ip: &str) -> (ResponseCode, Vec<Record>) {
-    if let Ok(ip_addr) = ip.parse::<IpAddr>()
-        && let Ok(name) = Name::from_str(qname)
-    {
+pub(crate) fn make_static_ip_answer(qname: &str, ips: &str) -> (ResponseCode, Vec<Record>) {
+    let Ok(name) = Name::from_str(qname) else {
+        return (ResponseCode::ServFail, Vec::new());
+    };
+
+    let mut answers = Vec::new();
+    for ip in ips.split(',') {
+        let Ok(ip_addr) = ip.trim().parse::<IpAddr>() else {
+            // Treat the configured list atomically: never return a partial answer.
+            return (ResponseCode::ServFail, Vec::new());
+        };
         let rdata = match ip_addr {
             IpAddr::V4(v4) => RData::A(A(v4)),
             IpAddr::V6(v6) => RData::AAAA(AAAA(v6)),
         };
-        let record = Record::from_rdata(name, 300, rdata);
-        return (ResponseCode::NoError, vec![record]);
+        answers.push(Record::from_rdata(name.clone(), 300, rdata));
     }
-    (ResponseCode::ServFail, Vec::new())
+
+    (ResponseCode::NoError, answers)
 }
 
 /// 创建静态TXT记录响应 / Create static TXT record response
