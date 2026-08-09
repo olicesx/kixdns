@@ -1431,6 +1431,73 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn static_ip_fast_path_serializes_multiple_answers_by_query_type() {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [{
+                "id": "static",
+                "rules": [{
+                    "name": "static-ip",
+                    "matchers": [{ "type": "domain_suffix", "value": "example.com" }],
+                    "actions": [{
+                        "type": "static_ip_response",
+                        "ip": "192.0.2.1,2001:db8::1,192.0.2.2"
+                    }]
+                }]
+            }]
+        });
+        let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
+        let engine = Engine::new(runtime, "test".to_string()).expect("initialize engine");
+        let peer = "127.0.0.1:53000".parse().unwrap();
+
+        let assert_response = |qtype, expected_ips: &[IpAddr]| {
+            let mut request = Message::new(0xCAFE, MessageType::Query, OpCode::Query);
+            request.metadata.recursion_desired = true;
+            request.add_query(Query::query(
+                Name::from_str("www.example.com").unwrap(),
+                qtype,
+            ));
+
+            let response = match engine
+                .handle_packet_fast(&request.to_vec().unwrap(), peer)
+                .expect("fast path")
+            {
+                Some(FastPathResponse::Direct(bytes)) => Message::from_bytes(&bytes).unwrap(),
+                other => panic!("expected direct fast-path response, got {other:?}"),
+            };
+
+            assert_eq!(response.metadata.id, 0xCAFE);
+            assert_eq!(response.metadata.message_type, MessageType::Response);
+            assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+            assert!(response.metadata.recursion_desired);
+            assert!(response.metadata.recursion_available);
+            assert_eq!(response.queries.len(), 1);
+            assert_eq!(response.queries[0].query_type(), qtype);
+
+            let actual_ips: Vec<IpAddr> = response
+                .answers
+                .iter()
+                .map(|answer| {
+                    assert_eq!(answer.ttl, 300);
+                    match &answer.data {
+                        RData::A(address) => IpAddr::V4(address.0),
+                        RData::AAAA(address) => IpAddr::V6(address.0),
+                        other => panic!("unexpected static IP answer: {other:?}"),
+                    }
+                })
+                .collect();
+            assert_eq!(actual_ips, expected_ips);
+        };
+
+        assert_response(
+            RecordType::A,
+            &["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap()],
+        );
+        assert_response(RecordType::AAAA, &["2001:db8::1".parse().unwrap()]);
+    }
+
     #[test]
     fn pipeline_select_picks_matching_pipeline() {
         // Arrange: Create configuration with pipeline selection rules
