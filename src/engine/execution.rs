@@ -1319,7 +1319,7 @@ mod tests {
         let ipv4 = "1.2.3.4";
 
         // Act: Generate static IP answer
-        let (rcode, answers) = make_static_ip_answer(domain, ipv4);
+        let (rcode, answers) = make_static_ip_answer(domain, RecordType::A, ipv4);
 
         // Assert: Verify response code and record type
         assert_eq!(
@@ -1342,7 +1342,7 @@ mod tests {
         let ipv6 = "2001:db8::1";
 
         // Act: Generate static IP answer
-        let (rcode, answers) = make_static_ip_answer(domain, ipv6);
+        let (rcode, answers) = make_static_ip_answer(domain, RecordType::AAAA, ipv6);
 
         // Assert: Verify response code and record type
         assert_eq!(
@@ -1359,21 +1359,51 @@ mod tests {
     }
 
     #[test]
-    fn make_static_ip_answer_returns_comma_separated_ipv4_and_ipv6_records() {
-        let (rcode, answers) =
-            make_static_ip_answer("example.com", " 192.0.2.1, 2001:db8::1,192.0.2.2 ");
+    fn make_static_ip_answer_filters_comma_separated_addresses_by_query_type() {
+        let ips = " 192.0.2.1, 2001:db8::1,192.0.2.2 ";
+
+        let (a_rcode, a_answers) = make_static_ip_answer("example.com", RecordType::A, ips);
+        assert_eq!(a_rcode, ResponseCode::NoError);
+        assert_eq!(a_answers.len(), 2);
+        assert!(
+            a_answers
+                .iter()
+                .all(|answer| answer.record_type() == RecordType::A)
+        );
+
+        let (aaaa_rcode, aaaa_answers) =
+            make_static_ip_answer("example.com", RecordType::AAAA, ips);
+        assert_eq!(aaaa_rcode, ResponseCode::NoError);
+        assert_eq!(aaaa_answers.len(), 1);
+        assert_eq!(aaaa_answers[0].record_type(), RecordType::AAAA);
+    }
+
+    #[test]
+    fn make_static_ip_answer_returns_nodata_for_unconfigured_query_family() {
+        let (rcode, answers) = make_static_ip_answer("example.com", RecordType::AAAA, "192.0.2.1");
 
         assert_eq!(rcode, ResponseCode::NoError);
-        assert_eq!(answers.len(), 3);
+        assert!(answers.is_empty());
+    }
+
+    #[test]
+    fn make_static_ip_answer_returns_both_families_for_any_query() {
+        let (rcode, answers) =
+            make_static_ip_answer("example.com", RecordType::ANY, "192.0.2.1,2001:db8::1");
+
+        assert_eq!(rcode, ResponseCode::NoError);
+        assert_eq!(answers.len(), 2);
         assert_eq!(answers[0].record_type(), RecordType::A);
         assert_eq!(answers[1].record_type(), RecordType::AAAA);
-        assert_eq!(answers[2].record_type(), RecordType::A);
     }
 
     #[test]
     fn make_static_ip_answer_rejects_invalid_input_atomically() {
-        let (rcode, answers) =
-            make_static_ip_answer("example.com", "192.0.2.1,not-an-ip,2001:db8::1");
+        let (rcode, answers) = make_static_ip_answer(
+            "example.com",
+            RecordType::A,
+            "192.0.2.1,not-an-ip,2001:db8::1",
+        );
 
         assert_eq!(
             rcode,
@@ -1386,7 +1416,7 @@ mod tests {
     #[test]
     fn make_static_ip_answer_rejects_empty_entries() {
         for ips in ["", "192.0.2.1,", ",192.0.2.1", "192.0.2.1,,2001:db8::1"] {
-            let (rcode, answers) = make_static_ip_answer("example.com", ips);
+            let (rcode, answers) = make_static_ip_answer("example.com", RecordType::A, ips);
             assert_eq!(rcode, ResponseCode::ServFail, "input: {ips:?}");
             assert!(answers.is_empty(), "input: {ips:?}");
         }

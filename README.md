@@ -341,7 +341,7 @@ The aliases and-not, andnot, or-not, and ornot are also accepted.
 |---|---|---|
 | log | level (optional) | Emits a tracing event for the matched rule. Supported levels are trace, debug, info, warn, and error. |
 | static_response | rcode | Returns NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, or REFUSED. |
-| static_ip_response | ip | Returns A and/or AAAA records. `ip` accepts one address or a comma-separated list of IPv4/IPv6 addresses (for example, `192.0.2.1,2001:db8::1`). |
+| static_ip_response | ip | Returns A or AAAA records matching the query type (both for ANY queries). `ip` accepts one address or a comma-separated list of IPv4/IPv6 addresses (for example, `192.0.2.1,2001:db8::1`). |
 | static_txt_response | text, ttl (optional) | Returns a TXT response. text accepts a string or string array; ttl defaults to 300. |
 | jump_to_pipeline | pipeline | Starts processing the referenced pipeline. |
 | allow | none | Request phase: forward with the global default UDP upstream. Response phase: keep the current upstream response. |

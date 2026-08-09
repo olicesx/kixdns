@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{
-    DNSClass, Name, RData, Record,
+    DNSClass, Name, RData, Record, RecordType,
     rdata::{A, AAAA, TXT},
 };
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
@@ -45,23 +45,34 @@ pub(crate) fn build_fast_static_response(
     Ok(Bytes::from(out))
 }
 
-pub(crate) fn make_static_ip_answer(qname: &str, ips: &str) -> (ResponseCode, Vec<Record>) {
+pub(crate) fn make_static_ip_answer(
+    qname: &str,
+    qtype: RecordType,
+    ips: &str,
+) -> (ResponseCode, Vec<Record>) {
     let Ok(name) = Name::from_str(qname) else {
         return (ResponseCode::ServFail, Vec::new());
     };
 
-    let mut answers = Vec::new();
+    // Parse the complete list first so invalid entries still fail atomically,
+    // even when their address family is not relevant to this query.
+    let mut parsed_ips = Vec::new();
     for ip in ips.split(',') {
         let Ok(ip_addr) = ip.trim().parse::<IpAddr>() else {
-            // Treat the configured list atomically: never return a partial answer.
             return (ResponseCode::ServFail, Vec::new());
         };
-        let rdata = match ip_addr {
-            IpAddr::V4(v4) => RData::A(A(v4)),
-            IpAddr::V6(v6) => RData::AAAA(AAAA(v6)),
-        };
-        answers.push(Record::from_rdata(name.clone(), 300, rdata));
+        parsed_ips.push(ip_addr);
     }
+
+    let answers = parsed_ips
+        .into_iter()
+        .filter_map(|ip_addr| match (qtype, ip_addr) {
+            (RecordType::A | RecordType::ANY, IpAddr::V4(v4)) => Some(RData::A(A(v4))),
+            (RecordType::AAAA | RecordType::ANY, IpAddr::V6(v6)) => Some(RData::AAAA(AAAA(v6))),
+            _ => None,
+        })
+        .map(|rdata| Record::from_rdata(name.clone(), 300, rdata))
+        .collect();
 
     (ResponseCode::NoError, answers)
 }

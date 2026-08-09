@@ -384,7 +384,7 @@ impl Engine {
                             return d;
                         }
                         Action::StaticIpResponse { ip } => {
-                            let (rcode, answers) = make_static_ip_answer(qname, ip);
+                            let (rcode, answers) = make_static_ip_answer(qname, request.qtype, ip);
                             let d = Decision::Static { rcode, answers };
                             self.insert_rule_cache(
                                 rule_hash,

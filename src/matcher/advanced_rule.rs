@@ -291,7 +291,7 @@ pub(crate) fn fast_static_match(
                     });
                 }
                 PrecomputedAction::StaticIp { ip } => {
-                    let (rcode, answers) = make_static_ip_answer(qname, ip);
+                    let (rcode, answers) = make_static_ip_answer(qname, qtype, ip);
                     return Some(Decision::Static { rcode, answers });
                 }
             }
