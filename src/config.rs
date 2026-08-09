@@ -377,6 +377,7 @@ pub enum Matcher {
     },
     /// 匹配客户端 IP 的 GeoIP 国家代码或命名标签（大小写不敏感）。 / Match client IP GeoIP country code or named tag (case insensitive)
     GeoipCountry {
+        #[serde(deserialize_with = "deserialize_string_or_vec")]
         country_codes: Vec<String>,
     },
     /// 匹配客户端IP是否为私有IP（内网）。 / Match whether client IP is private (internal network)
@@ -427,7 +428,10 @@ pub enum PipelineSelectorMatcher {
     /// GeoSite 否定匹配（匹配不在该分类的域名）。 / GeoSite negation matching (match domains NOT in category)
     GeoSiteNot { value: String },
     /// 匹配客户端 IP 的 GeoIP 国家代码或命名标签（大小写不敏感）。 / Match client IP GeoIP country code or named tag (case insensitive)
-    GeoipCountry { country_codes: Vec<String> },
+    GeoipCountry {
+        #[serde(deserialize_with = "deserialize_string_or_vec")]
+        country_codes: Vec<String>,
+    },
     /// 匹配客户端IP是否为私有IP（内网）。 / Match whether client IP is private (internal network)
     GeoipPrivate { expect: bool },
     /// 请求 QTYPE（如 A/AAAA/CNAME/TXT/MX 等）。 / Request QTYPE (e.g., A/AAAA/CNAME/TXT/MX, etc.)
@@ -489,7 +493,10 @@ pub enum ResponseMatcher {
     /// 响应是否携带 EDNS。 / Whether response carries EDNS
     ResponseEdnsPresent { expect: bool },
     /// 匹配响应中 IP 的 GeoIP 国家代码或命名标签（大小写不敏感）/ Match GeoIP country code or named tag of response IPs (case insensitive)
-    ResponseAnswerIpGeoipCountry { country_codes: Vec<String> },
+    ResponseAnswerIpGeoipCountry {
+        #[serde(deserialize_with = "deserialize_string_or_vec")]
+        country_codes: Vec<String>,
+    },
     /// 匹配响应中 IP 是否为私有 IP / Match whether IPs in response are private IPs
     ResponseAnswerIpGeoipPrivate { expect: bool },
     /// 匹配响应中的请求域名是否属于指定 GeoSite 分类 / Match if request domain in response belongs to specified GeoSite category
@@ -1035,13 +1042,34 @@ where
     }
 }
 
+/// Deserialize a string field that also accepts an array of strings.
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        String(String),
+        Array(Vec<String>),
+    }
+
+    match StringOrVec::deserialize(deserializer)? {
+        StringOrVec::String(value) => Ok(value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect()),
+        StringOrVec::Array(values) => Ok(values),
+    }
+}
+
 /// 反序列化TXT文本字段，支持单个字符串或字符串数组 / Deserialize TXT text field, supports single string or string array
 fn deserialize_txt_text<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::Deserialize;
-
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum TxtTextInput {
@@ -1049,11 +1077,9 @@ where
         Array(Vec<String>),
     }
 
-    let input = TxtTextInput::deserialize(deserializer)?;
-
-    match input {
-        TxtTextInput::String(s) => Ok(vec![s]),
-        TxtTextInput::Array(arr) => Ok(arr),
+    match TxtTextInput::deserialize(deserializer)? {
+        TxtTextInput::String(value) => Ok(vec![value]),
+        TxtTextInput::Array(values) => Ok(values),
     }
 }
 
@@ -1110,4 +1136,36 @@ fn default_ecs_prefix_v4() -> u8 {
 
 fn default_ecs_prefix_v6() -> u8 {
     56 // Common ISP allocation boundary
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Matcher, PipelineSelectorMatcher, ResponseMatcher};
+
+    #[test]
+    fn geoip_country_codes_accept_string_or_array() {
+        let Matcher::GeoipCountry { country_codes } =
+            serde_json::from_str(r#"{"type":"geoip_country","country_codes":"cloudflare"}"#)
+                .expect("request matcher should accept a string")
+        else {
+            panic!("unexpected request matcher variant");
+        };
+        assert_eq!(country_codes, ["cloudflare"]);
+
+        let PipelineSelectorMatcher::GeoipCountry { country_codes } =
+            serde_json::from_str(r#"{"type":"geoip_country","country_codes":"CN, cloudflare"}"#)
+                .expect("pipeline selector should accept a comma-separated string")
+        else {
+            panic!("unexpected pipeline selector matcher variant");
+        };
+        assert_eq!(country_codes, ["CN", "cloudflare"]);
+
+        let ResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } = serde_json::from_str(
+            r#"{"type":"response_answer_ip_geoip_country","country_codes":["CN","cloudflare"]}"#,
+        )
+        .expect("response matcher should accept an array") else {
+            panic!("unexpected response matcher variant");
+        };
+        assert_eq!(country_codes, ["CN", "cloudflare"]);
+    }
 }

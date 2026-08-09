@@ -297,7 +297,7 @@ pipeline_select 的每项包含 Pipeline id、可选的匹配器列表和可选�
 
 Pipeline selector 支持上表全部类型；请求规则支持除 listener_label 之外的全部类型。
 
-域名后缀和 GeoSite 匹配不区分大小写。domain_regex 和 request_domain_regex 使用 Rust 正则语法。
+域名后缀、GeoSite 标签和 GeoIP 标签匹配不区分大小写。`geoip_country.country_codes` 可使用 ISO 国家代码或 `cloudflare`、`netflix`、`telegram` 等 V2Ray GeoIP 命名标签。规范 JSON 形式为字符串数组；为兼容旧配置，也接受单个字符串或逗号分隔字符串。GeoIP `.dat`/JSON 索引会保留重叠成员关系，因此同一 IP 可以同时属于国家代码和一个或多个命名标签。domain_regex 和 request_domain_regex 使用 Rust 正则语法。
 
 ### 响应匹配器
 

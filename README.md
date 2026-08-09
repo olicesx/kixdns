@@ -298,7 +298,7 @@ The same structure is used for response_matchers, response_matcher_operator, res
 
 Pipeline selectors support all of the rows above. Request rules support all rows except listener_label.
 
-Domain suffix matching, GeoSite tags, and GeoIP tags are case-insensitive. `geoip_country.country_codes` accepts both ISO country codes and named V2Ray GeoIP tags such as `cloudflare`, `netflix`, or `telegram`. GeoIP `.dat`/JSON indexes preserve overlapping memberships, so one IP may match both a country code and one or more named tags. `domain_regex` and `request_domain_regex` use Rust regular-expression syntax.
+Domain suffix matching, GeoSite tags, and GeoIP tags are case-insensitive. `geoip_country.country_codes` accepts both ISO country codes and named V2Ray GeoIP tags such as `cloudflare`, `netflix`, or `telegram`. The canonical JSON form is a string array; a single string or comma-separated string is also accepted for backward compatibility. GeoIP `.dat`/JSON indexes preserve overlapping memberships, so one IP may match both a country code and one or more named tags. `domain_regex` and `request_domain_regex` use Rust regular-expression syntax.
 
 ### Response matchers
 
