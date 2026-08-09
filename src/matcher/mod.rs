@@ -98,6 +98,76 @@ mod matcher_helpers {
         manager.matches(tag, domain)
     }
 
+    fn all_svc_param_ips_match<F>(
+        svc_params: &[(
+            hickory_proto::rr::rdata::svcb::SvcParamKey,
+            hickory_proto::rr::rdata::svcb::SvcParamValue,
+        )],
+        has_ip: &mut bool,
+        predicate: &mut F,
+    ) -> bool
+    where
+        F: FnMut(IpAddr) -> bool,
+    {
+        use hickory_proto::rr::rdata::svcb::SvcParamValue;
+
+        svc_params.iter().all(|(_, value)| match value {
+            SvcParamValue::Ipv4Hint(hints) => hints.0.iter().all(|hint| {
+                *has_ip = true;
+                predicate(IpAddr::V4(hint.0))
+            }),
+            SvcParamValue::Ipv6Hint(hints) => hints.0.iter().all(|hint| {
+                *has_ip = true;
+                predicate(IpAddr::V6(hint.0))
+            }),
+            _ => true,
+        })
+    }
+
+    /// Apply a predicate to every address represented directly or as an HTTPS/SVCB IP hint.
+    pub fn all_rdata_ips_match<F>(
+        data: &hickory_proto::rr::RData,
+        has_ip: &mut bool,
+        predicate: &mut F,
+    ) -> bool
+    where
+        F: FnMut(IpAddr) -> bool,
+    {
+        use hickory_proto::rr::RData;
+
+        match data {
+            RData::A(address) => {
+                *has_ip = true;
+                predicate(IpAddr::V4(address.0))
+            }
+            RData::AAAA(address) => {
+                *has_ip = true;
+                predicate(IpAddr::V6(address.0))
+            }
+            RData::SVCB(svcb) => all_svc_param_ips_match(&svcb.svc_params, has_ip, predicate),
+            RData::HTTPS(https) => all_svc_param_ips_match(&https.svc_params, has_ip, predicate),
+            _ => true,
+        }
+    }
+
+    pub fn rdata_has_matching_ip<F>(data: &hickory_proto::rr::RData, predicate: &mut F) -> bool
+    where
+        F: FnMut(IpAddr) -> bool,
+    {
+        let mut has_ip = false;
+        let mut matched = false;
+        let mut stop_on_match = |ip| {
+            if predicate(ip) {
+                matched = true;
+                false
+            } else {
+                true
+            }
+        };
+        let _ = all_rdata_ips_match(data, &mut has_ip, &mut stop_on_match);
+        matched
+    }
+
     /// 检查响应消息中是否有任意 IP 匹配指定的 CIDR 列表
     /// Check if any IP in response message matches the specified CIDR list
     ///
@@ -109,25 +179,16 @@ mod matcher_helpers {
     /// - `true`: 至少有一个 IP 匹配 / At least one IP matches
     /// - `false`: 没有IP匹配 / No IP matches
     pub fn any_ip_matches_nets(msg: &Message, nets: &[IpNet]) -> bool {
-        use hickory_proto::rr::RData;
+        let mut matches_net = |ip| nets.iter().any(|net| net.contains(&ip));
 
-        // 先检查 Answer / Check Answer first
-        let found = msg.answers.iter().any(|record| match &record.data {
-            RData::A(a) => nets.iter().any(|net| net.contains(&IpAddr::V4(a.0))),
-            RData::AAAA(aaaa) => nets.iter().any(|net| net.contains(&IpAddr::V6(aaaa.0))),
-            _ => false,
-        });
-
-        if found {
-            return true;
-        }
-
-        // 再检查 Additionals / Check Additionals
-        msg.additionals.iter().any(|record| match &record.data {
-            RData::A(a) => nets.iter().any(|net| net.contains(&IpAddr::V4(a.0))),
-            RData::AAAA(aaaa) => nets.iter().any(|net| net.contains(&IpAddr::V6(aaaa.0))),
-            _ => false,
-        })
+        // Check Answer first, then Additionals. HTTPS/SVCB hints are part of their RDATA.
+        msg.answers
+            .iter()
+            .any(|record| rdata_has_matching_ip(&record.data, &mut matches_net))
+            || msg
+                .additionals
+                .iter()
+                .any(|record| rdata_has_matching_ip(&record.data, &mut matches_net))
     }
 }
 
@@ -247,7 +308,7 @@ pub enum RuntimeResponseMatcher {
     ResponseUpstreamIp {
         nets: Vec<IpNet>,
     },
-    /// 匹配 Answer 中任意 A/AAAA 记录的 IP / Match IPs of any A/AAAA records in the Answer
+    /// Match Answer A/AAAA addresses and HTTPS/SVCB IP hints.
     ResponseAnswerIp {
         nets: Vec<IpNet>,
     },
@@ -1333,76 +1394,28 @@ impl RuntimeResponseMatcher {
                 edns == *expect
             }
             RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } => {
-                // 优化：直接迭代 DNS 记录以避免分配 Vec，并在首次不匹配时短路
-                // Optimization: Iterate DNS records directly to avoid Vec allocation, and short-circuit on first mismatch
-                use hickory_proto::rr::RData;
-
+                let Some(manager) = geoip_manager else {
+                    return false;
+                };
                 let mut has_ip = false;
-
-                // 检查 Answers
-                let all_match_answers = msg.answers.iter().all(|record| {
-                    let ip = match &record.data {
-                        RData::A(a) => Some(IpAddr::V4(a.0)),
-                        RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
-                        _ => None,
-                    };
-
-                    if let Some(ip) = ip {
-                        has_ip = true;
-                        // 如果没有管理器，则无法匹配，视为失败
-                        // If no manager, cannot match, consider failure
-                        if let Some(manager) = geoip_manager {
-                            matcher_helpers::match_geoip_country(manager, ip, country_codes)
-                        } else {
-                            false
-                        }
-                    } else {
-                        // 非 IP 记录忽略，继续检查其他记录
-                        // Ignore non-IP records, continue checking others
-                        true
-                    }
+                let mut matches_country =
+                    |ip| matcher_helpers::match_geoip_country(manager, ip, country_codes);
+                let all_match = msg.answers.iter().all(|record| {
+                    matcher_helpers::all_rdata_ips_match(
+                        &record.data,
+                        &mut has_ip,
+                        &mut matches_country,
+                    )
                 });
-
-                if !all_match_answers {
-                    return false;
-                }
-
-                // 也检查 Additionals (如果策略要求检查整个消息中的 IP)
-                // Check Additionals as well (if policy requires checking IPs in entire message)
-                // 注意：通常 ResponseAnswerIp 只关注 Answers。这里保持与原 collect_ips_from_message 行为一致吗？
-                // 原 collect_ips_from_message 只迭代了 msg.answers()！
-                // Check matcher_helpers code: "for record in msg.answers() { ... }" - YES, only answers.
-                // 原代码逻辑：如果 answers 为空，返回 false (all_ips.is_empty check)
-
-                if !has_ip {
-                    return false;
-                }
-
-                true
+                all_match && has_ip
             }
             RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { expect } => {
-                // 检查 Answer 中是否有任意 IP 为私有 IP
-                use hickory_proto::rr::RData;
-                let mut has_private_ip = msg.answers.iter().any(|record| match &record.data {
-                    RData::A(a) => crate::matcher::geoip::is_private_ip(std::net::IpAddr::V4(a.0)),
-                    RData::AAAA(aaaa) => {
-                        crate::matcher::geoip::is_private_ip(std::net::IpAddr::V6(aaaa.0))
-                    }
-                    _ => false,
+                let mut is_private = crate::matcher::geoip::is_private_ip;
+                let has_private_ip = msg.answers.iter().any(|record| {
+                    matcher_helpers::rdata_has_matching_ip(&record.data, &mut is_private)
+                }) || msg.additionals.iter().any(|record| {
+                    matcher_helpers::rdata_has_matching_ip(&record.data, &mut is_private)
                 });
-
-                if !has_private_ip {
-                    // 检查 additionals
-                    has_private_ip = msg.additionals.iter().any(|record| match &record.data {
-                        RData::A(a) => {
-                            crate::matcher::geoip::is_private_ip(std::net::IpAddr::V4(a.0))
-                        }
-                        RData::AAAA(aaaa) => {
-                            crate::matcher::geoip::is_private_ip(std::net::IpAddr::V6(aaaa.0))
-                        }
-                        _ => false,
-                    });
-                }
 
                 has_private_ip == *expect
             }
@@ -1484,16 +1497,22 @@ mod tests {
     use super::*;
     use hickory_proto::{
         op::{MessageType, OpCode},
-        rr::{Name, RData, Record, rdata::A},
+        rr::{
+            Name, RData, Record,
+            rdata::{
+                A, AAAA, HTTPS, SVCB,
+                svcb::{IpHint, SvcParamKey, SvcParamValue},
+            },
+        },
     };
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn overlapping_geoip_tag_reaches_all_runtime_matchers() {
         let json = r#"{
             "entries": [
                 { "country_code": "US", "ips": ["104.16.0.0/12"] },
-                { "country_code": "cloudflare", "ips": ["104.16.0.0/12"] }
+                { "country_code": "cloudflare", "ips": ["104.16.0.0/12", "2606:4700::/32"] }
             ]
         }"#;
         let path = std::env::temp_dir().join("geoip_runtime_matchers.json");
@@ -1547,6 +1566,125 @@ mod tests {
             RecordType::A,
             DNSClass::IN,
             &message,
+            Some(&guard),
+            None,
+        ));
+
+        let mut https_message = Message::new(0, MessageType::Response, OpCode::Query);
+        https_message.add_answer(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            300,
+            RData::HTTPS(HTTPS(SVCB::new(
+                1,
+                Name::root(),
+                vec![
+                    (
+                        SvcParamKey::Ipv4Hint,
+                        SvcParamValue::Ipv4Hint(IpHint(vec![A(Ipv4Addr::new(104, 21, 11, 126))])),
+                    ),
+                    (
+                        SvcParamKey::Ipv6Hint,
+                        SvcParamValue::Ipv6Hint(IpHint(vec![AAAA(
+                            "2606:4700:3034::6815:b7e".parse::<Ipv6Addr>().unwrap(),
+                        )])),
+                    ),
+                ],
+            ))),
+        ));
+        assert!(response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::HTTPS,
+            DNSClass::IN,
+            &https_message,
+            Some(&guard),
+            None,
+        ));
+        assert!(!response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::HTTPS,
+            DNSClass::IN,
+            &https_message,
+            None,
+            None,
+        ));
+
+        let cidr_response = RuntimeResponseMatcher::ResponseAnswerIp {
+            nets: vec!["104.21.0.0/16".parse().unwrap()],
+        };
+        assert!(cidr_response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::HTTPS,
+            DNSClass::IN,
+            &https_message,
+            Some(&guard),
+            None,
+        ));
+
+        let mut mixed_message = https_message.clone();
+        mixed_message.add_answer(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            300,
+            RData::A(A(Ipv4Addr::new(203, 0, 113, 1))),
+        ));
+        assert!(!response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::HTTPS,
+            DNSClass::IN,
+            &mixed_message,
+            Some(&guard),
+            None,
+        ));
+
+        let mut additional_message = Message::new(0, MessageType::Response, OpCode::Query);
+        additional_message.add_additional(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            300,
+            RData::A(A(Ipv4Addr::new(104, 21, 11, 126))),
+        ));
+        assert!(!response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::A,
+            DNSClass::IN,
+            &additional_message,
+            Some(&guard),
+            None,
+        ));
+        assert!(cidr_response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::A,
+            DNSClass::IN,
+            &additional_message,
+            Some(&guard),
+            None,
+        ));
+
+        let mut svcb_message = Message::new(0, MessageType::Response, OpCode::Query);
+        svcb_message.add_additional(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            300,
+            RData::SVCB(SVCB::new(
+                1,
+                Name::root(),
+                vec![(
+                    SvcParamKey::Ipv4Hint,
+                    SvcParamValue::Ipv4Hint(IpHint(vec![A(Ipv4Addr::new(192, 168, 1, 1))])),
+                )],
+            )),
+        ));
+        let private_response =
+            RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { expect: true };
+        assert!(private_response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::SVCB,
+            DNSClass::IN,
+            &svcb_message,
             Some(&guard),
             None,
         ));

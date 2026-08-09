@@ -318,6 +318,8 @@ Pipeline selector 支持上表全部类型；请求规则支持除 listener_labe
 | response_request_domain_geosite_not | value：GeoSite tag |
 | response_txt_content | mode：exact、prefix 或 regex；value 为文本/模式 |
 
+响应 IP 和 GeoIP 匹配器会检查 A/AAAA 记录，以及 HTTPS/SVCB Answer 记录携带的 `ipv4hint`/`ipv6hint` 参数；它们不会合成或改写 HTTPS/SVCB 记录。
+
 当前成功上游标签包含传输前缀，例如 udp:1.1.1.1:53 或 tcp:1.1.1.1:53。因此 upstream_equals 的 value 必须包含该前缀。response_upstream_ip 当前解析原始 IP 或 host:port，不会剥离传输前缀。
 
 ### 逻辑运算符

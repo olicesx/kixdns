@@ -319,6 +319,8 @@ Domain suffix matching, GeoSite tags, and GeoIP tags are case-insensitive. `geoi
 | response_request_domain_geosite_not | value: GeoSite tag |
 | response_txt_content | mode: exact, prefix, or regex; value is the text/pattern |
 
+Response IP and GeoIP matchers inspect A/AAAA records and the `ipv4hint`/`ipv6hint` parameters carried by HTTPS/SVCB Answer records. They do not synthesize or rewrite HTTPS/SVCB records.
+
 The successful upstream label currently includes the transport prefix, for example udp:1.1.1.1:53 or tcp:1.1.1.1:53. Therefore upstream_equals values must include that prefix. response_upstream_ip currently parses a raw IP or host:port value; it does not strip the transport prefix.
 
 ### Logical operators
