@@ -1387,6 +1387,15 @@ mod tests {
     }
 
     #[test]
+    fn make_static_ip_answer_returns_nodata_for_https_query() {
+        let (rcode, answers) =
+            make_static_ip_answer("example.com", RecordType::HTTPS, "192.0.2.1,2001:db8::1");
+
+        assert_eq!(rcode, ResponseCode::NoError);
+        assert!(answers.is_empty());
+    }
+
+    #[test]
     fn make_static_ip_answer_returns_both_families_for_any_query() {
         let (rcode, answers) =
             make_static_ip_answer("example.com", RecordType::ANY, "192.0.2.1,2001:db8::1");

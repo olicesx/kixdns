@@ -340,7 +340,7 @@ Pipeline selector 支持上表全部类型；请求规则支持除 listener_labe
 |---|---|---|
 | log | level（可选） | 输出匹配规则的 tracing 事件；支持 trace、debug、info、warn、error。 |
 | static_response | rcode | 返回 NOERROR、FORMERR、SERVFAIL、NXDOMAIN、NOTIMP 或 REFUSED。 |
-| static_ip_response | ip | 按查询类型返回 A 或 AAAA 记录（ANY 查询返回两者）；`ip` 支持单个地址或逗号分隔的 IPv4/IPv6 地址列表（例如 `192.0.2.1,2001:db8::1`）。 |
+| static_ip_response | ip | 按查询类型返回 A 或 AAAA 记录（ANY 查询返回两者）；HTTPS、SVCB 等其他查询类型返回 NODATA，且不会合成 IP hints。`ip` 支持单个地址或逗号分隔的 IPv4/IPv6 地址列表（例如 `192.0.2.1,2001:db8::1`）。 |
 | static_txt_response | text、ttl（可选） | 返回 TXT 响应；text 支持字符串或字符串数组，ttl 默认 300。 |
 | jump_to_pipeline | pipeline | 开始处理指定 Pipeline。 |
 | allow | 无 | 请求阶段：使用全局默认 UDP 上游；响应阶段：保留当前上游响应。 |
