@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use prost::Message;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -107,128 +108,48 @@ impl GeoIpConverter {
 
     /// 从 V2Ray .dat 文件加载
     /// Load from V2Ray .dat file
+    /// 从 V2Ray .dat 文件加载
+    /// Load from V2Ray .dat file
     pub fn load_from_dat_file(&mut self, path: &Path) -> Result<usize> {
         let data = std::fs::read(path)
             .with_context(|| format!("Failed to read .dat file: {}", path.display()))?;
 
-        let mut pos = 0;
+        // 使用 Google 标准 protobuf 库 (prost) 解析，与 dae pkg/geodata 对齐
+        let list = super::geoip_proto::GeoIPList::decode(data.as_slice())
+            .context("Failed to decode .dat file as protobuf GeoIPList")?;
+
         let mut count = 0;
-
-        while pos < data.len() {
-            if pos >= data.len() {
-                break;
-            }
-
-            let field_tag = data[pos];
-            pos += 1;
-
-            let entry_len =
-                parse_varint(&data, &mut pos).context("Failed to parse varint for entry length")?;
-
-            if pos + entry_len > data.len() {
-                break;
-            }
-
-            let entry_end = pos + entry_len;
-
-            if field_tag == 0x0A {
-                let mut country_code = String::new();
-                let mut cidr_list = Vec::new();
-
-                while pos < entry_end {
-                    let inner_tag = data[pos];
-                    pos += 1;
-
-                    let inner_len = parse_varint(&data, &mut pos)
-                        .context("Failed to parse varint for inner field")?;
-
-                    if pos + inner_len > entry_end {
-                        break;
-                    }
-
-                    match inner_tag {
-                        0x0A => {
-                            if let Ok(code) = std::str::from_utf8(&data[pos..pos + inner_len]) {
-                                country_code = code.to_uppercase();
-                            }
-                            pos += inner_len;
-                        }
-                        0x12 => {
-                            let mut cidr_pos = pos;
-                            let cidr_end = pos + inner_len;
-
-                            while cidr_pos < cidr_end {
-                                if cidr_pos >= cidr_end {
-                                    break;
-                                }
-
-                                // Parse IP (field 1, tag 0x0A)
-                                if cidr_pos >= cidr_end || data[cidr_pos] != 0x0A {
-                                    break;
-                                }
-                                cidr_pos += 1;
-
-                                let ip_len = parse_varint(&data, &mut cidr_pos)?;
-                                if (ip_len != 4 && ip_len != 16)
-                                    || cidr_pos + ip_len as usize > cidr_end
-                                {
-                                    // 只支持 IPv4 (4B) 和 IPv6 (16B) / Only IPv4 (4B) and IPv6 (16B) supported
-                                    break;
-                                }
-
-                                let mut ip_bytes = [0u8; 16];
-                                ip_bytes[..ip_len as usize]
-                                    .copy_from_slice(&data[cidr_pos..cidr_pos + ip_len as usize]);
-                                cidr_pos += ip_len as usize;
-
-                                // Parse prefix (field 2, tag 0x10)
-                                if cidr_pos >= cidr_end || data[cidr_pos] != 0x10 {
-                                    break;
-                                }
-                                cidr_pos += 1;
-
-                                let prefix = parse_varint(&data, &mut cidr_pos)?;
-
-                                if ip_len == 4 {
-                                    // Create IPv4 network
-                                    let ipv4 = std::net::Ipv4Addr::new(
-                                        ip_bytes[0],
-                                        ip_bytes[1],
-                                        ip_bytes[2],
-                                        ip_bytes[3],
-                                    );
-                                    if let Ok(net) = Ipv4Net::new(ipv4, prefix as u8) {
-                                        cidr_list.push(IpNet::V4(net));
-                                    }
-                                } else {
-                                    // Create IPv6 network
-                                    let mut ipv6_bytes = [0u8; 16];
-                                    ipv6_bytes.copy_from_slice(&ip_bytes);
-                                    let ipv6 = std::net::Ipv6Addr::from(ipv6_bytes);
-                                    if let Ok(net) = Ipv6Net::new(ipv6, prefix as u8) {
-                                        cidr_list.push(IpNet::V6(net));
-                                    }
-                                }
-                            }
-
-                            pos = cidr_end;
-                        }
-                        _ => {
-                            pos += inner_len;
+        for entry in list.entry {
+            let country_code = entry.country_code.to_uppercase();
+            let mut cidr_list = Vec::new();
+            for cidr in entry.cidr {
+                match cidr.ip.len() {
+                    4 => {
+                        let ipv4 =
+                            std::net::Ipv4Addr::new(cidr.ip[0], cidr.ip[1], cidr.ip[2], cidr.ip[3]);
+                        if let Ok(net) = Ipv4Net::new(ipv4, cidr.prefix as u8) {
+                            cidr_list.push(IpNet::V4(net));
                         }
                     }
+                    16 => {
+                        let mut ipv6_bytes = [0u8; 16];
+                        ipv6_bytes.copy_from_slice(&cidr.ip);
+                        let ipv6 = std::net::Ipv6Addr::from(ipv6_bytes);
+                        if let Ok(net) = Ipv6Net::new(ipv6, cidr.prefix as u8) {
+                            cidr_list.push(IpNet::V6(net));
+                        }
+                    }
+                    _ => {}
                 }
+            }
 
-                if !country_code.is_empty() && !cidr_list.is_empty() {
-                    let entry_count = cidr_list.len();
-                    self.country_to_nets
-                        .entry(country_code)
-                        .or_default()
-                        .extend(cidr_list);
-                    count += entry_count;
-                }
-            } else {
-                pos = entry_end;
+            if !country_code.is_empty() && !cidr_list.is_empty() {
+                let entry_count = cidr_list.len();
+                self.country_to_nets
+                    .entry(country_code)
+                    .or_default()
+                    .extend(cidr_list);
+                count += entry_count;
             }
         }
 
@@ -240,9 +161,6 @@ impl GeoIpConverter {
 
         Ok(count)
     }
-
-    /// 从 V2Ray JSON 文件加载
-    /// Load from V2Ray JSON file
     pub fn load_from_v2ray_file(&mut self, path: &Path) -> Result<usize> {
         let data = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read JSON file: {}", path.display()))?;
@@ -468,7 +386,7 @@ fn networks_overlap_v6(a: &Ipv6Net, b: &Ipv6Net) -> bool {
 /// 检查两个 IPv4 网络是否相邻
 /// Check if two IPv4 networks are adjacent
 fn are_adjacent_ipv4(a: &Ipv4Net, b: &Ipv4Net) -> bool {
-    let a_end = u32::from(a.addr()) | (!u32::MAX << (32 - a.prefix_len()));
+    let a_end = u32::from(a.addr()) | u32::MAX.wrapping_shr(u32::from(a.prefix_len()));
     let b_start = u32::from(b.addr());
     a_end.wrapping_add(1) == b_start
 }
@@ -476,7 +394,7 @@ fn are_adjacent_ipv4(a: &Ipv4Net, b: &Ipv4Net) -> bool {
 /// 检查两个 IPv6 网络是否相邻
 /// Check if two IPv6 networks are adjacent
 fn are_adjacent_ipv6(a: &Ipv6Net, b: &Ipv6Net) -> bool {
-    let a_end = u128::from(a.addr()) | (!u128::MAX << (128 - a.prefix_len()));
+    let a_end = u128::from(a.addr()) | u128::MAX.wrapping_shr(u32::from(a.prefix_len()));
     let b_start = u128::from(b.addr());
     a_end.wrapping_add(1) == b_start
 }
@@ -485,9 +403,9 @@ fn are_adjacent_ipv6(a: &Ipv6Net, b: &Ipv6Net) -> bool {
 /// Merge two IPv4 networks
 fn merge_two_ipv4(a: &Ipv4Net, b: &Ipv4Net) -> Ipv4Net {
     let a_start = u32::from(a.addr());
-    let a_end = a_start | (!u32::MAX << (32 - a.prefix_len()));
+    let a_end = a_start | u32::MAX.wrapping_shr(u32::from(a.prefix_len()));
     let b_start = u32::from(b.addr());
-    let b_end = b_start | (!u32::MAX << (32 - b.prefix_len()));
+    let b_end = b_start | u32::MAX.wrapping_shr(u32::from(b.prefix_len()));
 
     let new_start = a_start.min(b_start);
     let new_end = a_end.max(b_end);
@@ -501,17 +419,24 @@ fn merge_two_ipv4(a: &Ipv4Net, b: &Ipv4Net) -> Ipv4Net {
         }
         prefix -= 1;
     }
-
-    Ipv4Net::new(std::net::Ipv4Addr::from(new_start), prefix).unwrap()
+    // Align the start address to the covering prefix's network boundary,
+    // otherwise Ipv4Net::new errors and unwrap panics (e.g. merging
+    // 1.2.3.0/24 + 1.2.4.0/24 → prefix 21, start must become 1.2.0.0).
+    let aligned_start = if prefix == 0 {
+        0
+    } else {
+        new_start & (u32::MAX << (32 - prefix))
+    };
+    Ipv4Net::new(std::net::Ipv4Addr::from(aligned_start), prefix).unwrap()
 }
 
 /// 合并两个 IPv6 网络
 /// Merge two IPv6 networks
 fn merge_two_ipv6(a: &Ipv6Net, b: &Ipv6Net) -> Ipv6Net {
     let a_start = u128::from(a.addr());
-    let a_end = a_start | (!u128::MAX << (128 - a.prefix_len()));
+    let a_end = a_start | u128::MAX.wrapping_shr(u32::from(a.prefix_len()));
     let b_start = u128::from(b.addr());
-    let b_end = b_start | (!u128::MAX << (128 - b.prefix_len()));
+    let b_end = b_start | u128::MAX.wrapping_shr(u32::from(b.prefix_len()));
 
     let new_start = a_start.min(b_start);
     let new_end = a_end.max(b_end);
@@ -525,29 +450,13 @@ fn merge_two_ipv6(a: &Ipv6Net, b: &Ipv6Net) -> Ipv6Net {
         prefix -= 1;
     }
 
-    Ipv6Net::new(std::net::Ipv6Addr::from(new_start), prefix).unwrap()
-}
-
-/// 解析 varint
-/// Parse varint
-fn parse_varint(data: &[u8], pos: &mut usize) -> Result<usize> {
-    let mut result = 0usize;
-    let mut shift = 0;
-
-    loop {
-        if *pos >= data.len() {
-            anyhow::bail!("Unexpected end of file while parsing varint");
-        }
-        let byte = data[*pos];
-        *pos += 1;
-        result |= ((byte & 0x7F) as usize) << shift;
-        shift += 7;
-        if byte & 0x80 == 0 {
-            break;
-        }
-    }
-
-    Ok(result)
+    // Align the start address to the covering prefix's network boundary
+    let aligned_start = if prefix == 0 {
+        0
+    } else {
+        new_start & (u128::MAX << (128 - prefix))
+    };
+    Ipv6Net::new(std::net::Ipv6Addr::from(aligned_start), prefix).unwrap()
 }
 
 /// 转换 .dat 为 MMDB 格式
@@ -603,4 +512,61 @@ pub fn convert_dat_to_mmdb(
     info!("Conversion completed:\n{}", stats);
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v4net(s: &str) -> Ipv4Net {
+        s.parse().unwrap()
+    }
+    fn v6net(s: &str) -> Ipv6Net {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn test_are_adjacent_ipv4_correct() {
+        // 1.2.3.0/24 与 1.2.4.0/24 相邻:end=1.2.3.255, +1 = 1.2.4.0
+        let a = v4net("1.2.3.0/24");
+        let b = v4net("1.2.4.0/24");
+        assert!(are_adjacent_ipv4(&a, &b), "1.2.3.0/24 与 1.2.4.0/24 应相邻");
+        // 旧 bug:!u32::MAX << 8 = 0 → a_end = a_start = 1.2.3.0 → 误判不相邻
+    }
+
+    #[test]
+    fn test_merge_two_ipv4_overlap_correct() {
+        // 重叠:1.2.3.0/24 + 1.2.3.128/25 → 1.2.3.0/24
+        let m = merge_two_ipv4(&v4net("1.2.3.0/24"), &v4net("1.2.3.128/25"));
+        assert_eq!(m.to_string(), "1.2.3.0/24");
+    }
+
+    #[test]
+    fn test_merge_adjacent_ipv4_crosses_network_boundary() {
+        // 相邻跨 /23 边界:1.2.3.0/24 + 1.2.4.0/24 → 最小覆盖 1.2.0.0/21
+        let m = merge_two_ipv4(&v4net("1.2.3.0/24"), &v4net("1.2.4.0/24"));
+        assert_eq!(m.to_string(), "1.2.0.0/21");
+        // 旧 bug:new_end 被算成 1.2.4.0 → prefix 22 → 且 start 未对齐会 panic
+    }
+
+    #[test]
+    fn test_merge_ipv6_halves_correct() {
+        // 2001:db8::/33 + 2001:db8:8000::/33 → 2001:db8::/32
+        let m = merge_two_ipv6(&v6net("2001:db8::/33"), &v6net("2001:db8:8000::/33"));
+        assert_eq!(m.to_string(), "2001:db8::/32");
+    }
+
+    #[test]
+    fn test_merge_ipv4_nets_chain() {
+        // 三段连续 /24 → 合并成一个 /22 网络
+        let nets = vec![
+            v4net("10.0.0.0/24"),
+            v4net("10.0.1.0/24"),
+            v4net("10.0.2.0/24"),
+            v4net("10.0.3.0/24"),
+        ];
+        let merged = merge_ipv4_nets(nets);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].to_string(), "10.0.0.0/22");
+    }
 }

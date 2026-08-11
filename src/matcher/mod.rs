@@ -1,6 +1,7 @@
 pub mod advanced_rule;
 pub mod geoip;
 pub mod geoip_converter;
+mod geoip_proto;
 pub mod geosite;
 
 use std::net::{IpAddr, SocketAddr};

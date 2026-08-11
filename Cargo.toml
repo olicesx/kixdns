@@ -48,6 +48,7 @@ hyper-util = { version = "0.1", features = ["server", "tokio"] }
 http-body-util = "0.1"
 rustls-pemfile = "2"
 base64 = "0.22"
+prost = { version = "0.14.4", features = ["derive"] }
 
 [dev-dependencies]
 criterion = "0.5"
