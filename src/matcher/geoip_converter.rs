@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use maxminddb_writer::paths::IpAddrWithMask;
 use prost::Message;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::{Deserialize, Serialize};
@@ -247,22 +248,34 @@ impl GeoIpConverter {
     /// 写入 MMDB 文件
     /// Write to MMDB file
     pub fn write_mmdb(&self, source_path: &Path, output_path: &Path) -> Result<ConversionStats> {
-        use maxminddb_writer::{Database, metadata::IpVersion, paths::IpAddrWithMask};
+        use maxminddb_writer::{Database, metadata::IpVersion};
         use std::io::Write;
 
         let mut db = Database::default();
 
         // Set metadata
+        // 标准字段：libmaxminddb 要求 binary_format_major_version 与 build_epoch 非零，
+        // 否则报 "Is this a valid MaxMind DB file?"
         db.metadata.database_type = "KixDNS GeoIP".to_string();
         db.metadata.description.insert(
             "en".to_string(),
             "GeoIP database converted from V2Ray .dat format".to_string(),
         );
         db.metadata.ip_version = IpVersion::V6;
+        db.metadata.binary_format_major_version = 2;
+        db.metadata.binary_format_minor_version = 0;
+        db.metadata.build_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(1);
+        db.metadata.languages = vec!["en".to_string()];
 
         let mut ipv4_count = 0;
         let mut ipv6_count = 0;
 
+        // 收集所有插入项后统一排序插入：按 prefix 升序（父网段先插），
+        // 规避 maxminddb-writer 的 NodeTree::insert 先子后父覆盖丢失子网的 bug
+        let mut inserts = Vec::new();
         for (country_code, nets) in &self.country_to_nets {
             let country_data = MmdbCountryData {
                 country: MmdbCountry {
@@ -275,15 +288,20 @@ impl GeoIpConverter {
                 .with_context(|| format!("Failed to insert data for country: {}", country_code))?;
 
             for net in nets {
-                let path_str = format!("{}/{}", net.addr(), net.prefix_len());
-                if let Ok(path) = path_str.parse::<IpAddrWithMask>() {
-                    db.insert_node(path, data_ref);
-                    match net {
-                        IpNet::V4(_) => ipv4_count += 1,
-                        IpNet::V6(_) => ipv6_count += 1,
-                    }
+                let Some(path) = ip_net_to_mmdb_path(net) else {
+                    continue;
+                };
+                inserts.push((path.mask, data_ref, path));
+                match net {
+                    IpNet::V4(_) => ipv4_count += 1,
+                    IpNet::V6(_) => ipv6_count += 1,
                 }
             }
+        }
+
+        inserts.sort_by_key(|(mask, _, _)| *mask);
+        for (_, data_ref, path) in inserts {
+            db.insert_node(path, data_ref);
         }
 
         // Write to file
@@ -313,6 +331,39 @@ impl GeoIpConverter {
     }
 }
 
+/// 将 IP 网段转换为 MMDB 插入路径
+/// Convert an IP network to an MMDB insertion path
+///
+/// IPv4 必须嵌入 `::/96`（前 96 位全 0 的 IPv6 地址），因为所有 maxminddb
+/// reader（Rust / libmaxminddb / Python）查询 IPv4 时都从树第 96 位（::/96
+/// 子树根）开始。maxminddb-writer 0.1.1 本身不处理嵌入，直接插树根会导致
+/// IPv4 网段全部落空。
+fn ip_net_to_mmdb_path(net: &IpNet) -> Option<IpAddrWithMask> {
+    match net {
+        IpNet::V4(v4) => {
+            let o = v4.addr().octets();
+            let ipv6 = std::net::Ipv6Addr::new(
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                ((o[0] as u16) << 8) | o[1] as u16,
+                ((o[2] as u16) << 8) | o[3] as u16,
+            );
+            Some(IpAddrWithMask::new(
+                std::net::IpAddr::V6(ipv6),
+                v4.prefix_len() + 96,
+            ))
+        }
+        IpNet::V6(v6) => Some(IpAddrWithMask::new(
+            std::net::IpAddr::V6(v6.addr()),
+            v6.prefix_len(),
+        )),
+    }
+}
+
 impl Default for GeoIpConverter {
     fn default() -> Self {
         Self::new()
@@ -321,142 +372,111 @@ impl Default for GeoIpConverter {
 
 /// 合并 IPv4 网络
 /// Merge IPv4 networks
+///
+/// 标准 CIDR 精确合并：完全包含取大者；同前缀的兄弟子网（低半 + 高半）
+/// 合并为父网络；否则保持独立。合并后回退与已合并的前一个网络再尝试
+/// 合并（链式），确保 4 个连续 /24 → /22。
 fn merge_ipv4_nets(mut nets: Vec<Ipv4Net>) -> Vec<Ipv4Net> {
-    if nets.is_empty() {
-        return nets;
-    }
-
     nets.sort();
 
-    let mut merged = Vec::new();
-    let mut current = nets[0];
-
-    for next in &nets[1..] {
-        // Check if networks overlap or are adjacent
-        if networks_overlap_v4(&current, next) || are_adjacent_ipv4(&current, next) {
-            // Merge by expanding current
-            current = merge_two_ipv4(&current, next);
-        } else {
+    let mut merged: Vec<Ipv4Net> = Vec::new();
+    for net in nets {
+        let mut current = net;
+        loop {
+            if let Some(last) = merged.last() {
+                if last.contains(&current.addr()) && last.contains(&current.broadcast()) {
+                    // current 完全被 last 覆盖，丢弃
+                    break;
+                }
+                if current.contains(&last.addr()) && current.contains(&last.broadcast()) {
+                    // last 完全被 current 覆盖，替换 last 后继续尝试与更前的合并
+                    merged.pop();
+                    continue;
+                }
+                if let Some(combined) = try_merge_ipv4(last, &current) {
+                    merged.pop();
+                    current = combined;
+                    continue;
+                }
+            }
             merged.push(current);
-            current = *next;
+            break;
         }
     }
-
-    merged.push(current);
     merged
 }
 
 /// 合并 IPv6 网络
 /// Merge IPv6 networks
 fn merge_ipv6_nets(mut nets: Vec<Ipv6Net>) -> Vec<Ipv6Net> {
-    if nets.is_empty() {
-        return nets;
-    }
-
     nets.sort();
 
-    let mut merged = Vec::new();
-    let mut current = nets[0];
-
-    for next in &nets[1..] {
-        if networks_overlap_v6(&current, next) || are_adjacent_ipv6(&current, next) {
-            current = merge_two_ipv6(&current, next);
-        } else {
+    let mut merged: Vec<Ipv6Net> = Vec::new();
+    for net in nets {
+        let mut current = net;
+        loop {
+            if let Some(last) = merged.last() {
+                if last.contains(&current.addr()) && last.contains(&current.broadcast()) {
+                    break;
+                }
+                if current.contains(&last.addr()) && current.contains(&last.broadcast()) {
+                    merged.pop();
+                    continue;
+                }
+                if let Some(combined) = try_merge_ipv6(last, &current) {
+                    merged.pop();
+                    current = combined;
+                    continue;
+                }
+            }
             merged.push(current);
-            current = *next;
+            break;
         }
     }
-
-    merged.push(current);
     merged
 }
 
-/// 检查两个 IPv4 网络是否重叠
-/// Check if two IPv4 networks overlap
-fn networks_overlap_v4(a: &Ipv4Net, b: &Ipv4Net) -> bool {
-    a.contains(&b.addr()) || b.contains(&a.addr())
-}
-
-/// 检查两个 IPv6 网络是否重叠
-/// Check if two IPv6 networks overlap
-fn networks_overlap_v6(a: &Ipv6Net, b: &Ipv6Net) -> bool {
-    a.contains(&b.addr()) || b.contains(&a.addr())
-}
-
-/// 检查两个 IPv4 网络是否相邻
-/// Check if two IPv4 networks are adjacent
-fn are_adjacent_ipv4(a: &Ipv4Net, b: &Ipv4Net) -> bool {
-    let a_end = u32::from(a.addr()) | u32::MAX.wrapping_shr(u32::from(a.prefix_len()));
-    let b_start = u32::from(b.addr());
-    a_end.wrapping_add(1) == b_start
-}
-
-/// 检查两个 IPv6 网络是否相邻
-/// Check if two IPv6 networks are adjacent
-fn are_adjacent_ipv6(a: &Ipv6Net, b: &Ipv6Net) -> bool {
-    let a_end = u128::from(a.addr()) | u128::MAX.wrapping_shr(u32::from(a.prefix_len()));
-    let b_start = u128::from(b.addr());
-    a_end.wrapping_add(1) == b_start
-}
-
-/// 合并两个 IPv4 网络
-/// Merge two IPv4 networks
-fn merge_two_ipv4(a: &Ipv4Net, b: &Ipv4Net) -> Ipv4Net {
-    let a_start = u32::from(a.addr());
-    let a_end = a_start | u32::MAX.wrapping_shr(u32::from(a.prefix_len()));
-    let b_start = u32::from(b.addr());
-    let b_end = b_start | u32::MAX.wrapping_shr(u32::from(b.prefix_len()));
-
-    let new_start = a_start.min(b_start);
-    let new_end = a_end.max(b_end);
-
-    // Find the minimal prefix that covers both
-    let mut prefix = 32u8;
-    while prefix > 0 {
-        let mask = u32::MAX << (32 - prefix);
-        if (new_start & mask) == (new_end & mask) {
-            break;
-        }
-        prefix -= 1;
+/// 尝试将两个 IPv4 网络精确合并为父网络
+/// Try to merge two IPv4 networks into their parent network
+///
+/// 仅当 `a` 是父网络的下半子网、`b` 是其相邻的高半兄弟子网时才可合并，
+/// 合并结果恰好等于两者的并集（不会多覆盖地址）。返回 `None` 表示不可合并。
+fn try_merge_ipv4(a: &Ipv4Net, b: &Ipv4Net) -> Option<Ipv4Net> {
+    if a.prefix_len() != b.prefix_len() || a.prefix_len() == 0 {
+        return None;
     }
-    // Align the start address to the covering prefix's network boundary,
-    // otherwise Ipv4Net::new errors and unwrap panics (e.g. merging
-    // 1.2.3.0/24 + 1.2.4.0/24 → prefix 21, start must become 1.2.0.0).
-    let aligned_start = if prefix == 0 {
-        0
+    let shift = 32 - a.prefix_len();
+    let a_addr = u32::from(a.addr());
+    let b_addr = u32::from(b.addr());
+    if (a_addr & (1 << shift)) == 0 && b_addr == (a_addr | (1 << shift)) {
+        Ipv4Net::new(
+            std::net::Ipv4Addr::from(a_addr & !(1 << shift)),
+            a.prefix_len() - 1,
+        )
+        .ok()
     } else {
-        new_start & (u32::MAX << (32 - prefix))
-    };
-    Ipv4Net::new(std::net::Ipv4Addr::from(aligned_start), prefix).unwrap()
+        None
+    }
 }
 
-/// 合并两个 IPv6 网络
-/// Merge two IPv6 networks
-fn merge_two_ipv6(a: &Ipv6Net, b: &Ipv6Net) -> Ipv6Net {
-    let a_start = u128::from(a.addr());
-    let a_end = a_start | u128::MAX.wrapping_shr(u32::from(a.prefix_len()));
-    let b_start = u128::from(b.addr());
-    let b_end = b_start | u128::MAX.wrapping_shr(u32::from(b.prefix_len()));
-
-    let new_start = a_start.min(b_start);
-    let new_end = a_end.max(b_end);
-
-    let mut prefix = 128u8;
-    while prefix > 0 {
-        let mask = u128::MAX << (128 - prefix);
-        if (new_start & mask) == (new_end & mask) {
-            break;
-        }
-        prefix -= 1;
+/// 尝试将两个 IPv6 网络精确合并为父网络
+/// Try to merge two IPv6 networks into their parent network
+fn try_merge_ipv6(a: &Ipv6Net, b: &Ipv6Net) -> Option<Ipv6Net> {
+    if a.prefix_len() != b.prefix_len() || a.prefix_len() == 0 {
+        return None;
     }
-
-    // Align the start address to the covering prefix's network boundary
-    let aligned_start = if prefix == 0 {
-        0
+    let shift = 128 - a.prefix_len();
+    let a_addr = u128::from(a.addr());
+    let b_addr = u128::from(b.addr());
+    if (a_addr & (1 << shift)) == 0 && b_addr == (a_addr | (1 << shift)) {
+        Ipv6Net::new(
+            std::net::Ipv6Addr::from(a_addr & !(1 << shift)),
+            a.prefix_len() - 1,
+        )
+        .ok()
     } else {
-        new_start & (u128::MAX << (128 - prefix))
-    };
-    Ipv6Net::new(std::net::Ipv6Addr::from(aligned_start), prefix).unwrap()
+        None
+    }
 }
 
 /// 转换 .dat 为 MMDB 格式
@@ -526,39 +546,45 @@ mod tests {
     }
 
     #[test]
-    fn test_are_adjacent_ipv4_correct() {
-        // 1.2.3.0/24 与 1.2.4.0/24 相邻:end=1.2.3.255, +1 = 1.2.4.0
-        let a = v4net("1.2.3.0/24");
-        let b = v4net("1.2.4.0/24");
-        assert!(are_adjacent_ipv4(&a, &b), "1.2.3.0/24 与 1.2.4.0/24 应相邻");
-        // 旧 bug:!u32::MAX << 8 = 0 → a_end = a_start = 1.2.3.0 → 误判不相邻
+    fn test_merge_ipv4_siblings_into_parent() {
+        // 兄弟子网:1.2.2.0/24 + 1.2.3.0/24 → 1.2.2.0/23（精确合并，不多覆盖）
+        let a = v4net("1.2.2.0/24");
+        let b = v4net("1.2.3.0/24");
+        assert_eq!(try_merge_ipv4(&a, &b).unwrap().to_string(), "1.2.2.0/23");
     }
 
     #[test]
-    fn test_merge_two_ipv4_overlap_correct() {
-        // 重叠:1.2.3.0/24 + 1.2.3.128/25 → 1.2.3.0/24
-        let m = merge_two_ipv4(&v4net("1.2.3.0/24"), &v4net("1.2.3.128/25"));
-        assert_eq!(m.to_string(), "1.2.3.0/24");
+    fn test_merge_ipv4_non_sibling_adjacent_not_merged() {
+        // 相邻但非兄弟:1.2.3.0/24 + 1.2.4.0/24 不能合并
+        // （并集 1.2.3.0-1.2.4.255 无法用单个网络精确表达，合并会多覆盖
+        //   1.2.0.0-1.2.2.255 与 1.2.5.0-1.2.7.255——即旧实现产出的 1.2.0.0/21）
+        let nets = vec![v4net("1.2.3.0/24"), v4net("1.2.4.0/24")];
+        let merged = merge_ipv4_nets(nets);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].to_string(), "1.2.3.0/24");
+        assert_eq!(merged[1].to_string(), "1.2.4.0/24");
     }
 
     #[test]
-    fn test_merge_adjacent_ipv4_crosses_network_boundary() {
-        // 相邻跨 /23 边界:1.2.3.0/24 + 1.2.4.0/24 → 最小覆盖 1.2.0.0/21
-        let m = merge_two_ipv4(&v4net("1.2.3.0/24"), &v4net("1.2.4.0/24"));
-        assert_eq!(m.to_string(), "1.2.0.0/21");
-        // 旧 bug:new_end 被算成 1.2.4.0 → prefix 22 → 且 start 未对齐会 panic
+    fn test_merge_ipv4_overlap_keeps_larger() {
+        // 完全包含:1.2.3.0/24 + 1.2.3.128/25 → 保留较大的 1.2.3.0/24
+        let nets = vec![v4net("1.2.3.0/24"), v4net("1.2.3.128/25")];
+        let merged = merge_ipv4_nets(nets);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].to_string(), "1.2.3.0/24");
     }
 
     #[test]
     fn test_merge_ipv6_halves_correct() {
-        // 2001:db8::/33 + 2001:db8:8000::/33 → 2001:db8::/32
-        let m = merge_two_ipv6(&v6net("2001:db8::/33"), &v6net("2001:db8:8000::/33"));
-        assert_eq!(m.to_string(), "2001:db8::/32");
+        // 兄弟子网:2001:db8::/33 + 2001:db8:8000::/33 → 2001:db8::/32
+        let a = v6net("2001:db8::/33");
+        let b = v6net("2001:db8:8000::/33");
+        assert_eq!(try_merge_ipv6(&a, &b).unwrap().to_string(), "2001:db8::/32");
     }
 
     #[test]
     fn test_merge_ipv4_nets_chain() {
-        // 三段连续 /24 → 合并成一个 /22 网络
+        // 四个连续 /24 → 链式合并成一个 /22 网络
         let nets = vec![
             v4net("10.0.0.0/24"),
             v4net("10.0.1.0/24"),
@@ -568,5 +594,91 @@ mod tests {
         let merged = merge_ipv4_nets(nets);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].to_string(), "10.0.0.0/22");
+    }
+
+    #[test]
+    fn test_merge_ipv4_issue40_no_over_merge() {
+        // issue #40 场景:相邻 /24 序列，只有能精确合并的才合并。
+        // 1.2.2.0/24 + 1.2.3.0/24 → 1.2.2.0/23；1.2.3.0/24 与 1.2.4.0/24 不合并
+        let nets = vec![
+            v4net("1.2.2.0/24"),
+            v4net("1.2.3.0/24"),
+            v4net("1.2.4.0/24"),
+        ];
+        let merged = merge_ipv4_nets(nets);
+        let strs: Vec<String> = merged.iter().map(|n| n.to_string()).collect();
+        assert_eq!(strs, vec!["1.2.2.0/23", "1.2.4.0/24"]);
+    }
+
+    #[test]
+    fn test_mmdb_roundtrip_ipv4_ipv6() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize, Debug)]
+        struct CountryRec {
+            country: Option<CountryIso>,
+        }
+        #[derive(Deserialize, Debug)]
+        struct CountryIso {
+            iso_code: Option<String>,
+        }
+
+        let mut converter = GeoIpConverter::new();
+        // CN: 1.2.3.0/24（IPv4）; US: 2001:db8::/32（IPv6）
+        converter
+            .country_to_nets
+            .insert("CN".to_string(), vec![IpNet::V4(v4net("1.2.3.0/24"))]);
+        converter
+            .country_to_nets
+            .insert("US".to_string(), vec![IpNet::V6(v6net("2001:db8::/32"))]);
+        converter.merge_cidrs();
+
+        let dir = std::env::temp_dir().join(format!("kixdns_mmdb_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.dat");
+        let out = dir.join("out.mmdb");
+        std::fs::write(&src, b"placeholder").unwrap();
+
+        let stats = converter.write_mmdb(&src, &out).unwrap();
+        assert_eq!(stats.ipv4_ranges_count, 1);
+        assert_eq!(stats.ipv6_ranges_count, 1);
+
+        let bytes = std::fs::read(&out).unwrap();
+        // 结构自校验:树区(6B/节点) + 16B separator + data + marker 不应越界
+        let marker = b"\xab\xcd\xefMaxMind.com";
+        let marker_idx = bytes
+            .windows(marker.len())
+            .rposition(|w| w == marker)
+            .expect("metadata marker not found");
+        assert!(marker_idx < bytes.len(), "metadata 越界");
+        let tree_end = bytes
+            .windows(16)
+            .position(|w| w == [0u8; 16])
+            .expect("data section separator not found");
+        assert!(tree_end < marker_idx, "树区应位于 data 之前");
+
+        let reader = maxminddb::Reader::from_source(&bytes).unwrap();
+        // metadata 标准字段（libmaxminddb 兼容）
+        assert_eq!(reader.metadata.binary_format_major_version, 2);
+        assert!(
+            reader.metadata.build_epoch > 0,
+            "build_epoch 应为非零时间戳"
+        );
+        assert_eq!(reader.metadata.ip_version, 6);
+
+        // IPv4 查询应命中 CN（修复前:IPv4 未嵌入 ::/96，全部落空）
+        let rec: CountryRec = reader.lookup("1.2.3.4".parse().unwrap()).unwrap();
+        assert_eq!(rec.country.unwrap().iso_code.as_deref(), Some("CN"));
+        // IPv6 查询应命中 US
+        let rec: CountryRec = reader.lookup("2001:db8::1".parse().unwrap()).unwrap();
+        assert_eq!(rec.country.unwrap().iso_code.as_deref(), Some("US"));
+        // 未命中网段应报错而不是返回错误国家
+        assert!(
+            reader
+                .lookup::<CountryRec>("9.9.9.9".parse().unwrap())
+                .is_err()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
