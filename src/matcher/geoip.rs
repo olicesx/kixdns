@@ -98,38 +98,47 @@ struct Ipv6Range {
 struct GeoIpTagIndex {
     ipv4_ranges: Vec<Ipv4Range>,
     ipv6_ranges: Vec<Ipv6Range>,
+    raw_ipv4_ranges: Vec<Ipv4Range>,
+    raw_ipv6_ranges: Vec<Ipv6Range>,
 }
 
 impl GeoIpTagIndex {
     fn finalize(&mut self) {
+        self.raw_ipv4_ranges = self.ipv4_ranges.clone();
+        self.raw_ipv4_ranges
+            .sort_unstable_by_key(|range| range.start);
+        self.raw_ipv6_ranges = self.ipv6_ranges.clone();
+        self.raw_ipv6_ranges
+            .sort_unstable_by_key(|range| range.start);
         merge_ipv4_ranges(&mut self.ipv4_ranges);
         merge_ipv6_ranges(&mut self.ipv6_ranges);
     }
 
     #[inline]
     fn contains(&self, ip: IpAddr) -> bool {
-        self.matching_range(ip).is_some()
-    }
-
-    #[inline]
-    fn matching_range(&self, ip: IpAddr) -> Option<(u128, u128)> {
         match ip {
             IpAddr::V4(ip) => {
                 let ip = u32::from(ip);
                 let index = self.ipv4_ranges.partition_point(|range| range.start <= ip);
-                self.ipv4_ranges
-                    .get(index.checked_sub(1)?)
-                    .filter(|range| range.end >= ip)
-                    .map(|range| (u128::from(range.start), u128::from(range.end)))
+                index > 0 && self.ipv4_ranges[index - 1].end >= ip
             }
             IpAddr::V6(ip) => {
                 let ip = u128::from(ip);
                 let index = self.ipv6_ranges.partition_point(|range| range.start <= ip);
-                self.ipv6_ranges
-                    .get(index.checked_sub(1)?)
-                    .filter(|range| range.end >= ip)
-                    .map(|range| (range.start, range.end))
+                index > 0 && self.ipv6_ranges[index - 1].end >= ip
             }
+        }
+    }
+
+    fn matching_range(&self, ip: IpAddr) -> Option<(u128, u128)> {
+        match ip {
+            IpAddr::V4(ip) => {
+                let ip = u32::from(ip);
+                most_specific_ipv4(&self.raw_ipv4_ranges, ip)
+                    .map(|range| (u128::from(range.start), u128::from(range.end)))
+            }
+            IpAddr::V6(ip) => most_specific_ipv6(&self.raw_ipv6_ranges, u128::from(ip))
+                .map(|range| (range.start, range.end)),
         }
     }
 
@@ -686,6 +695,44 @@ fn merge_ipv6_ranges(ranges: &mut Vec<Ipv6Range>) {
     *ranges = merged;
 }
 
+fn most_specific_ipv4(ranges: &[Ipv4Range], ip: u32) -> Option<Ipv4Range> {
+    let index = ranges.partition_point(|range| range.start <= ip);
+    let mut best: Option<Ipv4Range> = None;
+    for range in ranges[..index].iter().rev() {
+        if best.is_some_and(|best| range.start < best.start) {
+            break;
+        }
+        if range.end >= ip
+            && match best {
+                None => true,
+                Some(best) => range.end < best.end,
+            }
+        {
+            best = Some(*range);
+        }
+    }
+    best
+}
+
+fn most_specific_ipv6(ranges: &[Ipv6Range], ip: u128) -> Option<Ipv6Range> {
+    let index = ranges.partition_point(|range| range.start <= ip);
+    let mut best: Option<Ipv6Range> = None;
+    for range in ranges[..index].iter().rev() {
+        if best.is_some_and(|best| range.start < best.start) {
+            break;
+        }
+        if range.end >= ip
+            && match best {
+                None => true,
+                Some(best) => range.end < best.end,
+            }
+        {
+            best = Some(*range);
+        }
+    }
+    best
+}
+
 #[inline]
 fn is_country_tag(tag: &str) -> bool {
     tag.len() == 2 && tag.bytes().all(|byte| byte.is_ascii_alphabetic())
@@ -1003,6 +1050,43 @@ mod tests {
         assert_eq!(mgr.lookup(cn6).country_code.as_deref(), Some("CN"));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_lookup_preserves_same_tag_nested_specificity() {
+        let json = r#"{
+            "entries": [
+                {
+                    "country_code": "CN",
+                    "ips": ["10.0.0.0/8", "10.1.0.0/16", "2001:db8::/32", "2001:db8:1::/48"]
+                },
+                {
+                    "country_code": "US",
+                    "ips": ["10.0.0.0/12", "2001:db8::/40"]
+                }
+            ]
+        }"#;
+        let path = std::env::temp_dir().join("geoip_test_same_tag_nested.json");
+        std::fs::write(&path, json).unwrap();
+
+        let mut mgr = GeoIpManager::new(None).unwrap();
+        assert_eq!(mgr.load_from_v2ray_file(&path).unwrap(), 6);
+
+        let cn4: IpAddr = "10.1.1.1".parse().unwrap();
+        assert!(mgr.matches_tag(cn4, "CN"));
+        assert!(mgr.matches_tag(cn4, "US"));
+        assert_eq!(mgr.lookup(cn4).country_code.as_deref(), Some("CN"));
+        let us4: IpAddr = "10.2.1.1".parse().unwrap();
+        assert_eq!(mgr.lookup(us4).country_code.as_deref(), Some("US"));
+
+        let cn6: IpAddr = "2001:db8:1::1".parse().unwrap();
+        assert!(mgr.matches_tag(cn6, "CN"));
+        assert!(mgr.matches_tag(cn6, "US"));
+        assert_eq!(mgr.lookup(cn6).country_code.as_deref(), Some("CN"));
+        let us6: IpAddr = "2001:db8:2::1".parse().unwrap();
+        assert_eq!(mgr.lookup(us6).country_code.as_deref(), Some("US"));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
