@@ -268,7 +268,7 @@ pub(crate) async fn apply_response_actions(
                 });
             }
             Action::StaticIpResponse { ip } => {
-                let (rcode, answers) = make_static_ip_answer(ctx.qname, ip);
+                let (rcode, answers) = make_static_ip_answer(ctx.qname, ctx.qtype, ip);
                 let bytes = build_response(ctx.req, rcode, answers)?;
                 return Ok(ResponseActionResult::Static {
                     bytes,

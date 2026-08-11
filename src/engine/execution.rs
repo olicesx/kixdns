@@ -1319,7 +1319,7 @@ mod tests {
         let ipv4 = "1.2.3.4";
 
         // Act: Generate static IP answer
-        let (rcode, answers) = make_static_ip_answer(domain, ipv4);
+        let (rcode, answers) = make_static_ip_answer(domain, RecordType::A, ipv4);
 
         // Assert: Verify response code and record type
         assert_eq!(
@@ -1342,7 +1342,7 @@ mod tests {
         let ipv6 = "2001:db8::1";
 
         // Act: Generate static IP answer
-        let (rcode, answers) = make_static_ip_answer(domain, ipv6);
+        let (rcode, answers) = make_static_ip_answer(domain, RecordType::AAAA, ipv6);
 
         // Assert: Verify response code and record type
         assert_eq!(
@@ -1359,21 +1359,143 @@ mod tests {
     }
 
     #[test]
-    fn make_static_ip_answer_rejects_invalid_input() {
-        // Arrange: Define test domain and invalid IP
-        let domain = "example.com";
-        let invalid_ip = "not-an-ip";
+    fn make_static_ip_answer_filters_comma_separated_addresses_by_query_type() {
+        let ips = " 192.0.2.1, 2001:db8::1,192.0.2.2 ";
 
-        // Act: Generate static IP answer with invalid input
-        let (rcode, answers) = make_static_ip_answer(domain, invalid_ip);
+        let (a_rcode, a_answers) = make_static_ip_answer("example.com", RecordType::A, ips);
+        assert_eq!(a_rcode, ResponseCode::NoError);
+        assert_eq!(a_answers.len(), 2);
+        assert!(
+            a_answers
+                .iter()
+                .all(|answer| answer.record_type() == RecordType::A)
+        );
 
-        // Assert: Verify ServFail response and empty answers
+        let (aaaa_rcode, aaaa_answers) =
+            make_static_ip_answer("example.com", RecordType::AAAA, ips);
+        assert_eq!(aaaa_rcode, ResponseCode::NoError);
+        assert_eq!(aaaa_answers.len(), 1);
+        assert_eq!(aaaa_answers[0].record_type(), RecordType::AAAA);
+    }
+
+    #[test]
+    fn make_static_ip_answer_returns_nodata_for_unconfigured_query_family() {
+        let (rcode, answers) = make_static_ip_answer("example.com", RecordType::AAAA, "192.0.2.1");
+
+        assert_eq!(rcode, ResponseCode::NoError);
+        assert!(answers.is_empty());
+    }
+
+    #[test]
+    fn make_static_ip_answer_returns_nodata_for_https_query() {
+        let (rcode, answers) =
+            make_static_ip_answer("example.com", RecordType::HTTPS, "192.0.2.1,2001:db8::1");
+
+        assert_eq!(rcode, ResponseCode::NoError);
+        assert!(answers.is_empty());
+    }
+
+    #[test]
+    fn make_static_ip_answer_returns_both_families_for_any_query() {
+        let (rcode, answers) =
+            make_static_ip_answer("example.com", RecordType::ANY, "192.0.2.1,2001:db8::1");
+
+        assert_eq!(rcode, ResponseCode::NoError);
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[0].record_type(), RecordType::A);
+        assert_eq!(answers[1].record_type(), RecordType::AAAA);
+    }
+
+    #[test]
+    fn make_static_ip_answer_rejects_invalid_input_atomically() {
+        let (rcode, answers) = make_static_ip_answer(
+            "example.com",
+            RecordType::A,
+            "192.0.2.1,not-an-ip,2001:db8::1",
+        );
+
         assert_eq!(
             rcode,
             ResponseCode::ServFail,
-            "Should return ServFail for invalid IP"
+            "Should return ServFail when any IP is invalid"
         );
-        assert!(answers.is_empty(), "Should have no answers for invalid IP");
+        assert!(answers.is_empty(), "Should not return a partial answer");
+    }
+
+    #[test]
+    fn make_static_ip_answer_rejects_empty_entries() {
+        for ips in ["", "192.0.2.1,", ",192.0.2.1", "192.0.2.1,,2001:db8::1"] {
+            let (rcode, answers) = make_static_ip_answer("example.com", RecordType::A, ips);
+            assert_eq!(rcode, ResponseCode::ServFail, "input: {ips:?}");
+            assert!(answers.is_empty(), "input: {ips:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn static_ip_fast_path_serializes_multiple_answers_by_query_type() {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [{
+                "id": "static",
+                "rules": [{
+                    "name": "static-ip",
+                    "matchers": [{ "type": "domain_suffix", "value": "example.com" }],
+                    "actions": [{
+                        "type": "static_ip_response",
+                        "ip": "192.0.2.1,2001:db8::1,192.0.2.2"
+                    }]
+                }]
+            }]
+        });
+        let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
+        let engine = Engine::new(runtime, "test".to_string()).expect("initialize engine");
+        let peer = "127.0.0.1:53000".parse().unwrap();
+
+        let assert_response = |qtype, expected_ips: &[IpAddr]| {
+            let mut request = Message::new(0xCAFE, MessageType::Query, OpCode::Query);
+            request.metadata.recursion_desired = true;
+            request.add_query(Query::query(
+                Name::from_str("www.example.com").unwrap(),
+                qtype,
+            ));
+
+            let response = match engine
+                .handle_packet_fast(&request.to_vec().unwrap(), peer)
+                .expect("fast path")
+            {
+                Some(FastPathResponse::Direct(bytes)) => Message::from_bytes(&bytes).unwrap(),
+                other => panic!("expected direct fast-path response, got {other:?}"),
+            };
+
+            assert_eq!(response.metadata.id, 0xCAFE);
+            assert_eq!(response.metadata.message_type, MessageType::Response);
+            assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+            assert!(response.metadata.recursion_desired);
+            assert!(response.metadata.recursion_available);
+            assert_eq!(response.queries.len(), 1);
+            assert_eq!(response.queries[0].query_type(), qtype);
+
+            let actual_ips: Vec<IpAddr> = response
+                .answers
+                .iter()
+                .map(|answer| {
+                    assert_eq!(answer.ttl, 300);
+                    match &answer.data {
+                        RData::A(address) => IpAddr::V4(address.0),
+                        RData::AAAA(address) => IpAddr::V6(address.0),
+                        other => panic!("unexpected static IP answer: {other:?}"),
+                    }
+                })
+                .collect();
+            assert_eq!(actual_ips, expected_ips);
+        };
+
+        assert_response(
+            RecordType::A,
+            &["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap()],
+        );
+        assert_response(RecordType::AAAA, &["2001:db8::1".parse().unwrap()]);
     }
 
     #[test]
