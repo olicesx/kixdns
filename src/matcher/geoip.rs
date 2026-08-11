@@ -257,15 +257,25 @@ impl GeoIpManager {
                         }
                     }
                     Err(idx) => {
-                        // 检查相邻的范围 / Check adjacent ranges
-                        if idx > 0 {
-                            let range = &self.ip_ranges[idx - 1];
+                        // 向前扫描:网段仅按 start 排序,end 不单调。较大的覆盖
+                        // 网段(如 CN 111.0.0.0/10)可能位于更靠前的位置,被其后
+                        // 不覆盖 ip 的小网段(嵌套的 US /23)遮挡——只检查 idx-1
+                        // 会漏判。嵌套重叠是 geoip.dat 的合法形态(CN 大网段内
+                        // 嵌更小的国外网段),必须扫描到覆盖网段为止。
+                        // 返回 start 最大且覆盖的网段 = 最具体匹配优先。
+                        let mut i = idx.saturating_sub(1);
+                        loop {
+                            let range = &self.ip_ranges[i];
                             if ip_u32 >= range.start && ip_u32 <= range.end {
                                 return GeoIpResult {
                                     country_code: Some(Arc::from(range.country_code.as_str())),
                                     is_private: crate::matcher::geoip::is_private_ip(ip),
                                 };
                             }
+                            if i == 0 {
+                                break;
+                            }
+                            i -= 1;
                         }
                     }
                 }
@@ -293,15 +303,21 @@ impl GeoIpManager {
                         }
                     }
                     Err(idx) => {
-                        // 检查相邻的范围 / Check adjacent ranges
-                        if idx > 0 {
-                            let range = &self.ipv6_ranges[idx - 1];
+                        // 向前扫描:同 IPv4 分支,较大的覆盖网段可能位于更靠前
+                        // 的位置,只检查 idx-1 会漏判(嵌套重叠是合法形态)。
+                        let mut i = idx.saturating_sub(1);
+                        loop {
+                            let range = &self.ipv6_ranges[i];
                             if ip_u128 >= range.start && ip_u128 <= range.end {
                                 return GeoIpResult {
                                     country_code: Some(Arc::from(range.country_code.as_str())),
                                     is_private: crate::matcher::geoip::is_private_ip(ip),
                                 };
                             }
+                            if i == 0 {
+                                break;
+                            }
+                            i -= 1;
                         }
                     }
                 }
@@ -803,6 +819,79 @@ mod tests {
         let ip: std::net::IpAddr = "2001:db8:1::1234".parse().unwrap();
         let res = mgr.lookup(ip);
         assert_eq!(res.country_code.as_deref(), Some("JP"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+    /// 构造嵌套重叠的 .dat(CN /8 大网段内嵌 US /24,IPv4+IPv6)
+    /// Build a .dat with nested overlapping networks (CN /8 containing US /24)
+    fn build_nested_dat() -> Vec<u8> {
+        use prost::Message;
+        let v6_cn: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let v6_us: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let list = super::super::geoip_proto::GeoIPList {
+            entry: vec![
+                super::super::geoip_proto::GeoIP {
+                    country_code: "CN".to_string(),
+                    cidr: vec![
+                        super::super::geoip_proto::Cidr {
+                            ip: vec![10, 0, 0, 0],
+                            prefix: 8,
+                        },
+                        super::super::geoip_proto::Cidr {
+                            ip: v6_cn.to_vec(),
+                            prefix: 32,
+                        },
+                    ],
+                },
+                super::super::geoip_proto::GeoIP {
+                    country_code: "US".to_string(),
+                    cidr: vec![
+                        super::super::geoip_proto::Cidr {
+                            ip: vec![10, 1, 2, 0],
+                            prefix: 24,
+                        },
+                        super::super::geoip_proto::Cidr {
+                            ip: v6_us.to_vec(),
+                            prefix: 48,
+                        },
+                    ],
+                },
+            ],
+        };
+        list.encode_to_vec()
+    }
+
+    #[test]
+    fn test_lookup_nested_overlap_most_specific() {
+        let dat = build_nested_dat();
+        let mut path = std::env::temp_dir();
+        path.push("geoip_test_nested.dat");
+        std::fs::write(&path, &dat).unwrap();
+
+        let mut mgr = GeoIpManager::new(None).unwrap();
+        mgr.load_from_dat_file(&path).unwrap();
+
+        // 内嵌 US /24 内 → 最具体匹配 US
+        let us: std::net::IpAddr = "10.1.2.5".parse().unwrap();
+        assert_eq!(mgr.lookup(us).country_code.as_deref(), Some("US"));
+        // US /24 末边界
+        let b1: std::net::IpAddr = "10.1.2.255".parse().unwrap();
+        assert_eq!(mgr.lookup(b1).country_code.as_deref(), Some("US"));
+        // CN /8 内、US /24 外 → 向前扫描命中 CN
+        // (旧代码只查 idx-1 = US /24,不覆盖 → None,漏判)
+        let cn: std::net::IpAddr = "10.1.3.5".parse().unwrap();
+        assert_eq!(mgr.lookup(cn).country_code.as_deref(), Some("CN"));
+        let b2: std::net::IpAddr = "10.1.3.0".parse().unwrap();
+        assert_eq!(mgr.lookup(b2).country_code.as_deref(), Some("CN"));
+        // 远离嵌套段的 CN /8 内部
+        let cn2: std::net::IpAddr = "10.200.1.1".parse().unwrap();
+        assert_eq!(mgr.lookup(cn2).country_code.as_deref(), Some("CN"));
+
+        // IPv6 同样:内嵌 US /48 → US;外部 → CN
+        let us6: std::net::IpAddr = "2001:db8:1::1".parse().unwrap();
+        assert_eq!(mgr.lookup(us6).country_code.as_deref(), Some("US"));
+        let cn6: std::net::IpAddr = "2001:db8:2::1".parse().unwrap();
+        assert_eq!(mgr.lookup(cn6).country_code.as_deref(), Some("CN"));
 
         let _ = std::fs::remove_file(&path);
     }
