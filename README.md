@@ -264,7 +264,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | serve_stale_ttl_reset | true | Reset the stale-age window when stale data is served. |
 | serve_stale_client_timeout_ms | 0 | 0 serves stale immediately; a positive value tries the upstream for this many milliseconds first. |
 | geoip_db_path | null | MaxMind MMDB path. |
-| geoip_dat_path | null | V2Ray GeoIP .dat or supported V2Ray JSON path. IPv4 and IPv6 ranges are indexed independently for each GeoIP tag. |
+| geoip_dat_path | null | V2Ray GeoIP data path: either a protobuf `.dat` file or the compatible JSON format described below. |
 | geosite_data_paths | [] | V2Ray GeoSite .dat or JSON paths; multiple files are accepted. |
 
 The following fields are deserialized by the current config type but are not read by the running engine: geoip_auto_convert and geoip_filter_countries. Use convert-geo-ip with --filter for conversion-time filtering. The top-level background_refresh_rule is also currently ignored by runtime configuration compilation.
@@ -298,7 +298,15 @@ The same structure is used for response_matchers, response_matcher_operator, res
 
 Pipeline selectors support all of the rows above. Request rules support all rows except listener_label.
 
-Domain suffix matching, GeoSite tags, and GeoIP tags are case-insensitive. `geoip_country.country_codes` accepts both ISO country codes and named V2Ray GeoIP tags such as `cloudflare`, `netflix`, or `telegram`. The canonical JSON form is a string array; a single string or comma-separated string is also accepted for backward compatibility. GeoIP `.dat`/JSON indexes preserve overlapping memberships, so one IP may match both a country code and one or more named tags. When MMDB and `.dat`/JSON are both configured, MMDB remains authoritative for two-letter country codes while named tags continue to use the `.dat`/JSON index. `domain_regex` and `request_domain_regex` use Rust regular-expression syntax.
+#### GeoIP data sources and tags
+
+- `geoip_db_path` loads a MaxMind MMDB database. It supplies two-letter country codes such as `CN` and `US`.
+- `geoip_dat_path` loads either a V2Ray protobuf `.dat` file or a compatible JSON file. The JSON file is GeoIP data, not the main KixDNS configuration. Its shape is `{"entries":[{"country_code":"CLOUDFLARE","ips":["1.1.1.0/24"]}]}`.
+- V2Ray data may contain country codes and named tags such as `CLOUDFLARE`, `NETFLIX`, or `TELEGRAM`. One IP may belong to several tags.
+- When both sources are configured, MMDB decides two-letter country codes; named tags still come from `geoip_dat_path`.
+- Tag matching is case-insensitive. `country_codes` should normally be a JSON string array, for example `["CN", "cloudflare"]`; a single or comma-separated string is also accepted for compatibility.
+
+Domain suffix and GeoSite matching are also case-insensitive. `domain_regex` and `request_domain_regex` use Rust regular-expression syntax.
 
 ### Response matchers
 
@@ -319,7 +327,13 @@ Domain suffix matching, GeoSite tags, and GeoIP tags are case-insensitive. `geoi
 | response_request_domain_geosite_not | value: GeoSite tag |
 | response_txt_content | mode: exact, prefix, or regex; value is the text/pattern |
 
-`response_answer_ip_geoip_country` inspects Answer records only: every Answer record that represents IPs must match, while alternative `ipv4hint`/`ipv6hint` addresses within one HTTPS/SVCB record use any-match semantics. CIDR and private-IP response matchers inspect both Answers and Additionals with any-match semantics. These matchers read A/AAAA records and HTTPS/SVCB hints; they do not synthesize or rewrite HTTPS/SVCB records.
+Response address matching uses these scopes:
+
+- `response_answer_ip_geoip_country` checks Answers only. Every Answer that contains an address must match one of the requested GeoIP tags.
+- `response_answer_ip` and `response_answer_ip_geoip_private` check both Answers and Additionals and succeed when any address matches.
+- A/AAAA addresses and HTTPS/SVCB `ipv4hint`/`ipv6hint` values are inspected. Hints in one HTTPS/SVCB record are alternative endpoints, so any matching hint satisfies that record.
+
+These matchers only inspect existing records; they do not create or rewrite HTTPS/SVCB records.
 
 The successful upstream label currently includes the transport prefix, for example udp:1.1.1.1:53 or tcp:1.1.1.1:53. Therefore upstream_equals values must include that prefix. response_upstream_ip currently parses a raw IP or host:port value; it does not strip the transport prefix.
 
