@@ -356,6 +356,9 @@ pub struct StaticDecisionContext<'a> {
     pub min_ttl: Duration,
     pub start: Instant,
     pub peer: &'a std::net::SocketAddr,
+    /// Pipeline uses a client_ip matcher: skip dns_cache to avoid cross-client
+    /// reuse (rule_cache already isolates by client IP in that case).
+    pub uses_client_ip: bool,
 }
 
 /// Handles Decision::Static.
@@ -375,12 +378,16 @@ pub fn handle_static_decision(
         min_ttl,
         start,
         peer,
+        uses_client_ip,
     } = *context;
     // Need full request for building response / 需要完整请求来构建响应
     let req = Message::from_bytes(packet).context("parse request for static")?;
     let resp_bytes = build_response(&req, rcode, answers)?;
 
-    if min_ttl > Duration::from_secs(0) {
+    // Skip dns_cache when the pipeline matches on client_ip: dedupe_hash has no
+    // client dimension, so a cached static answer could leak across clients.
+    // rule_cache already caches static decisions with client-IP isolation.
+    if !uses_client_ip && min_ttl > Duration::from_secs(0) {
         let ttl = crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
         engine.insert_dns_cache_entry(
             dedupe_hash,

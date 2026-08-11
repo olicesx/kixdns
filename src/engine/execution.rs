@@ -791,6 +791,7 @@ impl Engine {
         let qname = qname_cow;
         let mut skip_rules: FxHashSet<Arc<str>> = FxHashSet::default();
         let mut current_pipeline_id = pipeline_id.clone();
+        let mut current_uses_client_ip = pipeline_opt.map(|p| p.uses_client_ip).unwrap_or(false);
         // Convert qname to bytes for hash calculation / 将 qname 转换为 bytes 进行哈希计算
         let qname_bytes = qname.as_bytes();
         // Reuse dedupe_hash from earlier computation (includes ECS key isolation)
@@ -879,6 +880,7 @@ impl Engine {
                 if let Some(&idx) = cfg.pipeline_id_index.get(pipeline.as_ref()) {
                     let p = &cfg.pipelines[idx];
                     current_pipeline_id = p.id.clone();
+                    current_uses_client_ip = p.uses_client_ip;
                     // Must recompute ECS key + dedupe_hash: pipeline changed via Jump,
                     // so the target pipeline's ECS config may differ from the source.
                     // 必须重算 ECS key + dedupe_hash：pipeline 因 Jump 改变，
@@ -934,6 +936,7 @@ impl Engine {
                             min_ttl,
                             start,
                             peer: &peer,
+                            uses_client_ip: current_uses_client_ip,
                         },
                         rcode,
                         answers,
@@ -1988,6 +1991,145 @@ mod tests {
             }
             _ => panic!("expected static refused"),
         }
+    }
+
+    #[tokio::test]
+    async fn response_actions_static_ip_filters_answers_by_query_type() {
+        // Arrange: Build test engine with a multi-address static IP response action
+        let engine = build_test_engine();
+        let req = Message::new(0, MessageType::Query, OpCode::Query);
+        let actions = [Action::StaticIpResponse {
+            ip: "192.0.2.1,2001:db8::1,192.0.2.2".to_string(),
+        }];
+        let response_matchers: Vec<RuntimeResponseMatcherWithOp> = Vec::new();
+        let packet = [0u8];
+        let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        let run = |qtype: RecordType| {
+            let ctx = crate::engine::rules::ApplyResponseActionsContext {
+                engine: &engine,
+                actions: &actions,
+                ctx_opt: None,
+                req: &req,
+                packet: &packet,
+                upstream_timeout: Duration::from_secs(1),
+                response_matchers: &response_matchers,
+                qname: "example.com",
+                qtype,
+                qclass: DNSClass::IN,
+                client_ip,
+                upstream_default: TEST_UPSTREAM,
+                pipeline_id: "pipeline",
+                rule_name: "rule",
+                remaining_jumps: 10,
+            };
+            apply_response_actions(ctx)
+        };
+        let answer_ips = |resp: &Message| -> Vec<IpAddr> {
+            resp.answers
+                .iter()
+                .map(|answer| match &answer.data {
+                    RData::A(a) => IpAddr::V4(a.0),
+                    RData::AAAA(a) => IpAddr::V6(a.0),
+                    other => panic!("unexpected static IP answer: {other:?}"),
+                })
+                .collect()
+        };
+
+        // Act & Assert: A query returns only the IPv4 addresses
+        match run(RecordType::A).await.expect("static ip") {
+            ResponseActionResult::Static { bytes, rcode, .. } => {
+                assert_eq!(rcode, ResponseCode::NoError);
+                assert_eq!(
+                    answer_ips(&Message::from_bytes(&bytes).unwrap()),
+                    vec![
+                        "192.0.2.1".parse::<IpAddr>().unwrap(),
+                        "192.0.2.2".parse().unwrap()
+                    ]
+                );
+            }
+            _ => panic!("expected static result"),
+        }
+
+        // Act & Assert: AAAA query returns only the IPv6 address
+        match run(RecordType::AAAA).await.expect("static ip") {
+            ResponseActionResult::Static { bytes, rcode, .. } => {
+                assert_eq!(rcode, ResponseCode::NoError);
+                assert_eq!(
+                    answer_ips(&Message::from_bytes(&bytes).unwrap()),
+                    vec!["2001:db8::1".parse::<IpAddr>().unwrap()]
+                );
+            }
+            _ => panic!("expected static result"),
+        }
+
+        // Act & Assert: HTTPS query returns NODATA (no synthesized address records)
+        match run(RecordType::HTTPS).await.expect("static ip") {
+            ResponseActionResult::Static { bytes, rcode, .. } => {
+                assert_eq!(rcode, ResponseCode::NoError);
+                assert!(
+                    Message::from_bytes(&bytes).unwrap().answers.is_empty(),
+                    "HTTPS should get NODATA, not synthesized A/AAAA records"
+                );
+            }
+            _ => panic!("expected static result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn static_decision_skips_dns_cache_when_pipeline_uses_client_ip() {
+        // Arrange: Build engine, request packet, and a static IP answer
+        let engine = build_test_engine();
+        let mut request = Message::new(0xBE, MessageType::Query, OpCode::Query);
+        request.metadata.recursion_desired = true;
+        request.add_query(Query::query(
+            Name::from_str("example.com").unwrap(),
+            RecordType::A,
+        ));
+        let packet = request.to_vec().unwrap();
+        let peer = "10.0.0.1:53000".parse().unwrap();
+        let (rcode, answers) = make_static_ip_answer("example.com", RecordType::A, "192.0.2.1");
+
+        // Act: uses_client_ip=true must NOT write into dns_cache (client isolation)
+        let ctx = phases::StaticDecisionContext {
+            packet: &packet,
+            qname: "example.com",
+            qtype: RecordType::A,
+            pipeline_id: &Arc::from("p1"),
+            dedupe_hash: 4242,
+            min_ttl: Duration::from_secs(60),
+            start: Instant::now(),
+            peer: &peer,
+            uses_client_ip: true,
+        };
+        phases::handle_static_decision(&engine, &ctx, rcode, answers.clone())
+            .expect("static decision");
+
+        // Assert: no dns_cache entry written
+        assert!(
+            engine.cache_get(&4242).is_none(),
+            "static decision with client_ip matcher must not pollute dns_cache"
+        );
+
+        // Control: uses_client_ip=false DOES write into dns_cache
+        let ctx_plain = phases::StaticDecisionContext {
+            packet: &packet,
+            qname: "example.com",
+            qtype: RecordType::A,
+            pipeline_id: &Arc::from("p1"),
+            dedupe_hash: 4243,
+            min_ttl: Duration::from_secs(60),
+            start: Instant::now(),
+            peer: &peer,
+            uses_client_ip: false,
+        };
+        phases::handle_static_decision(&engine, &ctx_plain, rcode, answers)
+            .expect("static decision");
+
+        assert!(
+            engine.cache_get(&4243).is_some(),
+            "static decision without client_ip matcher should still be cached"
+        );
     }
 
     #[test]
