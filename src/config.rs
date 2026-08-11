@@ -1061,7 +1061,11 @@ where
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
             .collect()),
-        StringOrVec::Array(values) => Ok(values),
+        StringOrVec::Array(values) => Ok(values
+            .into_iter()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect()),
     }
 }
 
@@ -1161,7 +1165,7 @@ mod tests {
         assert_eq!(country_codes, ["CN", "cloudflare"]);
 
         let ResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } = serde_json::from_str(
-            r#"{"type":"response_answer_ip_geoip_country","country_codes":["CN","cloudflare"]}"#,
+            r#"{"type":"response_answer_ip_geoip_country","country_codes":[" CN ",""," cloudflare"]}"#,
         )
         .expect("response matcher should accept an array") else {
             panic!("unexpected response matcher variant");

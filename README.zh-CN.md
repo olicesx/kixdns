@@ -263,7 +263,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | serve_stale_ttl_reset | true | 返回过期数据时重置过期时间窗口。 |
 | serve_stale_client_timeout_ms | 0 | 0 表示立即返回过期数据；大于 0 时先尝试上游指定毫秒数。 |
 | geoip_db_path | null | MaxMind MMDB 路径。 |
-| geoip_dat_path | null | V2Ray GeoIP .dat 或支持的 V2Ray JSON 路径；当前范围加载器使用 IPv4 范围。 |
+| geoip_dat_path | null | V2Ray GeoIP .dat 或支持的 V2Ray JSON 路径；IPv4 和 IPv6 范围按 GeoIP 标签分别建立索引。 |
 | geosite_data_paths | [] | V2Ray GeoSite .dat 或 JSON 路径列表；支持多个文件。 |
 
 当前配置类型会反序列化 geoip_auto_convert 和 geoip_filter_countries，但运行引擎没有读取它们，因此它们不会改变运行行为。转换时的国家过滤请使用 convert-geo-ip 的 --filter。顶层 background_refresh_rule 也会被读取，但当前运行时配置编译会忽略它。
@@ -297,7 +297,7 @@ pipeline_select 的每项包含 Pipeline id、可选的匹配器列表和可选�
 
 Pipeline selector 支持上表全部类型；请求规则支持除 listener_label 之外的全部类型。
 
-域名后缀、GeoSite 标签和 GeoIP 标签匹配不区分大小写。`geoip_country.country_codes` 可使用 ISO 国家代码或 `cloudflare`、`netflix`、`telegram` 等 V2Ray GeoIP 命名标签。规范 JSON 形式为字符串数组；为兼容旧配置，也接受单个字符串或逗号分隔字符串。GeoIP `.dat`/JSON 索引会保留重叠成员关系，因此同一 IP 可以同时属于国家代码和一个或多个命名标签。domain_regex 和 request_domain_regex 使用 Rust 正则语法。
+域名后缀、GeoSite 标签和 GeoIP 标签匹配不区分大小写。`geoip_country.country_codes` 可使用 ISO 国家代码或 `cloudflare`、`netflix`、`telegram` 等 V2Ray GeoIP 命名标签。规范 JSON 形式为字符串数组；为兼容旧配置，也接受单个字符串或逗号分隔字符串。GeoIP `.dat`/JSON 索引会保留重叠成员关系，因此同一 IP 可以同时属于国家代码和一个或多个命名标签。同时配置 MMDB 与 `.dat`/JSON 时，两位国家代码以 MMDB 为准，命名标签仍通过 `.dat`/JSON 索引匹配。domain_regex 和 request_domain_regex 使用 Rust 正则语法。
 
 ### 响应匹配器
 
@@ -318,7 +318,7 @@ Pipeline selector 支持上表全部类型；请求规则支持除 listener_labe
 | response_request_domain_geosite_not | value：GeoSite tag |
 | response_txt_content | mode：exact、prefix 或 regex；value 为文本/模式 |
 
-响应 IP 和 GeoIP 匹配器会检查 A/AAAA 记录，以及 HTTPS/SVCB Answer 记录携带的 `ipv4hint`/`ipv6hint` 参数；它们不会合成或改写 HTTPS/SVCB 记录。
+`response_answer_ip_geoip_country` 只检查 Answer：所有表示 IP 的 Answer 记录都必须匹配，但同一 HTTPS/SVCB 记录内作为候选地址的 `ipv4hint`/`ipv6hint` 使用任一匹配语义。CIDR 和私有 IP 响应匹配器会以任一匹配语义检查 Answer 与 Additional。它们会读取 A/AAAA 和 HTTPS/SVCB hints，但不会合成或改写 HTTPS/SVCB 记录。
 
 当前成功上游标签包含传输前缀，例如 udp:1.1.1.1:53 或 tcp:1.1.1.1:53。因此 upstream_equals 的 value 必须包含该前缀。response_upstream_ip 当前解析原始 IP 或 host:port，不会剥离传输前缀。
 

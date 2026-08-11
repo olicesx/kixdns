@@ -98,7 +98,7 @@ mod matcher_helpers {
         manager.matches(tag, domain)
     }
 
-    fn all_svc_param_ips_match<F>(
+    fn svc_param_ips_match<F>(
         svc_params: &[(
             hickory_proto::rr::rdata::svcb::SvcParamKey,
             hickory_proto::rr::rdata::svcb::SvcParamValue,
@@ -111,20 +111,30 @@ mod matcher_helpers {
     {
         use hickory_proto::rr::rdata::svcb::SvcParamValue;
 
-        svc_params.iter().all(|(_, value)| match value {
-            SvcParamValue::Ipv4Hint(hints) => hints.0.iter().all(|hint| {
-                *has_ip = true;
-                predicate(IpAddr::V4(hint.0))
-            }),
-            SvcParamValue::Ipv6Hint(hints) => hints.0.iter().all(|hint| {
-                *has_ip = true;
-                predicate(IpAddr::V6(hint.0))
-            }),
-            _ => true,
-        })
+        let mut has_hint = false;
+        let mut matched = false;
+        for (_, value) in svc_params {
+            match value {
+                SvcParamValue::Ipv4Hint(hints) => {
+                    for hint in &hints.0 {
+                        has_hint = true;
+                        matched |= predicate(IpAddr::V4(hint.0));
+                    }
+                }
+                SvcParamValue::Ipv6Hint(hints) => {
+                    for hint in &hints.0 {
+                        has_hint = true;
+                        matched |= predicate(IpAddr::V6(hint.0));
+                    }
+                }
+                _ => {}
+            }
+        }
+        *has_ip |= has_hint;
+        !has_hint || matched
     }
 
-    /// Apply a predicate to every address represented directly or as an HTTPS/SVCB IP hint.
+    /// Apply a predicate to direct addresses or any alternative HTTPS/SVCB IP hint.
     pub fn all_rdata_ips_match<F>(
         data: &hickory_proto::rr::RData,
         has_ip: &mut bool,
@@ -144,8 +154,8 @@ mod matcher_helpers {
                 *has_ip = true;
                 predicate(IpAddr::V6(address.0))
             }
-            RData::SVCB(svcb) => all_svc_param_ips_match(&svcb.svc_params, has_ip, predicate),
-            RData::HTTPS(https) => all_svc_param_ips_match(&https.svc_params, has_ip, predicate),
+            RData::SVCB(svcb) => svc_param_ips_match(&svcb.svc_params, has_ip, predicate),
+            RData::HTTPS(https) => svc_param_ips_match(&https.svc_params, has_ip, predicate),
             _ => true,
         }
     }
@@ -155,17 +165,7 @@ mod matcher_helpers {
         F: FnMut(IpAddr) -> bool,
     {
         let mut has_ip = false;
-        let mut matched = false;
-        let mut stop_on_match = |ip| {
-            if predicate(ip) {
-                matched = true;
-                false
-            } else {
-                true
-            }
-        };
-        let _ = all_rdata_ips_match(data, &mut has_ip, &mut stop_on_match);
-        matched
+        all_rdata_ips_match(data, &mut has_ip, predicate) && has_ip
     }
 
     /// 检查响应消息中是否有任意 IP 匹配指定的 CIDR 列表
@@ -1600,6 +1600,47 @@ mod tests {
             Some(&guard),
             None,
         ));
+        let country_response = RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry {
+            country_codes: vec![Arc::from("US")],
+        };
+        assert!(country_response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::HTTPS,
+            DNSClass::IN,
+            &https_message,
+            Some(&guard),
+            None,
+        ));
+
+        let no_hint_record = Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            300,
+            RData::HTTPS(HTTPS(SVCB::new(1, Name::root(), vec![]))),
+        );
+        let mut no_hint_message = Message::new(0, MessageType::Response, OpCode::Query);
+        no_hint_message.add_answer(no_hint_record.clone());
+        assert!(!country_response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::HTTPS,
+            DNSClass::IN,
+            &no_hint_message,
+            Some(&guard),
+            None,
+        ));
+        let mut mixed_no_hint_message = https_message.clone();
+        mixed_no_hint_message.add_answer(no_hint_record);
+        assert!(country_response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::HTTPS,
+            DNSClass::IN,
+            &mixed_no_hint_message,
+            Some(&guard),
+            None,
+        ));
+
         assert!(!response.matches(
             "udp:test",
             "example.com",
@@ -1619,6 +1660,46 @@ mod tests {
             RecordType::HTTPS,
             DNSClass::IN,
             &https_message,
+            Some(&guard),
+            None,
+        ));
+
+        let mut svcb_answer_message = Message::new(0, MessageType::Response, OpCode::Query);
+        svcb_answer_message.add_answer(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            300,
+            RData::SVCB(SVCB::new(
+                1,
+                Name::root(),
+                vec![
+                    (
+                        SvcParamKey::Ipv4Hint,
+                        SvcParamValue::Ipv4Hint(IpHint(vec![A(Ipv4Addr::new(104, 21, 11, 126))])),
+                    ),
+                    (
+                        SvcParamKey::Ipv6Hint,
+                        SvcParamValue::Ipv6Hint(IpHint(vec![AAAA(
+                            "2606:4700:3034::6815:b7e".parse::<Ipv6Addr>().unwrap(),
+                        )])),
+                    ),
+                ],
+            )),
+        ));
+        assert!(country_response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::SVCB,
+            DNSClass::IN,
+            &svcb_answer_message,
+            Some(&guard),
+            None,
+        ));
+        assert!(cidr_response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::SVCB,
+            DNSClass::IN,
+            &svcb_answer_message,
             Some(&guard),
             None,
         ));

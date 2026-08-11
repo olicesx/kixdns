@@ -298,7 +298,7 @@ The same structure is used for response_matchers, response_matcher_operator, res
 
 Pipeline selectors support all of the rows above. Request rules support all rows except listener_label.
 
-Domain suffix matching, GeoSite tags, and GeoIP tags are case-insensitive. `geoip_country.country_codes` accepts both ISO country codes and named V2Ray GeoIP tags such as `cloudflare`, `netflix`, or `telegram`. The canonical JSON form is a string array; a single string or comma-separated string is also accepted for backward compatibility. GeoIP `.dat`/JSON indexes preserve overlapping memberships, so one IP may match both a country code and one or more named tags. `domain_regex` and `request_domain_regex` use Rust regular-expression syntax.
+Domain suffix matching, GeoSite tags, and GeoIP tags are case-insensitive. `geoip_country.country_codes` accepts both ISO country codes and named V2Ray GeoIP tags such as `cloudflare`, `netflix`, or `telegram`. The canonical JSON form is a string array; a single string or comma-separated string is also accepted for backward compatibility. GeoIP `.dat`/JSON indexes preserve overlapping memberships, so one IP may match both a country code and one or more named tags. When MMDB and `.dat`/JSON are both configured, MMDB remains authoritative for two-letter country codes while named tags continue to use the `.dat`/JSON index. `domain_regex` and `request_domain_regex` use Rust regular-expression syntax.
 
 ### Response matchers
 
@@ -319,7 +319,7 @@ Domain suffix matching, GeoSite tags, and GeoIP tags are case-insensitive. `geoi
 | response_request_domain_geosite_not | value: GeoSite tag |
 | response_txt_content | mode: exact, prefix, or regex; value is the text/pattern |
 
-Response IP and GeoIP matchers inspect A/AAAA records and the `ipv4hint`/`ipv6hint` parameters carried by HTTPS/SVCB Answer records. They do not synthesize or rewrite HTTPS/SVCB records.
+`response_answer_ip_geoip_country` inspects Answer records only: every Answer record that represents IPs must match, while alternative `ipv4hint`/`ipv6hint` addresses within one HTTPS/SVCB record use any-match semantics. CIDR and private-IP response matchers inspect both Answers and Additionals with any-match semantics. These matchers read A/AAAA records and HTTPS/SVCB hints; they do not synthesize or rewrite HTTPS/SVCB records.
 
 The successful upstream label currently includes the transport prefix, for example udp:1.1.1.1:53 or tcp:1.1.1.1:53. Therefore upstream_equals values must include that prefix. response_upstream_ip currently parses a raw IP or host:port value; it does not strip the transport prefix.
 

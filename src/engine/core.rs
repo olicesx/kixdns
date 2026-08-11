@@ -145,7 +145,11 @@ impl Engine {
         } else {
             None
         };
-        let geoip_dat_path = cfg.settings.geoip_dat_path.clone();
+        let geoip_dat_path = if uses_geoip {
+            cfg.settings.geoip_dat_path.clone()
+        } else {
+            None
+        };
 
         // Extract GeoSite settings before moving cfg / 在 move cfg 之前提取 GeoSite 设置
         let geosite_data_paths = cfg.settings.geosite_data_paths.clone();
@@ -193,20 +197,9 @@ impl Engine {
                     .unwrap_or(false);
 
                 let load_result = if is_dat {
-                    if uses_geoip {
-                        geoip_manager.load_from_dat_file(&path)
-                    } else {
-                        info!("No GeoIP matchers used in config, skipping GeoIP .dat data loading");
-                        Ok(0)
-                    }
+                    geoip_manager.load_from_dat_file(&path)
                 } else {
-                    // JSON 格式：检查是否需要加载 / JSON format: check if loading is needed
-                    if uses_geoip {
-                        geoip_manager.load_from_v2ray_file(&path)
-                    } else {
-                        info!("No GeoIP matchers used in config, skipping GeoIP JSON data loading");
-                        Ok(0)
-                    }
+                    geoip_manager.load_from_v2ray_file(&path)
                 };
 
                 match load_result {

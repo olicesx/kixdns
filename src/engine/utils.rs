@@ -324,6 +324,17 @@ pub fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<Stri
 ///
 /// 扫描配置以确定是否使用了GeoIP匹配器，这样我们可以对MMDB文件实现延迟加载 / Scans the configuration to determine if any GeoIP matchers are used, so we can implement lazy loading for the MMDB file.
 pub fn uses_geoip_matchers(cfg: &RuntimePipelineConfig) -> bool {
+    if cfg.pipeline_select.iter().any(|rule| {
+        rule.matchers.iter().any(|matcher| {
+            matches!(
+                matcher.matcher,
+                crate::matcher::RuntimePipelineSelectorMatcher::GeoipCountry { .. }
+            )
+        })
+    }) {
+        return true;
+    }
+
     // Scan all pipeline rules / 扫描所有 pipeline 规则
     for pipeline in &cfg.pipelines {
         for rule in &pipeline.rules {
@@ -332,7 +343,6 @@ pub fn uses_geoip_matchers(cfg: &RuntimePipelineConfig) -> bool {
                 if matches!(
                     matcher.matcher,
                     crate::matcher::RuntimeMatcher::GeoipCountry { .. }
-                        | crate::matcher::RuntimeMatcher::GeoipPrivate { .. }
                 ) {
                     return true;
                 }
@@ -343,7 +353,6 @@ pub fn uses_geoip_matchers(cfg: &RuntimePipelineConfig) -> bool {
                 if matches!(
                     matcher.matcher,
                     crate::matcher::RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { .. }
-                        | crate::matcher::RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { .. }
                 ) {
                     return true;
                 }
@@ -369,5 +378,47 @@ pub(crate) fn parse_rcode(rcode: &str) -> Option<ResponseCode> {
         "NOTIMP" => Some(ResponseCode::NotImp),
         "REFUSED" => Some(ResponseCode::Refused),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::uses_geoip_matchers;
+    use crate::{config::PipelineConfig, matcher::RuntimePipelineConfig};
+
+    fn runtime_config(json: &str) -> RuntimePipelineConfig {
+        let config: PipelineConfig = serde_json::from_str(json).unwrap();
+        RuntimePipelineConfig::from_config(config).unwrap()
+    }
+
+    #[test]
+    fn geoip_loading_detection_covers_selectors_but_not_private_matchers() {
+        let selector = runtime_config(
+            r#"{
+                "pipeline_select": [{
+                    "pipeline": "default",
+                    "matchers": [{"type":"geoip_country","country_codes":["CN"]}]
+                }],
+                "pipelines": [{"id":"default"}]
+            }"#,
+        );
+        assert!(uses_geoip_matchers(&selector));
+
+        let private_only = runtime_config(
+            r#"{
+                "pipelines": [{
+                    "id":"default",
+                    "rules": [{
+                        "name":"private-only",
+                        "matchers": [{"type":"geoip_private","expect":true}],
+                        "response_matchers": [{
+                            "type":"response_answer_ip_geoip_private",
+                            "expect":true
+                        }]
+                    }]
+                }]
+            }"#,
+        );
+        assert!(!uses_geoip_matchers(&private_only));
     }
 }

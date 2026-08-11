@@ -290,13 +290,6 @@ impl GeoIpManager {
     /// 检查 IP 是否属于指定标签 / Check whether an IP belongs to a tag.
     #[inline]
     pub fn matches_tag(&self, ip: IpAddr, tag: &str) -> bool {
-        if let Some(reader) = self.reader.as_ref().as_ref() {
-            return self
-                .lookup_mmdb(reader, ip)
-                .country_code
-                .is_some_and(|code| code.eq_ignore_ascii_case(tag));
-        }
-
         let normalized;
         let tag = if tag.bytes().all(|b| !b.is_ascii_lowercase()) {
             tag
@@ -304,6 +297,13 @@ impl GeoIpManager {
             normalized = tag.to_ascii_uppercase();
             &normalized
         };
+
+        if self.reader.as_ref().is_some() && is_country_tag(tag) {
+            return self
+                .lookup(ip)
+                .country_code
+                .is_some_and(|code| code.eq_ignore_ascii_case(tag));
+        }
 
         self.tag_indexes
             .get(tag)
@@ -313,12 +313,8 @@ impl GeoIpManager {
     /// 检查 IP 是否属于任一指定标签 / Check whether an IP belongs to any requested tag.
     #[inline]
     pub fn matches_any_tag(&self, ip: IpAddr, tags: &[Arc<str>]) -> bool {
-        if let Some(reader) = self.reader.as_ref().as_ref() {
-            return self
-                .lookup_mmdb(reader, ip)
-                .country_code
-                .is_some_and(|code| tags.iter().any(|tag| tag.eq_ignore_ascii_case(&code)));
-        }
+        let has_mmdb = self.reader.as_ref().is_some();
+        let mmdb_country = has_mmdb.then(|| self.lookup(ip).country_code).flatten();
 
         for tag in tags {
             let normalized;
@@ -328,6 +324,16 @@ impl GeoIpManager {
                 normalized = tag.to_ascii_uppercase();
                 &normalized
             };
+
+            if has_mmdb && is_country_tag(tag) {
+                if mmdb_country
+                    .as_ref()
+                    .is_some_and(|country_code| country_code.eq_ignore_ascii_case(tag))
+                {
+                    return true;
+                }
+                continue;
+            }
 
             if self
                 .tag_indexes
@@ -343,21 +349,16 @@ impl GeoIpManager {
     /// 返回 IP 命中的全部标签，主要用于诊断和管理接口。
     /// Return all tags matching an IP, primarily for diagnostics and management APIs.
     pub fn lookup_tags(&self, ip: IpAddr) -> Vec<Arc<str>> {
-        if let Some(reader) = self.reader.as_ref().as_ref() {
-            return self
-                .lookup_mmdb(reader, ip)
-                .country_code
-                .into_iter()
-                .collect();
-        }
-
-        let mut tags: Vec<_> = self
-            .tag_indexes
-            .iter()
-            .filter(|(_, index)| index.contains(ip))
-            .map(|(tag, _)| Arc::clone(tag))
-            .collect();
+        let has_mmdb = self.reader.as_ref().is_some();
+        let mut tags: Vec<_> = self.lookup(ip).country_code.into_iter().collect();
+        tags.extend(
+            self.tag_indexes
+                .iter()
+                .filter(|(tag, index)| index.contains(ip) && (!has_mmdb || !is_country_tag(tag)))
+                .map(|(tag, _)| Arc::clone(tag)),
+        );
         tags.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        tags.dedup();
         tags
     }
 
@@ -1047,10 +1048,11 @@ mod tests {
     }
 
     #[test]
-    fn test_mmdb_keeps_precedence_over_dat_tags() {
+    fn test_mmdb_country_precedence_keeps_named_dat_tags() {
         let network = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let mmdb_source = build_dat("US", None, Some((network, 32)));
-        let dat = build_dat("CLOUDFLARE", None, Some((network, 32)));
+        let mut dat = build_dat("CN", None, Some((network, 16)));
+        dat.extend(build_dat("CLOUDFLARE", None, Some((network, 16))));
         let temp_dir = std::env::temp_dir();
         let mmdb_source_path = temp_dir.join("geoip_test_mmdb_source.dat");
         let dat_path = temp_dir.join("geoip_test_mmdb_precedence.dat");
@@ -1064,9 +1066,23 @@ mod tests {
 
         let ip: IpAddr = "2001:db8::1".parse().unwrap();
         assert!(mgr.matches_tag(ip, "US"));
-        assert!(!mgr.matches_tag(ip, "CLOUDFLARE"));
-        assert!(mgr.matches_any_tag(ip, &[Arc::from("US"), Arc::from("CLOUDFLARE")]));
-        assert_eq!(mgr.lookup_tags(ip), vec![Arc::from("US")]);
+        assert!(!mgr.matches_tag(ip, "CN"));
+        assert!(mgr.matches_tag(ip, "CLOUDFLARE"));
+        assert!(mgr.matches_any_tag(ip, &[Arc::from("CN"), Arc::from("CLOUDFLARE")]));
+        assert_eq!(
+            mgr.lookup_tags(ip),
+            vec![Arc::from("CLOUDFLARE"), Arc::from("US")]
+        );
+        assert!(
+            mgr.cache.get(&ip).is_some(),
+            "MMDB matches should use cache"
+        );
+
+        let mmdb_miss: IpAddr = "2001:db9::1".parse().unwrap();
+        assert!(!mgr.matches_tag(mmdb_miss, "CN"));
+        assert!(mgr.matches_tag(mmdb_miss, "CLOUDFLARE"));
+        assert_eq!(mgr.lookup(mmdb_miss).country_code, None);
+        assert_eq!(mgr.lookup_tags(mmdb_miss), vec![Arc::from("CLOUDFLARE")]);
 
         drop(mgr);
         let _ = std::fs::remove_file(mmdb_source_path);
