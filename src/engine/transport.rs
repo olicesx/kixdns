@@ -2976,8 +2976,14 @@ mod tests {
 
         let ptr_before = Arc::as_ptr(&client.client.load_full()) as usize;
         // Two errors stay below the threshold (3): no rebuild.
-        assert!(!client.record_error(upstream), "no rebuild before threshold (1/3)");
-        assert!(!client.record_error(upstream), "no rebuild before threshold (2/3)");
+        assert!(
+            !client.record_error(upstream),
+            "no rebuild before threshold (1/3)"
+        );
+        assert!(
+            !client.record_error(upstream),
+            "no rebuild before threshold (2/3)"
+        );
         assert_eq!(
             Arc::as_ptr(&client.client.load_full()) as usize,
             ptr_before,
@@ -3004,9 +3010,18 @@ mod tests {
         client.record_error(upstream);
         client.record_success(upstream); // reset to 0
         // Counter restarted: need 3 more to rebuild, not just 1.
-        assert!(!client.record_error(upstream), "counter reset: 1/3 after success");
-        assert!(!client.record_error(upstream), "counter reset: 2/3 after success");
-        assert!(client.record_error(upstream), "counter reset: rebuild at 3/3");
+        assert!(
+            !client.record_error(upstream),
+            "counter reset: 1/3 after success"
+        );
+        assert!(
+            !client.record_error(upstream),
+            "counter reset: 2/3 after success"
+        );
+        assert!(
+            client.record_error(upstream),
+            "counter reset: rebuild at 3/3"
+        );
     }
 
     #[test]
@@ -3036,19 +3051,28 @@ mod tests {
         // 只有 HTTP 状态码错误是非传输的（连接健康，重试无益）。
         // 其余（超时/连接/IO）都指示连接可能已死，单次重试安全（DoH 查询语义幂等）。
         let timeout_err = anyhow::anyhow!("doh request timeout");
-        assert!(is_transport_error(&timeout_err), "timeout is transport-level");
+        assert!(
+            is_transport_error(&timeout_err),
+            "timeout is transport-level"
+        );
 
         // A reqwest-style error wrapped via .context() must still classify as
         // transport (downcast finds no DohHttpStatusError at the top of the chain).
         // 经 .context() 包装的 reqwest 风格错误仍须归类为传输错误
         // （downcast 在链顶找不到 DohHttpStatusError）。
         let send_err = anyhow::anyhow!("doh request send failed").context("wrapped");
-        assert!(is_transport_error(&send_err), "wrapped send error is transport-level");
+        assert!(
+            is_transport_error(&send_err),
+            "wrapped send error is transport-level"
+        );
 
         let status_err = anyhow::Error::new(DohHttpStatusError(anyhow::anyhow!(
             "doh http status 503 Server Error"
         )));
-        assert!(!is_transport_error(&status_err), "HTTP status is NOT transport-level");
+        assert!(
+            !is_transport_error(&status_err),
+            "HTTP status is NOT transport-level"
+        );
     }
 
     #[tokio::test]
@@ -3109,7 +3133,10 @@ mod tests {
             .await
             .expect("server did not observe close within 5s of drop; pool_idle_timeout=60s means only the drop could close it");
         let clean_eof = joined.expect("server task join");
-        assert!(clean_eof, "server saw an error instead of clean EOF on Client drop");
+        assert!(
+            clean_eof,
+            "server saw an error instead of clean EOF on Client drop"
+        );
     }
 
     #[tokio::test]
