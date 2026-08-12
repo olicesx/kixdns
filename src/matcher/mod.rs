@@ -58,13 +58,13 @@ impl TxtMatchMode {
 mod matcher_helpers {
     use super::*;
 
-    /// 检查 IP 的 GeoIP 国家代码是否匹配指定的国家代码列表（大小写不敏感）
-    /// Check if IP's GeoIP country code matches the specified list (case insensitive)
+    /// 检查 IP 是否匹配指定的 GeoIP 标签列表（大小写不敏感）
+    /// Check whether an IP matches the specified GeoIP tags (case insensitive)
     ///
     /// # 参数 / Parameters
     /// - `manager`: GeoIpManager 引用 / GeoIpManager reference
     /// - `ip`: 要检查的 IP 地址 / IP address to check
-    /// - `country_codes`: 允许的国家代码列表（使用 Arc<str> 零拷贝）/ Allowed country codes (Arc<str> for zero-copy)
+    /// - `country_codes`: 允许的国家代码或命名标签 / Allowed country codes or named tags
     ///
     /// # 返回 / Returns
     /// - `true`: IP 属于指定的国家之一 / IP belongs to one of the specified countries
@@ -75,23 +75,7 @@ mod matcher_helpers {
         ip: IpAddr,
         country_codes: &[Arc<str>],
     ) -> bool {
-        let result = manager.lookup(ip);
-
-        // ✅ 优化：提前返回，避免闭包分配
-        // ✅ Optimization: Early return to avoid closure allocation
-        let country_code = match result.country_code.as_ref() {
-            Some(code) => code,
-            None => return false,
-        };
-
-        // ✅ 优化：直接迭代，避免 any() 的闭包开销
-        // ✅ Optimization: Direct iteration to avoid closure overhead of any()
-        for code in country_codes {
-            if code.eq_ignore_ascii_case(country_code.as_ref()) {
-                return true;
-            }
-        }
-        false
+        manager.matches_any_tag(ip, country_codes)
     }
 
     /// 检查域名是否属于指定的 GeoSite 分类
@@ -114,6 +98,76 @@ mod matcher_helpers {
         manager.matches(tag, domain)
     }
 
+    fn svc_param_ips_match<F>(
+        svc_params: &[(
+            hickory_proto::rr::rdata::svcb::SvcParamKey,
+            hickory_proto::rr::rdata::svcb::SvcParamValue,
+        )],
+        has_ip: &mut bool,
+        predicate: &mut F,
+    ) -> bool
+    where
+        F: FnMut(IpAddr) -> bool,
+    {
+        use hickory_proto::rr::rdata::svcb::SvcParamValue;
+
+        let mut has_hint = false;
+        let mut matched = false;
+        for (_, value) in svc_params {
+            match value {
+                SvcParamValue::Ipv4Hint(hints) => {
+                    for hint in &hints.0 {
+                        has_hint = true;
+                        matched |= predicate(IpAddr::V4(hint.0));
+                    }
+                }
+                SvcParamValue::Ipv6Hint(hints) => {
+                    for hint in &hints.0 {
+                        has_hint = true;
+                        matched |= predicate(IpAddr::V6(hint.0));
+                    }
+                }
+                _ => {}
+            }
+        }
+        *has_ip |= has_hint;
+        !has_hint || matched
+    }
+
+    /// Apply a predicate to direct addresses or any alternative HTTPS/SVCB IP hint.
+    pub fn all_rdata_ips_match<F>(
+        data: &hickory_proto::rr::RData,
+        has_ip: &mut bool,
+        predicate: &mut F,
+    ) -> bool
+    where
+        F: FnMut(IpAddr) -> bool,
+    {
+        use hickory_proto::rr::RData;
+
+        match data {
+            RData::A(address) => {
+                *has_ip = true;
+                predicate(IpAddr::V4(address.0))
+            }
+            RData::AAAA(address) => {
+                *has_ip = true;
+                predicate(IpAddr::V6(address.0))
+            }
+            RData::SVCB(svcb) => svc_param_ips_match(&svcb.svc_params, has_ip, predicate),
+            RData::HTTPS(https) => svc_param_ips_match(&https.svc_params, has_ip, predicate),
+            _ => true,
+        }
+    }
+
+    pub fn rdata_has_matching_ip<F>(data: &hickory_proto::rr::RData, predicate: &mut F) -> bool
+    where
+        F: FnMut(IpAddr) -> bool,
+    {
+        let mut has_ip = false;
+        all_rdata_ips_match(data, &mut has_ip, predicate) && has_ip
+    }
+
     /// 检查响应消息中是否有任意 IP 匹配指定的 CIDR 列表
     /// Check if any IP in response message matches the specified CIDR list
     ///
@@ -125,25 +179,16 @@ mod matcher_helpers {
     /// - `true`: 至少有一个 IP 匹配 / At least one IP matches
     /// - `false`: 没有IP匹配 / No IP matches
     pub fn any_ip_matches_nets(msg: &Message, nets: &[IpNet]) -> bool {
-        use hickory_proto::rr::RData;
+        let mut matches_net = |ip| nets.iter().any(|net| net.contains(&ip));
 
-        // 先检查 Answer / Check Answer first
-        let found = msg.answers.iter().any(|record| match &record.data {
-            RData::A(a) => nets.iter().any(|net| net.contains(&IpAddr::V4(a.0))),
-            RData::AAAA(aaaa) => nets.iter().any(|net| net.contains(&IpAddr::V6(aaaa.0))),
-            _ => false,
-        });
-
-        if found {
-            return true;
-        }
-
-        // 再检查 Additionals / Check Additionals
-        msg.additionals.iter().any(|record| match &record.data {
-            RData::A(a) => nets.iter().any(|net| net.contains(&IpAddr::V4(a.0))),
-            RData::AAAA(aaaa) => nets.iter().any(|net| net.contains(&IpAddr::V6(aaaa.0))),
-            _ => false,
-        })
+        // Check Answer first, then Additionals. HTTPS/SVCB hints are part of their RDATA.
+        msg.answers
+            .iter()
+            .any(|record| rdata_has_matching_ip(&record.data, &mut matches_net))
+            || msg
+                .additionals
+                .iter()
+                .any(|record| rdata_has_matching_ip(&record.data, &mut matches_net))
     }
 }
 
@@ -263,7 +308,7 @@ pub enum RuntimeResponseMatcher {
     ResponseUpstreamIp {
         nets: Vec<IpNet>,
     },
-    /// 匹配 Answer 中任意 A/AAAA 记录的 IP / Match IPs of any A/AAAA records in the Answer
+    /// Match Answer A/AAAA addresses and HTTPS/SVCB IP hints.
     ResponseAnswerIp {
         nets: Vec<IpNet>,
     },
@@ -283,7 +328,7 @@ pub enum RuntimeResponseMatcher {
     ResponseEdnsPresent {
         expect: bool,
     },
-    /// 匹配响应中 IP 的 GeoIP 国家代码 / Match GeoIP country code of IPs in response
+    /// 匹配响应中 IP 的 GeoIP 国家代码或命名标签 / Match GeoIP country codes or named tags of response IPs
     ResponseAnswerIpGeoipCountry {
         country_codes: Vec<Arc<str>>,
     },
@@ -713,6 +758,19 @@ fn normalize_upstream_addr(addr: &str) -> String {
     }
 }
 
+fn normalize_geoip_country_codes(country_codes: Vec<String>, matcher: &str) -> Vec<Arc<str>> {
+    if country_codes.is_empty() {
+        tracing::warn!(
+            matcher,
+            "GeoIP country matcher has no country codes and will never match"
+        );
+    }
+    country_codes
+        .into_iter()
+        .map(|code| Arc::from(code.to_ascii_uppercase()))
+        .collect()
+}
+
 impl RuntimeMatcher {
     fn from_config(m: config::Matcher) -> anyhow::Result<Self> {
         Ok(match m {
@@ -728,7 +786,7 @@ impl RuntimeMatcher {
                     .build()?,
             },
             config::Matcher::GeoipCountry { country_codes } => RuntimeMatcher::GeoipCountry {
-                country_codes: country_codes.into_iter().map(Arc::from).collect(),
+                country_codes: normalize_geoip_country_codes(country_codes, "geoip_country"),
             },
             config::Matcher::GeoipPrivate { expect } => RuntimeMatcher::GeoipPrivate { expect },
             config::Matcher::Qclass { value } => RuntimeMatcher::Qclass {
@@ -788,15 +846,7 @@ impl RuntimeMatcher {
                 })
             }
             RuntimeMatcher::GeoipPrivate { expect } => {
-                // 按需获取锁：只在GeoIP matcher时才获取
-                if let Some(manager) = geoip_manager {
-                    let guard = manager.read();
-                    let result = guard.lookup(client_ip);
-                    result.is_private == *expect
-                } else {
-                    // Fallback to basic private IP check
-                    crate::matcher::geoip::is_private_ip(client_ip) == *expect
-                }
+                crate::matcher::geoip::is_private_ip(client_ip) == *expect
             }
             RuntimeMatcher::Qclass { value } => &qclass == value,
             RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
@@ -850,15 +900,7 @@ impl RuntimeMatcher {
                 })
             }
             RuntimeMatcher::GeoipPrivate { expect } => {
-                // 按需获取锁：只在GeoIP matcher时才获取
-                if let Some(manager) = geoip_manager {
-                    let guard = manager.read();
-                    let result = guard.lookup(client_ip);
-                    result.is_private == *expect
-                } else {
-                    // Fallback to basic private IP check
-                    crate::matcher::geoip::is_private_ip(client_ip) == *expect
-                }
+                crate::matcher::geoip::is_private_ip(client_ip) == *expect
             }
             RuntimeMatcher::Qclass { value } => &qclass == value,
             RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
@@ -937,7 +979,7 @@ impl RuntimePipelineSelectorMatcher {
             }
             config::PipelineSelectorMatcher::GeoipCountry { country_codes } => {
                 RuntimePipelineSelectorMatcher::GeoipCountry {
-                    country_codes: country_codes.into_iter().map(Arc::from).collect(),
+                    country_codes: normalize_geoip_country_codes(country_codes, "geoip_country"),
                 }
             }
             config::PipelineSelectorMatcher::GeoipPrivate { expect } => {
@@ -996,11 +1038,7 @@ impl RuntimePipelineSelectorMatcher {
     /// 如果此匹配器需要 GeoIP 管理器才能评估则返回 true。
     #[inline]
     pub const fn needs_geoip(&self) -> bool {
-        matches!(
-            self,
-            RuntimePipelineSelectorMatcher::GeoipCountry { .. }
-                | RuntimePipelineSelectorMatcher::GeoipPrivate { .. }
-        )
+        matches!(self, RuntimePipelineSelectorMatcher::GeoipCountry { .. })
     }
 
     #[inline]
@@ -1042,25 +1080,10 @@ impl RuntimePipelineSelectorMatcher {
                 }
             }
             RuntimePipelineSelectorMatcher::GeoipCountry { country_codes } => {
-                if let Some(mgr) = geoip_ready {
-                    let result = mgr.lookup(client_ip);
-                    if let Some(cc) = result.country_code {
-                        country_codes.iter().any(|c| c.eq_ignore_ascii_case(&cc))
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
+                geoip_ready.is_some_and(|mgr| mgr.matches_any_tag(client_ip, country_codes))
             }
             RuntimePipelineSelectorMatcher::GeoipPrivate { expect } => {
-                if let Some(mgr) = geoip_ready {
-                    let result = mgr.lookup(client_ip);
-                    result.is_private == *expect
-                } else {
-                    // Fallback to basic private IP check
-                    crate::matcher::geoip::is_private_ip(client_ip) == *expect
-                }
+                crate::matcher::geoip::is_private_ip(client_ip) == *expect
             }
             RuntimePipelineSelectorMatcher::Qtype { value } => *value == qtype,
         }
@@ -1115,25 +1138,12 @@ impl RuntimePipelineSelectorMatcher {
             }
             RuntimePipelineSelectorMatcher::GeoipCountry { country_codes } => {
                 // 按需获取锁：只在GeoIP matcher时才获取 / On-demand lock: only acquire for GeoIP matcher
-                geoip_manager.map(|mgr| mgr.read()).is_some_and(|guard| {
-                    let result = guard.lookup(client_ip);
-                    if let Some(cc) = result.country_code {
-                        country_codes.iter().any(|c| c.eq_ignore_ascii_case(&cc))
-                    } else {
-                        false
-                    }
-                })
+                geoip_manager
+                    .map(|mgr| mgr.read())
+                    .is_some_and(|guard| guard.matches_any_tag(client_ip, country_codes))
             }
             RuntimePipelineSelectorMatcher::GeoipPrivate { expect } => {
-                // 按需获取锁：只在GeoIP matcher时才获取
-                if let Some(manager) = geoip_manager {
-                    let guard = manager.read();
-                    let result = guard.lookup(client_ip);
-                    result.is_private == *expect
-                } else {
-                    // Fallback to basic private IP check
-                    crate::matcher::geoip::is_private_ip(client_ip) == *expect
-                }
+                crate::matcher::geoip::is_private_ip(client_ip) == *expect
             }
             RuntimePipelineSelectorMatcher::Qtype { value } => *value == qtype,
         }
@@ -1283,7 +1293,10 @@ impl RuntimeResponseMatcher {
             }
             config::ResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } => {
                 RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry {
-                    country_codes: country_codes.into_iter().map(Arc::from).collect(),
+                    country_codes: normalize_geoip_country_codes(
+                        country_codes,
+                        "response_answer_ip_geoip_country",
+                    ),
                 }
             }
             config::ResponseMatcher::ResponseAnswerIpGeoipPrivate { expect } => {
@@ -1388,76 +1401,28 @@ impl RuntimeResponseMatcher {
                 edns == *expect
             }
             RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } => {
-                // 优化：直接迭代 DNS 记录以避免分配 Vec，并在首次不匹配时短路
-                // Optimization: Iterate DNS records directly to avoid Vec allocation, and short-circuit on first mismatch
-                use hickory_proto::rr::RData;
-
+                let Some(manager) = geoip_manager else {
+                    return false;
+                };
                 let mut has_ip = false;
-
-                // 检查 Answers
-                let all_match_answers = msg.answers.iter().all(|record| {
-                    let ip = match &record.data {
-                        RData::A(a) => Some(IpAddr::V4(a.0)),
-                        RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
-                        _ => None,
-                    };
-
-                    if let Some(ip) = ip {
-                        has_ip = true;
-                        // 如果没有管理器，则无法匹配，视为失败
-                        // If no manager, cannot match, consider failure
-                        if let Some(manager) = geoip_manager {
-                            matcher_helpers::match_geoip_country(manager, ip, country_codes)
-                        } else {
-                            false
-                        }
-                    } else {
-                        // 非 IP 记录忽略，继续检查其他记录
-                        // Ignore non-IP records, continue checking others
-                        true
-                    }
+                let mut matches_country =
+                    |ip| matcher_helpers::match_geoip_country(manager, ip, country_codes);
+                let all_match = msg.answers.iter().all(|record| {
+                    matcher_helpers::all_rdata_ips_match(
+                        &record.data,
+                        &mut has_ip,
+                        &mut matches_country,
+                    )
                 });
-
-                if !all_match_answers {
-                    return false;
-                }
-
-                // 也检查 Additionals (如果策略要求检查整个消息中的 IP)
-                // Check Additionals as well (if policy requires checking IPs in entire message)
-                // 注意：通常 ResponseAnswerIp 只关注 Answers。这里保持与原 collect_ips_from_message 行为一致吗？
-                // 原 collect_ips_from_message 只迭代了 msg.answers()！
-                // Check matcher_helpers code: "for record in msg.answers() { ... }" - YES, only answers.
-                // 原代码逻辑：如果 answers 为空，返回 false (all_ips.is_empty check)
-
-                if !has_ip {
-                    return false;
-                }
-
-                true
+                all_match && has_ip
             }
             RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { expect } => {
-                // 检查 Answer 中是否有任意 IP 为私有 IP
-                use hickory_proto::rr::RData;
-                let mut has_private_ip = msg.answers.iter().any(|record| match &record.data {
-                    RData::A(a) => crate::matcher::geoip::is_private_ip(std::net::IpAddr::V4(a.0)),
-                    RData::AAAA(aaaa) => {
-                        crate::matcher::geoip::is_private_ip(std::net::IpAddr::V6(aaaa.0))
-                    }
-                    _ => false,
+                let mut is_private = crate::matcher::geoip::is_private_ip;
+                let has_private_ip = msg.answers.iter().any(|record| {
+                    matcher_helpers::rdata_has_matching_ip(&record.data, &mut is_private)
+                }) || msg.additionals.iter().any(|record| {
+                    matcher_helpers::rdata_has_matching_ip(&record.data, &mut is_private)
                 });
-
-                if !has_private_ip {
-                    // 检查 additionals
-                    has_private_ip = msg.additionals.iter().any(|record| match &record.data {
-                        RData::A(a) => {
-                            crate::matcher::geoip::is_private_ip(std::net::IpAddr::V4(a.0))
-                        }
-                        RData::AAAA(aaaa) => {
-                            crate::matcher::geoip::is_private_ip(std::net::IpAddr::V6(aaaa.0))
-                        }
-                        _ => false,
-                    });
-                }
 
                 has_private_ip == *expect
             }
@@ -1532,4 +1497,287 @@ fn parse_dns_type(v: &str) -> anyhow::Result<RecordType> {
         _ => anyhow::bail!("unsupported qtype: {upper}"),
     };
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::{
+        op::{MessageType, OpCode},
+        rr::{
+            Name, RData, Record,
+            rdata::{
+                A, AAAA, HTTPS, SVCB,
+                svcb::{IpHint, SvcParamKey, SvcParamValue},
+            },
+        },
+    };
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn overlapping_geoip_tag_reaches_all_runtime_matchers() {
+        let json = r#"{
+            "entries": [
+                { "country_code": "US", "ips": ["104.16.0.0/12"] },
+                { "country_code": "cloudflare", "ips": ["104.16.0.0/12", "2606:4700::/32"] }
+            ]
+        }"#;
+        let path = std::env::temp_dir().join("geoip_runtime_matchers.json");
+        std::fs::write(&path, json).unwrap();
+
+        let mut manager = geoip::GeoIpManager::new(None).unwrap();
+        manager.load_from_v2ray_file(&path).unwrap();
+        let manager = Arc::new(crate::lock::RwLock::new(manager));
+        let ip: IpAddr = "104.16.0.1".parse().unwrap();
+        let tags = vec![Arc::from("cloudflare")];
+
+        let request = RuntimeMatcher::GeoipCountry {
+            country_codes: tags.clone(),
+        };
+        assert!(request.matches_with_qtype(
+            "example.com",
+            DNSClass::IN,
+            ip,
+            false,
+            RecordType::A,
+            Some(&manager),
+            None,
+        ));
+
+        let pipeline = RuntimePipelineSelectorMatcher::GeoipCountry {
+            country_codes: tags.clone(),
+        };
+        let query = PipelineSelectorQuery {
+            listener_label: "test",
+            client_ip: ip,
+            qname: "example.com",
+            qclass: DNSClass::IN,
+            edns_present: false,
+            qtype: RecordType::A,
+        };
+        let guard = manager.read();
+        assert!(pipeline.matches_with_ready_managers(&query, Some(&guard), None));
+
+        let response = RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry {
+            country_codes: tags,
+        };
+        let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+        message.add_answer(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            300,
+            RData::A(A(Ipv4Addr::new(104, 16, 0, 1))),
+        ));
+        assert!(response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::A,
+            DNSClass::IN,
+            &message,
+            Some(&guard),
+            None,
+        ));
+
+        let mut https_message = Message::new(0, MessageType::Response, OpCode::Query);
+        https_message.add_answer(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            300,
+            RData::HTTPS(HTTPS(SVCB::new(
+                1,
+                Name::root(),
+                vec![
+                    (
+                        SvcParamKey::Ipv4Hint,
+                        SvcParamValue::Ipv4Hint(IpHint(vec![A(Ipv4Addr::new(104, 21, 11, 126))])),
+                    ),
+                    (
+                        SvcParamKey::Ipv6Hint,
+                        SvcParamValue::Ipv6Hint(IpHint(vec![AAAA(
+                            "2606:4700:3034::6815:b7e".parse::<Ipv6Addr>().unwrap(),
+                        )])),
+                    ),
+                ],
+            ))),
+        ));
+        assert!(response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::HTTPS,
+            DNSClass::IN,
+            &https_message,
+            Some(&guard),
+            None,
+        ));
+        let country_response = RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry {
+            country_codes: vec![Arc::from("US")],
+        };
+        assert!(country_response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::HTTPS,
+            DNSClass::IN,
+            &https_message,
+            Some(&guard),
+            None,
+        ));
+
+        let no_hint_record = Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            300,
+            RData::HTTPS(HTTPS(SVCB::new(1, Name::root(), vec![]))),
+        );
+        let mut no_hint_message = Message::new(0, MessageType::Response, OpCode::Query);
+        no_hint_message.add_answer(no_hint_record.clone());
+        assert!(!country_response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::HTTPS,
+            DNSClass::IN,
+            &no_hint_message,
+            Some(&guard),
+            None,
+        ));
+        let mut mixed_no_hint_message = https_message.clone();
+        mixed_no_hint_message.add_answer(no_hint_record);
+        assert!(country_response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::HTTPS,
+            DNSClass::IN,
+            &mixed_no_hint_message,
+            Some(&guard),
+            None,
+        ));
+
+        assert!(!response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::HTTPS,
+            DNSClass::IN,
+            &https_message,
+            None,
+            None,
+        ));
+
+        let cidr_response = RuntimeResponseMatcher::ResponseAnswerIp {
+            nets: vec!["104.21.0.0/16".parse().unwrap()],
+        };
+        assert!(cidr_response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::HTTPS,
+            DNSClass::IN,
+            &https_message,
+            Some(&guard),
+            None,
+        ));
+
+        let mut svcb_answer_message = Message::new(0, MessageType::Response, OpCode::Query);
+        svcb_answer_message.add_answer(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            300,
+            RData::SVCB(SVCB::new(
+                1,
+                Name::root(),
+                vec![
+                    (
+                        SvcParamKey::Ipv4Hint,
+                        SvcParamValue::Ipv4Hint(IpHint(vec![A(Ipv4Addr::new(104, 21, 11, 126))])),
+                    ),
+                    (
+                        SvcParamKey::Ipv6Hint,
+                        SvcParamValue::Ipv6Hint(IpHint(vec![AAAA(
+                            "2606:4700:3034::6815:b7e".parse::<Ipv6Addr>().unwrap(),
+                        )])),
+                    ),
+                ],
+            )),
+        ));
+        assert!(country_response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::SVCB,
+            DNSClass::IN,
+            &svcb_answer_message,
+            Some(&guard),
+            None,
+        ));
+        assert!(cidr_response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::SVCB,
+            DNSClass::IN,
+            &svcb_answer_message,
+            Some(&guard),
+            None,
+        ));
+
+        let mut mixed_message = https_message.clone();
+        mixed_message.add_answer(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            300,
+            RData::A(A(Ipv4Addr::new(203, 0, 113, 1))),
+        ));
+        assert!(!response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::HTTPS,
+            DNSClass::IN,
+            &mixed_message,
+            Some(&guard),
+            None,
+        ));
+
+        let mut additional_message = Message::new(0, MessageType::Response, OpCode::Query);
+        additional_message.add_additional(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            300,
+            RData::A(A(Ipv4Addr::new(104, 21, 11, 126))),
+        ));
+        assert!(!response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::A,
+            DNSClass::IN,
+            &additional_message,
+            Some(&guard),
+            None,
+        ));
+        assert!(cidr_response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::A,
+            DNSClass::IN,
+            &additional_message,
+            Some(&guard),
+            None,
+        ));
+
+        let mut svcb_message = Message::new(0, MessageType::Response, OpCode::Query);
+        svcb_message.add_additional(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            300,
+            RData::SVCB(SVCB::new(
+                1,
+                Name::root(),
+                vec![(
+                    SvcParamKey::Ipv4Hint,
+                    SvcParamValue::Ipv4Hint(IpHint(vec![A(Ipv4Addr::new(192, 168, 1, 1))])),
+                )],
+            )),
+        ));
+        let private_response =
+            RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { expect: true };
+        assert!(private_response.matches(
+            "udp:test",
+            "example.com",
+            RecordType::SVCB,
+            DNSClass::IN,
+            &svcb_message,
+            Some(&guard),
+            None,
+        ));
+
+        drop(guard);
+        let _ = std::fs::remove_file(path);
+    }
 }

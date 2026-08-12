@@ -83,13 +83,13 @@ kixdns run -c /path/to/pipeline.json
 
 编辑器只是静态前端，不会启动 KixDNS，也不会检查证书、数据文件、CIDR、正则或上游连通性。下载后应以 KixDNS 启动时的解析和校验结果为准。
 
-当前 Rust 配置类型对 geoip_country 和 response_answer_ip_geoip_country 的 country_codes 要求字符串数组，例如：
+`geoip_country` 和 `response_answer_ip_geoip_country` 的 `country_codes` 规范格式是字符串数组，例如：
 
 ~~~json
 { "type": "geoip_country", "country_codes": ["CN", "US"] }
 ~~~
 
-如果手动编辑右侧 JSON，请保持这个数组格式。编辑器界面中的国家代码输入是逗号分隔文本；生成文件后应检查 JSON 中是否为数组。
+服务端为兼容旧配置也接受单个字符串或逗号分隔字符串，并会去除首尾空白和空项。编辑器界面使用逗号分隔文本，导出时生成规范数组格式。
 
 以下字段目前虽然会被编辑器显示或输出，但不会改变运行引擎行为：
 
@@ -141,7 +141,7 @@ Pipeline selector 支持：
 - response_request_domain_geosite_not
 - response_txt_content
 
-GeoSite 和 GeoIP 的输入值在编辑器中可以使用普通字段。编辑器还会识别 geosite:tag 和 geoip:COUNTRY 形式并将参数写入对应字段；服务端最终仍按 Rust 配置枚举解析。
+GeoSite 和 GeoIP 的输入值在编辑器中可以使用普通字段。编辑器还会识别 geosite:tag 和 geoip:COUNTRY 形式并将参数写入对应字段；`COUNTRY` 也可以是 `cloudflare`、`netflix` 等 V2Ray GeoIP 标签。GeoIP 标签大小写不敏感，且同一 IP 可以同时匹配国家代码和命名标签；服务端最终仍按 Rust 配置枚举解析。
 
 ### 动作
 
