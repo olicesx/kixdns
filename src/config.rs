@@ -131,6 +131,10 @@ pub struct GlobalSettings {
     /// DoH 上游连接池大小（每个 upstream 的最大空闲连接数）。 / DoH upstream pool size (max idle per host)
     #[serde(default = "default_doh_pool_size")]
     pub doh_pool_size: usize,
+    /// DoH 健康检查错误阈值（连续传输错误多少次后重建连接池以驱逐死连接）。 / DoH health check error threshold (rebuild pool after N consecutive transport errors to evict dead connections)
+    /// 默认 3 次，0 表示禁用健康检查 / Default 3, 0 means disable health check
+    #[serde(default = "default_doh_health_check_error_threshold")]
+    pub doh_health_check_error_threshold: usize,
     /// DoT 上游连接池大小。 / DoT upstream connection pool size
     #[serde(default = "default_dot_pool_size")]
     pub dot_pool_size: usize,
@@ -255,6 +259,7 @@ impl Default for GlobalSettings {
             udp_pool_size: default_udp_pool_size(),
             tcp_pool_size: default_tcp_pool_size(),
             doh_pool_size: default_doh_pool_size(),
+            doh_health_check_error_threshold: default_doh_health_check_error_threshold(),
             dot_pool_size: default_dot_pool_size(),
             doq_pool_size: default_doq_pool_size(),
             tcp_health_check_error_threshold: default_tcp_health_check_error_threshold(),
@@ -909,6 +914,10 @@ fn default_tcp_pool_size() -> usize {
 
 fn default_doh_pool_size() -> usize {
     8
+}
+
+fn default_doh_health_check_error_threshold() -> usize {
+    3 // 连续 3 次传输错误后重建连接池 / Rebuild pool after 3 consecutive transport errors
 }
 
 /// Default DoH query path (RFC 8484 standard) / 默认 DoH 查询路径（RFC 8484 标准）

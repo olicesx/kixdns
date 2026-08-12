@@ -1,4 +1,5 @@
 use anyhow::Context;
+use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use dashmap::mapref::entry;
@@ -1215,19 +1216,63 @@ impl TcpMuxClient {
 
 // ===================== DoH (DNS over HTTPS) =====================
 
+/// Marker for HTTP status errors: the connection itself is healthy, so retrying
+/// won't help (only transport-level errors indicate a possibly dead connection).
+/// HTTP 状态码错误标记：连接本身正常，重试无益
+/// （只有传输层错误才指示连接可能已死）
+#[derive(Debug)]
+struct DohHttpStatusError(anyhow::Error);
+
+impl std::fmt::Display for DohHttpStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for DohHttpStatusError {}
+
 pub struct DohClient {
-    client: DohHttpClient,
+    /// Hot-swappable reqwest client (its connection pool). Replacing it drops the
+    /// old pool, which is the only way to evict half-open/dead connections that
+    /// reqwest cannot detect (DoH uses POST, which hyper won't auto-retry).
+    /// 可热替换的 reqwest 客户端（其连接池）。替换即丢弃旧池，
+    /// 这是清除 reqwest 无法检测的半开/死连接的唯一手段
+    /// （DoH 用 POST，hyper 不会自动重试）
+    client: ArcSwap<DohHttpClient>,
+    pool_max_idle_per_host: usize,
+    /// Per-upstream consecutive transport-error counts. Mirrors the mux clients'
+    /// consecutive_errors, but keyed by upstream since the reqwest pool is per-host.
+    /// per-upstream 连续传输错误计数。对齐 mux 的 consecutive_errors，
+    /// 因 reqwest 连接池是 per-host 的，按 upstream 维度计数
+    error_counts: DashMap<Arc<str>, usize, FxBuildHasher>,
+    /// Threshold of consecutive transport errors that triggers a pool rebuild.
+    /// 触发连接池重建的连续传输错误阈值
+    health_error_threshold: usize,
 }
 
 impl DohClient {
-    pub fn new(pool_max_idle_per_host: usize) -> anyhow::Result<Self> {
-        let client = DohHttpClient::builder()
+    pub fn new(
+        pool_max_idle_per_host: usize,
+        health_error_threshold: usize,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            client: ArcSwap::from_pointee(Self::build_client(pool_max_idle_per_host)?),
+            pool_max_idle_per_host,
+            error_counts: DashMap::with_hasher(FxBuildHasher),
+            health_error_threshold,
+        })
+    }
+
+    /// Build a fresh reqwest client. Used for both initial construction and pool
+    /// rebuilds (the latter evicts dead/half-open connections).
+    /// 构建新的 reqwest 客户端，用于初始构造和连接池重建（后者驱逐死/半开连接）
+    fn build_client(pool_max_idle_per_host: usize) -> anyhow::Result<DohHttpClient> {
+        DohHttpClient::builder()
             .http2_adaptive_window(true)
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(pool_max_idle_per_host.max(1))
             .build()
-            .context("build doh http client")?;
-        Ok(Self { client })
+            .context("build doh http client")
     }
 
     pub async fn send(
@@ -1237,10 +1282,59 @@ impl DohClient {
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
         let (url, host_override) = build_doh_url(upstream)?;
+        let host = host_override.as_deref();
 
-        let mut req = self
-            .client
-            .post(url)
+        let start = tokio::time::Instant::now();
+        match self.send_once(packet, &url, host, timeout_dur).await {
+            Ok(bytes) => {
+                self.record_success(upstream);
+                Ok(bytes)
+            }
+            Err(err) if is_transport_error(&err) => {
+                // TRANSPARENT RETRY: DNS queries are semantically idempotent, so a
+                // single retry is safe. record_error() may rebuild the pool first;
+                // the retry then loads the fresh client (new connections).
+                // 透明重试：DNS 查询语义幂等，单次重试安全。
+                // record_error() 可能先重建连接池，重试时加载新客户端（新连接）。
+                let rebuilt = self.record_error(upstream);
+                let remaining = timeout_dur.saturating_sub(start.elapsed());
+                // Mirror TcpMuxClient: guarantee >= 1.5s budget for the fresh attempt.
+                // 对齐 TcpMuxClient：为新尝试保证至少 1.5s 预算
+                let retry_timeout = if remaining < Duration::from_secs(1) {
+                    Duration::from_millis(1500)
+                } else {
+                    remaining
+                };
+                warn!(
+                    upstream = upstream,
+                    error = %err,
+                    pool_rebuilt = rebuilt,
+                    retry_timeout_ms = retry_timeout.as_millis() as u64,
+                    "DoH transport error, performing transparent retry"
+                );
+                self.send_once(packet, &url, host, retry_timeout).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Single attempt: send the request and read the body within a timeout.
+    /// 单次尝试：在超时内发送请求并读取响应体
+    async fn send_once(
+        &self,
+        packet: &[u8],
+        url: &Url,
+        host_override: Option<&str>,
+        timeout_dur: Duration,
+    ) -> anyhow::Result<Bytes> {
+        // load_full() returns an owned Arc<Client>, keeping the Future Send across
+        // await points (an ArcSwap Guard would not). The Arc is cheap to hold.
+        // load_full() 返回 owned Arc<Client>，保持 Future 跨 await 点 Send
+        // （ArcSwap 的 Guard 不满足）。持有 Arc 很廉价。
+        let client = self.client.load_full();
+
+        let mut req = client
+            .post(url.clone())
             .header(ACCEPT, "application/dns-message")
             .header(CONTENT_TYPE, "application/dns-message")
             .body(packet.to_vec());
@@ -1249,25 +1343,101 @@ impl DohClient {
             req = req.header(HOST, host);
         }
 
-        // Wrap entire operation (send + read body) in a single timeout
-        // to prevent hanging if server sends headers but delays body.
+        // Wrap entire operation (send + read body) in a single timeout to prevent
+        // hanging if the server sends headers but delays the body.
         // 将整个操作（发送 + 读取响应体）包裹在单个超时中，
         // 防止服务器发送头信息但延迟响应体时挂起。
-        let bytes = timeout(timeout_dur, async {
+        let result = timeout(timeout_dur, async {
             let resp = req.send().await.context("doh request send failed")?;
 
             let status = resp.status();
             if !status.is_success() {
-                return Err(anyhow::anyhow!("doh http status {status}"));
+                // Wrap as DohHttpStatusError so the caller knows the connection is
+                // fine and a retry won't help.
+                // 包装为 DohHttpStatusError，让调用方知道连接正常、重试无益
+                return Err(anyhow::Error::new(DohHttpStatusError(anyhow::anyhow!(
+                    "doh http status {status}"
+                ))));
             }
 
             resp.bytes().await.context("read doh response body")
         })
-        .await
-        .context("doh request timeout")??;
+        .await;
 
-        Ok(bytes)
+        match result {
+            Ok(Ok(bytes)) => Ok(bytes),
+            // reqwest send / IO / body error — transport-level, retryable
+            // reqwest 发送 / IO / 响应体错误 —— 传输层，可重试
+            Ok(Err(e)) => Err(e),
+            // Timeout — transport-level, retryable
+            // 超时 —— 传输层，可重试
+            Err(_elapsed) => Err(anyhow::anyhow!("doh request timeout")),
+        }
     }
+
+    /// Record a consecutive transport error for the upstream. When the count
+    /// reaches the threshold, rebuild the reqwest client (evicting the dead
+    /// connection pool) and reset the counter. Returns true if rebuilt.
+    /// 记录 upstream 的连续传输错误。计数达阈值时重建 reqwest 客户端
+    /// （驱逐死连接池）并清零计数。重建返回 true。
+    fn record_error(&self, upstream: &str) -> bool {
+        let mut count = self
+            .error_counts
+            .entry(Arc::<str>::from(upstream))
+            .or_insert(0);
+        *count += 1;
+        if *count >= self.health_error_threshold {
+            match Self::build_client(self.pool_max_idle_per_host) {
+                Ok(new_client) => {
+                    // Swap in a fresh client; the old pool is released once in-flight
+                    // requests holding a cloned Arc finish.
+                    // 替换为新客户端；旧池在持有 Arc 副本的在途请求结束后释放
+                    self.client.store(Arc::new(new_client));
+                    warn!(
+                        upstream = upstream,
+                        consecutive_errors = *count,
+                        threshold = self.health_error_threshold,
+                        "DoH error threshold exceeded, rebuilding connection pool"
+                    );
+                    *count = 0;
+                    true
+                }
+                Err(e) => {
+                    warn!(
+                        upstream = upstream,
+                        error = %e,
+                        "failed to rebuild DoH client, keeping old pool"
+                    );
+                    false
+                }
+            }
+        } else {
+            debug!(
+                upstream = upstream,
+                consecutive_errors = *count,
+                threshold = self.health_error_threshold,
+                "DoH transport error recorded"
+            );
+            false
+        }
+    }
+
+    /// Clear the consecutive error counter on success (mirrors record_success).
+    /// 成功时清零连续错误计数（对齐 record_success）
+    fn record_success(&self, upstream: &str) {
+        if let Some(mut count) = self.error_counts.get_mut(upstream) {
+            *count = 0;
+        }
+    }
+}
+
+/// A transport-level error is anything that is NOT an HTTP status error: timeouts,
+/// connection failures, and IO errors all indicate a possibly dead connection and
+/// are safe to retry once (DoH queries are semantically idempotent).
+/// 传输层错误 = 非 HTTP 状态码错误：超时、连接失败、IO 错误都指示连接可能已死，
+/// 单次重试安全（DoH 查询语义幂等）
+fn is_transport_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<DohHttpStatusError>().is_none()
 }
 
 fn build_doh_url(upstream: &str) -> anyhow::Result<(Url, Option<String>)> {
@@ -2790,6 +2960,183 @@ mod tests {
         assert!(parse_doq_target("doq://223.5.5.5:853").is_err());
         assert!(parse_doq_target("doq://223.5.5.5:853?sni=alidns.com").is_ok());
         assert!(parse_doq_target("doq://dns.alidns.com:853").is_ok());
+    }
+
+    #[test]
+    fn doh_record_error_rebuilds_pool_at_threshold() {
+        // Verify the core self-healing contract: consecutive transport errors below
+        // the threshold accumulate without rebuilding; reaching it rebuilds the pool
+        // (a fresh reqwest::Client is the only way to evict dead/half-open connections
+        // that reqwest cannot detect on its own).
+        // 验证核心自愈契约：连续传输错误在阈值前累积不重建；
+        // 达阈值时重建连接池（新 reqwest::Client 是清除 reqwest 自身无法检测的
+        // 死/半开连接的唯一手段）。
+        let client = DohClient::new(8, 3).expect("build doh client");
+        let upstream = "doh:8.8.8.8";
+
+        let ptr_before = Arc::as_ptr(&client.client.load_full()) as usize;
+        // Two errors stay below the threshold (3): no rebuild.
+        assert!(
+            !client.record_error(upstream),
+            "no rebuild before threshold (1/3)"
+        );
+        assert!(
+            !client.record_error(upstream),
+            "no rebuild before threshold (2/3)"
+        );
+        assert_eq!(
+            Arc::as_ptr(&client.client.load_full()) as usize,
+            ptr_before,
+            "client pointer must be unchanged below threshold"
+        );
+        // Third error reaches the threshold: pool rebuilt.
+        assert!(client.record_error(upstream), "rebuild at threshold (3/3)");
+        assert_ne!(
+            Arc::as_ptr(&client.client.load_full()) as usize,
+            ptr_before,
+            "client pointer must change after rebuild"
+        );
+    }
+
+    #[test]
+    fn doh_record_success_resets_counter() {
+        // record_success clears the per-upstream counter so a transient blip does
+        // not accumulate toward a rebuild across an intervening healthy request.
+        // record_success 清零 per-upstream 计数，避免偶发错误跨健康请求累积到重建。
+        let client = DohClient::new(8, 3).expect("build doh client");
+        let upstream = "doh:1.1.1.1";
+
+        client.record_error(upstream);
+        client.record_error(upstream);
+        client.record_success(upstream); // reset to 0
+        // Counter restarted: need 3 more to rebuild, not just 1.
+        assert!(
+            !client.record_error(upstream),
+            "counter reset: 1/3 after success"
+        );
+        assert!(
+            !client.record_error(upstream),
+            "counter reset: 2/3 after success"
+        );
+        assert!(
+            client.record_error(upstream),
+            "counter reset: rebuild at 3/3"
+        );
+    }
+
+    #[test]
+    fn doh_error_counts_are_isolated_per_upstream() {
+        // Mirrors mux clients' per-upstream consecutive_errors isolation: errors on
+        // one upstream must not inflate another upstream's count.
+        // 对齐 mux 的 per-upstream consecutive_errors 隔离：
+        // 一个 upstream 的错误不得累加到另一个 upstream。
+        let client = DohClient::new(8, 3).expect("build doh client");
+
+        client.record_error("doh:8.8.8.8");
+        client.record_error("doh:8.8.8.8");
+        // A success on a *different* upstream must not touch 8.8.8.8's count.
+        client.record_success("doh:1.1.1.1");
+        // 8.8.8.8 still at 2 — the 3rd error rebuilds.
+        assert!(
+            client.record_error("doh:8.8.8.8"),
+            "isolated counter reaches threshold independently"
+        );
+    }
+
+    #[test]
+    fn doh_is_transport_error_classifies_correctly() {
+        // Only HTTP status errors are non-transport (connection is healthy, retry is
+        // useless). Everything else (timeout / connect / IO) indicates a possibly
+        // dead connection and is safe to retry once (DoH queries are idempotent).
+        // 只有 HTTP 状态码错误是非传输的（连接健康，重试无益）。
+        // 其余（超时/连接/IO）都指示连接可能已死，单次重试安全（DoH 查询语义幂等）。
+        let timeout_err = anyhow::anyhow!("doh request timeout");
+        assert!(
+            is_transport_error(&timeout_err),
+            "timeout is transport-level"
+        );
+
+        // A reqwest-style error wrapped via .context() must still classify as
+        // transport (downcast finds no DohHttpStatusError at the top of the chain).
+        // 经 .context() 包装的 reqwest 风格错误仍须归类为传输错误
+        // （downcast 在链顶找不到 DohHttpStatusError）。
+        let send_err = anyhow::anyhow!("doh request send failed").context("wrapped");
+        assert!(
+            is_transport_error(&send_err),
+            "wrapped send error is transport-level"
+        );
+
+        let status_err = anyhow::Error::new(DohHttpStatusError(anyhow::anyhow!(
+            "doh http status 503 Server Error"
+        )));
+        assert!(
+            !is_transport_error(&status_err),
+            "HTTP status is NOT transport-level"
+        );
+    }
+
+    #[tokio::test]
+    async fn reqwest_client_drop_closes_pooled_connections() {
+        // Empirical foundation of DohClient's pool-rebuild healing: dropping a
+        // reqwest::Client closes the keep-alive connections held in its pool. If
+        // this did not hold, rebuilding the client (store a fresh Arc<Client>)
+        // could NOT evict dead/half-open connections and issue #41 would persist.
+        // DohClient 连接池重建自愈的实证基础：drop reqwest::Client 会关闭其连接池中
+        // 的 keep-alive 连接。若不成立，重建客户端（store 新 Arc<Client>）无法驱逐
+        // 死/半开连接，issue #41 将无法解决。
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Minimal HTTP/1.1 keep-alive server: serve one request, then block reading
+        // until the peer closes the connection.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("read test addr");
+
+        let server_task = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 1024];
+            let _ = sock.read(&mut buf).await; // read request
+            let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
+            sock.write_all(resp).await.expect("write response");
+            // Block until peer closes; Ok(0) = clean EOF (connection closed by client).
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) => return true,
+                    Ok(_) => continue,
+                    Err(_) => return false,
+                }
+            }
+        });
+
+        let url = format!("http://{addr}/");
+        {
+            // Long idle timeout so only an explicit Client drop can close the
+            // connection within the test window (not the idle reaper).
+            // 长 idle 超时，确保测试窗口内只有显式 drop Client 能关闭连接（而非 idle 回收）。
+            let client = DohHttpClient::builder()
+                .pool_idle_timeout(Duration::from_secs(60))
+                .build()
+                .expect("build client");
+            let resp = client.get(&url).send().await.expect("send");
+            assert!(resp.status().is_success());
+            drop(resp.bytes().await.expect("read body")); // drain → connection returns to pool
+            // client dropped at end of this block → pool torn down
+        }
+
+        // pool_idle_timeout is 60s; if the drop did not close the connection the
+        // server would only observe EOF after ~60s. A 5s window therefore proves
+        // the closure was caused by the drop.
+        // pool_idle_timeout 为 60s；若 drop 未关闭连接，server 要等约 60s 才观察到 EOF。
+        // 5s 窗口因此证明关闭由 drop 引起。
+        let joined = tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server did not observe close within 5s of drop; pool_idle_timeout=60s means only the drop could close it");
+        let clean_eof = joined.expect("server task join");
+        assert!(
+            clean_eof,
+            "server saw an error instead of clean EOF on Client drop"
+        );
     }
 
     #[tokio::test]

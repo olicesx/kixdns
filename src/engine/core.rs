@@ -111,6 +111,7 @@ impl Engine {
         let udp_pool_size = cfg.settings.udp_pool_size;
         let tcp_pool_size = cfg.settings.tcp_pool_size;
         let doh_pool_size = cfg.settings.doh_pool_size;
+        let doh_health_error_threshold = cfg.settings.doh_health_check_error_threshold;
         let dot_pool_size = cfg.settings.dot_pool_size;
         let doq_pool_size = cfg.settings.doq_pool_size;
         let doq_idle_timeout_secs = cfg.settings.doq_connection_idle_timeout_seconds;
@@ -341,7 +342,10 @@ impl Engine {
             .context("initialize DoT multiplexer")?,
         );
 
-        let doh_client = Arc::new(DohClient::new(doh_pool_size).context("initialize DoH client")?);
+        let doh_client = Arc::new(
+            DohClient::new(doh_pool_size, doh_health_error_threshold)
+                .context("initialize DoH client")?,
+        );
         let doq_client = Arc::new(
             DoqClient::new(
                 doq_pool_size,
