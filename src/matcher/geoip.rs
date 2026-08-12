@@ -697,40 +697,20 @@ fn merge_ipv6_ranges(ranges: &mut Vec<Ipv6Range>) {
 
 fn most_specific_ipv4(ranges: &[Ipv4Range], ip: u32) -> Option<Ipv4Range> {
     let index = ranges.partition_point(|range| range.start <= ip);
-    let mut best: Option<Ipv4Range> = None;
-    for range in ranges[..index].iter().rev() {
-        if best.is_some_and(|best| range.start < best.start) {
-            break;
-        }
-        if range.end >= ip
-            && match best {
-                None => true,
-                Some(best) => range.end < best.end,
-            }
-        {
-            best = Some(*range);
-        }
-    }
-    best
+    ranges[..index]
+        .iter()
+        .filter(|range| range.end >= ip)
+        .min_by_key(|range| (range.end - range.start, std::cmp::Reverse(range.start)))
+        .copied()
 }
 
 fn most_specific_ipv6(ranges: &[Ipv6Range], ip: u128) -> Option<Ipv6Range> {
     let index = ranges.partition_point(|range| range.start <= ip);
-    let mut best: Option<Ipv6Range> = None;
-    for range in ranges[..index].iter().rev() {
-        if best.is_some_and(|best| range.start < best.start) {
-            break;
-        }
-        if range.end >= ip
-            && match best {
-                None => true,
-                Some(best) => range.end < best.end,
-            }
-        {
-            best = Some(*range);
-        }
-    }
-    best
+    ranges[..index]
+        .iter()
+        .filter(|range| range.end >= ip)
+        .min_by_key(|range| (range.end - range.start, std::cmp::Reverse(range.start)))
+        .copied()
 }
 
 #[inline]
@@ -747,9 +727,11 @@ fn is_more_specific(
     match current {
         None => true,
         Some((current_tag, current_start, current_end)) => {
-            start > *current_start
-                || (start == *current_start && end < *current_end)
-                || (start == *current_start && end == *current_end && tag < current_tag.as_ref())
+            let span = end - start;
+            let current_span = *current_end - *current_start;
+            span < current_span
+                || (span == current_span && start > *current_start)
+                || (span == current_span && start == *current_start && tag < current_tag.as_ref())
         }
     }
 }
@@ -1021,6 +1003,23 @@ mod tests {
             ],
         };
         list.encode_to_vec()
+    }
+
+    #[test]
+    fn test_most_specific_handles_crossing_overlaps() {
+        let ipv4_ranges = [
+            Ipv4Range { start: 40, end: 55 },
+            Ipv4Range { start: 45, end: 70 },
+        ];
+        let ipv4_match = most_specific_ipv4(&ipv4_ranges, 50).unwrap();
+        assert_eq!((ipv4_match.start, ipv4_match.end), (40, 55));
+
+        let ipv6_ranges = [
+            Ipv6Range { start: 40, end: 55 },
+            Ipv6Range { start: 45, end: 70 },
+        ];
+        let ipv6_match = most_specific_ipv6(&ipv6_ranges, 50).unwrap();
+        assert_eq!((ipv6_match.start, ipv6_match.end), (40, 55));
     }
 
     #[test]

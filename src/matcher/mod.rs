@@ -758,6 +758,19 @@ fn normalize_upstream_addr(addr: &str) -> String {
     }
 }
 
+fn normalize_geoip_country_codes(country_codes: Vec<String>, matcher: &str) -> Vec<Arc<str>> {
+    if country_codes.is_empty() {
+        tracing::warn!(
+            matcher,
+            "GeoIP country matcher has no country codes and will never match"
+        );
+    }
+    country_codes
+        .into_iter()
+        .map(|code| Arc::from(code.to_ascii_uppercase()))
+        .collect()
+}
+
 impl RuntimeMatcher {
     fn from_config(m: config::Matcher) -> anyhow::Result<Self> {
         Ok(match m {
@@ -773,10 +786,7 @@ impl RuntimeMatcher {
                     .build()?,
             },
             config::Matcher::GeoipCountry { country_codes } => RuntimeMatcher::GeoipCountry {
-                country_codes: country_codes
-                    .into_iter()
-                    .map(|code| Arc::from(code.to_ascii_uppercase()))
-                    .collect(),
+                country_codes: normalize_geoip_country_codes(country_codes, "geoip_country"),
             },
             config::Matcher::GeoipPrivate { expect } => RuntimeMatcher::GeoipPrivate { expect },
             config::Matcher::Qclass { value } => RuntimeMatcher::Qclass {
@@ -969,10 +979,7 @@ impl RuntimePipelineSelectorMatcher {
             }
             config::PipelineSelectorMatcher::GeoipCountry { country_codes } => {
                 RuntimePipelineSelectorMatcher::GeoipCountry {
-                    country_codes: country_codes
-                        .into_iter()
-                        .map(|code| Arc::from(code.to_ascii_uppercase()))
-                        .collect(),
+                    country_codes: normalize_geoip_country_codes(country_codes, "geoip_country"),
                 }
             }
             config::PipelineSelectorMatcher::GeoipPrivate { expect } => {
@@ -1286,10 +1293,10 @@ impl RuntimeResponseMatcher {
             }
             config::ResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } => {
                 RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry {
-                    country_codes: country_codes
-                        .into_iter()
-                        .map(|code| Arc::from(code.to_ascii_uppercase()))
-                        .collect(),
+                    country_codes: normalize_geoip_country_codes(
+                        country_codes,
+                        "response_answer_ip_geoip_country",
+                    ),
                 }
             }
             config::ResponseMatcher::ResponseAnswerIpGeoipPrivate { expect } => {

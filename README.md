@@ -329,7 +329,7 @@ Domain suffix and GeoSite matching are also case-insensitive. `domain_regex` and
 
 Response address matching uses these scopes:
 
-- `response_answer_ip_geoip_country` checks Answers only. Every Answer that contains an address must match one of the requested GeoIP tags.
+- `response_answer_ip_geoip_country` checks Answers only. Every Answer that contains an address must match one of the requested GeoIP tags, and at least one Answer must contain an address.
 - `response_answer_ip` and `response_answer_ip_geoip_private` check both Answers and Additionals and succeed when any address matches.
 - A/AAAA addresses and HTTPS/SVCB `ipv4hint`/`ipv6hint` values are inspected. Hints in one HTTPS/SVCB record are alternative endpoints, so any matching hint satisfies that record.
 
