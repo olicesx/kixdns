@@ -19,11 +19,11 @@ use crate::matcher::{
 };
 
 use super::core::Engine;
-use super::make_static_ip_answer;
 use super::matcher_adapter::{MatcherContext, matcher_matches};
 use super::rules::Decision;
 use super::rules::{RuleCacheEntry, calculate_rule_hash, contains_continue, fast_hash_str};
 use super::types::EngineInner;
+use super::{make_static_cname_answer, make_static_ip_answer};
 
 /// Request and manager references required to select a runtime pipeline.
 pub struct PipelineSelectionContext<'a> {
@@ -385,6 +385,19 @@ impl Engine {
                         }
                         Action::StaticIpResponse { ip } => {
                             let (rcode, answers) = make_static_ip_answer(qname, request.qtype, ip);
+                            let d = Decision::Static { rcode, answers };
+                            self.insert_rule_cache(
+                                rule_hash,
+                                pipeline.id.clone(),
+                                request,
+                                d.clone(),
+                                include_ip,
+                            );
+                            return d;
+                        }
+                        Action::StaticCnameResponse { target, ttl } => {
+                            let (rcode, answers) =
+                                make_static_cname_answer(qname, target, ttl.unwrap_or(300));
                             let d = Decision::Static { rcode, answers };
                             self.insert_rule_cache(
                                 rule_hash,
