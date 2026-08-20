@@ -2,7 +2,7 @@ use bytes::Bytes;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{
     DNSClass, Name, RData, Record, RecordType,
-    rdata::{A, AAAA, TXT},
+    rdata::{A, AAAA, CNAME, TXT},
 };
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use std::net::IpAddr;
@@ -75,6 +75,25 @@ pub(crate) fn make_static_ip_answer(
         .collect();
 
     (ResponseCode::NoError, answers)
+}
+
+/// 创建静态 CNAME 记录响应 / Create a static CNAME record response
+pub(crate) fn make_static_cname_answer(
+    qname: &str,
+    target: &str,
+    ttl: u32,
+) -> (ResponseCode, Vec<Record>) {
+    let target = target.trim();
+    if target.is_empty() {
+        return (ResponseCode::ServFail, Vec::new());
+    }
+
+    let (Ok(name), Ok(target)) = (Name::from_str(qname), Name::from_str(target)) else {
+        return (ResponseCode::ServFail, Vec::new());
+    };
+
+    let record = Record::from_rdata(name, ttl, RData::CNAME(CNAME(target)));
+    (ResponseCode::NoError, vec![record])
 }
 
 /// 创建静态TXT记录响应 / Create static TXT record response
@@ -175,6 +194,35 @@ fn extract_soa_negative_ttl(msg: &Message) -> u64 {
 mod tests {
     use super::*;
     use hickory_proto::rr::rdata::SOA;
+
+    #[test]
+    fn static_cname_answer_uses_configured_target_and_ttl() {
+        let (rcode, answers) = make_static_cname_answer("alias.example.", "origin.example.", 120);
+
+        assert_eq!(rcode, ResponseCode::NoError);
+        assert_eq!(answers.len(), 1);
+        assert_eq!(&answers[0].name, &Name::from_str("alias.example.").unwrap());
+        assert_eq!(answers[0].ttl, 120);
+        match &answers[0].data {
+            RData::CNAME(CNAME(target)) => {
+                assert_eq!(target, &Name::from_str("origin.example.").unwrap());
+            }
+            other => panic!("unexpected static CNAME answer: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn static_cname_answer_rejects_invalid_names() {
+        for (qname, target) in [
+            ("invalid name", "origin.example."),
+            ("alias.example.", "invalid name"),
+            ("alias.example.", ""),
+        ] {
+            let (rcode, answers) = make_static_cname_answer(qname, target, 300);
+            assert_eq!(rcode, ResponseCode::ServFail);
+            assert!(answers.is_empty());
+        }
+    }
 
     #[test]
     fn test_extract_ttl_positive_response() {

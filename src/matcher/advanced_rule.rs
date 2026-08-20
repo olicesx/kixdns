@@ -10,7 +10,7 @@ use smallvec::SmallVec;
 
 use crate::config::{Action, MatchOperator};
 use crate::engine::utils::parse_rcode;
-use crate::engine::{Decision, make_static_ip_answer};
+use crate::engine::{Decision, make_static_cname_answer, make_static_ip_answer};
 use crate::matcher::eval_match_chain;
 use crate::matcher::{RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig, RuntimeRule};
 
@@ -68,6 +68,7 @@ pub enum CompiledMatcher {
 pub enum PrecomputedAction {
     Static { rcode: ResponseCode },
     StaticIp { ip: String },
+    StaticCname { target: String, ttl: u32 },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -254,6 +255,10 @@ fn precompute_action(rule: &RuntimeRule) -> Option<PrecomputedAction> {
             parse_rcode(rcode).map(|rc| PrecomputedAction::Static { rcode: rc })
         }
         Action::StaticIpResponse { ip } => Some(PrecomputedAction::StaticIp { ip: ip.clone() }),
+        Action::StaticCnameResponse { target, ttl } => Some(PrecomputedAction::StaticCname {
+            target: target.clone(),
+            ttl: ttl.unwrap_or(300),
+        }),
         Action::Deny => Some(PrecomputedAction::Static {
             rcode: ResponseCode::Refused,
         }),
@@ -292,6 +297,10 @@ pub(crate) fn fast_static_match(
                 }
                 PrecomputedAction::StaticIp { ip } => {
                     let (rcode, answers) = make_static_ip_answer(qname, qtype, ip);
+                    return Some(Decision::Static { rcode, answers });
+                }
+                PrecomputedAction::StaticCname { target, ttl } => {
+                    let (rcode, answers) = make_static_cname_answer(qname, target, *ttl);
                     return Some(Decision::Static { rcode, answers });
                 }
             }
