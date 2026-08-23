@@ -358,7 +358,7 @@ The aliases and-not, andnot, or-not, and ornot are also accepted.
 | log | level (optional) | Emits a tracing event for the matched rule. Supported levels are trace, debug, info, warn, and error. |
 | static_response | rcode | Returns NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, or REFUSED. |
 | static_ip_response | ip | Returns A or AAAA records matching the query type (both for ANY queries). Other query types, including HTTPS and SVCB, receive NODATA; this action does not synthesize IP hints. `ip` accepts one address or a comma-separated list of IPv4/IPv6 addresses (for example, `192.0.2.1,2001:db8::1`). Addresses are returned as-is; a very large list may exceed the UDP response size limit. |
-| static_cname_response | target, ttl (optional) | Returns a CNAME record that maps the queried name to `target`; ttl defaults to 300. Invalid owner or target names return SERVFAIL. |
+| static_cname_response | target, ttl (optional) | Returns a CNAME record for every query type that maps the queried name to `target`; ttl defaults to 300. The target is not resolved server-side and its address records are not included, so the client or resolver must follow the alias. Clients that do not follow a bare CNAME may report no data. Invalid owner or target names return SERVFAIL. |
 | static_txt_response | text, ttl (optional) | Returns a TXT response. text accepts a string or string array; ttl defaults to 300. |
 | jump_to_pipeline | pipeline | Starts processing the referenced pipeline. |
 | allow | none | Request phase: forward with the global default UDP upstream. Response phase: keep the current upstream response. |

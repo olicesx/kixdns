@@ -1541,6 +1541,7 @@ mod tests {
         assert_eq!(response.metadata.response_code, ResponseCode::NoError);
         assert_eq!(response.queries[0].query_type(), RecordType::A);
         assert_eq!(response.answers.len(), 1);
+        assert_eq!(&response.answers[0].name, response.queries[0].name());
         assert_eq!(response.answers[0].record_type(), RecordType::CNAME);
         assert_eq!(response.answers[0].ttl, 120);
         match &response.answers[0].data {
@@ -2163,6 +2164,7 @@ mod tests {
                 assert_eq!(rcode, ResponseCode::NoError);
                 let response = Message::from_bytes(&bytes).unwrap();
                 assert_eq!(response.answers.len(), 1);
+                assert_eq!(&response.answers[0].name, response.queries[0].name());
                 assert_eq!(response.answers[0].ttl, 60);
                 match &response.answers[0].data {
                     RData::CNAME(cname) => {
