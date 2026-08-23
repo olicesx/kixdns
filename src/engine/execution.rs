@@ -1501,6 +1501,57 @@ mod tests {
         assert_response(RecordType::AAAA, &["2001:db8::1".parse().unwrap()]);
     }
 
+    #[tokio::test]
+    async fn static_cname_fast_path_maps_query_name_to_target() {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [{
+                "id": "static",
+                "rules": [{
+                    "name": "static-cname",
+                    "matchers": [{ "type": "domain_suffix", "value": "alias.example" }],
+                    "actions": [{
+                        "type": "static_cname_response",
+                        "target": "origin.example.",
+                        "ttl": 120
+                    }]
+                }]
+            }]
+        });
+        let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
+        let engine = Engine::new(runtime, "test".to_string()).expect("initialize engine");
+        let peer = "127.0.0.1:53000".parse().unwrap();
+
+        let mut request = Message::new(0xCAFE, MessageType::Query, OpCode::Query);
+        request.metadata.recursion_desired = true;
+        request.add_query(Query::query(
+            Name::from_str("alias.example").unwrap(),
+            RecordType::A,
+        ));
+
+        let response = match engine
+            .handle_packet_fast(&request.to_vec().unwrap(), peer)
+            .expect("fast path")
+        {
+            Some(FastPathResponse::Direct(bytes)) => Message::from_bytes(&bytes).unwrap(),
+            other => panic!("expected direct fast-path response, got {other:?}"),
+        };
+
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(response.queries[0].query_type(), RecordType::A);
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(&response.answers[0].name, response.queries[0].name());
+        assert_eq!(response.answers[0].record_type(), RecordType::CNAME);
+        assert_eq!(response.answers[0].ttl, 120);
+        match &response.answers[0].data {
+            RData::CNAME(cname) => {
+                assert_eq!(cname.0, Name::from_str("origin.example.").unwrap());
+            }
+            other => panic!("unexpected static CNAME answer: {other:?}"),
+        }
+    }
+
     #[test]
     fn pipeline_select_picks_matching_pipeline() {
         // Arrange: Create configuration with pipeline selection rules
@@ -2071,6 +2122,56 @@ mod tests {
                     Message::from_bytes(&bytes).unwrap().answers.is_empty(),
                     "HTTPS should get NODATA, not synthesized A/AAAA records"
                 );
+            }
+            _ => panic!("expected static result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_actions_static_cname_returns_configured_alias() {
+        let engine = build_test_engine();
+        let mut req = Message::new(0xCAFE, MessageType::Query, OpCode::Query);
+        req.add_query(Query::query(
+            Name::from_str("alias.example").unwrap(),
+            RecordType::A,
+        ));
+        let actions = [Action::StaticCnameResponse {
+            target: "origin.example.".to_string(),
+            ttl: Some(60),
+        }];
+        let response_matchers: Vec<RuntimeResponseMatcherWithOp> = Vec::new();
+        let packet = req.to_vec().unwrap();
+        let ctx = crate::engine::rules::ApplyResponseActionsContext {
+            engine: &engine,
+            actions: &actions,
+            ctx_opt: None,
+            req: &req,
+            packet: &packet,
+            upstream_timeout: Duration::from_secs(1),
+            response_matchers: &response_matchers,
+            qname: "alias.example",
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            client_ip: "10.0.0.1".parse().unwrap(),
+            upstream_default: TEST_UPSTREAM,
+            pipeline_id: "pipeline",
+            rule_name: "rule",
+            remaining_jumps: 10,
+        };
+
+        match apply_response_actions(ctx).await.expect("static cname") {
+            ResponseActionResult::Static { bytes, rcode, .. } => {
+                assert_eq!(rcode, ResponseCode::NoError);
+                let response = Message::from_bytes(&bytes).unwrap();
+                assert_eq!(response.answers.len(), 1);
+                assert_eq!(&response.answers[0].name, response.queries[0].name());
+                assert_eq!(response.answers[0].ttl, 60);
+                match &response.answers[0].data {
+                    RData::CNAME(cname) => {
+                        assert_eq!(cname.0, Name::from_str("origin.example.").unwrap());
+                    }
+                    other => panic!("unexpected static CNAME answer: {other:?}"),
+                }
             }
             _ => panic!("expected static result"),
         }

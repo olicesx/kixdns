@@ -17,7 +17,8 @@ use crate::engine::core::Engine;
 use crate::engine::matcher_adapter::log_match;
 use crate::engine::pipeline::RuleEvaluationContext;
 use crate::engine::response::{
-    extract_ttl, extract_ttl_for_refresh, make_static_ip_answer, make_static_txt_answer,
+    extract_ttl, extract_ttl_for_refresh, make_static_cname_answer, make_static_ip_answer,
+    make_static_txt_answer,
 };
 use crate::engine::types::EngineInner;
 use crate::engine::types::InflightMap;
@@ -269,6 +270,16 @@ pub(crate) async fn apply_response_actions(
             }
             Action::StaticIpResponse { ip } => {
                 let (rcode, answers) = make_static_ip_answer(ctx.qname, ctx.qtype, ip);
+                let bytes = build_response(ctx.req, rcode, answers)?;
+                return Ok(ResponseActionResult::Static {
+                    bytes,
+                    rcode,
+                    source: "response_action",
+                });
+            }
+            Action::StaticCnameResponse { target, ttl } => {
+                let (rcode, answers) =
+                    make_static_cname_answer(ctx.qname, target, ttl.unwrap_or(300));
                 let bytes = build_response(ctx.req, rcode, answers)?;
                 return Ok(ResponseActionResult::Static {
                     bytes,

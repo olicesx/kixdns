@@ -526,6 +526,14 @@ pub enum Action {
     StaticResponse { rcode: String },
     /// 返回一个或逗号分隔的多个固定 IPv4/IPv6 地址。 / Return one or more comma-separated static IPv4/IPv6 addresses.
     StaticIpResponse { ip: String },
+    /// 返回固定 CNAME 记录。 / Return a static CNAME record.
+    StaticCnameResponse {
+        /// CNAME 目标域名 / Canonical target domain name
+        target: String,
+        /// TTL (可选，默认 300) / TTL (optional, default 300)
+        #[serde(default)]
+        ttl: Option<u32>,
+    },
     /// 返回固定 TXT 记录。支持单个字符串或字符串数组。 / Return static TXT record. Supports single string or string array.
     StaticTxtResponse {
         /// TXT 记录内容 / TXT record content
