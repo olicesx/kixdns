@@ -88,26 +88,6 @@ pub enum ResponseActionResult {
 
 #[inline]
 pub fn calculate_rule_hash(
-    pipeline_id: &str,
-    qname: &str,
-    qtype: RecordType,
-    qclass: DNSClass,
-    client_ip: IpAddr,
-    uses_client_ip: bool,
-) -> u64 {
-    calculate_rule_hash_in_namespace(
-        0,
-        pipeline_id,
-        qname,
-        qtype,
-        qclass,
-        client_ip,
-        uses_client_ip,
-    )
-}
-
-#[inline]
-pub(crate) fn calculate_rule_hash_in_namespace(
     cache_namespace: u64,
     pipeline_id: &str,
     qname: &str,
@@ -701,7 +681,7 @@ pub(crate) async fn process_response_jump(
         }
 
         remaining_jumps = local_jumps;
-        let dedupe_hash = Engine::calculate_cache_hash_in_namespace(
+        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(
             state.cache_namespace(&pipeline_id),
             &pipeline_id,
             qname.as_bytes(),

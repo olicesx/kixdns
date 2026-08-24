@@ -216,17 +216,6 @@ impl Engine {
 
     #[inline]
     pub fn calculate_cache_hash_for_dedupe(
-        pipeline_id: &str,
-        qname: &[u8],
-        qtype: hickory_proto::rr::RecordType,
-        qclass: hickory_proto::rr::DNSClass,
-        ecs_key: Option<&crate::ecs::EcsKey>,
-    ) -> u64 {
-        Self::calculate_cache_hash_in_namespace(0, pipeline_id, qname, qtype, qclass, ecs_key)
-    }
-
-    #[inline]
-    pub(crate) fn calculate_cache_hash_in_namespace(
         cache_namespace: u64,
         pipeline_id: &str,
         qname: &[u8],
@@ -303,7 +292,7 @@ impl Engine {
         self.incr_total_requests();
 
         // Get pipeline ID / 获取 pipeline ID
-        let state = self.state.load();
+        let state = self.state.load_full();
         let cfg = &state.pipeline;
         let qclass = DNSClass::from(q.qclass);
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
@@ -335,7 +324,7 @@ impl Engine {
                 .and_then(|mode| crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip()))
         });
         let cache_namespace = state.cache_namespace(&pipeline_id);
-        let cache_hash = Self::calculate_cache_hash_in_namespace(
+        let cache_hash = Self::calculate_cache_hash_for_dedupe(
             cache_namespace,
             &pipeline_id,
             q.qname_bytes,
@@ -411,13 +400,13 @@ impl Engine {
                                 "triggering background cache refresh"
                             );
                             self.spawn_background_refresh(
+                                state.clone(),
                                 cache_hash,
                                 &pipeline_id,
                                 qname_str,
                                 qtype,
                                 qclass,
                                 peer.ip(),
-                                hit.upstream.as_deref(),
                             );
                         }
                     }
@@ -462,7 +451,7 @@ impl Engine {
             // Optimization: only include IP in hash when rule uses client_ip matcher or config requires it
             // 优化：仅当规则使用client_ip匹配器或配置要求时才包含IP在哈希中
             let include_ip_in_hash = p.uses_client_ip || self.cache_background_refresh;
-            let rule_hash = crate::engine::rules::calculate_rule_hash_in_namespace(
+            let rule_hash = crate::engine::rules::calculate_rule_hash(
                 cache_namespace,
                 &pipeline_id,
                 qname_str,
@@ -511,7 +500,7 @@ impl Engine {
     }
 
     pub async fn handle_packet(&self, packet: &[u8], peer: SocketAddr) -> anyhow::Result<Bytes> {
-        self.handle_packet_internal(packet, peer, false, None, None)
+        self.handle_packet_internal(packet, peer, false, None, None, None)
             .await
     }
 
@@ -527,7 +516,7 @@ impl Engine {
         skip_cache: bool,
         pre_parsed: PreParsedData,
     ) -> anyhow::Result<Bytes> {
-        self.handle_packet_internal(packet, peer, skip_cache, Some(pre_parsed), None)
+        self.handle_packet_internal(packet, peer, skip_cache, Some(pre_parsed), None, None)
             .await
     }
 
@@ -557,6 +546,7 @@ impl Engine {
         skip_cache: bool,
         pre_parsed: Option<PreParsedData>,
         explicit_cache_hash: Option<u64>,
+        state_override: Option<Arc<EngineInner>>,
     ) -> anyhow::Result<Bytes> {
         // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
         let _req_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
@@ -569,7 +559,10 @@ impl Engine {
         }
         self.metrics_inflight.fetch_add(1, Ordering::Relaxed);
         let _inflight_guard = InflightGuard(&self.metrics_inflight);
-        let state = self.state.load();
+        // A request uses one immutable configuration snapshot from selection
+        // through response actions and cache writes. Background refresh passes
+        // the snapshot that produced its cache key via `state_override`.
+        let state = state_override.unwrap_or_else(|| self.state.load_full());
         let cfg = &state.pipeline;
         let min_ttl = cfg.min_ttl();
         let upstream_timeout = cfg.upstream_timeout();
@@ -683,7 +676,7 @@ impl Engine {
         let dedupe_hash = if let Some(h) = explicit_cache_hash {
             h
         } else {
-            Self::calculate_cache_hash_in_namespace(
+            Self::calculate_cache_hash_for_dedupe(
                 state.cache_namespace(&pipeline_id),
                 &pipeline_id,
                 qname_bytes,
@@ -699,6 +692,7 @@ impl Engine {
             && let Some(resp_bytes) = phases::check_cache(
                 self,
                 &phases::CacheLookupContext {
+                    state: &state,
                     qname: qname_ref,
                     qtype,
                     qclass,
@@ -757,6 +751,7 @@ impl Engine {
                         if let Some(fresh_bytes) = phases::check_cache(
                             self,
                             &phases::CacheLookupContext {
+                                state: &state,
                                 qname: qname_ref,
                                 qtype,
                                 qclass,
@@ -782,13 +777,17 @@ impl Engine {
                 // 客户端超时 - 返回过期缓存响应
                 if let Some(stale_bytes) = phases::check_stale_cache(
                     self,
-                    qname_ref,
-                    qtype,
-                    qclass,
-                    &pipeline_id,
-                    dedupe_hash,
-                    tx_id,
-                    &peer,
+                    &phases::CacheLookupContext {
+                        state: &state,
+                        qname: qname_ref,
+                        qtype,
+                        qclass,
+                        pipeline_id: &pipeline_id,
+                        dedupe_hash,
+                        tx_id,
+                        start,
+                        peer: &peer,
+                    },
                 ) {
                     tracing::debug!(
                         event = "serve_stale_on_client_timeout",
@@ -910,7 +909,7 @@ impl Engine {
                         .ecs
                         .as_ref()
                         .and_then(|mode| crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip()));
-                    dedupe_hash = Self::calculate_cache_hash_in_namespace(
+                    dedupe_hash = Self::calculate_cache_hash_for_dedupe(
                         state.cache_namespace(&current_pipeline_id),
                         &current_pipeline_id,
                         qname_bytes,
@@ -981,6 +980,7 @@ impl Engine {
                     let res = phases::handle_forward_decision(
                         self,
                         phases::ForwardDecisionContext {
+                            state: &state,
                             packet,
                             qname: &qname,
                             qtype,
@@ -1090,23 +1090,23 @@ impl Engine {
     /// 3. 刷新失败不会删除现有缓存条目
     pub(crate) fn spawn_background_refresh(
         &self,
+        state: Arc<EngineInner>,
         cache_hash: u64,
         pipeline_id: &str,
         qname: &str,
         qtype: hickory_proto::rr::RecordType,
         qclass: DNSClass,
         peer_ip: std::net::IpAddr,
-        upstream: Option<&str>, // Reserved for future use
     ) {
         crate::engine::refresh::spawn_background_refresh(
             self,
+            state,
             cache_hash,
             pipeline_id,
             qname,
             qtype,
             qclass,
             peer_ip,
-            upstream,
         )
     }
 
@@ -1190,12 +1190,32 @@ mod tests {
         RuntimePipelineConfig::from_config(config).expect("build runtime config")
     }
 
+    fn runtime_with_static_ip(ip: &str) -> RuntimePipelineConfig {
+        let raw = serde_json::json!({
+            "settings": {
+                "default_upstream": "1.1.1.1:53",
+                "min_ttl": 60
+            },
+            "pipelines": [{
+                "id": "main",
+                "rules": [{
+                    "name": "static",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "static_ip_response", "ip": ip }]
+                }]
+            }]
+        });
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        RuntimePipelineConfig::from_config(config).expect("build runtime config")
+    }
+
     #[tokio::test]
     async fn reload_changes_cache_keys_only_when_pipeline_configuration_changes() {
         let original = runtime_with_upstream("8.8.8.8:53");
         let engine = Engine::new(original.clone(), "test".to_string()).expect("create engine");
         let original_namespace = engine.state.load().cache_namespace("main");
-        let old_key = Engine::calculate_cache_hash_in_namespace(
+        let old_key = Engine::calculate_cache_hash_for_dedupe(
             original_namespace,
             "main",
             b"example.com",
@@ -1231,7 +1251,7 @@ mod tests {
             "a changed pipeline must stop addressing entries from the old configuration"
         );
 
-        let new_key = Engine::calculate_cache_hash_in_namespace(
+        let new_key = Engine::calculate_cache_hash_for_dedupe(
             changed_namespace,
             "main",
             b"example.com",
@@ -1243,6 +1263,61 @@ mod tests {
         assert!(
             engine.cache_get(&new_key).is_none(),
             "the changed pipeline must not address the previous response cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_snapshot_cannot_write_into_the_active_generation_after_reload() {
+        let engine = Engine::new(runtime_with_static_ip("192.0.2.1"), "test".to_string())
+            .expect("create engine");
+        let old_state = engine.state.load_full();
+        let old_namespace = old_state.cache_namespace("main");
+        let old_key = Engine::calculate_cache_hash_for_dedupe(
+            old_namespace,
+            "main",
+            b"example.com",
+            RecordType::A,
+            DNSClass::IN,
+            None,
+        );
+
+        engine.reload(runtime_with_static_ip("192.0.2.2"));
+        let new_namespace = engine.state.load().cache_namespace("main");
+        let new_key = Engine::calculate_cache_hash_for_dedupe(
+            new_namespace,
+            "main",
+            b"example.com",
+            RecordType::A,
+            DNSClass::IN,
+            None,
+        );
+
+        let mut request = Message::new(0xCAFE, MessageType::Query, OpCode::Query);
+        request.add_query(Query::query(
+            Name::from_str("example.com").unwrap(),
+            RecordType::A,
+        ));
+        let response = engine
+            .handle_packet_internal(
+                &request.to_vec().unwrap(),
+                "127.0.0.1:53000".parse().unwrap(),
+                true,
+                None,
+                Some(old_key),
+                Some(old_state),
+            )
+            .await
+            .expect("complete request from old snapshot");
+        let response = Message::from_bytes(&response).expect("parse response");
+
+        assert!(matches!(
+            response.answers.first().map(|record| &record.data),
+            Some(RData::A(address)) if address.0 == "192.0.2.1".parse::<std::net::Ipv4Addr>().unwrap()
+        ));
+        assert!(engine.cache_get(&old_key).is_some());
+        assert!(
+            engine.cache_get(&new_key).is_none(),
+            "work from the old snapshot must not populate the active generation"
         );
     }
 
@@ -2339,13 +2414,13 @@ mod tests {
         let ip2 = "5.6.7.8".parse::<IpAddr>().unwrap();
 
         // Act & Assert: When uses_client_ip is false, both IPs should result in the same hash
-        let h1_no_ip = calculate_rule_hash(pipeline_id, qname, qtype, qclass, ip1, false);
-        let h2_no_ip = calculate_rule_hash(pipeline_id, qname, qtype, qclass, ip2, false);
+        let h1_no_ip = calculate_rule_hash(0, pipeline_id, qname, qtype, qclass, ip1, false);
+        let h2_no_ip = calculate_rule_hash(0, pipeline_id, qname, qtype, qclass, ip2, false);
         assert_eq!(h1_no_ip, h2_no_ip, "Hashes should match when IP is ignored");
 
         // Act & Assert: When uses_client_ip is true, different IPs should result in different hashes
-        let h1_with_ip = calculate_rule_hash(pipeline_id, qname, qtype, qclass, ip1, true);
-        let h2_with_ip = calculate_rule_hash(pipeline_id, qname, qtype, qclass, ip2, true);
+        let h1_with_ip = calculate_rule_hash(0, pipeline_id, qname, qtype, qclass, ip1, true);
+        let h2_with_ip = calculate_rule_hash(0, pipeline_id, qname, qtype, qclass, ip2, true);
         assert_ne!(
             h1_with_ip, h2_with_ip,
             "Hashes should differ when IP is included"
@@ -2367,6 +2442,7 @@ mod tests {
         let qtype = RecordType::A;
         let qclass = DNSClass::IN;
         let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(
+            0,
             &pipeline_id,
             qname.as_bytes(),
             qtype,
@@ -2551,6 +2627,7 @@ mod tests {
 
         // Act: Calculate hashes for same QNAME+QTYPE but different QCLASS
         let hash_in = Engine::calculate_cache_hash_for_dedupe(
+            0,
             pipeline_id,
             qname.as_bytes(),
             qtype,
@@ -2558,6 +2635,7 @@ mod tests {
             None,
         );
         let hash_ch = Engine::calculate_cache_hash_for_dedupe(
+            0,
             pipeline_id,
             qname.as_bytes(),
             qtype,
@@ -2573,6 +2651,7 @@ mod tests {
 
         // Act: Calculate hash for same QCLASS to verify consistency
         let hash_in2 = Engine::calculate_cache_hash_for_dedupe(
+            0,
             pipeline_id,
             qname.as_bytes(),
             qtype,
@@ -2604,6 +2683,7 @@ mod tests {
         // 注意：在 parse_quick() 中，qname 在传递给此函数之前已经转为小写
         // 所以我们通过先小写输入来模拟这种行为
         let hash1 = Engine::calculate_cache_hash_for_dedupe(
+            0,
             pipeline_id,
             qname_lower.to_lowercase().as_bytes(),
             qtype,
@@ -2611,6 +2691,7 @@ mod tests {
             None,
         );
         let hash2 = Engine::calculate_cache_hash_for_dedupe(
+            0,
             pipeline_id,
             qname_upper.to_lowercase().as_bytes(),
             qtype,
@@ -2618,6 +2699,7 @@ mod tests {
             None,
         );
         let hash3 = Engine::calculate_cache_hash_for_dedupe(
+            0,
             pipeline_id,
             qname_mixed.to_lowercase().as_bytes(),
             qtype,
@@ -2642,6 +2724,7 @@ mod tests {
 
         // Act: Calculate hashes for different QTYPE values
         let hash_a = Engine::calculate_cache_hash_for_dedupe(
+            0,
             pipeline_id,
             qname.as_bytes(),
             qtype_a,
@@ -2649,6 +2732,7 @@ mod tests {
             None,
         );
         let hash_aaaa = Engine::calculate_cache_hash_for_dedupe(
+            0,
             pipeline_id,
             qname.as_bytes(),
             qtype_aaaa,
@@ -2675,6 +2759,7 @@ mod tests {
 
         // Act: Calculate hashes for different QNAME values
         let hash1 = Engine::calculate_cache_hash_for_dedupe(
+            0,
             pipeline_id,
             qname1.as_bytes(),
             qtype,
@@ -2682,6 +2767,7 @@ mod tests {
             None,
         );
         let hash2 = Engine::calculate_cache_hash_for_dedupe(
+            0,
             pipeline_id,
             qname2.as_bytes(),
             qtype,

@@ -21,9 +21,7 @@ use crate::matcher::{
 use super::core::Engine;
 use super::matcher_adapter::{MatcherContext, matcher_matches};
 use super::rules::Decision;
-use super::rules::{
-    RuleCacheEntry, calculate_rule_hash_in_namespace, contains_continue, fast_hash_str,
-};
+use super::rules::{RuleCacheEntry, calculate_rule_hash, contains_continue, fast_hash_str};
 use super::types::EngineInner;
 use super::{make_static_cname_answer, make_static_ip_answer};
 
@@ -243,7 +241,7 @@ impl Engine {
         // 1. Check Rule Cache
         // Use hash for lookup to avoid cloning String for key on every lookup
         let include_ip = pipeline.uses_client_ip || self.cache_background_refresh;
-        let rule_hash = calculate_rule_hash_in_namespace(
+        let rule_hash = calculate_rule_hash(
             state.cache_namespace(&pipeline.id),
             &pipeline.id,
             qname,

@@ -1,10 +1,14 @@
-use crate::matcher::RuntimePipelineConfig;
+use crate::config::{Action, EcsMode, GlobalSettings, MatchOperator};
 use crate::matcher::advanced_rule::CompiledPipeline;
+use crate::matcher::{
+    RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig, RuntimeResponseMatcher,
+};
 use bytes::Bytes;
 use dashmap::DashMap;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::mem::discriminant;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::watch;
@@ -74,11 +78,258 @@ pub(crate) fn build_cache_namespaces(cfg: &RuntimePipelineConfig) -> FxHashMap<A
             let mut hasher = DefaultHasher::new();
             // Global settings can affect forwarding, TTL handling and response
             // processing, so they are part of every pipeline namespace.
-            format!("{:?}", cfg.settings).hash(&mut hasher);
-            format!("{:?}", pipeline).hash(&mut hasher);
+            hash_global_settings_semantics(&cfg.settings, &mut hasher);
+            hash_pipeline_semantics(pipeline, &mut hasher);
             (pipeline.id.clone(), hasher.finish())
         })
         .collect()
+}
+
+fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl Hasher) {
+    let GlobalSettings {
+        min_ttl,
+        bind_udp,
+        bind_tcp,
+        bind_doh,
+        doh_tls_cert,
+        doh_tls_key,
+        doh_path,
+        cache_capacity,
+        cache_max_ttl,
+        dashmap_shards,
+        default_upstream,
+        default_upstream_pre_split: _,
+        upstream_timeout_ms,
+        request_timeout_ms,
+        response_jump_limit,
+        udp_pool_size,
+        tcp_pool_size,
+        doh_pool_size,
+        doh_health_check_error_threshold,
+        dot_pool_size,
+        doq_pool_size,
+        tcp_health_check_error_threshold,
+        tcp_connection_max_age_seconds,
+        tcp_connection_idle_timeout_seconds,
+        doq_connection_idle_timeout_seconds,
+        doq_keepalive_interval_ms,
+        doq_enable_0rtt,
+        flow_control_enabled,
+        flow_control_initial_permits,
+        flow_control_min_permits,
+        flow_control_max_permits,
+        flow_control_latency_threshold_ms,
+        flow_control_adjustment_interval_secs,
+        serve_stale,
+        serve_stale_ttl,
+        serve_stale_expire_ttl,
+        serve_stale_ttl_reset,
+        serve_stale_client_timeout_ms,
+        cache_background_refresh,
+        cache_refresh_threshold_percent,
+        cache_refresh_min_ttl,
+        geoip_db_path,
+        geoip_dat_path,
+        geoip_auto_convert,
+        geoip_filter_countries,
+        geosite_data_paths,
+        enable_tcp_fallback,
+    } = settings;
+
+    (
+        min_ttl,
+        bind_udp,
+        bind_tcp,
+        bind_doh,
+        doh_tls_cert,
+        doh_tls_key,
+        doh_path,
+        cache_capacity,
+        cache_max_ttl,
+        dashmap_shards,
+        default_upstream,
+    )
+        .hash(hasher);
+    (
+        upstream_timeout_ms,
+        request_timeout_ms,
+        response_jump_limit,
+        udp_pool_size,
+        tcp_pool_size,
+        doh_pool_size,
+        doh_health_check_error_threshold,
+        dot_pool_size,
+        doq_pool_size,
+    )
+        .hash(hasher);
+    (
+        tcp_health_check_error_threshold,
+        tcp_connection_max_age_seconds,
+        tcp_connection_idle_timeout_seconds,
+        doq_connection_idle_timeout_seconds,
+        doq_keepalive_interval_ms,
+        doq_enable_0rtt,
+        flow_control_enabled,
+        flow_control_initial_permits,
+        flow_control_min_permits,
+        flow_control_max_permits,
+        flow_control_latency_threshold_ms,
+    )
+        .hash(hasher);
+    (
+        flow_control_adjustment_interval_secs,
+        serve_stale,
+        serve_stale_ttl,
+        serve_stale_expire_ttl,
+        serve_stale_ttl_reset,
+        serve_stale_client_timeout_ms,
+        cache_background_refresh,
+        cache_refresh_threshold_percent,
+        cache_refresh_min_ttl,
+    )
+        .hash(hasher);
+    (
+        geoip_db_path,
+        geoip_dat_path,
+        geoip_auto_convert,
+        geoip_filter_countries,
+        geosite_data_paths,
+        enable_tcp_fallback,
+    )
+        .hash(hasher);
+}
+
+fn hash_pipeline_semantics(pipeline: &RuntimePipeline, hasher: &mut impl Hasher) {
+    pipeline.id.hash(hasher);
+    hash_ecs_mode(pipeline.ecs.as_ref(), hasher);
+    pipeline.rules.len().hash(hasher);
+    for rule in &pipeline.rules {
+        rule.name.hash(hasher);
+        hash_match_operator(rule.matcher_operator, hasher);
+        rule.matchers.len().hash(hasher);
+        for matcher in &rule.matchers {
+            hash_match_operator(matcher.operator, hasher);
+            hash_runtime_matcher(&matcher.matcher, hasher);
+        }
+        rule.actions.len().hash(hasher);
+        for action in &rule.actions {
+            hash_action(action, hasher);
+        }
+        rule.response_matchers.len().hash(hasher);
+        for matcher in &rule.response_matchers {
+            hash_match_operator(matcher.operator, hasher);
+            hash_runtime_response_matcher(&matcher.matcher, hasher);
+        }
+        hash_match_operator(rule.response_matcher_operator, hasher);
+        rule.response_actions_on_match.len().hash(hasher);
+        for action in &rule.response_actions_on_match {
+            hash_action(action, hasher);
+        }
+        rule.response_actions_on_miss.len().hash(hasher);
+        for action in &rule.response_actions_on_miss {
+            hash_action(action, hasher);
+        }
+    }
+}
+
+fn hash_match_operator(operator: MatchOperator, hasher: &mut impl Hasher) {
+    discriminant(&operator).hash(hasher);
+}
+
+fn hash_ecs_mode(mode: Option<&EcsMode>, hasher: &mut impl Hasher) {
+    mode.is_some().hash(hasher);
+    let Some(mode) = mode else {
+        return;
+    };
+    discriminant(mode).hash(hasher);
+    match mode {
+        EcsMode::Clear => {}
+        EcsMode::FromClientIp {
+            prefix_v4,
+            prefix_v6,
+        } => {
+            prefix_v4.hash(hasher);
+            prefix_v6.hash(hasher);
+        }
+        EcsMode::Static { ip, prefix } => {
+            ip.hash(hasher);
+            prefix.hash(hasher);
+        }
+    }
+}
+
+fn hash_action(action: &Action, hasher: &mut impl Hasher) {
+    discriminant(action).hash(hasher);
+    match action {
+        Action::Log { level } => level.hash(hasher),
+        Action::StaticResponse { rcode } => rcode.hash(hasher),
+        Action::StaticIpResponse { ip } => ip.hash(hasher),
+        Action::StaticCnameResponse { target, ttl } => {
+            target.hash(hasher);
+            ttl.hash(hasher);
+        }
+        Action::StaticTxtResponse { text, ttl } => {
+            text.hash(hasher);
+            ttl.hash(hasher);
+        }
+        Action::JumpToPipeline { pipeline } => pipeline.hash(hasher),
+        Action::Forward {
+            upstream,
+            transport,
+            ecs,
+            ..
+        } => {
+            upstream.hash(hasher);
+            transport.hash(hasher);
+            hash_ecs_mode(ecs.as_ref(), hasher);
+        }
+        Action::ReplaceTxtResponse { text } => text.hash(hasher),
+        Action::Allow | Action::Deny | Action::Continue => {}
+    }
+}
+
+fn hash_runtime_matcher(matcher: &RuntimeMatcher, hasher: &mut impl Hasher) {
+    discriminant(matcher).hash(hasher);
+    match matcher {
+        RuntimeMatcher::Any => {}
+        RuntimeMatcher::DomainExact { value } | RuntimeMatcher::DomainSuffix { value } => {
+            value.hash(hasher)
+        }
+        RuntimeMatcher::ClientIp { net } => net.hash(hasher),
+        RuntimeMatcher::DomainRegex { regex } => regex.as_str().hash(hasher),
+        RuntimeMatcher::GeoipCountry { country_codes } => country_codes.hash(hasher),
+        RuntimeMatcher::GeoipPrivate { expect } | RuntimeMatcher::EdnsPresent { expect } => {
+            expect.hash(hasher)
+        }
+        RuntimeMatcher::Qclass { value } => u16::from(*value).hash(hasher),
+        RuntimeMatcher::GeoSite { tag } | RuntimeMatcher::GeoSiteNot { tag } => tag.hash(hasher),
+        RuntimeMatcher::Qtype { value } => u16::from(*value).hash(hasher),
+    }
+}
+
+fn hash_runtime_response_matcher(matcher: &RuntimeResponseMatcher, hasher: &mut impl Hasher) {
+    discriminant(matcher).hash(hasher);
+    match matcher {
+        RuntimeResponseMatcher::UpstreamEquals { value }
+        | RuntimeResponseMatcher::RequestDomainSuffix { value }
+        | RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value }
+        | RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { value } => value.hash(hasher),
+        RuntimeResponseMatcher::RequestDomainRegex { regex } => regex.as_str().hash(hasher),
+        RuntimeResponseMatcher::ResponseUpstreamIp { nets }
+        | RuntimeResponseMatcher::ResponseAnswerIp { nets } => nets.hash(hasher),
+        RuntimeResponseMatcher::ResponseType { value } => u16::from(*value).hash(hasher),
+        RuntimeResponseMatcher::ResponseRcode { value } => value.hash(hasher),
+        RuntimeResponseMatcher::ResponseQclass { value } => u16::from(*value).hash(hasher),
+        RuntimeResponseMatcher::ResponseEdnsPresent { expect }
+        | RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { expect } => expect.hash(hasher),
+        RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } => {
+            country_codes.hash(hasher)
+        }
+        RuntimeResponseMatcher::ResponseTxtContent { mode, value, .. } => {
+            discriminant(mode).hash(hasher);
+            value.hash(hasher);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -86,6 +337,8 @@ mod tests {
     use super::build_cache_namespaces;
     use crate::config::PipelineConfig;
     use crate::matcher::RuntimePipelineConfig;
+    use hickory_proto::rr::RecordType;
+    use std::sync::Arc;
 
     fn runtime_config(first_upstream: &str, second_upstream: &str) -> RuntimePipelineConfig {
         let raw = serde_json::json!({
@@ -93,11 +346,26 @@ mod tests {
             "pipelines": [
                 {
                     "id": "first",
-                    "rules": [{
-                        "name": "forward-first",
-                        "matchers": [{ "type": "any" }],
-                        "actions": [{ "type": "forward", "upstream": first_upstream }]
-                    }]
+                    "rules": [
+                        {
+                            "name": "forward-first-indexed",
+                            "matchers": [
+                                { "type": "domain_suffix", "value": "www.example.com" },
+                                { "type": "qtype", "value": "A" }
+                            ],
+                            "actions": [{ "type": "forward", "upstream": first_upstream }]
+                        },
+                        {
+                            "name": "forward-first-suffix",
+                            "matchers": [{ "type": "domain_suffix", "value": "example.com" }],
+                            "actions": [{ "type": "forward", "upstream": first_upstream }]
+                        },
+                        {
+                            "name": "forward-first-regex",
+                            "matchers": [{ "type": "domain_regex", "value": "^api[0-9]+\\.example\\.com$" }],
+                            "actions": [{ "type": "forward", "upstream": first_upstream }]
+                        }
+                    ]
                 },
                 {
                     "id": "second",
@@ -116,7 +384,19 @@ mod tests {
     #[test]
     fn namespace_is_stable_for_identical_configuration() {
         let first = runtime_config("8.8.8.8:53", "9.9.9.9:53");
-        let second = runtime_config("8.8.8.8:53", "9.9.9.9:53");
+        let mut second = runtime_config("8.8.8.8:53", "9.9.9.9:53");
+        second.settings.default_upstream_pre_split = Some(Arc::new(vec![Arc::from("derived")]));
+        // Derived lookup indexes are deliberately excluded from the semantic
+        // fingerprint. Mutating them must not rotate a cache namespace.
+        second.pipelines[0]
+            .domain_exact_index
+            .insert(Arc::from("derived.example"), vec![0]);
+        second.pipelines[0]
+            .domain_suffix_index
+            .insert(Arc::from("derived.example"), vec![1]);
+        second.pipelines[0]
+            .query_type_index
+            .insert(RecordType::AAAA, vec![2]);
 
         assert_eq!(
             build_cache_namespaces(&first),
