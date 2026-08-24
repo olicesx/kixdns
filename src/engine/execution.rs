@@ -27,9 +27,11 @@ use crate::matcher::advanced_rule::{compile_pipelines, fast_static_match};
 use crate::proto_utils::parse_quick;
 
 use super::response::build_fast_static_response;
-use super::types::{EngineInner, FastPathResponse};
+use super::types::{EngineInner, FastPathResponse, build_cache_namespaces};
 use super::utils::{engine_helpers, is_refreshing};
-use crate::engine::rules::{Decision, ResponseContext, calculate_rule_hash};
+#[cfg(test)]
+use crate::engine::rules::calculate_rule_hash;
+use crate::engine::rules::{Decision, ResponseContext};
 
 /// Pre-parsed data from handle_packet_fast to avoid re-parsing
 /// 来自 handle_packet_fast 的预解析数据，避免重新解析
@@ -89,12 +91,14 @@ impl Engine {
             .map(|(i, p)| (p.id.clone(), i))
             .collect();
         self.state.store(Arc::new(EngineInner {
+            cache_namespaces: build_cache_namespaces(&new_cfg),
             pipeline: new_cfg,
             compiled_pipelines: compiled,
             pipeline_index,
         }));
-        // Clear rule cache to ensure new rules take effect immediately / 清除规则缓存以确保新规则立即生效
-        self.rule_cache.invalidate_all();
+        // Cache keys include a per-pipeline configuration namespace. Changed
+        // pipelines become unreachable immediately, while unchanged pipelines
+        // keep their warm response and rule caches.
         // Reset background refresh rule to allow re-initialization with new config
         // 重置后台刷新规则以允许使用新配置重新初始化
         // Note: OnceLock cannot be reset, so we rely on the fact that the rule is
@@ -218,7 +222,20 @@ impl Engine {
         qclass: hickory_proto::rr::DNSClass,
         ecs_key: Option<&crate::ecs::EcsKey>,
     ) -> u64 {
+        Self::calculate_cache_hash_in_namespace(0, pipeline_id, qname, qtype, qclass, ecs_key)
+    }
+
+    #[inline]
+    pub(crate) fn calculate_cache_hash_in_namespace(
+        cache_namespace: u64,
+        pipeline_id: &str,
+        qname: &[u8],
+        qtype: hickory_proto::rr::RecordType,
+        qclass: hickory_proto::rr::DNSClass,
+        ecs_key: Option<&crate::ecs::EcsKey>,
+    ) -> u64 {
         let mut h = FxHasher::default();
+        cache_namespace.hash(&mut h);
         pipeline_id.hash(&mut h);
         // Hash qname case-insensitively without allocation / 不分配内存地进行不区分大小写的 qname 哈希
         // qname is already lowercased from parse_quick() / qname 已经在 parse_quick() 中转为小写
@@ -317,7 +334,9 @@ impl Engine {
                 .as_ref()
                 .and_then(|mode| crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip()))
         });
-        let cache_hash = Self::calculate_cache_hash_for_dedupe(
+        let cache_namespace = state.cache_namespace(&pipeline_id);
+        let cache_hash = Self::calculate_cache_hash_in_namespace(
+            cache_namespace,
             &pipeline_id,
             q.qname_bytes,
             qtype,
@@ -443,7 +462,8 @@ impl Engine {
             // Optimization: only include IP in hash when rule uses client_ip matcher or config requires it
             // 优化：仅当规则使用client_ip匹配器或配置要求时才包含IP在哈希中
             let include_ip_in_hash = p.uses_client_ip || self.cache_background_refresh;
-            let rule_hash = calculate_rule_hash(
+            let rule_hash = crate::engine::rules::calculate_rule_hash_in_namespace(
+                cache_namespace,
                 &pipeline_id,
                 qname_str,
                 qtype,
@@ -663,7 +683,8 @@ impl Engine {
         let dedupe_hash = if let Some(h) = explicit_cache_hash {
             h
         } else {
-            Self::calculate_cache_hash_for_dedupe(
+            Self::calculate_cache_hash_in_namespace(
+                state.cache_namespace(&pipeline_id),
                 &pipeline_id,
                 qname_bytes,
                 qtype,
@@ -889,7 +910,8 @@ impl Engine {
                         .ecs
                         .as_ref()
                         .and_then(|mode| crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip()));
-                    dedupe_hash = Self::calculate_cache_hash_for_dedupe(
+                    dedupe_hash = Self::calculate_cache_hash_in_namespace(
+                        state.cache_namespace(&current_pipeline_id),
                         &current_pipeline_id,
                         qname_bytes,
                         qtype,
@@ -1150,6 +1172,79 @@ mod tests {
     use hickory_proto::rr::{RData, Record};
     use std::net::IpAddr;
     use std::sync::Arc;
+
+    fn runtime_with_upstream(upstream: &str) -> RuntimePipelineConfig {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [{
+                "id": "main",
+                "rules": [{
+                    "name": "forward",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": upstream }]
+                }]
+            }]
+        });
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        RuntimePipelineConfig::from_config(config).expect("build runtime config")
+    }
+
+    #[tokio::test]
+    async fn reload_changes_cache_keys_only_when_pipeline_configuration_changes() {
+        let original = runtime_with_upstream("8.8.8.8:53");
+        let engine = Engine::new(original.clone(), "test".to_string()).expect("create engine");
+        let original_namespace = engine.state.load().cache_namespace("main");
+        let old_key = Engine::calculate_cache_hash_in_namespace(
+            original_namespace,
+            "main",
+            b"example.com",
+            RecordType::A,
+            DNSClass::IN,
+            None,
+        );
+        engine.insert_dns_cache_entry(
+            old_key,
+            CacheEntry::from_response(
+                Bytes::from_static(b"cached response"),
+                ResponseCode::NoError,
+                Some(Arc::from("8.8.8.8:53")),
+                "example.com",
+                Arc::from("main"),
+                u16::from(RecordType::A),
+                (60, 60),
+            ),
+        );
+
+        engine.reload(original);
+        assert_eq!(
+            original_namespace,
+            engine.state.load().cache_namespace("main"),
+            "an unchanged pipeline should retain its cache namespace"
+        );
+        assert!(engine.cache_get(&old_key).is_some());
+
+        engine.reload(runtime_with_upstream("8.8.4.4:53"));
+        let changed_namespace = engine.state.load().cache_namespace("main");
+        assert_ne!(
+            original_namespace, changed_namespace,
+            "a changed pipeline must stop addressing entries from the old configuration"
+        );
+
+        let new_key = Engine::calculate_cache_hash_in_namespace(
+            changed_namespace,
+            "main",
+            b"example.com",
+            RecordType::A,
+            DNSClass::IN,
+            None,
+        );
+        assert_ne!(old_key, new_key);
+        assert!(
+            engine.cache_get(&new_key).is_none(),
+            "the changed pipeline must not address the previous response cache entry"
+        );
+    }
 
     // ========================================================================
     // Engine Helper Functions Unit Tests / 引擎辅助函数单元测试

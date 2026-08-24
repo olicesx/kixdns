@@ -20,7 +20,7 @@ use crate::matcher::geosite::GeoSiteManager;
 use super::concurrency::{FlowControlState, PermitManager};
 use super::rules::RuleCacheEntry;
 use super::transport::{DohClient, DoqClient, DotMultiplexer, TcpMultiplexer, UdpClient};
-use super::types::{EngineInner, InflightMap};
+use super::types::{EngineInner, InflightMap, build_cache_namespaces};
 
 #[derive(Clone)]
 pub struct Engine {
@@ -169,6 +169,7 @@ impl Engine {
             .collect();
 
         let state = Arc::new(ArcSwap::from_pointee(EngineInner {
+            cache_namespaces: build_cache_namespaces(&cfg),
             pipeline: cfg,
             compiled_pipelines: compiled,
             pipeline_index,

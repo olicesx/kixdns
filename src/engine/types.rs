@@ -3,6 +3,8 @@ use crate::matcher::advanced_rule::CompiledPipeline;
 use bytes::Bytes;
 use dashmap::DashMap;
 use rustc_hash::{FxBuildHasher, FxHashMap};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::watch;
@@ -49,4 +51,97 @@ pub struct EngineInner {
     pub compiled_pipelines: Vec<CompiledPipeline>,
     /// O(1) pipeline lookup index: pipeline_id -> index in compiled_pipelines / O(1) 管道查找索引：pipeline_id -> compiled_pipelines 中的索引
     pub pipeline_index: FxHashMap<Arc<str>, usize>,
+    /// Response-affecting configuration fingerprint for each pipeline.
+    /// It namespaces response/rule/inflight caches across hot reloads while
+    /// allowing unchanged pipelines to keep their warm cache entries.
+    pub cache_namespaces: FxHashMap<Arc<str>, u64>,
+}
+
+impl EngineInner {
+    #[inline]
+    pub(crate) fn cache_namespace(&self, pipeline_id: &str) -> u64 {
+        self.cache_namespaces
+            .get(pipeline_id)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+pub(crate) fn build_cache_namespaces(cfg: &RuntimePipelineConfig) -> FxHashMap<Arc<str>, u64> {
+    cfg.pipelines
+        .iter()
+        .map(|pipeline| {
+            let mut hasher = DefaultHasher::new();
+            // Global settings can affect forwarding, TTL handling and response
+            // processing, so they are part of every pipeline namespace.
+            format!("{:?}", cfg.settings).hash(&mut hasher);
+            format!("{:?}", pipeline).hash(&mut hasher);
+            (pipeline.id.clone(), hasher.finish())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_cache_namespaces;
+    use crate::config::PipelineConfig;
+    use crate::matcher::RuntimePipelineConfig;
+
+    fn runtime_config(first_upstream: &str, second_upstream: &str) -> RuntimePipelineConfig {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [
+                {
+                    "id": "first",
+                    "rules": [{
+                        "name": "forward-first",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": first_upstream }]
+                    }]
+                },
+                {
+                    "id": "second",
+                    "rules": [{
+                        "name": "forward-second",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": second_upstream }]
+                    }]
+                }
+            ]
+        });
+        let config: PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        RuntimePipelineConfig::from_config(config).expect("build runtime config")
+    }
+
+    #[test]
+    fn namespace_is_stable_for_identical_configuration() {
+        let first = runtime_config("8.8.8.8:53", "9.9.9.9:53");
+        let second = runtime_config("8.8.8.8:53", "9.9.9.9:53");
+
+        assert_eq!(
+            build_cache_namespaces(&first),
+            build_cache_namespaces(&second)
+        );
+    }
+
+    #[test]
+    fn changing_one_pipeline_only_changes_its_namespace() {
+        let before = build_cache_namespaces(&runtime_config("8.8.8.8:53", "9.9.9.9:53"));
+        let after = build_cache_namespaces(&runtime_config("8.8.4.4:53", "9.9.9.9:53"));
+
+        assert_ne!(before.get("first"), after.get("first"));
+        assert_eq!(before.get("second"), after.get("second"));
+    }
+
+    #[test]
+    fn global_response_setting_changes_all_namespaces() {
+        let before_config = runtime_config("8.8.8.8:53", "9.9.9.9:53");
+        let mut after_config = before_config.clone();
+        after_config.settings.default_upstream = "1.0.0.1:53".to_string();
+        let before = build_cache_namespaces(&before_config);
+        let after = build_cache_namespaces(&after_config);
+
+        assert_ne!(before.get("first"), after.get("first"));
+        assert_ne!(before.get("second"), after.get("second"));
+    }
 }
