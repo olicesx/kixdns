@@ -1167,7 +1167,7 @@ mod tests {
     use crate::engine::response::*;
     use crate::engine::rules::*;
     use crate::matcher::RuntimeResponseMatcherWithOp;
-    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::op::{Message, MessageType, OpCode, Query, UpdateMessage};
     use hickory_proto::rr::RecordType;
     use hickory_proto::rr::{RData, Record};
     use std::net::IpAddr;
@@ -1318,6 +1318,130 @@ mod tests {
         assert!(
             engine.cache_get(&new_key).is_none(),
             "work from the old snapshot must not populate the active generation"
+        );
+    }
+
+    /// Minimal UDP upstream that echoes each query back as a NOERROR response
+    /// with a single A record, so the forward path completes without network
+    /// access. / 最小 UDP 上游：把查询回显为带一条 A 记录的 NOERROR 响应。
+    async fn spawn_echo_upstream() -> String {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                let query = match Message::from_bytes(&buf[..n]) {
+                    Ok(q) => q,
+                    Err(_) => continue,
+                };
+                let Some(question) = query.queries.first().cloned() else {
+                    continue;
+                };
+                let mut resp = Message::new(query.id(), MessageType::Response, OpCode::Query);
+                resp.add_query(question.clone());
+                resp.add_answer(Record::from_rdata(
+                    question.name().clone(),
+                    300,
+                    RData::A(hickory_proto::rr::rdata::A(std::net::Ipv4Addr::LOCALHOST)),
+                ));
+                let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
+            }
+        });
+        addr
+    }
+
+    fn jump_config(upstream: &str, target_ip: &str) -> RuntimePipelineConfig {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53", "min_ttl": 60 },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [{
+                        "name": "forward-and-jump",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": upstream }],
+                        "response_matchers": [{ "type": "upstream_equals", "value": upstream }],
+                        "response_actions_on_match": [
+                            { "type": "jump_to_pipeline", "pipeline": "target" }
+                        ]
+                    }]
+                },
+                {
+                    "id": "target",
+                    "rules": [{
+                        "name": "static",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "static_ip_response", "ip": target_ip }]
+                    }]
+                }
+            ]
+        });
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        RuntimePipelineConfig::from_config(config).expect("build runtime config")
+    }
+
+    #[tokio::test]
+    async fn response_jump_writes_only_into_its_own_generation() {
+        let upstream = spawn_echo_upstream().await;
+        let engine =
+            Engine::new(jump_config(&upstream, "192.0.2.1"), "test".to_string()).expect("engine");
+        let old_state = engine.state.load_full();
+        let old_target_key = Engine::calculate_cache_hash_for_dedupe(
+            old_state.cache_namespace("target"),
+            "target",
+            b"example.com",
+            RecordType::A,
+            DNSClass::IN,
+            None,
+        );
+
+        // Reload changes only the jump target, so "target" rotates its
+        // namespace while the entry pipeline stays warm.
+        engine.reload(jump_config(&upstream, "192.0.2.2"));
+        let new_state = engine.state.load_full();
+        let new_target_key = Engine::calculate_cache_hash_for_dedupe(
+            new_state.cache_namespace("target"),
+            "target",
+            b"example.com",
+            RecordType::A,
+            DNSClass::IN,
+            None,
+        );
+
+        let mut request = Message::new(0xBEEF, MessageType::Query, OpCode::Query);
+        request.add_query(Query::query(
+            Name::from_str("example.com").unwrap(),
+            RecordType::A,
+        ));
+        // No explicit cache hash: the jump-path key must be recomputed from
+        // the request snapshot, exercising the phases.rs threading.
+        let response = engine
+            .handle_packet_internal(
+                &request.to_vec().unwrap(),
+                "127.0.0.1:53000".parse().unwrap(),
+                false,
+                None,
+                None,
+                Some(old_state),
+            )
+            .await
+            .expect("complete forwarded request with response jump");
+        let response = Message::from_bytes(&response).expect("parse response");
+
+        // The jump must execute the target pipeline of the request snapshot
+        // (192.0.2.1), not the reloaded one (192.0.2.2).
+        assert!(matches!(
+            response.answers.first().map(|record| &record.data),
+            Some(RData::A(address)) if address.0 == "192.0.2.1".parse::<std::net::Ipv4Addr>().unwrap()
+        ));
+        assert!(
+            engine.cache_get(&old_target_key).is_some(),
+            "the response jump must cache under the snapshot generation's key"
+        );
+        assert!(
+            engine.cache_get(&new_target_key).is_none(),
+            "the response jump must not populate the active generation"
         );
     }
 
