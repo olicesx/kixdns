@@ -522,7 +522,9 @@ The DNS response cache uses the upstream response's minimum TTL, raised to min_t
 
 When cache_background_refresh is enabled, entries near expiry can trigger an asynchronous refresh. A failed refresh leaves the existing entry in place. When serve_stale is enabled, an expired entry can be returned with serve_stale_ttl, subject to serve_stale_expire_ttl and serve_stale_client_timeout_ms.
 
-The main configuration watcher reloads a valid JSON file and clears the rule cache. Invalid reloads leave the previous configuration active. The listener addresses, UDP worker count, TLS DoH listener, connection-pool construction, cache construction, and other Engine initialization settings are created at startup; changing those settings should be followed by a restart.
+The main configuration watcher reloads a valid JSON file using per-pipeline cache namespaces. A changed pipeline immediately stops addressing response-cache, rule-cache, and in-flight entries created by its previous configuration; an unchanged pipeline keeps its warm caches. A change to global settings rotates every pipeline namespace. Old namespace entries are not synchronously deleted and remain bounded by the existing cache capacity and TTL policies. Each request, including background refresh and response-phase jumps, keeps the configuration snapshot that selected its namespace, so work started before a reload cannot write into the active generation. Invalid reloads leave the previous configuration active.
+
+The listener addresses, UDP worker count, TLS DoH listener, connection-pool construction, cache construction, and other Engine initialization settings are created at startup; changing those settings should be followed by a restart.
 
 GeoSite files in geosite_data_paths are watched and reloaded. GeoIP files supplied through geoip_dat_path are watched and reloaded. A GeoIP MMDB supplied through geoip_db_path is loaded at startup; the current watcher is for geoip_dat_path, not the MMDB path.
 

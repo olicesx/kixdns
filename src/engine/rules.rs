@@ -88,6 +88,7 @@ pub enum ResponseActionResult {
 
 #[inline]
 pub fn calculate_rule_hash(
+    cache_namespace: u64,
     pipeline_id: &str,
     qname: &str,
     qtype: RecordType,
@@ -96,6 +97,7 @@ pub fn calculate_rule_hash(
     uses_client_ip: bool,
 ) -> u64 {
     let mut hasher = FxHasher::default();
+    cache_namespace.hash(&mut hasher);
     pipeline_id.hash(&mut hasher);
     qname.hash(&mut hasher);
     u16::from(qtype).hash(&mut hasher);
@@ -680,6 +682,7 @@ pub(crate) async fn process_response_jump(
 
         remaining_jumps = local_jumps;
         let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(
+            state.cache_namespace(&pipeline_id),
             &pipeline_id,
             qname.as_bytes(),
             qtype,

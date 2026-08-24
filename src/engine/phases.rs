@@ -3,6 +3,7 @@ use crate::cache::CacheEntry;
 use crate::config::{Action, Transport};
 use crate::engine::response::{extract_ttl, extract_ttl_for_refresh};
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
+use crate::engine::types::EngineInner;
 use crate::engine::upstream::UpstreamFailure;
 use crate::engine::utils::InflightCleanupGuard;
 use crate::engine::utils::engine_helpers::{build_response, build_servfail_response_fast};
@@ -30,6 +31,7 @@ use hickory_proto::serialize::binary::BinDecodable;
 /// Checks Moka cache, validates TTL, patches response, and triggers background refresh if needed.
 /// Immutable cache lookup data shared by normal and refresh-wait paths.
 pub struct CacheLookupContext<'a> {
+    pub state: &'a Arc<EngineInner>,
     pub qname: &'a str,
     pub qtype: RecordType,
     pub qclass: DNSClass,
@@ -42,6 +44,7 @@ pub struct CacheLookupContext<'a> {
 
 pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<Bytes> {
     let CacheLookupContext {
+        state,
         qname: qname_ref,
         qtype,
         qclass,
@@ -99,15 +102,15 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
                 if engine.serve_stale_client_timeout_ms > 0 {
                     // Don't invalidate - we still need the stale entry for the client_timeout path.
                     // Spawn background refresh proactively.
-                    if let Some(upstream_ref) = hit.upstream.as_deref() {
+                    if hit.upstream.is_some() {
                         engine.spawn_background_refresh(
+                            (*state).clone(),
                             dedupe_hash,
                             pipeline_id,
                             qname_ref,
                             qtype,
                             qclass,
                             peer.ip(),
-                            Some(upstream_ref),
                         );
                     }
                     return None;
@@ -137,15 +140,15 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
                 }
 
                 // Trigger background refresh to get fresh data
-                if let Some(upstream_ref) = hit.upstream.as_deref() {
+                if hit.upstream.is_some() {
                     engine.spawn_background_refresh(
+                        (*state).clone(),
                         dedupe_hash,
                         pipeline_id,
                         qname_ref,
                         qtype,
                         qclass,
                         peer.ip(),
-                        Some(upstream_ref),
                     );
                 }
 
@@ -188,7 +191,7 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
                 let resp_bytes = resp_bytes.freeze();
 
                 // ========== NEW: Trigger background refresh before returning cached response ==========
-                let cfg = &engine.state.load().pipeline;
+                let cfg = &state.pipeline;
 
                 let remaining_ttl = hit.refresh_ttl.saturating_sub(elapsed);
 
@@ -218,13 +221,13 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
                     );
 
                     engine.spawn_background_refresh(
+                        (*state).clone(),
                         dedupe_hash,
                         pipeline_id,
                         qname_ref,
                         qtype,
                         qclass,
                         peer.ip(),
-                        hit.upstream.as_deref(), // Pass upstream if available
                     );
                 }
 
@@ -255,16 +258,18 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
 /// Returns the stale response bytes with TTL set to serve_stale_ttl.
 /// RFC 8767: 检查是否存在过期但仍在 moka 中的缓存条目。
 /// 返回 TTL 设置为 serve_stale_ttl 的过期响应字节。
-pub fn check_stale_cache(
-    engine: &Engine,
-    qname_ref: &str,
-    qtype: RecordType,
-    qclass: DNSClass,
-    pipeline_id: &str,
-    dedupe_hash: u64,
-    tx_id: u16,
-    peer: &std::net::SocketAddr,
-) -> Option<Bytes> {
+pub fn check_stale_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<Bytes> {
+    let CacheLookupContext {
+        state,
+        qname: qname_ref,
+        qtype,
+        qclass,
+        pipeline_id,
+        dedupe_hash,
+        tx_id,
+        start: _,
+        peer,
+    } = *context;
     if !engine.serve_stale {
         return None;
     }
@@ -329,15 +334,15 @@ pub fn check_stale_cache(
 
             // Also trigger background refresh to try to get fresh data
             // 同时触发后台刷新以尝试获取新数据
-            if let Some(upstream_ref) = hit.upstream.as_deref() {
+            if hit.upstream.is_some() {
                 engine.spawn_background_refresh(
+                    (*state).clone(),
                     dedupe_hash,
                     pipeline_id,
                     qname_ref,
                     qtype,
                     qclass,
                     peer.ip(),
-                    Some(upstream_ref),
                 );
             }
 
@@ -422,6 +427,7 @@ pub fn handle_static_decision(
 /// Handles Decision::Forward.
 /// Manages Singleflight, upstream forwarding, response matching, and caching.
 pub struct ForwardDecisionContext<'a> {
+    pub state: &'a Arc<EngineInner>,
     pub packet: &'a [u8],
     pub qname: &'a str,
     pub qtype: RecordType,
@@ -451,6 +457,7 @@ pub async fn handle_forward_decision(
     context: ForwardDecisionContext<'_>,
 ) -> anyhow::Result<ForwardResult> {
     let ForwardDecisionContext {
+        state,
         packet,
         qname,
         qtype,
@@ -639,7 +646,7 @@ pub async fn handle_forward_decision(
             };
 
             // 检查 TCP fallback 配置 / Check TCP fallback configuration
-            let enable_tcp_fallback = engine.state.load().pipeline.settings.enable_tcp_fallback;
+            let enable_tcp_fallback = state.pipeline.settings.enable_tcp_fallback;
             if truncated && transport == Some(Transport::Udp) && enable_tcp_fallback {
                 tracing::debug!(event = "tc_flag_retry", upstream = %upstream, "response truncated, retrying with tcp");
                 let (tcp_resp, _) = crate::engine::upstream::forward_upstream(
@@ -781,7 +788,6 @@ pub async fn handle_forward_decision(
                 transport: transport.unwrap_or(Transport::Udp),
             };
 
-            let state = engine.state.load(); // Load state for config access
             let default_upstream = state.pipeline.settings.default_upstream.as_str();
             let response_jump_limit = state.pipeline.settings.response_jump_limit as usize;
 
@@ -865,7 +871,7 @@ pub async fn handle_forward_decision(
                     let resp_bytes = rules::process_response_jump(
                         engine,
                         rules::ResponseJumpContext {
-                            state: &state,
+                            state,
                             pipeline_id: pipeline,
                             remaining_jumps,
                             req: &req_full,
@@ -930,13 +936,17 @@ pub async fn handle_forward_decision(
                 // RFC 8767: 在返回 SERVFAIL 之前尝试提供过期缓存
                 if let Some(stale_bytes) = check_stale_cache(
                     engine,
-                    qname,
-                    qtype,
-                    qclass,
-                    pipeline_id,
-                    dedupe_hash,
-                    tx_id,
-                    peer,
+                    &CacheLookupContext {
+                        state,
+                        qname,
+                        qtype,
+                        qclass,
+                        pipeline_id,
+                        dedupe_hash,
+                        tx_id,
+                        start,
+                        peer,
+                    },
                 ) {
                     warn!(
                         event = "serve_stale_on_upstream_failure",
@@ -1003,7 +1013,6 @@ pub async fn handle_forward_decision(
                     Ok(r) => r,
                     Err(_) => return Err(e),
                 };
-                let state = engine.state.load();
                 let default_upstream = state.pipeline.settings.default_upstream.as_str();
                 let response_jump_limit = state.pipeline.settings.response_jump_limit as usize;
 
@@ -1096,7 +1105,7 @@ pub async fn handle_forward_decision(
                         let resp_bytes = rules::process_response_jump(
                             engine,
                             rules::ResponseJumpContext {
-                                state: &state,
+                                state,
                                 pipeline_id: pipeline,
                                 remaining_jumps,
                                 req: &req,

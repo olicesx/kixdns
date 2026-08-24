@@ -521,7 +521,9 @@ DNS 响应缓存使用上游响应的最小 TTL；配置 min_ttl 时会将其提
 
 启用 cache_background_refresh 后，接近过期的条目可以触发异步刷新；刷新失败会保留现有条目。启用 serve_stale 后，可以返回过期条目，并使用 serve_stale_ttl 作为响应 TTL，同时受 serve_stale_expire_ttl 和 serve_stale_client_timeout_ms 限制。
 
-主配置 watcher 会重载有效 JSON 并清空规则缓存。无效的重载会保留旧配置。监听地址、UDP worker 数量、TLS DoH 监听器、连接池构造、缓存构造和其他 Engine 初始化参数均在启动时创建；修改这些设置后应重启服务。
+主配置 watcher 使用按 Pipeline 划分的缓存命名空间重载有效 JSON。发生变化的 Pipeline 会立即停止访问旧配置产生的响应缓存、规则缓存和进行中请求；未变化的 Pipeline 会保留热缓存。任意全局设置变化都会轮换所有 Pipeline 的缓存命名空间。旧命名空间中的条目不会被同步删除，而是继续受现有缓存容量和 TTL 策略限制。包括后台刷新和响应阶段跳转在内，每个请求都会保持选择其缓存命名空间时的配置快照，因此重载前启动的任务无法写入当前生效的缓存代际。无效的重载会保留旧配置。
+
+监听地址、UDP worker 数量、TLS DoH 监听器、连接池构造、缓存构造和其他 Engine 初始化参数均在启动时创建；修改这些设置后应重启服务。
 
 geosite_data_paths 中的 GeoSite 文件会被监控并重载。geoip_dat_path 指定的 GeoIP 文件会被监控并重载。geoip_db_path 指定的 MMDB 在启动时加载；当前 watcher 监控的是 geoip_dat_path，不是 MMDB 路径。
 

@@ -241,8 +241,15 @@ impl Engine {
         // 1. Check Rule Cache
         // Use hash for lookup to avoid cloning String for key on every lookup
         let include_ip = pipeline.uses_client_ip || self.cache_background_refresh;
-        let rule_hash =
-            calculate_rule_hash(&pipeline.id, qname, qtype, qclass, client_ip, include_ip);
+        let rule_hash = calculate_rule_hash(
+            state.cache_namespace(&pipeline.id),
+            &pipeline.id,
+            qname,
+            qtype,
+            qclass,
+            client_ip,
+            include_ip,
+        );
         let allow_rule_cache_lookup = !skip_cache && skip_rules.is_none_or(|set| set.is_empty());
 
         if allow_rule_cache_lookup && let Some(entry) = self.rule_cache.get(&rule_hash) {

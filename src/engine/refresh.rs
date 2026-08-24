@@ -1,9 +1,11 @@
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use hickory_proto::rr::{DNSClass, RecordType};
 use tracing::{error, warn};
 
 use crate::engine::Engine;
+use crate::engine::types::EngineInner;
 use crate::engine::utils::{RefreshingGuard, is_refreshing};
 
 /// spawn_background_refresh spawns a task to refresh a DNS record in the background.
@@ -25,13 +27,13 @@ use crate::engine::utils::{RefreshingGuard, is_refreshing};
 /// - Pipeline 选择与原始请求路径一致
 pub fn spawn_background_refresh(
     engine: &Engine,
+    state: Arc<EngineInner>,
     cache_hash: u64,
     pipeline_id: &str,
     qname: &str,
     qtype: RecordType,
     qclass: DNSClass,
     peer_ip: IpAddr,
-    _upstream: Option<&str>, // Reserved for future use
 ) {
     // FIX: Check if already refreshing to prevent duplicate refreshes
     // 修复：检查是否已在刷新，防止重复刷新
@@ -93,7 +95,14 @@ pub fn spawn_background_refresh(
         // 调用 handle_packet_internal 并设置 skip_cache=true，传入显式 cache_hash。
         // 配合原始 peer_ip，确保后台刷新既写入正确的缓存槽，又注入正确的 ECS (RFC 7871)。
         let result = engine
-            .handle_packet_internal(&packet, peer_addr, true, None, Some(cache_hash))
+            .handle_packet_internal(
+                &packet,
+                peer_addr,
+                true,
+                None,
+                Some(cache_hash),
+                Some(state),
+            )
             .await;
 
         match result {
