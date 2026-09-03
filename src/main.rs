@@ -53,8 +53,30 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // 防御性关闭启动链遗传的 fd：OPNsense boot 时序的 daemon/configd 链可能遗传数万个
+    // 构建/部署 fd（2026-08-30 事故：fd 水位 90%，28180 个已删除构建产物文件的句柄被遗传且持有 3 天）。
+    // Defensively close fds inherited from the startup chain: the OPNsense boot sequence
+    // (daemon/configd/build processes) can leak tens of thousands of inherited fds into the
+    // process (2026-08-30 incident: 28180 fds pointing to deleted build artifacts held for 3 days).
+    // 注意：closefrom 必须先于 tokio runtime 创建执行——runtime 的 kqueue/定时器 fd 也从 4 号起
+    // 分配，晚关会误杀。因此这里不能使用 #[tokio::main]，手动构建 runtime。
+    // Note: closefrom must run before the tokio runtime is created (its kqueue/timer fds are
+    // allocated from 4 upward as well), so #[tokio::main] cannot be used here; build manually.
+    #[cfg(target_os = "freebsd")]
+    unsafe {
+        // 保留 0/1/2 stdio；closefrom(2) 在 FreeBSD 为原生系统调用。/ Keep stdio only; closefrom(2) is a native FreeBSD syscall.
+        libc::closefrom(3);
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime")
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     match args.command {
