@@ -3,12 +3,16 @@
 //! 架构：TLS terminator → HTTP/1.1 handler → Engine 入口
 //! 完全复用 Engine 的 `handle_packet_fast` / `handle_packet_internal_with_pre_parsed`，
 //! 不重复任何 DNS 处理逻辑。
+//! TLS 证书/私钥文件变更时热更新 acceptor（如 acme 续期），失败保持旧证书。
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use anyhow::Context;
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 #[cfg(test)]
 use hickory_proto::op::{Message, ResponseCode};
@@ -22,12 +26,18 @@ use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers};
 use crate::proto_utils;
+use crate::watcher;
 
 const MAX_DNS_MESSAGE: usize = 64 * 1024;
+
+/// TLS acceptor shared between the accept loop and the certificate watcher:
+/// wait-free snapshot per connection, swapped wholesale on reload — the same
+/// hot-reload pattern as Engine's `Arc<ArcSwap<...>>` state.
+type SharedTlsAcceptor = Arc<ArcSwap<TlsAcceptor>>;
 
 /// 启动 DoH 服务器 / Start DoH server
 pub async fn run_doh(
@@ -51,19 +61,19 @@ pub async fn run_doh_with_listener(
     engine: Engine,
     doh_path: String,
 ) -> anyhow::Result<()> {
-    let certs = load_certs(cert_path)?;
-    let key = load_private_key(key_path)?;
+    let acceptor: SharedTlsAcceptor = Arc::new(ArcSwap::from_pointee(build_tls_acceptor(
+        cert_path, key_path,
+    )?));
 
-    let tls_config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("build TLS server config")?;
-
-    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    // 证书文件变更时热更新 TLS acceptor；重载失败保持旧证书继续服务
+    // Hot-reload the TLS acceptor on cert/key file changes; keep the previous certificate on failure
+    spawn_cert_watcher(cert_path, key_path, Arc::clone(&acceptor));
 
     loop {
         let (stream, peer) = listener.accept().await?;
-        let acceptor = acceptor.clone();
+        // Snapshot the current acceptor for this connection; in-flight
+        // connections keep serving with the certificate they were established with.
+        let acceptor = acceptor.load_full();
         let engine = engine.clone();
         let doh_path = doh_path.clone();
         tokio::spawn(async move {
@@ -242,6 +252,42 @@ fn error_response(status: StatusCode) -> Response<Full<Bytes>> {
         .status(status)
         .body(Full::new(Bytes::new()))
         .unwrap()
+}
+
+/// Build the TLS acceptor from PEM cert/key files. Single source of truth for
+/// both startup and hot reload, so the two paths validate identically.
+fn build_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsAcceptor> {
+    let certs = load_certs(cert_path)?;
+    anyhow::ensure!(!certs.is_empty(), "no certificates found in {cert_path}");
+    let key = load_private_key(key_path)?;
+
+    let tls_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .with_context(|| format!("build TLS server config (cert: {cert_path}, key: {key_path})"))?;
+    Ok(TlsAcceptor::from(Arc::new(tls_config)))
+}
+
+/// 监听证书/私钥文件变更并热更新 TLS acceptor（阻塞线程，与 config watcher 生命周期一致）
+/// Watch cert/key files and rebuild the TLS acceptor on change (blocking thread,
+/// mirroring the config watcher lifecycle).
+fn spawn_cert_watcher(cert_path: &str, key_path: &str, acceptor: SharedTlsAcceptor) {
+    let paths = vec![PathBuf::from(cert_path), PathBuf::from(key_path)];
+    let cert = cert_path.to_string();
+    let key = key_path.to_string();
+    thread::spawn(move || {
+        let result = watcher::run_files_watcher(&paths, || {
+            if let Some(new_acceptor) =
+                watcher::load_with_retry("DoH TLS certificate", || build_tls_acceptor(&cert, &key))
+            {
+                acceptor.store(Arc::new(new_acceptor));
+                info!(target = "doh", cert = %cert, key = %key, "DoH TLS certificate reloaded");
+            }
+        });
+        if let Err(err) = result {
+            error!(target = "doh", error = %err, "DoH certificate watcher exited with error");
+        }
+    });
 }
 
 /// 从 PEM 文件加载证书 / Load certificates from PEM file
@@ -486,5 +532,42 @@ mod tests {
     fn test_max_dns_message_constant() {
         // RFC 1035 limits DNS messages to 65535 bytes; we cap at 64KB for safety
         assert_eq!(MAX_DNS_MESSAGE, 64 * 1024);
+    }
+
+    // ---- build_tls_acceptor ----
+
+    #[test]
+    fn test_build_tls_acceptor_rejects_empty_cert_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, "").expect("write empty cert");
+        std::fs::write(&key_path, "not a pem").expect("write key");
+
+        let Err(err) = build_tls_acceptor(cert_path.to_str().unwrap(), key_path.to_str().unwrap())
+        else {
+            panic!("empty cert file must be rejected");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no certificates"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_build_tls_acceptor_accepts_generated_pair() {
+        use rcgen::{CertificateParams, KeyPair};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let params = CertificateParams::new(vec!["localhost".to_string()]).expect("params");
+        let key_pair = KeyPair::generate().expect("generate key pair");
+        let cert = params.self_signed(&key_pair).expect("self-signed cert");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).expect("write cert pem");
+        std::fs::write(&key_path, key_pair.serialize_pem()).expect("write key pem");
+
+        assert!(
+            build_tls_acceptor(cert_path.to_str().unwrap(), key_path.to_str().unwrap()).is_ok(),
+            "valid cert/key pair must build an acceptor"
+        );
     }
 }

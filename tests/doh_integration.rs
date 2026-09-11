@@ -2,8 +2,10 @@
 //!
 //! Full-stack tests: self-signed TLS cert → HTTP/1.1 → DNS engine → wire response.
 //! Tests both POST (RFC 8484 §4.1) and GET (§4.1.5) methods, error paths,
-//! and the 64 KiB message-size guard.
+//! the 64 KiB message-size guard, and TLS certificate hot-reload.
 
+use std::net::{IpAddr, Ipv4Addr};
+use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -67,24 +69,34 @@ fn make_static_ip_engine() -> Engine {
     Engine::new(runtime, "test".to_string()).expect("initialize test engine")
 }
 
-/// Generate a self-signed TLS certificate, write cert + key PEM to temp files.
-fn make_test_cert() -> (tempfile::TempDir, String, String) {
-    use rcgen::{CertificateParams, DnType, KeyPair};
+/// Generate a fresh self-signed cert/key PEM pair in memory. The common name
+/// distinguishes identities; SANs cover both `localhost` and `127.0.0.1` so
+/// fully-verifying clients can connect to `https://127.0.0.1:{port}`.
+fn generate_cert_pem_pair(common_name: &str) -> (String, String) {
+    use rcgen::{CertificateParams, DnType, KeyPair, SanType};
 
     let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     params
         .distinguished_name
-        .push(DnType::CommonName, "kixdns-test");
+        .push(DnType::CommonName, common_name);
+    params
+        .subject_alt_names
+        .push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
 
     let key_pair = KeyPair::generate().expect("generate key pair");
     let cert = params.self_signed(&key_pair).expect("self-signed cert");
+    (cert.pem(), key_pair.serialize_pem())
+}
 
+/// Generate a self-signed TLS certificate, write cert + key PEM to temp files.
+fn make_test_cert() -> (tempfile::TempDir, String, String) {
     let dir = tempfile::TempDir::new().expect("tempdir");
+    let (cert_pem, key_pem) = generate_cert_pem_pair("kixdns-test");
     let cert_path = dir.path().join("cert.pem");
     let key_path = dir.path().join("key.pem");
 
-    std::fs::write(&cert_path, cert.pem()).expect("write cert pem");
-    std::fs::write(&key_path, key_pair.serialize_pem()).expect("write key pem");
+    std::fs::write(&cert_path, cert_pem).expect("write cert pem");
+    std::fs::write(&key_path, key_pem).expect("write key pem");
 
     (
         dir,
@@ -110,6 +122,61 @@ fn make_https_client() -> reqwest::Client {
         .expect("build client")
 }
 
+/// Fully-verifying client that trusts exactly the given self-signed PEM
+/// (plus the built-in public roots, which our test identities are not in).
+fn make_client_trusting(cert_pem: &str) -> reqwest::Client {
+    let root = reqwest::Certificate::from_pem(cert_pem.as_bytes()).expect("parse root pem");
+    reqwest::Client::builder()
+        .add_root_certificate(root)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build client")
+}
+
+/// Do a DoH POST query; true iff the server answered OK over a verified TLS chain.
+async fn doh_query_ok(client: &reqwest::Client, port: u16, txid: u16) -> bool {
+    client
+        .post(doh_url(port))
+        .header("content-type", "application/dns-message")
+        .body(make_dns_query("reload.example.com", txid))
+        .send()
+        .await
+        .is_ok_and(|r| r.status() == reqwest::StatusCode::OK)
+}
+
+/// Atomically replace file contents (write sibling tmp + rename over target),
+/// like acme.sh/certbot deploy hooks, so the watcher sees a single swap.
+fn atomically_replace(path: &Path, contents: &str) {
+    let tmp = path.with_extension("renew.tmp");
+    std::fs::write(&tmp, contents).expect("write tmp file");
+    std::fs::rename(&tmp, path).expect("atomic rename");
+}
+
+/// Spawn the DoH server on a pre-bound listener and wait for it to enter the
+/// accept loop.
+async fn spawn_doh(
+    listener: tokio::net::TcpListener,
+    engine: Engine,
+    cert_path: &str,
+    key_path: &str,
+) {
+    let cert_path = cert_path.to_string();
+    let key_path = key_path.to_string();
+    tokio::spawn(async move {
+        let _ = run_doh_with_listener(
+            listener,
+            &cert_path,
+            &key_path,
+            engine,
+            "/dns-query".to_string(),
+        )
+        .await;
+    });
+
+    // Brief delay to let the spawned task load certs and enter accept loop
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
 /// Holds the running DoH test server and keeps temp cert files alive.
 struct DohTestServer {
     port: u16,
@@ -126,19 +193,7 @@ async fn start_doh(engine: Engine) -> DohTestServer {
         .expect("bind listener");
     let port = listener.local_addr().expect("local addr").port();
 
-    tokio::spawn(async move {
-        let _ = run_doh_with_listener(
-            listener,
-            &cert_path,
-            &key_path,
-            engine,
-            "/dns-query".to_string(),
-        )
-        .await;
-    });
-
-    // Brief delay to let the spawned task load certs and enter accept loop
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    spawn_doh(listener, engine, &cert_path, &key_path).await;
 
     DohTestServer {
         port,
@@ -380,4 +435,105 @@ async fn test_doh_concurrent_requests() {
         assert_eq!(txid, i as u16, "TXID should be {i}");
         assert_eq!(body[3] & 0x0F, 0x03, "NXDOMAIN");
     }
+}
+
+// ============================================================================
+// TLS certificate auto-reload tests (issue #43)
+// ============================================================================
+
+/// Wait until the server verifies against `client`'s trust anchor, i.e. it
+/// serves the certificate the client trusts. Polls to ride out watcher latency.
+async fn poll_until_served(client: &reqwest::Client, port: u16, txid: u16) -> bool {
+    for _ in 0..100 {
+        if doh_query_ok(client, port, txid).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// End-to-end renewal: swap cert+key files on disk while the server runs; new
+/// connections must verify against the renewed identity without a restart.
+#[tokio::test]
+async fn test_doh_tls_cert_auto_reload() {
+    let (_dir, cert_path, key_path) = make_test_cert();
+    let cert_a_pem = std::fs::read_to_string(&cert_path).expect("read cert A");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let port = listener.local_addr().expect("local addr").port();
+    spawn_doh(listener, make_nxdomain_engine(), &cert_path, &key_path).await;
+
+    let (cert_b_pem, key_b_pem) = generate_cert_pem_pair("kixdns-test-renewed");
+    let client_a = make_client_trusting(&cert_a_pem);
+    let client_b = make_client_trusting(&cert_b_pem);
+
+    // Before renewal: identity A is served, B is rejected.
+    assert!(
+        doh_query_ok(&client_a, port, 0x0001).await,
+        "client trusting A must work before reload"
+    );
+    assert!(
+        !doh_query_ok(&client_b, port, 0x0002).await,
+        "client trusting B must fail before reload"
+    );
+
+    // Renewal: atomically swap both files, like acme.sh/certbot deploy hooks.
+    atomically_replace(Path::new(&cert_path), &cert_b_pem);
+    atomically_replace(Path::new(&key_path), &key_b_pem);
+
+    assert!(
+        poll_until_served(&client_b, port, 0x0003).await,
+        "server must serve the renewed certificate without restart"
+    );
+    // Fresh pool: the old client's keep-alive connection predates the swap, so
+    // reuse would succeed without exercising the new handshake.
+    let client_a_fresh = make_client_trusting(&cert_a_pem);
+    assert!(
+        !doh_query_ok(&client_a_fresh, port, 0x0004).await,
+        "client trusting A must fail after reload"
+    );
+}
+
+/// Failure safety: an invalid key on disk must not degrade the running server —
+/// it keeps serving the last good certificate and adopts new files once valid.
+#[tokio::test]
+async fn test_doh_tls_cert_reload_failure_keeps_last_good() {
+    let (_dir, cert_path, key_path) = make_test_cert();
+    let cert_a_pem = std::fs::read_to_string(&cert_path).expect("read cert A");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let port = listener.local_addr().expect("local addr").port();
+    spawn_doh(listener, make_nxdomain_engine(), &cert_path, &key_path).await;
+
+    let (cert_b_pem, key_b_pem) = generate_cert_pem_pair("kixdns-test-recovered");
+    let client_a = make_client_trusting(&cert_a_pem);
+    let client_b = make_client_trusting(&cert_b_pem);
+
+    // Corrupt the key: reload attempts must fail and keep serving A.
+    atomically_replace(Path::new(&key_path), "definitely not a pem\n");
+    // Give the watcher time to attempt (and reject) the broken state.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        doh_query_ok(&client_a, port, 0x0011).await,
+        "server must keep serving the last good certificate after a failed reload"
+    );
+
+    // Once cert+key are valid again, the server adopts them.
+    atomically_replace(Path::new(&cert_path), &cert_b_pem);
+    atomically_replace(Path::new(&key_path), &key_b_pem);
+    assert!(
+        poll_until_served(&client_b, port, 0x0012).await,
+        "server must adopt the certificate once files are valid again"
+    );
+    // Fresh pool: see test_doh_tls_cert_auto_reload.
+    let client_a_fresh = make_client_trusting(&cert_a_pem);
+    assert!(
+        !doh_query_ok(&client_a_fresh, port, 0x0013).await,
+        "retired identity must be gone after recovery"
+    );
 }

@@ -47,6 +47,7 @@ This document describes the implementation currently on the main branch. Configu
 ### Operations
 
 - **Hot configuration reload** — valid JSON changes are reloaded through the file watcher; invalid changes keep the previous configuration.
+- **DoH TLS certificate hot-reload** — renewed cert/key PEM files take effect without restart; files that fail to load keep the previous certificate serving.
 - **Structured tracing** — text output by default, with filtering controlled by `--debug` and `RUST_LOG`.
 - **GeoIP conversion** — convert a V2Ray GeoIP `.dat` file to MMDB from the command line.
 
@@ -524,7 +525,7 @@ When cache_background_refresh is enabled, entries near expiry can trigger an asy
 
 The main configuration watcher reloads a valid JSON file using per-pipeline cache namespaces. A changed pipeline immediately stops addressing response-cache, rule-cache, and in-flight entries created by its previous configuration; an unchanged pipeline keeps its warm caches. A change to global settings rotates every pipeline namespace. Old namespace entries are not synchronously deleted and remain bounded by the existing cache capacity and TTL policies. Each request, including background refresh and response-phase jumps, keeps the configuration snapshot that selected its namespace, so work started before a reload cannot write into the active generation. Invalid reloads leave the previous configuration active.
 
-The listener addresses, UDP worker count, TLS DoH listener, connection-pool construction, cache construction, and other Engine initialization settings are created at startup; changing those settings should be followed by a restart.
+The listener addresses, UDP worker count, TLS DoH listener, connection-pool construction, cache construction, and other Engine initialization settings are created at startup; changing those settings should be followed by a restart. The DoH TLS certificate is the one exception: renewed cert/key PEM files are hot-reloaded, though changing the configured file paths still requires a restart.
 
 GeoSite files in geosite_data_paths are watched and reloaded. GeoIP files supplied through geoip_dat_path are watched and reloaded. A GeoIP MMDB supplied through geoip_db_path is loaded at startup; the current watcher is for geoip_dat_path, not the MMDB path.
 
