@@ -550,7 +550,7 @@ impl Engine {
                             cache_hash,
                         );
 
-                        tracing::warn!(
+                        tracing::debug!(
                             original_ttl = hit.original_ttl,
                             refresh_ttl = hit.refresh_ttl,
                             elapsed_secs = elapsed_secs,
@@ -571,7 +571,7 @@ impl Engine {
                             // Note: RefreshingGuard inside spawn_background_refresh will handle cleanup
                             // 注意：spawn_background_refresh 内部的 RefreshingGuard 将处理清理
                             let qname_str = q.qname_str_unchecked(); // Zero-allocation / 零分配
-                            tracing::warn!(
+                            tracing::debug!(
                                 qname = %qname_str,
                                 original_ttl = hit.original_ttl,
                                 refresh_ttl = hit.refresh_ttl,

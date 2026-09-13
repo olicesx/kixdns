@@ -2,7 +2,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use hickory_proto::rr::{DNSClass, RecordType};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::engine::Engine;
 use crate::engine::types::EngineInner;
@@ -107,7 +107,7 @@ pub fn spawn_background_refresh(
 
         match result {
             Ok(_resp_bytes) => {
-                warn!(
+                debug!(
                     event = "background_refresh_success",
                     qname = %qname_owned,
                     qtype = ?qtype,
