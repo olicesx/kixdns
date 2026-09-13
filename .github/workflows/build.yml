@@ -255,3 +255,19 @@ jobs:
 
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  audit-linux:
+    name: Audit dependencies (RustSec)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Audit Cargo.lock against the RustSec advisory database
+        run: cargo audit --deny warnings
