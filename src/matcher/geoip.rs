@@ -267,8 +267,11 @@ impl GeoIpManager {
     /// 从 MMDB 查询 / Lookup from MMDB
     fn lookup_mmdb(&self, reader: &maxminddb::Reader<Vec<u8>>, ip: IpAddr) -> GeoIpResult {
         // 使用 MaxMind 数据结构进行查询 / Use MaxMind data structure for lookup
-        match reader.lookup::<MaxMindCountryRecord>(ip) {
-            Ok(record) => {
+        match reader
+            .lookup(ip)
+            .and_then(|result| result.decode::<MaxMindCountryRecord>())
+        {
+            Ok(Some(record)) => {
                 // 尝试从多个字段获取国家代码 / Try to get country code from multiple fields
                 // 优先级: country > registered_country > represented_country
                 // Priority: country > registered_country > represented_country
@@ -286,7 +289,7 @@ impl GeoIpManager {
                     is_private: is_private_ip(ip),
                 }
             }
-            Err(_) => {
+            Ok(None) | Err(_) => {
                 // 查询失败，回退到私有 IP 检测 / Lookup failed, fallback to private IP check
                 GeoIpResult {
                     country_code: None,

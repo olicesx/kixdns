@@ -23,7 +23,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
@@ -292,20 +292,15 @@ fn spawn_cert_watcher(cert_path: &str, key_path: &str, acceptor: SharedTlsAccept
 
 /// 从 PEM 文件加载证书 / Load certificates from PEM file
 fn load_certs(path: &str) -> anyhow::Result<Vec<CertificateDer<'static>>> {
-    let file = std::fs::File::open(path).context("open cert file")?;
-    let mut reader = std::io::BufReader::new(file);
-    rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_file_iter(path)
+        .context("open cert file")?
         .collect::<Result<Vec<_>, _>>()
         .context("parse PEM certificates")
 }
 
 /// 从 PEM 文件加载私钥 / Load private key from PEM file
 fn load_private_key(path: &str) -> anyhow::Result<PrivateKeyDer<'static>> {
-    let file = std::fs::File::open(path).context("open key file")?;
-    let mut reader = std::io::BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)
-        .context("parse PEM private key")?
-        .context("no private key found in PEM file")
+    PrivateKeyDer::from_pem_file(path).context("parse PEM private key")
 }
 
 // ============================================================================

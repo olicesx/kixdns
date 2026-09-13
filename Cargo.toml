@@ -31,7 +31,7 @@ socket2 = "0.6"
 libc = "0.2"
 rustc-hash = "2.1.1"
 smallvec = "1.13"
-maxminddb = "0.24"
+maxminddb = "0.27"
 maxminddb-writer = "0.1"
 futures = "0.3"
 parking_lot = "0.12"
@@ -46,7 +46,6 @@ quinn = { version = "0.11", features = ["runtime-tokio", "rustls"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "tokio"] }
 http-body-util = "0.1"
-rustls-pemfile = "2"
 base64 = "0.22"
 prost = { version = "0.14.4", features = ["derive"] }
 

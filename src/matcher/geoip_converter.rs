@@ -667,17 +667,25 @@ mod tests {
         assert_eq!(reader.metadata.ip_version, 6);
 
         // IPv4 查询应命中 CN（修复前:IPv4 未嵌入 ::/96，全部落空）
-        let rec: CountryRec = reader.lookup("1.2.3.4".parse().unwrap()).unwrap();
+        let rec: CountryRec = reader
+            .lookup("1.2.3.4".parse().unwrap())
+            .unwrap()
+            .decode()
+            .unwrap()
+            .expect("IPv4 range should contain country data");
         assert_eq!(rec.country.unwrap().iso_code.as_deref(), Some("CN"));
         // IPv6 查询应命中 US
-        let rec: CountryRec = reader.lookup("2001:db8::1".parse().unwrap()).unwrap();
+        let rec: CountryRec = reader
+            .lookup("2001:db8::1".parse().unwrap())
+            .unwrap()
+            .decode()
+            .unwrap()
+            .expect("IPv6 range should contain country data");
         assert_eq!(rec.country.unwrap().iso_code.as_deref(), Some("US"));
-        // 未命中网段应报错而不是返回错误国家
-        assert!(
-            reader
-                .lookup::<CountryRec>("9.9.9.9".parse().unwrap())
-                .is_err()
-        );
+        // 未命中网段应返回空数据，而不是错误国家
+        let missing = reader.lookup("9.9.9.9".parse().unwrap()).unwrap();
+        assert!(!missing.has_data());
+        assert!(missing.decode::<CountryRec>().unwrap().is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }
