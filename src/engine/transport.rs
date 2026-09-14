@@ -87,7 +87,11 @@ struct UdpSocketState {
 }
 
 pub struct UdpClient {
+    /// IPv4 sockets, one ephemeral port each. / IPv4 socket，各占一个临时端口。
     pool: Vec<UdpSocketState>,
+    /// IPv6 sockets (IPV6_V6ONLY), same size as `pool`; empty when the host has
+    /// no IPv6 support. / IPv6 socket（IPV6_V6ONLY），与 `pool` 同规模；主机不支持 IPv6 时为空。
+    pool_v6: Vec<UdpSocketState>,
 }
 
 impl UdpClient {
@@ -96,126 +100,172 @@ impl UdpClient {
         let effective_size = if size == 0 { 1 } else { size };
         let mut pool = Vec::with_capacity(effective_size);
         for idx in 0..effective_size {
-            // Use socket2 to set buffer sizes
-            let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
-                .context("create UDP pool socket")?;
-            // Set buffer sizes to 4MB to prevent packet loss under load
-            if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
-                warn!("failed to set udp recv buffer size: {}", e);
+            pool.push(Self::spawn_socket(
+                idx,
+                Domain::IPV4,
+                SocketAddr::from(([0, 0, 0, 0], 0)),
+            )?);
+        }
+
+        // IPv6 上游需要自己的 socket：AF_INET 的 socket 发往 IPv6 地址只会得到
+        // EAFNOSUPPORT，请求最终变成 SERVFAIL。主机没有 IPv6 时保持空池，
+        // 行为与只有 IPv4 池时一致。
+        // IPv6 upstreams need their own sockets: an AF_INET socket sending to an
+        // IPv6 address only yields EAFNOSUPPORT and the query ends as SERVFAIL.
+        // On a host without IPv6 the pool stays empty and nothing else changes.
+        let mut pool_v6 = Vec::with_capacity(effective_size);
+        for idx in 0..effective_size {
+            match Self::spawn_socket(
+                idx,
+                Domain::IPV6,
+                SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
+            ) {
+                Ok(state) => pool_v6.push(state),
+                Err(err) => {
+                    info!(
+                        error = %err,
+                        "IPv6 UDP pool unavailable, IPv6 upstreams over UDP will be rejected"
+                    );
+                    pool_v6.clear();
+                    break;
+                }
             }
-            if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
-                warn!("failed to set udp send buffer size: {}", e);
-            }
-            let bind_addr = SocketAddr::from(([0, 0, 0, 0], 0));
+        }
+
+        Ok(Self { pool, pool_v6 })
+    }
+
+    /// 建立一个池内 socket 并启动它的接收任务 / Create one pool socket and start its reader
+    fn spawn_socket(
+        idx: usize,
+        domain: Domain,
+        bind_addr: SocketAddr,
+    ) -> anyhow::Result<UdpSocketState> {
+        // Use socket2 to set buffer sizes
+        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+            .context("create UDP pool socket")?;
+        // IPv6 socket 只收发 IPv6：IPv4 上游始终走 IPv4 池，两边互不重叠。
+        // Keep the IPv6 socket to IPv6 only: IPv4 upstreams always use the IPv4
+        // pool, so the two never overlap.
+        if domain == Domain::IPV6 {
             socket
-                .bind(&bind_addr.into())
-                .context("bind UDP pool socket")?;
-            socket
-                .set_nonblocking(true)
-                .context("set UDP pool socket nonblocking")?;
+                .set_only_v6(true)
+                .context("set UDP pool socket IPV6_V6ONLY")?;
+        }
+        // Set buffer sizes to 4MB to prevent packet loss under load
+        if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
+            warn!("failed to set udp recv buffer size: {}", e);
+        }
+        if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
+            warn!("failed to set udp send buffer size: {}", e);
+        }
+        socket
+            .bind(&bind_addr.into())
+            .context("bind UDP pool socket")?;
+        socket
+            .set_nonblocking(true)
+            .context("set UDP pool socket nonblocking")?;
 
-            let std_sock: std::net::UdpSocket = socket.into();
-            let socket = Arc::new(
-                tokio::net::UdpSocket::from_std(std_sock)
-                    .context("create Tokio UDP pool socket")?,
-            );
-            let inflight = Arc::new(DashMap::with_hasher(FxBuildHasher));
+        let std_sock: std::net::UdpSocket = socket.into();
+        let socket = Arc::new(
+            tokio::net::UdpSocket::from_std(std_sock).context("create Tokio UDP pool socket")?,
+        );
+        let inflight = Arc::new(DashMap::with_hasher(FxBuildHasher));
 
-            let state = UdpSocketState {
-                socket: socket.clone(),
-                inflight: inflight.clone(),
-            };
-            pool.push(state);
+        let state = UdpSocketState {
+            socket: socket.clone(),
+            inflight: inflight.clone(),
+        };
 
-            let socket_clone = socket.clone();
-            let inflight_clone = inflight.clone();
-            tokio::spawn(async move {
-                // Use BytesMut for efficient buffer management
-                let mut buf = BytesMut::with_capacity(4096);
-                loop {
-                    // Reset buffer: keep capacity but length=0
-                    // 重置缓冲区：保留容量但长度设为 0
-                    buf.clear();
+        let socket_clone = socket.clone();
+        let inflight_clone = inflight.clone();
+        tokio::spawn(async move {
+            // Use BytesMut for efficient buffer management
+            let mut buf = BytesMut::with_capacity(4096);
+            loop {
+                // Reset buffer: keep capacity but length=0
+                // 重置缓冲区：保留容量但长度设为 0
+                buf.clear();
 
-                    // Use recv_buf_from to write directly into uninitialized memory part of BytesMut
-                    // avoid zero-filling overhead from resize()
-                    // 使用 recv_buf_from 直接写入 BytesMut 的未初始化内存部分，避免 resize() 的置零开销
-                    if buf.capacity() < 4096 {
-                        buf.reserve(4096 - buf.capacity());
-                    }
+                // Use recv_buf_from to write directly into uninitialized memory part of BytesMut
+                // avoid zero-filling overhead from resize()
+                // 使用 recv_buf_from 直接写入 BytesMut 的未初始化内存部分，避免 resize() 的置零开销
+                if buf.capacity() < 4096 {
+                    buf.reserve(4096 - buf.capacity());
+                }
 
-                    match socket_clone.recv_buf_from(&mut buf).await {
-                        Ok((_len, src)) => {
-                            let len = buf.len();
-                            if len >= 2 {
-                                let id = u16::from_be_bytes([buf[0], buf[1]]);
-                                // 修复：使用 Entry API 原子操作，避免 remove-then-insert 导致的竞态条件
-                                // Fix: Use Entry API for atomic operations to avoid remove-then-insert race condition
-                                if let entry::Entry::Occupied(entry) = inflight_clone.entry(id) {
-                                    let (_, expected_addr, query, _) = entry.get();
-                                    if src != *expected_addr {
-                                        // Address mismatch: keep entry and wait for correct response
-                                        // 地址不匹配：保留条目等待正确响应（可能是网络攻击或路由异常）
-                                        tracing::warn!(
+                match socket_clone.recv_buf_from(&mut buf).await {
+                    Ok((_len, src)) => {
+                        let len = buf.len();
+                        if len >= 2 {
+                            let id = u16::from_be_bytes([buf[0], buf[1]]);
+                            // 修复：使用 Entry API 原子操作，避免 remove-then-insert 导致的竞态条件
+                            // Fix: Use Entry API for atomic operations to avoid remove-then-insert race condition
+                            if let entry::Entry::Occupied(entry) = inflight_clone.entry(id) {
+                                let (_, expected_addr, query, _) = entry.get();
+                                if src != *expected_addr {
+                                    // Address mismatch: keep entry and wait for correct response
+                                    // 地址不匹配：保留条目等待正确响应（可能是网络攻击或路由异常）
+                                    tracing::warn!(
+                                        socket_idx = idx,
+                                        response_id = id,
+                                        expected_addr = %expected_addr,
+                                        actual_addr = %src,
+                                        "UDP response address mismatch, possible spoofing or routing anomaly"
+                                    );
+                                } else if !crate::proto_utils::question_matches(query, &buf) {
+                                    // RFC 5452 §9.1: matching ID and address are not enough,
+                                    // the question must match too. Keep waiting for the real one.
+                                    // RFC 5452 §9.1：ID 和地址相符还不够，question 段也必须一致；
+                                    // 保留条目继续等待真正的应答。
+                                    tracing::warn!(
+                                        socket_idx = idx,
+                                        response_id = id,
+                                        upstream = %src,
+                                        "UDP response question mismatch, possible spoofing"
+                                    );
+                                } else {
+                                    let (_, (original_id, _, _, tx)) = entry.remove_entry();
+
+                                    // Restore original TXID
+                                    let orig_bytes = original_id.to_be_bytes();
+                                    buf[0] = orig_bytes[0];
+                                    buf[1] = orig_bytes[1];
+
+                                    // 零拷贝优化：使用 split_to 复用已有容量，避免分配新内存
+                                    let response = buf.split_to(len).freeze();
+                                    let resp_len = response.len();
+
+                                    if tx.send(Ok(response)).is_err() {
+                                        tracing::debug!(
                                             socket_idx = idx,
+                                            original_id = original_id,
                                             response_id = id,
-                                            expected_addr = %expected_addr,
-                                            actual_addr = %src,
-                                            "UDP response address mismatch, possible spoofing or routing anomaly"
-                                        );
-                                    } else if !crate::proto_utils::question_matches(query, &buf) {
-                                        // RFC 5452 §9.1: matching ID and address are not enough,
-                                        // the question must match too. Keep waiting for the real one.
-                                        // RFC 5452 §9.1：ID 和地址相符还不够，question 段也必须一致；
-                                        // 保留条目继续等待真正的应答。
-                                        tracing::warn!(
-                                            socket_idx = idx,
-                                            response_id = id,
-                                            upstream = %src,
-                                            "UDP response question mismatch, possible spoofing"
+                                            response_len = resp_len,
+                                            "Failed to send UDP response, channel already closed"
                                         );
                                     } else {
-                                        let (_, (original_id, _, _, tx)) = entry.remove_entry();
-
-                                        // Restore original TXID
-                                        let orig_bytes = original_id.to_be_bytes();
-                                        buf[0] = orig_bytes[0];
-                                        buf[1] = orig_bytes[1];
-
-                                        // 零拷贝优化：使用 split_to 复用已有容量，避免分配新内存
-                                        let response = buf.split_to(len).freeze();
-                                        let resp_len = response.len();
-
-                                        if tx.send(Ok(response)).is_err() {
-                                            tracing::debug!(
-                                                socket_idx = idx,
-                                                original_id = original_id,
-                                                response_id = id,
-                                                response_len = resp_len,
-                                                "Failed to send UDP response, channel already closed"
-                                            );
-                                        } else {
-                                            tracing::trace!(
-                                                socket_idx = idx,
-                                                original_id = original_id,
-                                                response_id = id,
-                                                response_len = resp_len,
-                                                "UDP response sent successfully"
-                                            );
-                                        }
+                                        tracing::trace!(
+                                            socket_idx = idx,
+                                            original_id = original_id,
+                                            response_id = id,
+                                            response_len = resp_len,
+                                            "UDP response sent successfully"
+                                        );
                                     }
                                 }
                             }
                         }
-                        Err(e) => {
-                            tracing::error!("UDP pool recv error: {}", e);
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("UDP pool recv error: {}", e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
-            });
-        }
-        Ok(Self { pool })
+            }
+        });
+
+        Ok(state)
     }
 
     #[inline]
@@ -225,8 +275,19 @@ impl UdpClient {
         upstream: &str,
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
-        if self.pool.is_empty() {
-            return Err(anyhow::anyhow!("UDP pool not initialized"));
+        let addr: SocketAddr = upstream.parse().context("invalid upstream address")?;
+        // 按目标地址族选池：IPv4 路径只多一次判别
+        // Pick the pool by address family; the IPv4 path only gains one check.
+        let pool = if addr.is_ipv6() {
+            &self.pool_v6
+        } else {
+            &self.pool
+        };
+        if pool.is_empty() {
+            return Err(anyhow::anyhow!(
+                "UDP pool not initialized for {}",
+                if addr.is_ipv6() { "IPv6" } else { "IPv4" }
+            ));
         }
 
         // RFC 5452 §4.3 / §9.2: neither the transaction ID nor the source port
@@ -238,9 +299,8 @@ impl UdpClient {
         // 从线程本地 RNG 取一次 32 位：高 16 位随机选 socket（池内每个 socket 各占
         // 一个临时端口），低 16 位作为 ID 起点。
         let draw: u32 = rand::random();
-        let idx = (draw >> 16) as usize % self.pool.len();
-        let state = &self.pool[idx];
-        let addr: SocketAddr = upstream.parse().context("invalid upstream address")?;
+        let idx = (draw >> 16) as usize % pool.len();
+        let state = &pool[idx];
 
         if packet.len() < 2 {
             return Err(anyhow::anyhow!("packet too short"));
@@ -3340,6 +3400,51 @@ mod tests {
             elapsed < Duration::from_millis(700),
             "second query took {elapsed:?} on a 200 ms budget: {err:#}"
         );
+    }
+
+    /// UDP upstream on `bind` that echoes every query back with QR set, or
+    /// `None` when the address family is unavailable on this host.
+    /// 绑定在 `bind` 上、把每个查询置 QR 位后原样回显的 UDP 上游；该地址族不可用时为 None。
+    async fn spawn_udp_echo_upstream(bind: &str) -> Option<String> {
+        let socket = tokio::net::UdpSocket::bind(bind).await.ok()?;
+        let addr = socket.local_addr().expect("read UDP echo address");
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, src)) = socket.recv_from(&mut buf).await {
+                buf[2] |= 0x80;
+                let _ = socket.send_to(&buf[..n], src).await;
+            }
+        });
+        Some(addr.to_string())
+    }
+
+    #[tokio::test]
+    async fn udp_send_reaches_an_ipv6_upstream() {
+        // The pool only ever created AF_INET sockets, so an IPv6 UDP upstream
+        // failed every send with "address family not supported" and the query
+        // ended in SERVFAIL while the same host over TCP worked.
+        // 连接池只建 AF_INET socket：IPv6 UDP 上游每次发送都失败，查询以 SERVFAIL 告终，
+        // 而同一主机走 TCP 正常。
+        let Some(upstream) = spawn_udp_echo_upstream("[::1]:0").await else {
+            eprintln!("IPv6 loopback unavailable, skipping");
+            return;
+        };
+        let client = UdpClient::new(1).expect("create UDP client");
+        let query = [0x12, 0x34, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+        let response = client
+            .send(&query, &upstream, Duration::from_secs(2))
+            .await
+            .expect("IPv6 UDP upstream must be reachable");
+        assert_eq!(&response[..2], &query[..2], "original ID restored");
+
+        // IPv4 keeps working through the same client.
+        let upstream_v4 = spawn_udp_echo_upstream("127.0.0.1:0")
+            .await
+            .expect("IPv4 loopback");
+        client
+            .send(&query, &upstream_v4, Duration::from_secs(2))
+            .await
+            .expect("IPv4 UDP upstream still reachable");
     }
 
     async fn connected_tcp_write_half() -> (OwnedWriteHalf, TcpStream) {
