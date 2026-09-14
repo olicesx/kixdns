@@ -646,25 +646,25 @@ impl GeoSiteManager {
             tags.push(tag);
         }
 
-        // 只删这个文件不再提供、且没有别的文件在提供的 tag。多个文件声明同一个
-        // tag 时最后加载的一份生效（与全量加载一致），从其中一个文件里删掉它不会
-        // 让另一个文件的数据跟着消失。
-        // Drop only the tags this file no longer provides and no other file does
-        // either. When several files declare the same tag the last load wins, as
-        // with a full load, and removing it from one file does not take the other
-        // file's data with it.
+        // 这个文件不再提供的 tag：没有别的文件提供就删掉；还有别的文件提供，
+        // 就从那个文件里重新读出来顶上——否则索引里留着的仍是本文件的旧条目，
+        // 名义上 tag 还在，命中的却是已经被删掉的数据。多个文件声明同一个 tag
+        // 时最后加载的一份生效（与全量加载一致）。
+        // For tags this file no longer provides: drop them when no other file
+        // provides them, and re-read them from a file that still does otherwise.
+        // Without that the index keeps this file's own stale entries, so the tag
+        // survives but matches data that was deleted. When several files declare
+        // the same tag the last load wins, as with a full load.
         for tag in previous {
             if tags.contains(&tag) {
                 continue;
             }
-            if self
-                .sources
-                .values()
-                .any(|provided| provided.contains(&tag))
-            {
-                continue;
+            match self.other_source_providing(&key, &tag) {
+                Some(other) => self.reload_tag_from(&other, &tag),
+                None => {
+                    self.database.remove(&tag);
+                }
             }
-            self.database.remove(&tag);
         }
 
         let loaded_count = tags.len();
@@ -672,6 +672,49 @@ impl GeoSiteManager {
 
         self.rebuild_cache();
         loaded_count
+    }
+
+    /// 找一个仍在提供这个 tag 的其它数据文件；多个候选时取路径最小的一个，
+    /// 让结果与哈希表的遍历顺序无关。
+    /// Find another data file still providing this tag; with several candidates
+    /// the smallest path wins, so the result does not depend on hash order.
+    fn other_source_providing(&self, skip: &Path, tag: &str) -> Option<PathBuf> {
+        self.sources
+            .iter()
+            .filter(|(path, provided)| {
+                path.as_path() != skip && provided.iter().any(|name| name == tag)
+            })
+            .map(|(path, _)| path.clone())
+            .min()
+    }
+
+    /// 从另一个数据文件里重新读出单个 tag；读不出来就保持原样，等那个文件自己
+    /// 重载时纠正，总好过留下一个空 tag。
+    /// Re-read a single tag from another data file; leave the index as it is when
+    /// that fails and let the other file's own reload fix it, which beats leaving
+    /// the tag empty.
+    fn reload_tag_from(&mut self, path: &Path, tag: &str) {
+        let wanted = [tag.to_string()];
+        match Self::parse_dat_file_selective(path, &wanted) {
+            Ok(parsed) => {
+                if let Some((_, matchers)) = parsed.into_iter().find(|(name, _)| name == tag) {
+                    self.database.insert(tag.to_string(), matchers);
+                    return;
+                }
+                warn!(
+                    target = "geosite",
+                    path = %path.display(), tag,
+                    "data file no longer contains a tag it was recorded as providing"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    target = "geosite",
+                    path = %path.display(), tag, error = %e,
+                    "failed to re-read a shared tag, keeping the current entries"
+                );
+            }
+        }
     }
 
     /// 数据文件的身份：尽量用规范化后的绝对路径，这样配置里写的相对路径与
@@ -1585,6 +1628,51 @@ mod tests {
             "a tag another file still provides must survive"
         );
         assert!(manager.matches("only-a", "www.only-a.example"));
+    }
+
+    /// 后加载的文件删掉共享 tag 之后，索引里必须换成仍在声明它的那个文件的数据，
+    /// 而不是留着被删掉的那份。
+    /// When the file that loaded last drops a shared tag, the index must fall
+    /// back to the data of the file still declaring it instead of keeping the
+    /// entries that were just deleted.
+    #[test]
+    fn dropping_a_shared_tag_falls_back_to_the_file_still_providing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.dat");
+        let b = dir.path().join("b.dat");
+        std::fs::write(
+            &a,
+            build_dat(&[build_geosite(
+                "ADS",
+                &[build_domain(2, "doubleclick.net", &[])],
+            )]),
+        )
+        .unwrap();
+        std::fs::write(
+            &b,
+            build_dat(&[build_geosite("ADS", &[build_domain(2, "ads.example", &[])])]),
+        )
+        .unwrap();
+
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_dat_file(&a).unwrap();
+        // b.dat 后加载，此刻 ads 命中的是 b.dat 的数据
+        // b.dat loads last, so ads matches b.dat's data at this point
+        manager.load_from_dat_file(&b).unwrap();
+        assert!(manager.matches("ads", "www.ads.example"));
+
+        // b.dat 去掉 ads，只剩 a.dat 在提供 / ads leaves b.dat, only a.dat provides it
+        std::fs::write(&b, build_dat(&[])).unwrap();
+        manager.load_from_dat_file(&b).unwrap();
+
+        assert!(
+            manager.matches("ads", "www.doubleclick.net"),
+            "the remaining file's data must be the one serving the tag"
+        );
+        assert!(
+            !manager.matches("ads", "www.ads.example"),
+            "entries from the file that dropped the tag must not survive"
+        );
     }
 
     /// 截断的文件（写入中断）必须整份拒绝，而不是把读到的部分当成完整版本。
