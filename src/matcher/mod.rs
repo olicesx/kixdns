@@ -371,14 +371,17 @@ impl RuntimePipelineConfig {
         if cfg.settings.cache_max_ttl == 0 {
             anyhow::bail!("cache_max_ttl must be greater than 0");
         }
-        // 阈值是剩余 TTL 的百分比，超过 100 时每次缓存命中都会触发后台刷新，
-        // 上游负载等于客户端负载；要关闭刷新请用 cache_background_refresh。
-        // The threshold is a percentage of the remaining TTL; above 100 every
-        // cache hit triggers a background refresh and the upstream carries the
-        // client's full load. Use cache_background_refresh to turn it off.
-        if cfg.settings.cache_refresh_threshold_percent > 100 {
+        // 阈值是条目 TTL 的百分比，刷新条件是剩余 TTL 低于它。取 100 时阈值等于
+        // 条目自身的 TTL，任何时间一过就满足，和超过 100 一样每次缓存命中都触发
+        // 后台刷新，上游负载等于客户端负载；要关闭刷新请用 cache_background_refresh。
+        // The threshold is a percentage of the entry's TTL and a refresh happens
+        // once the remaining TTL falls below it. At 100 the threshold equals the
+        // entry's own TTL, so any elapsed time satisfies it and, like a value
+        // above 100, every cache hit triggers a refresh and the upstream carries
+        // the client's full load. Use cache_background_refresh to turn it off.
+        if cfg.settings.cache_refresh_threshold_percent >= 100 {
             anyhow::bail!(
-                "cache_refresh_threshold_percent must be between 0 and 100, got {}",
+                "cache_refresh_threshold_percent must be below 100 (at 100 every cache hit refreshes upstream), got {}",
                 cfg.settings.cache_refresh_threshold_percent
             );
         }
@@ -1563,10 +1566,16 @@ mod tests {
             "unexpected error: {error}"
         );
 
+        let at_100 = settings_config(serde_json::json!({
+            "cache_refresh_threshold_percent": 100
+        }));
+        RuntimePipelineConfig::from_config(at_100)
+            .expect_err("100% refreshes on every hit, same as above 100");
+
         // 边界值仍然合法 / The boundary values stay valid
         RuntimePipelineConfig::from_config(settings_config(serde_json::json!({
             "cache_max_ttl": 1,
-            "cache_refresh_threshold_percent": 100
+            "cache_refresh_threshold_percent": 99
         })))
         .expect("boundary values must stay valid");
     }

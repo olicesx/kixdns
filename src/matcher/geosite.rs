@@ -528,9 +528,17 @@ impl GeoSiteManager {
             // 解析 varint 长度 / Parse varint length
             let entry_len = parse_varint(&content, &mut pos)?;
 
-            // 检查是否有足够的数据 / Check if we have enough data
+            // 文件被截断（写入中断或读到写了一半的覆盖）：拒绝整份文件，
+            // 否则调用方会把读到的那部分当成完整版本，文件里其余的 tag 就被删掉了。
+            // A truncated file (an interrupted write, or a half-written overwrite
+            // caught in the act) is rejected outright: otherwise the caller takes
+            // the part that was read as the complete file and drops every tag the
+            // rest of it holds.
             if pos + entry_len > content.len() {
-                break;
+                anyhow::bail!(
+                    "truncated .dat file: entry at offset {pos} needs {entry_len} bytes, {} left",
+                    content.len() - pos
+                );
             }
 
             let entry_end = pos + entry_len;
@@ -629,23 +637,52 @@ impl GeoSiteManager {
     /// stay (`geosite_data_paths` accepts several files); the query cache is
     /// rebuilt along the way.
     pub fn apply_source<P: AsRef<Path>>(&mut self, path: P, parsed: ParsedGeoSite) -> usize {
-        let path = path.as_ref();
-        if let Some(previous) = self.sources.remove(path) {
-            for tag in previous {
-                self.database.remove(&tag);
-            }
-        }
+        let key = Self::source_key(path.as_ref());
+        let previous = self.sources.remove(&key).unwrap_or_default();
 
         let mut tags = Vec::with_capacity(parsed.len());
         for (tag, matchers) in parsed {
             self.database.insert(tag.clone(), matchers);
             tags.push(tag);
         }
+
+        // 只删这个文件不再提供、且没有别的文件在提供的 tag。多个文件声明同一个
+        // tag 时最后加载的一份生效（与全量加载一致），从其中一个文件里删掉它不会
+        // 让另一个文件的数据跟着消失。
+        // Drop only the tags this file no longer provides and no other file does
+        // either. When several files declare the same tag the last load wins, as
+        // with a full load, and removing it from one file does not take the other
+        // file's data with it.
+        for tag in previous {
+            if tags.contains(&tag) {
+                continue;
+            }
+            if self
+                .sources
+                .values()
+                .any(|provided| provided.contains(&tag))
+            {
+                continue;
+            }
+            self.database.remove(&tag);
+        }
+
         let loaded_count = tags.len();
-        self.sources.insert(path.to_path_buf(), tags);
+        self.sources.insert(key, tags);
 
         self.rebuild_cache();
         loaded_count
+    }
+
+    /// 数据文件的身份：尽量用规范化后的绝对路径，这样配置里写的相对路径与
+    /// 监视器事件带来的绝对路径指向同一条记录；无法规范化（文件刚被删掉等）时
+    /// 退回原路径。
+    /// Identity of a data file: the canonical absolute path where possible, so a
+    /// relative path from the configuration and the absolute path a watcher
+    /// event carries refer to the same entry; falls back to the path as given
+    /// when it cannot be canonicalised (the file was just removed, say).
+    fn source_key(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     }
 
     /// 解析 varint / Parse varint
@@ -737,8 +774,13 @@ impl GeoSiteManager {
 
             let entry_len = parse_varint(&content, &mut pos)?;
 
+            // 截断的文件同样整份拒绝，理由见 parse_dat_file
+            // A truncated file is rejected here too, see parse_dat_file
             if pos + entry_len > content.len() {
-                break;
+                anyhow::bail!(
+                    "truncated .dat file: entry at offset {pos} needs {entry_len} bytes, {} left",
+                    content.len() - pos
+                );
             }
 
             let entry_end = pos + entry_len;
@@ -1457,6 +1499,121 @@ mod tests {
             !manager.matches("new", "www.new.example"),
             "nothing from the failed file may leak into the live table"
         );
+    }
+
+    /// 配置里写相对路径、监视器事件给绝对路径，两者必须指向同一条记录，
+    /// 否则删除动作永远打不中启动时那次加载。
+    /// A relative path from the configuration and the absolute path a watcher
+    /// event carries must refer to the same entry, or the removal never matches
+    /// the load that happened at startup.
+    #[test]
+    fn dat_reload_matches_the_same_file_through_a_different_path_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let absolute = write_dat(
+            &dir,
+            &[
+                build_geosite("CN", &[build_domain(2, "baidu.com", &[])]),
+                build_geosite("ADS", &[build_domain(2, "doubleclick.net", &[])]),
+            ],
+        );
+        // 同一个文件的另一种写法：绕一层子目录再退回来。Rust 的 Path 比较会规范化
+        // 掉 "."，但不会规范化 ".."，正好模拟配置里的相对路径与监视器给出的绝对
+        // 路径指向同一个文件却不相等的情况。
+        // Another spelling of the same file, via a subdirectory and back. Rust's
+        // Path comparison normalises "." away but not "..", which reproduces a
+        // relative path from the configuration and the absolute path a watcher
+        // reports pointing at one file without comparing equal.
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let indirect = dir.path().join("sub").join("..").join("geosite.dat");
+
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_dat_file(&indirect).unwrap();
+        assert!(manager.matches("ads", "www.doubleclick.net"));
+
+        write_dat(
+            &dir,
+            &[build_geosite("CN", &[build_domain(2, "qq.com", &[])])],
+        );
+        manager.load_from_dat_file(&absolute).unwrap();
+
+        assert!(
+            !manager.matches("ads", "www.doubleclick.net"),
+            "the same file under another spelling must count as the same source"
+        );
+        assert!(manager.matches("cn", "www.qq.com"));
+    }
+
+    /// 两个文件都声明同一个 tag 时，重载其中一个不能把另一个的数据带走。
+    /// When two files declare the same tag, reloading one must not take the
+    /// other file's data with it.
+    #[test]
+    fn reloading_one_file_keeps_a_tag_another_file_still_provides() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.dat");
+        let b = dir.path().join("b.dat");
+        std::fs::write(
+            &a,
+            build_dat(&[
+                build_geosite("ADS", &[build_domain(2, "doubleclick.net", &[])]),
+                build_geosite("ONLY-A", &[build_domain(2, "only-a.example", &[])]),
+            ]),
+        )
+        .unwrap();
+        std::fs::write(
+            &b,
+            build_dat(&[build_geosite("ADS", &[build_domain(2, "ads.example", &[])])]),
+        )
+        .unwrap();
+
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_dat_file(&a).unwrap();
+        manager.load_from_dat_file(&b).unwrap();
+
+        // a.dat 去掉 ads，b.dat 原封不动 / ads leaves a.dat, b.dat is untouched
+        std::fs::write(
+            &a,
+            build_dat(&[build_geosite(
+                "ONLY-A",
+                &[build_domain(2, "only-a.example", &[])],
+            )]),
+        )
+        .unwrap();
+        manager.load_from_dat_file(&a).unwrap();
+
+        assert!(
+            manager.has_tag("ads"),
+            "a tag another file still provides must survive"
+        );
+        assert!(manager.matches("only-a", "www.only-a.example"));
+    }
+
+    /// 截断的文件（写入中断）必须整份拒绝，而不是把读到的部分当成完整版本。
+    /// A truncated file must be rejected outright rather than taken as complete.
+    #[test]
+    fn truncated_dat_is_rejected_instead_of_dropping_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dat(
+            &dir,
+            &[
+                build_geosite("CN", &[build_domain(2, "baidu.com", &[])]),
+                build_geosite("ADS", &[build_domain(2, "doubleclick.net", &[])]),
+            ],
+        );
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_dat_file(&path).unwrap();
+
+        // 只写出前半段，模拟覆盖写到一半 / Write only the first half
+        let full = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &full[..full.len() * 2 / 3]).unwrap();
+        manager
+            .load_from_dat_file(&path)
+            .expect_err("a truncated file must be rejected");
+
+        assert!(
+            manager.matches("ads", "www.doubleclick.net"),
+            "a rejected file must leave the previous data in place"
+        );
+        assert!(manager.matches("cn", "www.baidu.com"));
     }
 
     #[test]

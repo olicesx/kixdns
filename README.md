@@ -254,10 +254,10 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | flow_control_latency_threshold_ms | 100 | Latency threshold used by adaptive flow control. |
 | flow_control_adjustment_interval_secs | 5 | Permit adjustment interval. |
 | cache_capacity | 10000 | Maximum entries in the DNS response cache; must be greater than zero. |
-| cache_max_ttl | 86400 | Maximum lifetime of a DNS cache entry in seconds. |
+| cache_max_ttl | 86400 | Maximum lifetime of a DNS cache entry in seconds; must be greater than zero. |
 | dashmap_shards | 0 | Internal shard setting; 0 uses the DashMap default, otherwise the value must be a power of two. |
 | cache_background_refresh | false | Refresh entries before their TTL expires. |
-| cache_refresh_threshold_percent | 10 | Refresh threshold based on remaining TTL percentage. |
+| cache_refresh_threshold_percent | 10 | Refresh threshold as a percentage of the entry TTL; must be below 100, since at 100 every cache hit refreshes upstream. |
 | cache_refresh_min_ttl | 5 | Minimum refresh TTL considered for background refresh. |
 | serve_stale | false | Keep and serve expired entries according to RFC 8767 behavior. |
 | serve_stale_ttl | 30 | TTL written into a stale response. |
