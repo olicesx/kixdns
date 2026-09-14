@@ -73,7 +73,7 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
             // Check manual expiration (in case moka hasn't evicted it yet or for strict TTL compliance)
             if elapsed_secs >= hit.original_ttl as u64 {
                 // serve_stale disabled → invalidate and miss
-                if !engine.serve_stale {
+                if !state.pipeline.settings.serve_stale {
                     engine.cache_invalidate(&dedupe_hash);
                     return None;
                 }
@@ -86,7 +86,9 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
                 // Check serve_stale_expire_ttl: how long past original TTL has this been stale?
                 // 检查 serve_stale_expire_ttl：此条目已过期多长时间？
                 let stale_age = elapsed_secs - hit.original_ttl as u64;
-                if engine.serve_stale_expire_ttl > 0 && stale_age > engine.serve_stale_expire_ttl {
+                if state.pipeline.settings.serve_stale_expire_ttl > 0
+                    && stale_age > state.pipeline.settings.serve_stale_expire_ttl
+                {
                     // Stale entry has exceeded the maximum stale window
                     // 过期条目已超过最大过期窗口
                     engine.cache_invalidate(&dedupe_hash);
@@ -95,7 +97,7 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
                         qname = %qname_ref,
                         qtype = ?qtype,
                         stale_age = stale_age,
-                        serve_stale_expire_ttl = engine.serve_stale_expire_ttl,
+                        serve_stale_expire_ttl = state.pipeline.settings.serve_stale_expire_ttl,
                         "stale entry exceeded serve_stale_expire_ttl, invalidating"
                     );
                     return None;
@@ -105,7 +107,7 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
                 // try upstream first with a short timeout (handled in handle_packet_internal).
                 // serve_stale_client_timeout_ms > 0: 不在此处返回 stale，
                 // 让调用者先尝试上游查询（在 handle_packet_internal 中处理）。
-                if engine.serve_stale_client_timeout_ms > 0 {
+                if state.pipeline.settings.serve_stale_client_timeout_ms > 0 {
                     // Don't invalidate - we still need the stale entry for the client_timeout path.
                     // Spawn background refresh proactively.
                     if hit.upstream.is_some() {
@@ -124,7 +126,7 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
 
                 // serve_stale_client_timeout_ms == 0: Serve stale immediately (optimistic mode)
                 // RFC 8767: 立即返回 stale 数据 + 后台刷新
-                let stale_ttl = engine.serve_stale_ttl;
+                let stale_ttl = state.pipeline.settings.serve_stale_ttl;
                 let mut resp_bytes = BytesMut::with_capacity(hit.bytes.len());
                 resp_bytes.extend_from_slice(&hit.bytes);
 
@@ -140,7 +142,7 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
 
                 // serve_stale_ttl_reset: reset stale expiry timer by re-inserting with shifted inserted_at
                 // 重置过期计时器：通过重新插入条目并将 inserted_at 设置为"刚过期"的时间点
-                if engine.serve_stale_ttl_reset {
+                if state.pipeline.settings.serve_stale_ttl_reset {
                     let new_entry = hit.clone_with_refreshed_ttl();
                     engine.cache_insert(dedupe_hash, std::sync::Arc::new(new_entry));
                 }
@@ -167,7 +169,7 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
                     elapsed_secs = elapsed_secs,
                     stale_ttl = stale_ttl,
                     stale_age = stale_age,
-                    ttl_reset = engine.serve_stale_ttl_reset,
+                    ttl_reset = state.pipeline.settings.serve_stale_ttl_reset,
                     client_ip = %peer.ip(),
                     pipeline = %pipeline_id,
                     "RFC 8767: serving stale cache entry on TTL expiry"
@@ -306,7 +308,7 @@ pub fn check_stale_cache(
         peer,
         observed,
     } = *context;
-    if !engine.serve_stale {
+    if !state.pipeline.settings.serve_stale {
         return None;
     }
 
@@ -328,11 +330,13 @@ pub fn check_stale_cache(
             // Check serve_stale_expire_ttl: max stale age window
             // 检查 serve_stale_expire_ttl：过期数据的最大可用窗口
             let stale_age = elapsed_secs - hit.original_ttl as u64;
-            if engine.serve_stale_expire_ttl > 0 && stale_age > engine.serve_stale_expire_ttl {
+            if state.pipeline.settings.serve_stale_expire_ttl > 0
+                && stale_age > state.pipeline.settings.serve_stale_expire_ttl
+            {
                 return None;
             }
 
-            let stale_ttl = engine.serve_stale_ttl;
+            let stale_ttl = state.pipeline.settings.serve_stale_ttl;
 
             let mut resp_bytes = BytesMut::with_capacity(hit.bytes.len());
             resp_bytes.extend_from_slice(&hit.bytes);
@@ -349,7 +353,7 @@ pub fn check_stale_cache(
 
             // serve_stale_ttl_reset: reset stale expiry timer
             // 重置过期计时器
-            if engine.serve_stale_ttl_reset {
+            if state.pipeline.settings.serve_stale_ttl_reset {
                 let new_entry = hit.clone_with_refreshed_ttl();
                 engine.cache_insert(dedupe_hash, std::sync::Arc::new(new_entry));
             }

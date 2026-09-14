@@ -524,7 +524,7 @@ impl Engine {
                 if elapsed_secs >= hit.original_ttl {
                     // RFC 8767: When serve_stale is enabled, keep stale entries for fallback
                     // RFC 8767: 当 serve_stale 启用时，保留过期条目以便 fallback
-                    if !self.serve_stale {
+                    if !cfg.settings.serve_stale {
                         self.cache.invalidate(&cache_hash);
                     }
                 } else {
@@ -532,15 +532,15 @@ impl Engine {
                     // 缓存后台刷新：当TTL < 阈值百分比时，触发异步刷新
                     // Only refresh cache entries that came from an upstream server
                     // 只有来自 upstream 的缓存条目才进行预取刷新
-                    if self.cache_background_refresh
+                    if cfg.settings.cache_background_refresh
                         && hit.upstream.is_some()
-                        && hit.refresh_ttl >= self.cache_refresh_min_ttl
+                        && hit.refresh_ttl >= cfg.settings.cache_refresh_min_ttl
                     {
                         // Calculate remaining TTL and refresh threshold
                         // 计算剩余 TTL 和刷新阈值
                         let remaining_ttl = hit.refresh_ttl.saturating_sub(elapsed_secs);
                         let threshold = (hit.refresh_ttl as u64
-                            * self.cache_refresh_threshold_percent as u64)
+                            * cfg.settings.cache_refresh_threshold_percent as u64)
                             / 100;
 
                         // OPTIMIZATION: Hybrid bloom filter + DashSet check / 优化：混合布隆过滤器 + DashSet 检查
@@ -555,9 +555,9 @@ impl Engine {
                             refresh_ttl = hit.refresh_ttl,
                             elapsed_secs = elapsed_secs,
                             remaining_ttl = remaining_ttl,
-                            threshold_percent = self.cache_refresh_threshold_percent,
+                            threshold_percent = cfg.settings.cache_refresh_threshold_percent,
                             threshold_value = threshold,
-                            min_ttl = self.cache_refresh_min_ttl,
+                            min_ttl = cfg.settings.cache_refresh_min_ttl,
                             is_refreshing = is_refreshing,
                             should_trigger = !is_refreshing && remaining_ttl as u64 <= threshold,
                             upstream = ?hit.upstream,
@@ -656,7 +656,7 @@ impl Engine {
         if let Some(p) = pipeline_opt {
             // Optimization: only include IP in hash when rule uses client_ip matcher or config requires it
             // 优化：仅当规则使用client_ip匹配器或配置要求时才包含IP在哈希中
-            let include_ip_in_hash = p.uses_client_ip || self.cache_background_refresh;
+            let include_ip_in_hash = p.uses_client_ip || cfg.settings.cache_background_refresh;
             let rule_hash = crate::engine::rules::calculate_rule_hash(
                 cache_namespace,
                 &pipeline_id,
@@ -974,7 +974,10 @@ impl Engine {
             // when the background refresh completes. If client_timeout expires, serve stale.
             // 设计：check_cache() 在 client_timeout > 0 且缓存过期时已触发 spawn_background_refresh。
             // 这里以 5ms 间隔轮询缓存，检测后台刷新是否完成。超时则返回过期数据。
-            if !skip_cache && self.serve_stale && self.serve_stale_client_timeout_ms > 0 {
+            if !skip_cache
+                && cfg.settings.serve_stale
+                && cfg.settings.serve_stale_client_timeout_ms > 0
+            {
                 let has_stale = self
                     .cache
                     .get(&dedupe_hash)
@@ -989,8 +992,9 @@ impl Engine {
                     .is_some();
 
                 if has_stale {
-                    let client_timeout =
-                        std::time::Duration::from_millis(self.serve_stale_client_timeout_ms);
+                    let client_timeout = std::time::Duration::from_millis(
+                        cfg.settings.serve_stale_client_timeout_ms,
+                    );
                     let poll_interval = std::time::Duration::from_millis(5);
                     let wait_start = Instant::now();
 
@@ -1053,7 +1057,7 @@ impl Engine {
                             event = "serve_stale_on_client_timeout",
                             qname = %qname_ref,
                             qtype = ?qtype,
-                            timeout_ms = self.serve_stale_client_timeout_ms,
+                            timeout_ms = cfg.settings.serve_stale_client_timeout_ms,
                             client_ip = %peer.ip(),
                             pipeline = %pipeline_id,
                             "RFC 8767: client timeout expired, serving stale"
@@ -2912,6 +2916,66 @@ mod tests {
         assert!(
             engine.cache.get(&dedupe_hash).is_none(),
             "Cache entry should be removed after expiration check"
+        );
+    }
+
+    /// serve_stale 等设置曾在构造 Engine 时拷贝，热重载改不动；这里断言重载后的
+    /// 新值立刻生效：serve_stale 打开后过期条目必须保留下来供兜底。
+    /// serve_stale and friends used to be copied when the Engine was built, so a
+    /// reload could not change them; assert the reloaded value takes effect at
+    /// once: with serve_stale on, an expired entry must be kept for fallback.
+    #[tokio::test]
+    async fn reloaded_serve_stale_setting_keeps_expired_entries() {
+        let engine = build_test_engine();
+        engine.reload(RuntimePipelineConfig {
+            settings: GlobalSettings {
+                default_upstream: TEST_UPSTREAM.to_string(),
+                serve_stale: true,
+                ..Default::default()
+            },
+            pipeline_select: Vec::new(),
+            pipelines: Vec::new(),
+            pipeline_id_index: FxHashMap::default(),
+        });
+
+        let pipeline_id: Arc<str> = Arc::from("default");
+        let qname = "stale.com";
+        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(
+            engine.state.load().cache_namespace(&pipeline_id),
+            &pipeline_id,
+            qname.as_bytes(),
+            RecordType::A,
+            DNSClass::IN,
+            None,
+        );
+        engine.cache.insert(
+            dedupe_hash,
+            Arc::new(CacheEntry {
+                bytes: Bytes::from_static(b"old_resp"),
+                rcode: ResponseCode::NoError,
+                upstream: None,
+                qname: Arc::from(qname),
+                pipeline_id: pipeline_id.clone(),
+                qtype: u16::from(RecordType::A),
+                inserted_at: Instant::now() - Duration::from_secs(10),
+                original_ttl: 5,
+                refresh_ttl: 5,
+            }),
+        );
+
+        let mut packet = vec![0u8; 12];
+        packet[0] = 0xAA;
+        packet[1] = 0xBB;
+        packet[5] = 1;
+        packet.extend_from_slice(b"\x05stale\x03com\x00\x00\x01\x00\x01");
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        engine
+            .handle_packet_fast(&packet, peer)
+            .expect("parse query");
+
+        assert!(
+            engine.cache.get(&dedupe_hash).is_some(),
+            "serve_stale enabled by the reload must keep the expired entry"
         );
     }
 

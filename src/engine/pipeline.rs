@@ -260,7 +260,8 @@ impl Engine {
         } = *request;
         // 1. Check Rule Cache
         // Use hash for lookup to avoid cloning String for key on every lookup
-        let include_ip = pipeline.uses_client_ip || self.cache_background_refresh;
+        let include_ip =
+            pipeline.uses_client_ip || state.pipeline.settings.cache_background_refresh;
         let rule_hash = calculate_rule_hash(
             state.cache_namespace(&pipeline.id),
             &pipeline.id,

@@ -128,7 +128,13 @@ pub fn spawn_background_refresh(
                 // singleflight state and prevents repeated stale hits from spawning a retry storm.
                 // 在短暂退避期间保留刷新标记，避免 stale 请求持续触发失败重试。
                 tokio::time::sleep(std::time::Duration::from_secs(
-                    engine.cache_refresh_min_ttl.max(1) as u64,
+                    engine
+                        .state
+                        .load()
+                        .pipeline
+                        .settings
+                        .cache_refresh_min_ttl
+                        .max(1) as u64,
                 ))
                 .await;
             }
