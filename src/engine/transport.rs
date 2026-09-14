@@ -1266,7 +1266,13 @@ impl std::fmt::Display for DohHttpStatusError {
 
 impl std::error::Error for DohHttpStatusError {}
 
-pub struct DohClient {
+/// One DoH upstream's state: its own reqwest client (connection pool) and its
+/// consecutive transport-error count. Rebuilding a pool after repeated
+/// failures therefore only evicts that upstream's connections; the other DoH
+/// upstreams keep their keep-alive connections.
+/// 单个 DoH 上游的状态：独立的 reqwest 客户端（连接池）和连续传输错误计数。连续失败后
+/// 重建连接池只影响该上游，其它 DoH 上游的 keep-alive 连接不受牵连。
+struct DohUpstream {
     /// Hot-swappable reqwest client (its connection pool). Replacing it drops the
     /// old pool, which is the only way to evict half-open/dead connections that
     /// reqwest cannot detect (DoH uses POST, which hyper won't auto-retry).
@@ -1274,12 +1280,16 @@ pub struct DohClient {
     /// 这是清除 reqwest 无法检测的半开/死连接的唯一手段
     /// （DoH 用 POST，hyper 不会自动重试）
     client: ArcSwap<DohHttpClient>,
+    /// Consecutive transport errors; cleared by a success or a rebuild.
+    /// 连续传输错误数；成功或重建后清零。
+    consecutive_errors: AtomicUsize,
+}
+
+pub struct DohClient {
+    /// Per-upstream state, created the first time an upstream is used.
+    /// 按上游划分的状态，首次使用该上游时创建。
+    upstreams: DashMap<Arc<str>, Arc<DohUpstream>, FxBuildHasher>,
     pool_max_idle_per_host: usize,
-    /// Per-upstream consecutive transport-error counts. Mirrors the mux clients'
-    /// consecutive_errors, but keyed by upstream since the reqwest pool is per-host.
-    /// per-upstream 连续传输错误计数。对齐 mux 的 consecutive_errors，
-    /// 因 reqwest 连接池是 per-host 的，按 upstream 维度计数
-    error_counts: DashMap<Arc<str>, usize, FxBuildHasher>,
     /// Threshold of consecutive transport errors that triggers a pool rebuild.
     /// 触发连接池重建的连续传输错误阈值
     health_error_threshold: usize,
@@ -1291,9 +1301,8 @@ impl DohClient {
         health_error_threshold: usize,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            client: ArcSwap::from_pointee(Self::build_client(pool_max_idle_per_host)?),
+            upstreams: DashMap::with_hasher(FxBuildHasher),
             pool_max_idle_per_host,
-            error_counts: DashMap::with_hasher(FxBuildHasher),
             health_error_threshold,
         })
     }
@@ -1310,6 +1319,26 @@ impl DohClient {
             .context("build doh http client")
     }
 
+    /// State for `upstream`, built on first sight. One map read per query on
+    /// the hot path; the key is allocated once per upstream.
+    /// `upstream` 的状态，首次遇到时创建。热路径每查询一次 map 读取；key 每个上游只分配一次。
+    fn upstream(&self, upstream: &str) -> anyhow::Result<Arc<DohUpstream>> {
+        if let Some(state) = self.upstreams.get(upstream) {
+            return Ok(Arc::clone(&state));
+        }
+        match self.upstreams.entry(Arc::from(upstream)) {
+            entry::Entry::Occupied(existing) => Ok(Arc::clone(existing.get())),
+            entry::Entry::Vacant(slot) => {
+                let state = Arc::new(DohUpstream {
+                    client: ArcSwap::from_pointee(Self::build_client(self.pool_max_idle_per_host)?),
+                    consecutive_errors: AtomicUsize::new(0),
+                });
+                slot.insert(Arc::clone(&state));
+                Ok(state)
+            }
+        }
+    }
+
     pub async fn send(
         &self,
         packet: &[u8],
@@ -1318,11 +1347,12 @@ impl DohClient {
     ) -> anyhow::Result<Bytes> {
         let (url, host_override) = build_doh_url(upstream)?;
         let host = host_override.as_deref();
+        let state = self.upstream(upstream)?;
 
         let start = tokio::time::Instant::now();
-        match self.send_once(packet, &url, host, timeout_dur).await {
+        match Self::send_once(&state, packet, &url, host, timeout_dur).await {
             Ok(bytes) => {
-                self.record_success(upstream);
+                state.consecutive_errors.store(0, Ordering::Release);
                 Ok(bytes)
             }
             Err(err) if is_transport_error(&err) => {
@@ -1343,7 +1373,7 @@ impl DohClient {
                     retry_timeout_ms = remaining.as_millis() as u64,
                     "DoH transport error, performing transparent retry"
                 );
-                self.send_once(packet, &url, host, remaining).await
+                Self::send_once(&state, packet, &url, host, remaining).await
             }
             Err(e) => Err(e),
         }
@@ -1352,7 +1382,7 @@ impl DohClient {
     /// Single attempt: send the request and read the body within a timeout.
     /// 单次尝试：在超时内发送请求并读取响应体
     async fn send_once(
-        &self,
+        state: &DohUpstream,
         packet: &[u8],
         url: &Url,
         host_override: Option<&str>,
@@ -1362,7 +1392,7 @@ impl DohClient {
         // await points (an ArcSwap Guard would not). The Arc is cheap to hold.
         // load_full() 返回 owned Arc<Client>，保持 Future 跨 await 点 Send
         // （ArcSwap 的 Guard 不满足）。持有 Arc 很廉价。
-        let client = self.client.load_full();
+        let client = state.client.load_full();
 
         let mut req = client
             .post(url.clone())
@@ -1407,30 +1437,33 @@ impl DohClient {
     }
 
     /// Record a consecutive transport error for the upstream. When the count
-    /// reaches the threshold, rebuild the reqwest client (evicting the dead
-    /// connection pool) and reset the counter. Returns true if rebuilt.
-    /// 记录 upstream 的连续传输错误。计数达阈值时重建 reqwest 客户端
-    /// （驱逐死连接池）并清零计数。重建返回 true。
+    /// reaches the threshold, rebuild that upstream's reqwest client (evicting
+    /// its dead connection pool) and reset the counter. Returns true if rebuilt.
+    /// 记录 upstream 的连续传输错误。计数达阈值时重建该上游的 reqwest 客户端
+    /// （驱逐其死连接池）并清零计数。重建返回 true。
     fn record_error(&self, upstream: &str) -> bool {
-        let mut count = self
-            .error_counts
-            .entry(Arc::<str>::from(upstream))
-            .or_insert(0);
-        *count += 1;
-        if *count >= self.health_error_threshold {
+        let state = match self.upstream(upstream) {
+            Ok(state) => state,
+            Err(e) => {
+                warn!(upstream = upstream, error = %e, "failed to build DoH client");
+                return false;
+            }
+        };
+        let count = state.consecutive_errors.fetch_add(1, Ordering::AcqRel) + 1;
+        if count >= self.health_error_threshold {
             match Self::build_client(self.pool_max_idle_per_host) {
                 Ok(new_client) => {
                     // Swap in a fresh client; the old pool is released once in-flight
                     // requests holding a cloned Arc finish.
                     // 替换为新客户端；旧池在持有 Arc 副本的在途请求结束后释放
-                    self.client.store(Arc::new(new_client));
+                    state.client.store(Arc::new(new_client));
                     warn!(
                         upstream = upstream,
-                        consecutive_errors = *count,
+                        consecutive_errors = count,
                         threshold = self.health_error_threshold,
                         "DoH error threshold exceeded, rebuilding connection pool"
                     );
-                    *count = 0;
+                    state.consecutive_errors.store(0, Ordering::Release);
                     true
                 }
                 Err(e) => {
@@ -1445,7 +1478,7 @@ impl DohClient {
         } else {
             debug!(
                 upstream = upstream,
-                consecutive_errors = *count,
+                consecutive_errors = count,
                 threshold = self.health_error_threshold,
                 "DoH transport error recorded"
             );
@@ -1453,11 +1486,12 @@ impl DohClient {
         }
     }
 
-    /// Clear the consecutive error counter on success (mirrors record_success).
-    /// 成功时清零连续错误计数（对齐 record_success）
+    /// Clear the consecutive error counter of `upstream` (what a successful
+    /// send does inline). / 清零 `upstream` 的连续错误计数（成功发送时内联完成）。
+    #[cfg(test)]
     fn record_success(&self, upstream: &str) {
-        if let Some(mut count) = self.error_counts.get_mut(upstream) {
-            *count = 0;
+        if let Some(state) = self.upstreams.get(upstream) {
+            state.consecutive_errors.store(0, Ordering::Release);
         }
     }
 }
@@ -3391,7 +3425,8 @@ mod tests {
         let client = DohClient::new(8, 3).expect("build doh client");
         let upstream = "doh:8.8.8.8";
 
-        let ptr_before = Arc::as_ptr(&client.client.load_full()) as usize;
+        let ptr_before =
+            Arc::as_ptr(&client.upstream(upstream).unwrap().client.load_full()) as usize;
         // Two errors stay below the threshold (3): no rebuild.
         assert!(
             !client.record_error(upstream),
@@ -3402,16 +3437,50 @@ mod tests {
             "no rebuild before threshold (2/3)"
         );
         assert_eq!(
-            Arc::as_ptr(&client.client.load_full()) as usize,
+            Arc::as_ptr(&client.upstream(upstream).unwrap().client.load_full()) as usize,
             ptr_before,
             "client pointer must be unchanged below threshold"
         );
         // Third error reaches the threshold: pool rebuilt.
         assert!(client.record_error(upstream), "rebuild at threshold (3/3)");
         assert_ne!(
-            Arc::as_ptr(&client.client.load_full()) as usize,
+            Arc::as_ptr(&client.upstream(upstream).unwrap().client.load_full()) as usize,
             ptr_before,
             "client pointer must change after rebuild"
+        );
+    }
+
+    #[test]
+    fn doh_rebuild_is_scoped_to_the_failing_upstream() {
+        // A single reqwest client used to be shared by every DoH upstream, so
+        // reaching the error threshold on one upstream replaced the pool of all
+        // of them: the healthy upstream lost its keep-alive connections and had
+        // to handshake again. Each upstream now owns its client.
+        // 以前所有 DoH 上游共用一个 reqwest 客户端，一个上游达到错误阈值会把所有
+        // 上游的连接池一起换掉，健康上游丢失 keep-alive 连接、被迫重新握手。
+        // 现在每个上游各持一个客户端。
+        let client = DohClient::new(8, 3).expect("build doh client");
+        let healthy = "doh:1.1.1.1";
+        let failing = "doh:bad.example";
+        let healthy_before =
+            Arc::as_ptr(&client.upstream(healthy).unwrap().client.load_full()) as usize;
+        let failing_before =
+            Arc::as_ptr(&client.upstream(failing).unwrap().client.load_full()) as usize;
+
+        for _ in 0..2 {
+            assert!(!client.record_error(failing));
+        }
+        assert!(client.record_error(failing), "third error rebuilds");
+
+        assert_ne!(
+            Arc::as_ptr(&client.upstream(failing).unwrap().client.load_full()) as usize,
+            failing_before,
+            "the failing upstream's pool is rebuilt"
+        );
+        assert_eq!(
+            Arc::as_ptr(&client.upstream(healthy).unwrap().client.load_full()) as usize,
+            healthy_before,
+            "the healthy upstream keeps its pool"
         );
     }
 
