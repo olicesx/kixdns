@@ -889,9 +889,11 @@ impl TcpMuxClient {
             self.last_health_check_time.store(now, Ordering::Relaxed);
         }
 
-        // 1. Ensure connection exists (acquires connection-level permit if needed)
-        // 确保连接存在（如果需要则获取连接级别 permit）
-        self.ensure_connection().await?;
+        // 1. Ensure connection exists (acquires connection-level permit if needed),
+        //    within what is left of the budget
+        // 确保连接存在（如果需要则获取连接级别 permit），受剩余预算约束
+        self.ensure_connection(timeout_dur.saturating_sub(start.elapsed()))
+            .await?;
 
         let elapsed = start.elapsed();
         if elapsed >= timeout_dur {
@@ -1044,7 +1046,11 @@ impl TcpMuxClient {
     /// - 连接生命周期内持有
     /// - 连接关闭/重置时释放
     /// - 允许同一连接上无限请求（TCP 多路复用）
-    async fn ensure_connection(&self) -> anyhow::Result<()> {
+    ///
+    /// `budget` bounds the connect; on failure the lock and the permit are
+    /// released immediately.
+    /// `budget` 约束建连；失败时立即释放锁和 permit。
+    async fn ensure_connection(&self, budget: Duration) -> anyhow::Result<()> {
         // First, check if we need to reconnect based on error state
         // 首先，根据错误状态检查是否需要重连
         let errors = self.consecutive_errors.load(Ordering::Acquire);
@@ -1069,11 +1075,16 @@ impl TcpMuxClient {
                 .try_acquire()
                 .ok_or_else(|| anyhow::anyhow!("tcp connection limit exceeded"))?;
 
-            // Establish TCP connection
-            // 建立 TCP 连接
-            let stream = TcpStream::connect(&*self.upstream)
-                .await
-                .map_err(|e| anyhow::anyhow!("tcp connect failed: {}", e))?;
+            // Establish TCP connection within the budget. Unbounded, a blackholed
+            // SYN blocks here until the kernel gives up (minutes) while every
+            // other request on this client waits for the lock.
+            // 在预算内建立 TCP 连接。不设限时 SYN 被黑洞会在此阻塞到内核放弃（分钟级），
+            // 期间该客户端的其他请求都在等这把锁。
+            let stream = match timeout(budget, TcpStream::connect(&*self.upstream)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => anyhow::bail!("tcp connect failed: {e}"),
+                Err(_) => anyhow::bail!("tcp connect timeout after {}ms", budget.as_millis()),
+            };
 
             // Configure socket options for robustness
             // 配置 socket 选项以增强健壮性
@@ -1881,7 +1892,8 @@ impl DotMuxClient {
             self.last_health_check_time.store(now, Ordering::Relaxed);
         }
 
-        self.ensure_connection().await?;
+        self.ensure_connection(timeout_dur.saturating_sub(start.elapsed()))
+            .await?;
 
         let elapsed = start.elapsed();
         if elapsed >= timeout_dur {
@@ -1977,7 +1989,10 @@ impl DotMuxClient {
         Ok(resp)
     }
 
-    async fn ensure_connection(&self) -> anyhow::Result<()> {
+    /// `budget` bounds the TCP connect and the TLS handshake together; on
+    /// failure the lock and the permit are released immediately.
+    /// `budget` 同时约束 TCP 建连和 TLS 握手；失败时立即释放锁和 permit。
+    async fn ensure_connection(&self, budget: Duration) -> anyhow::Result<()> {
         let errors = self.consecutive_errors.load(Ordering::Acquire);
         let needs_reset = errors > 0;
 
@@ -2008,24 +2023,39 @@ impl DotMuxClient {
                     .clone()
             };
 
-            let stream = TcpStream::connect(&*target.connect_addr)
-                .await
-                .map_err(|e| anyhow::anyhow!("dot connect failed: {}", e))?;
-
-            let _ = stream.set_nodelay(true);
-            let sock = SockRef::from(&stream);
-            let mut ka = TcpKeepalive::new();
-            ka = ka.with_time(Duration::from_secs(5));
-            ka = ka.with_interval(Duration::from_secs(2));
-            let _ = sock.set_keepalive(true);
-            let _ = sock.set_tcp_keepalive(&ka);
-
+            // Connect and complete the TLS handshake within the budget: an
+            // upstream that accepts and stays silent would otherwise hold the
+            // lock, and every request queued behind it, indefinitely.
+            // 在预算内建连并完成 TLS 握手：accept 后沉默的上游否则会无限期占住锁，
+            // 排在后面的请求一起被钉死。
             let tls_connector = TlsConnector::from(self.tls_config.clone());
             let server_name = build_server_name(&target.sni)?;
-            let tls_stream = tls_connector
-                .connect(server_name, stream)
-                .await
-                .context("dot tls handshake failed")?;
+            let connect = async {
+                let stream = TcpStream::connect(&*target.connect_addr)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("dot connect failed: {}", e))?;
+
+                let _ = stream.set_nodelay(true);
+                let sock = SockRef::from(&stream);
+                let mut ka = TcpKeepalive::new();
+                ka = ka.with_time(Duration::from_secs(5));
+                ka = ka.with_interval(Duration::from_secs(2));
+                let _ = sock.set_keepalive(true);
+                let _ = sock.set_tcp_keepalive(&ka);
+
+                tls_connector
+                    .connect(server_name, stream)
+                    .await
+                    .context("dot tls handshake failed")
+            };
+            let tls_stream = match timeout(budget, connect).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => anyhow::bail!(
+                    "dot connect/handshake timeout after {}ms",
+                    budget.as_millis()
+                ),
+            };
 
             let (read_half, write_half) = tokio::io::split(tls_stream);
             *guard = Some(write_half);
@@ -3113,6 +3143,115 @@ mod tests {
             &response[12..],
             &query[12..],
             "delivered answer is the genuine one"
+        );
+    }
+
+    /// Listener whose accept queue is full and never drained: the kernel drops
+    /// further SYNs, so a connect() to it hangs until the SYN retransmits give
+    /// up (minutes) unless the caller bounds it.
+    /// accept 队列已满且从不 accept 的监听器：内核丢弃后续 SYN，connect() 会挂到
+    /// SYN 重传耗尽（分钟级），除非调用方自己设限。
+    struct BlackholedListener {
+        addr: SocketAddr,
+        _listener: Socket,
+        _queued: Vec<std::net::TcpStream>,
+    }
+
+    async fn blackholed_tcp_listener() -> BlackholedListener {
+        let listener = Socket::new(Domain::IPV4, Type::STREAM, None).expect("create listener");
+        listener
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .expect("bind listener");
+        listener.listen(1).expect("listen with backlog 1");
+        let addr = listener.local_addr().unwrap().as_socket().unwrap();
+        let queued = tokio::task::spawn_blocking(move || {
+            let mut held = Vec::new();
+            for _ in 0..8 {
+                if let Ok(stream) =
+                    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200))
+                {
+                    held.push(stream);
+                }
+            }
+            held
+        })
+        .await
+        .expect("fill accept queue");
+        BlackholedListener {
+            addr,
+            _listener: listener,
+            _queued: queued,
+        }
+    }
+
+    /// Listener that accepts and then never sends a byte, so a TLS handshake
+    /// against it never completes.
+    /// accept 后一个字节都不发的监听器：TLS 握手永远完不成。
+    async fn silent_tcp_listener() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind silent listener");
+        let addr = listener.local_addr().expect("read silent listener address");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_is_bounded_by_the_request_budget() {
+        // ensure_connection used to call TcpStream::connect with no timeout while
+        // holding the connection lock: a blackholed upstream pinned the request
+        // (and every request queued behind the lock) for the kernel's SYN
+        // timeout, regardless of the configured upstream timeout.
+        // ensure_connection 曾在持有连接锁时无超时地 connect：上游黑洞时请求（以及排在
+        // 锁后的所有请求）会等满内核 SYN 超时，配置的 upstream 超时形同虚设。
+        let blackhole = blackholed_tcp_listener().await;
+        let client = TcpMuxClient::new(
+            Arc::from(blackhole.addr.to_string()),
+            Arc::new(PermitManager::new(1)),
+        );
+        let started = tokio::time::Instant::now();
+        let result = timeout(
+            Duration::from_secs(3),
+            client.send(&[0u8; 12], Duration::from_millis(300)),
+        )
+        .await
+        .expect("send must give up within its budget, not wait for the kernel SYN timeout");
+        assert!(result.is_err(), "a blackholed upstream cannot succeed");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "gave up after {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn dot_connect_and_handshake_are_bounded_by_the_request_budget() {
+        // Same for DoT, where the TLS handshake is the part that can stall: an
+        // upstream that accepts and stays silent must not pin the request.
+        // DoT 同理，卡住的是 TLS 握手：accept 后沉默的上游不能钉死请求。
+        let addr = silent_tcp_listener().await;
+        let client = DotMuxClient::new(
+            Arc::from(format!("dot://{addr}?sni=localhost")),
+            Arc::new(build_tls_client_config().expect("tls config")),
+            Arc::new(PermitManager::new(1)),
+        );
+        let started = tokio::time::Instant::now();
+        let result = timeout(
+            Duration::from_secs(3),
+            client.send(&[0u8; 12], Duration::from_millis(300)),
+        )
+        .await
+        .expect("send must give up within its budget, not wait for a handshake that never comes");
+        assert!(result.is_err(), "a silent upstream cannot succeed");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "gave up after {:?}",
+            started.elapsed()
         );
     }
 
