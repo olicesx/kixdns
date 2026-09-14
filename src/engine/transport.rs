@@ -64,12 +64,10 @@ struct UdpSocketState {
     /// Inflight map: ID -> (OriginalID, ExpectedAddr, Sender)
     /// Note: Using FxBuildHasher for performance
     inflight: Arc<UdpInflightMap>,
-    next_id: AtomicU16,
 }
 
 pub struct UdpClient {
     pool: Vec<UdpSocketState>,
-    next_idx: AtomicUsize,
 }
 
 impl UdpClient {
@@ -106,7 +104,6 @@ impl UdpClient {
             let state = UdpSocketState {
                 socket: socket.clone(),
                 inflight: inflight.clone(),
-                next_id: AtomicU16::new(0),
             };
             pool.push(state);
 
@@ -187,10 +184,7 @@ impl UdpClient {
                 }
             });
         }
-        Ok(Self {
-            pool,
-            next_idx: AtomicUsize::new(0),
-        })
+        Ok(Self { pool })
     }
 
     #[inline]
@@ -204,8 +198,16 @@ impl UdpClient {
             return Err(anyhow::anyhow!("UDP pool not initialized"));
         }
 
-        // Pool logic
-        let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % self.pool.len();
+        // RFC 5452 §4.3 / §9.2: neither the transaction ID nor the source port
+        // may be predictable, or a forged answer only has to guess the next
+        // value. One draw from the thread-local RNG serves both: the high half
+        // picks the socket (each pool socket sits on its own ephemeral port),
+        // the low half seeds the ID.
+        // RFC 5452 §4.3/§9.2：TXID 和源端口都不能可预测，否则伪造应答只需猜下一个值。
+        // 从线程本地 RNG 取一次 32 位：高 16 位随机选 socket（池内每个 socket 各占
+        // 一个临时端口），低 16 位作为 ID 起点。
+        let draw: u32 = rand::random();
+        let idx = (draw >> 16) as usize % self.pool.len();
         let state = &self.pool[idx];
         let addr: SocketAddr = upstream.parse().context("invalid upstream address")?;
 
@@ -214,20 +216,21 @@ impl UdpClient {
         }
         let original_id = u16::from_be_bytes([packet[0], packet[1]]);
 
-        // Find a free ID using atomic entry API
-        // 使用原子 Entry API 查找空闲 ID
+        // Claim a free ID using the atomic entry API; on a collision with an
+        // in-flight query draw a fresh random ID rather than the next one.
+        // 使用原子 Entry API 占用空闲 ID；与在途查询冲突时重新随机，而不是取下一个。
         let mut attempts = 0;
-        let mut new_id;
+        let mut new_id = draw as u16;
         let (tx, rx) = oneshot::channel();
 
         loop {
-            new_id = state.next_id.fetch_add(1, Ordering::Relaxed);
             match state.inflight.entry(new_id) {
                 entry::Entry::Vacant(e) => {
                     e.insert((original_id, addr, tx));
                     break;
                 }
                 entry::Entry::Occupied(_) => {
+                    new_id = rand::random();
                     attempts += 1;
                     if attempts > 100 {
                         warn!(
@@ -2890,6 +2893,92 @@ mod tests {
     use futures::future::join_all;
     use std::time::Duration;
     use tokio::time::timeout;
+
+    /// UDP "upstream" for UdpClient tests: records the (transaction id, source
+    /// port) of every query it receives and answers with `reply(query)`.
+    /// UdpClient 测试用的 UDP "上游"：记录每个查询的 (TXID, 源端口)，用 reply(query) 应答。
+    async fn spawn_udp_upstream(
+        reply: impl Fn(&[u8]) -> Vec<u8> + Send + 'static,
+    ) -> (String, Arc<std::sync::Mutex<Vec<(u16, u16)>>>) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind UDP test upstream");
+        let addr = socket.local_addr().expect("read UDP test address");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, src)) = socket.recv_from(&mut buf).await {
+                let query = &buf[..n];
+                let id = u16::from_be_bytes([query[0], query[1]]);
+                recorder.lock().unwrap().push((id, src.port()));
+                let _ = socket.send_to(&reply(query), src).await;
+            }
+        });
+        (addr.to_string(), seen)
+    }
+
+    /// A query for `name` (A, IN) with a fixed transaction id.
+    fn udp_test_query(name: &str) -> Vec<u8> {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RecordType};
+        let mut msg = Message::new(0x1234, MessageType::Query, OpCode::Query);
+        msg.add_query(Query::query(
+            Name::from_ascii(name).expect("parse test name"),
+            RecordType::A,
+        ));
+        msg.to_vec().expect("encode test query")
+    }
+
+    /// Flip the QR bit so `query` becomes a (empty) response to itself.
+    fn udp_echo_response(query: &[u8]) -> Vec<u8> {
+        let mut response = query.to_vec();
+        response[2] |= 0x80;
+        response
+    }
+
+    #[tokio::test]
+    async fn udp_send_randomizes_transaction_id_and_source_port() {
+        // RFC 5452 §4.3 / §9.2: neither the ID nor the source port may be
+        // predictable. Before this, every socket numbered its IDs 0, 1, 2, …
+        // and sockets were picked round-robin, so the sequence of (ID, port)
+        // pairs was fully predictable.
+        // RFC 5452 §4.3/§9.2：TXID 和源端口都不能可预测。此前每个 socket 的 ID 从
+        // 0 顺序递增、socket 轮询选择，(ID, 端口) 序列完全可预测。
+        let (upstream, seen) = spawn_udp_upstream(udp_echo_response).await;
+        let client = UdpClient::new(4).expect("create UDP client");
+        let sends = 16;
+        for _ in 0..sends {
+            client
+                .send(
+                    &udp_test_query("id.example."),
+                    &upstream,
+                    Duration::from_secs(2),
+                )
+                .await
+                .expect("query answered");
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), sends);
+
+        // Sequential numbering keeps every ID below the number of sends per
+        // socket; random IDs spread over the whole 16-bit space.
+        let ids: Vec<u16> = seen.iter().map(|(id, _)| *id).collect();
+        assert!(
+            ids.iter().any(|&id| id as usize >= sends),
+            "transaction IDs look sequential: {ids:?}"
+        );
+
+        // Round-robin socket choice repeats the same port every pool_size sends.
+        let ports: Vec<u16> = seen.iter().map(|(_, port)| *port).collect();
+        assert!(
+            ports
+                .iter()
+                .enumerate()
+                .any(|(i, port)| *port != ports[i % 4]),
+            "source ports cycle round-robin: {ports:?}"
+        );
+    }
 
     async fn connected_tcp_write_half() -> (OwnedWriteHalf, TcpStream) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
