@@ -1346,10 +1346,12 @@ impl std::error::Error for DohHttpStatusError {}
 /// 单个 DoH 上游的状态：独立的 reqwest 客户端（连接池）和连续传输错误计数。连续失败后
 /// 重建连接池只影响该上游，其它 DoH 上游的 keep-alive 连接不受牵连。
 /// 超过这个数量后，新增上游时顺带清理长期不用的条目
-/// Past this many entries, adding an upstream also prunes the idle ones
+/// Past this many entries, looking an upstream up also prunes the idle ones
 const DOH_UPSTREAM_PRUNE_AT: usize = 32;
 /// 多久没被用过就算可以清理 / How long an entry must sit unused to be pruned
 const DOH_UPSTREAM_IDLE: Duration = Duration::from_secs(600);
+/// 两次清理之间的最小间隔 / Shortest gap between two prunes
+const DOH_UPSTREAM_PRUNE_EVERY: Duration = Duration::from_secs(60);
 
 struct DohUpstream {
     /// Hot-swappable reqwest client (its connection pool). Replacing it drops the
@@ -1375,6 +1377,8 @@ pub struct DohClient {
     /// Threshold of consecutive transport errors that triggers a pool rebuild.
     /// 触发连接池重建的连续传输错误阈值
     health_error_threshold: usize,
+    /// 上次清理空闲上游的时刻 / When idle upstreams were last pruned
+    last_prune_millis: AtomicU64,
 }
 
 impl DohClient {
@@ -1386,6 +1390,7 @@ impl DohClient {
             upstreams: DashMap::with_hasher(FxBuildHasher),
             pool_max_idle_per_host,
             health_error_threshold,
+            last_prune_millis: AtomicU64::new(unix_time_millis()),
         })
     }
 
@@ -1406,6 +1411,15 @@ impl DohClient {
     /// `upstream` 的状态，首次遇到时创建。热路径每查询一次 map 读取；key 每个上游只分配一次。
     fn upstream(&self, upstream: &str) -> anyhow::Result<Arc<DohUpstream>> {
         let now = unix_time_millis();
+        let state = self.lookup_or_create(upstream, now)?;
+        // 清理放在查表之后：此刻没有持有任何分片守卫，retain 不会和自己抢锁。
+        // Prune after the lookup: no shard guard is held here, so retain cannot
+        // contend with this very call.
+        self.prune_idle_upstreams(now);
+        Ok(state)
+    }
+
+    fn lookup_or_create(&self, upstream: &str, now: u64) -> anyhow::Result<Arc<DohUpstream>> {
         if let Some(state) = self.upstreams.get(upstream) {
             state.last_used_millis.store(now, Ordering::Relaxed);
             return Ok(Arc::clone(&state));
@@ -1425,7 +1439,6 @@ impl DohClient {
                     last_used_millis: AtomicU64::new(now),
                 });
                 slot.insert(Arc::clone(&state));
-                self.prune_idle_upstreams(now);
                 Ok(state)
             }
         }
@@ -1434,8 +1447,28 @@ impl DohClient {
     /// 清理长期不用的上游条目，让热重载换掉的上游不会一直占着连接池
     /// Drop entries nothing has used for a while, so upstreams a reload replaced
     /// do not keep their connection pools for the life of the process
+    ///
+    /// 每次查表之后都会调用，但受时间间隔节流：一次热重载换掉整批上游、之后再没有
+    /// 新上游出现时，旧条目同样会在下一个间隔被清掉，不必等下一次新键插入。
+    /// Called after every lookup but throttled by time: when a reload swaps the
+    /// whole set of upstreams and no new one ever appears again, the old entries
+    /// still go at the next interval instead of waiting for another new key.
     fn prune_idle_upstreams(&self, now: u64) {
+        // 热路径上只剩一次 relaxed 读 / A single relaxed load on the hot path
+        let last_prune = self.last_prune_millis.load(Ordering::Relaxed);
+        let prune_every = u64::try_from(DOH_UPSTREAM_PRUNE_EVERY.as_millis()).unwrap_or(u64::MAX);
+        if now.saturating_sub(last_prune) < prune_every {
+            return;
+        }
         if self.upstreams.len() <= DOH_UPSTREAM_PRUNE_AT {
+            return;
+        }
+        // 只让一个调用者真正执行这一轮 / Only one caller runs this round
+        if self
+            .last_prune_millis
+            .compare_exchange(last_prune, now, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
             return;
         }
         let idle_millis = u64::try_from(DOH_UPSTREAM_IDLE.as_millis()).unwrap_or(u64::MAX);
@@ -3642,17 +3675,7 @@ mod tests {
         }
         let live = "https://live.example/dns-query";
         client.upstream(live).expect("create live upstream");
-
-        // 把除 live 之外的条目标记为长期未使用 / Age every entry except live
-        let stale = unix_time_millis().saturating_sub(DOH_UPSTREAM_IDLE.as_millis() as u64 * 2);
-        for entry in client.upstreams.iter() {
-            if entry.key().as_ref() != live {
-                entry
-                    .value()
-                    .last_used_millis
-                    .store(stale, Ordering::Relaxed);
-            }
-        }
+        age_out_idle_upstreams(&client, live);
 
         client
             .upstream("https://new.example/dns-query")
@@ -3666,6 +3689,57 @@ mod tests {
         assert!(
             client.upstreams.contains_key(live),
             "an upstream in use must never be pruned"
+        );
+    }
+
+    /// 热重载换掉整批上游之后可能再没有新上游出现，此前清理只挂在新键插入上，
+    /// 旧条目会留到进程结束；现在查一次已有上游也会触发清理。
+    /// A reload can swap the whole upstream set and no new upstream ever follows;
+    /// pruning used to hang off new-key inserts alone, so the old entries lived
+    /// until the process exited. A lookup of an existing upstream now prunes too.
+    #[test]
+    fn doh_prunes_idle_upstreams_without_new_keys() {
+        let client = DohClient::new(8, 3).expect("build doh client");
+        for idx in 0..=DOH_UPSTREAM_PRUNE_AT {
+            client
+                .upstream(&format!("https://{idx}.example/dns-query"))
+                .expect("create upstream");
+        }
+        let live = "https://live.example/dns-query";
+        client.upstream(live).expect("create live upstream");
+        age_out_idle_upstreams(&client, live);
+
+        // 只重复查询已有上游，不插入任何新键
+        // Only look the existing upstream up again; no new key is inserted
+        client.upstream(live).expect("look up live upstream");
+
+        assert!(
+            client.upstreams.len() <= 2,
+            "idle upstreams must be pruned without a new key, {} left",
+            client.upstreams.len()
+        );
+        assert!(
+            client.upstreams.contains_key(live),
+            "an upstream in use must never be pruned"
+        );
+    }
+
+    /// 把除 `live` 之外的条目标记为长期未使用，并让节流窗口过期
+    /// Age every entry except `live`, and let the prune interval lapse
+    fn age_out_idle_upstreams(client: &DohClient, live: &str) {
+        let now = unix_time_millis();
+        let stale = now.saturating_sub(DOH_UPSTREAM_IDLE.as_millis() as u64 * 2);
+        for entry in client.upstreams.iter() {
+            if entry.key().as_ref() != live {
+                entry
+                    .value()
+                    .last_used_millis
+                    .store(stale, Ordering::Relaxed);
+            }
+        }
+        client.last_prune_millis.store(
+            now.saturating_sub(DOH_UPSTREAM_PRUNE_EVERY.as_millis() as u64 * 2),
+            Ordering::Relaxed,
         );
     }
 
