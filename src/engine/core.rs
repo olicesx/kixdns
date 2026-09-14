@@ -327,12 +327,17 @@ impl Engine {
                         info!(path = %path.display(), loaded_count = count,
                              used_tags = used_geosite_tags.len(),
                              "loaded GeoSite data from file");
-                        geosite_paths_for_watcher.push(path);
                     }
                     Err(e) => {
-                        warn!(path = %path.display(), error = %e, "failed to load GeoSite data, skipping");
+                        warn!(path = %path.display(), error = %e, "failed to load GeoSite data, waiting for the file to change");
                     }
                 }
+                // 解析失败也交给 watcher：写了一半或被截断的文件在下次写入完成时
+                // 能自己恢复，不必重启进程。
+                // Register with the watcher even when the parse failed: a
+                // half-written or truncated file heals itself on the next write
+                // instead of needing a restart.
+                geosite_paths_for_watcher.push(path);
             } else {
                 warn!(path = %path.display(), "GeoSite data file not found, skipping");
             }
