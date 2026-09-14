@@ -197,6 +197,19 @@ impl PermitManager {
         }
     }
 
+    /// Return one permit. Saturates at zero so the counter can never wrap: a
+    /// wrapped counter reads as "full" and refuses every acquire until restart.
+    /// 归还一个 permit。在 0 处饱和，计数永不回绕：回绕后的计数看起来是"满的"，
+    /// 会拒绝所有 acquire 直到重启。
+    #[inline]
+    fn release_one(&self) {
+        let _ = self
+            .active_permits
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |active| {
+                active.checked_sub(1)
+            });
+    }
+
     /// Get current inflight permits count / 获取当前进行中的 permits 数
     #[inline]
     pub fn inflight(&self) -> usize {
@@ -221,9 +234,24 @@ impl PermitManager {
         self.dropped_requests.load(Ordering::Relaxed)
     }
 
-    /// Check and recover from permit leakage / 检查并从permit泄漏中恢复
-    /// This should be called periodically or when pool exhaustion is detected
-    /// 应该定期调用或在检测到pool耗尽时调用
+    /// Log pool saturation, at most once per minute. Called from the periodic
+    /// flow-control adjustment and when an acquire is refused.
+    ///
+    /// This used to also "recover from leakage" by forcing `active_permits`
+    /// down to `max_permits` whenever it exceeded it. That state is not a leak:
+    /// the counter only moves through `try_acquire` and `PermitGuard`, which
+    /// release exactly once, so a guard that is never dropped keeps `active`
+    /// at or below `max`, never above it. `active > max` only arises when
+    /// `set_max_permits` lowers the limit under live guards, and clamping the
+    /// counter there made their later releases underflow it, after which every
+    /// acquire was refused for good.
+    /// 记录池饱和，每分钟最多一次。由周期性流控调整和 acquire 被拒时调用。
+    ///
+    /// 这里原本还会在 active 超过 max 时把 active 强行压到 max 来"恢复泄漏"。那不是
+    /// 泄漏：计数只经由 try_acquire 和恰好释放一次的 PermitGuard 变化，永不释放的
+    /// guard 只会让 active 停在 ≤ max，不会超过 max。active > max 只在
+    /// set_max_permits 于在途 guard 之下调低上限时出现，此时压低计数会让这些 guard
+    /// 之后的释放把计数减到下溢，从此所有 acquire 都被拒绝。
     pub fn check_and_recover(&self) {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -232,68 +260,30 @@ impl PermitManager {
 
         let last_ms = self.last_recovery_ms.load(Ordering::Relaxed);
 
-        // Only recover once per minute to avoid excessive recovery attempts
-        // 每分钟只恢复一次，避免过度恢复尝试
+        // At most once per minute / 每分钟最多一次
         if now_ms.saturating_sub(last_ms) < 60_000 {
             return;
         }
 
-        // Try to update recovery timestamp / 尝试更新恢复时间戳
-        match self.last_recovery_ms.compare_exchange_weak(
-            last_ms,
-            now_ms,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => {
-                // We won the race, perform recovery / 我们赢得了竞争，执行恢复
-                let active = self.active_permits.load(Ordering::Acquire);
-                let max = self.max_permits.load(Ordering::Acquire);
-
-                // If active permits exceed max significantly, it indicates leakage
-                // 如果活跃permits显著超过最大值，表示有泄漏
-                if active > max {
-                    tracing::error!(
-                        active = active,
-                        max = max,
-                        "Detected permit leakage: active permits exceed max, forcing recovery"
-                    );
-
-                    // Force reset to max to recover from leakage / 强制重置为最大值以从泄漏中恢复
-                    self.active_permits.store(max, Ordering::Release);
-
-                    let dropped = self.dropped_requests.load(Ordering::Relaxed);
-                    tracing::warn!(
-                        recovered = active - max,
-                        dropped_total = dropped,
-                        "Permit pool recovered from leakage"
-                    );
-                } else if active == max {
-                    // Pool is full but not leaked, log for monitoring / Pool满了但没泄漏，记录用于监控
-                    let dropped = self.dropped_requests.load(Ordering::Relaxed);
-                    tracing::warn!(
-                        active = active,
-                        max = max,
-                        dropped_total = dropped,
-                        "Permit pool is at capacity, consider increasing max_permits or checking upstream health"
-                    );
-                }
-            }
-            Err(_) => {
-                // Another thread is performing recovery, skip / 另一个线程正在执行恢复，跳过
-            }
+        // Try to update the timestamp; whoever wins reports / 尝试更新时间戳，赢者上报
+        if self
+            .last_recovery_ms
+            .compare_exchange_weak(last_ms, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
         }
-    }
 
-    /// Manual force recovery (for debugging or emergency use) / 手动强制恢复（用于调试或紧急情况）
-    #[cfg(debug_assertions)]
-    pub fn force_recover(&self) {
         let active = self.active_permits.load(Ordering::Acquire);
         let max = self.max_permits.load(Ordering::Acquire);
-
-        if active > max {
-            self.active_permits.store(max, Ordering::Release);
-            tracing::warn!(active = active, max = max, "Force recovered permit pool");
+        if active >= max {
+            let dropped = self.dropped_requests.load(Ordering::Relaxed);
+            tracing::warn!(
+                active = active,
+                max = max,
+                dropped_total = dropped,
+                "Permit pool is at capacity, consider increasing max_permits or checking upstream health"
+            );
         }
     }
 
@@ -336,7 +326,7 @@ impl PermitGuard {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            self.manager.active_permits.fetch_sub(1, Ordering::Release);
+            self.manager.release_one();
         }
         // self is dropped here; Drop::drop sees released=true → no double free
     }
@@ -351,7 +341,40 @@ impl Drop for PermitGuard {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            self.manager.active_permits.fetch_sub(1, Ordering::Release);
+            self.manager.release_one();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shrinking_max_below_inflight_does_not_corrupt_the_counter() {
+        // Flow control lowering max_permits while guards are live is the normal
+        // way active can exceed max; it is not a leak. Once those guards drop
+        // the pool must be empty and usable again.
+        // 流控在有在途 guard 时调低 max_permits 是 active 超过 max 的正常途径，不是
+        // 泄漏。这些 guard 释放后，池必须回到空闲且可用。
+        let manager = Arc::new(PermitManager::new(100));
+        let guards: Vec<_> = (0..60)
+            .map(|_| manager.try_acquire().expect("permit within limit"))
+            .collect();
+        manager.set_max_permits(59);
+        // The periodic health hook runs unconditionally from adjust().
+        manager.check_and_recover();
+        drop(guards);
+
+        assert_eq!(
+            manager.inflight(),
+            0,
+            "every released permit must be counted back"
+        );
+        manager.set_max_permits(100);
+        assert!(
+            manager.try_acquire().is_some(),
+            "pool must accept requests again after the guards are gone"
+        );
     }
 }
