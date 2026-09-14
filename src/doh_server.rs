@@ -35,6 +35,18 @@ use crate::watcher;
 
 const MAX_DNS_MESSAGE: usize = 64 * 1024;
 
+/// 客户端发送完整请求头的时限，也覆盖 keep-alive 连接上等待下一个请求的空闲期；
+/// 到期由 hyper 关闭连接。RFC 7766 §6.2.3 建议 DNS 服务端对空闲连接设数秒量级
+/// 的超时：10 s 足以让慢链路发完请求头，又不让只发半个请求头的连接无限期占用
+/// 一个任务和一个文件描述符。
+/// Time a client has to send a complete request head, which also bounds the
+/// idle wait for the next request on a keep-alive connection; hyper closes the
+/// connection when it expires. RFC 7766 §6.2.3 recommends a DNS server idle
+/// timeout in the order of seconds: 10 s leaves a slow link room to finish a
+/// request head while keeping half-sent requests from pinning a task and a
+/// file descriptor indefinitely.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// TLS acceptor shared between the accept loop and the certificate watcher:
 /// wait-free snapshot per connection, swapped wholesale on reload — the same
 /// hot-reload pattern as Engine's `Arc<ArcSwap<...>>` state.
@@ -87,7 +99,14 @@ pub async fn run_doh_with_listener(
                         let doh_path = doh_path.clone();
                         async move { handle_doh_request(req, peer, engine, &doh_path).await }
                     });
+                    // hyper 只在装了 timer 时才执行 header_read_timeout，否则静默
+                    // 禁用；TokioTimer 是零大小类型，每连接无额外开销。
+                    // hyper only enforces header_read_timeout when a timer is
+                    // installed and silently disables it otherwise; TokioTimer is
+                    // zero-sized, so this costs nothing per connection.
                     let _ = http1::Builder::new()
+                        .timer(hyper_util::rt::TokioTimer::new())
+                        .header_read_timeout(HEADER_READ_TIMEOUT)
                         .keep_alive(true)
                         .serve_connection(io, svc)
                         .await;

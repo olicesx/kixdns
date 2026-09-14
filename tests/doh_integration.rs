@@ -530,6 +530,45 @@ async fn test_doh_post_body_at_limit_still_processed() {
 }
 
 // ============================================================================
+// Request head timeout: half-sent requests do not pin a connection
+// ============================================================================
+
+/// A client that stops mid-header is disconnected by the server once the head
+/// read timeout elapses, instead of holding a task and a file descriptor until
+/// it decides to finish (or never does).
+#[tokio::test]
+async fn test_doh_half_sent_request_head_is_closed_after_timeout() {
+    let server = start_doh(make_nxdomain_engine()).await;
+    let mut stream = raw_tls_connect(&server).await;
+
+    // Start a request head and never finish it.
+    stream
+        .write_all(b"POST /dns-query HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+        .await
+        .expect("write partial head");
+
+    let started = std::time::Instant::now();
+    let mut buf = [0u8; 64];
+    let outcome = tokio::time::timeout(Duration::from_secs(30), stream.read(&mut buf))
+        .await
+        .expect("server must close the connection instead of waiting for the rest of the head");
+    let elapsed = started.elapsed();
+
+    // EOF (close_notify) or a reset both mean the server hung up; a response
+    // would mean it somehow accepted the truncated head.
+    assert!(
+        matches!(outcome, Ok(0) | Err(_)),
+        "expected the server to hang up, got {outcome:?}"
+    );
+    // Closed by the timeout, not by something else: it took a few seconds and
+    // did not need the outer 30 s guard.
+    assert!(
+        elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(20),
+        "server hung up after {elapsed:?}"
+    );
+}
+
+// ============================================================================
 // Concurrent request test
 // ============================================================================
 
