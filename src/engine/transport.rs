@@ -2200,6 +2200,9 @@ struct DoqRuntime {
     endpoint_v4: QuicEndpoint,
     endpoint_v6: QuicEndpoint,
     enable_0rtt: bool,
+    /// 0-RTT 的安全提示只在真正用上 0-RTT 时打印一次
+    /// Prints the 0-RTT security notice once, and only if 0-RTT is really used
+    zero_rtt_notice: std::sync::Once,
 }
 
 struct DoqConnectionInfo {
@@ -2274,21 +2277,6 @@ impl DoqClient {
         tls.alpn_protocols = vec![b"doq".to_vec()];
         tls.enable_early_data = enable_0rtt;
 
-        // Security warning: 0-RTT (early data) is vulnerable to replay attacks
-        // per RFC 8446 §8 and RFC 9001 §5.4. DNS queries are idempotent, so
-        // replay impact is limited to redundant lookups and potential cache
-        // timing side-channels. Only enable 0-RTT in trusted network environments.
-        // 安全警告：0-RTT（早期数据）容易受到重放攻击（RFC 8446 §8, RFC 9001 §5.4）。
-        // DNS 查询是幂等的，因此重放影响仅限于冗余查询和潜在的缓存时序侧信道。
-        // 仅在可信网络环境中启用 0-RTT。
-        if enable_0rtt {
-            tracing::warn!(
-                "DoQ 0-RTT enabled: vulnerable to replay attacks (RFC 8446 §8). \
-                 DNS queries are idempotent but an attacker can observe timing patterns. \
-                 Disable 0-RTT in untrusted environments."
-            );
-        }
-
         let quic_crypto = QuicClientConfig::try_from(tls).context("build quic client config")?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
 
@@ -2335,6 +2323,7 @@ impl DoqClient {
             endpoint_v4,
             endpoint_v6,
             enable_0rtt,
+            zero_rtt_notice: std::sync::Once::new(),
         });
 
         Ok(Self {
@@ -2789,6 +2778,24 @@ impl DoqMuxClient {
         let should_try_0rtt = enable_0rtt && !was_rejected;
 
         if should_try_0rtt {
+            // Security warning: 0-RTT (early data) is vulnerable to replay attacks
+            // per RFC 8446 §8 and RFC 9001 §5.4. DNS queries are idempotent, so
+            // replay impact is limited to redundant lookups and potential cache
+            // timing side-channels. Only enable 0-RTT in trusted network environments.
+            // The client is built for every configuration, so the notice waits for
+            // the first connection that actually offers early data.
+            // 安全警告：0-RTT（早期数据）容易受到重放攻击（RFC 8446 §8, RFC 9001 §5.4）。
+            // DNS 查询是幂等的，因此重放影响仅限于冗余查询和潜在的缓存时序侧信道。
+            // 仅在可信网络环境中启用 0-RTT。客户端在任何配置下都会构造，因此提示
+            // 推迟到第一个真正发送早期数据的连接。
+            self.runtime.zero_rtt_notice.call_once(|| {
+                tracing::warn!(
+                    upstream = %target.host,
+                    "DoQ 0-RTT enabled: vulnerable to replay attacks (RFC 8446 §8). \
+                     DNS queries are idempotent but an attacker can observe timing patterns. \
+                     Disable 0-RTT in untrusted environments."
+                );
+            });
             match connecting.into_0rtt() {
                 Ok((conn, _zero_rtt_accepted)) => {
                     // 0-RTT connection established
@@ -2901,6 +2908,20 @@ mod tests {
         let (server, _) = server.expect("accept TCP test client");
         let (_, write_half) = client.into_split();
         (write_half, server)
+    }
+
+    /// 0-RTT 的安全提示曾在构造 DoQ 客户端时打印，而客户端在任何配置下都会构造，
+    /// 于是没有任何 DoQ 上游的部署每次启动也会看到它。
+    /// The 0-RTT security notice used to be printed when the DoQ client was
+    /// built, and the client is built for every configuration, so deployments
+    /// without a single DoQ upstream saw it at every start.
+    #[tokio::test]
+    async fn doq_client_holds_the_0rtt_notice_until_early_data_is_offered() {
+        let client = DoqClient::new(1, 60, 15_000, true).expect("build DoQ client");
+        assert!(
+            !client.runtime.zero_rtt_notice.is_completed(),
+            "building the client must not emit the 0-RTT notice"
+        );
     }
 
     #[test]
