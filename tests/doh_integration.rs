@@ -14,6 +14,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{Name, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use kixdns::config::PipelineConfig;
 use kixdns::doh_server::run_doh_with_listener;
@@ -180,6 +181,8 @@ async fn spawn_doh(
 /// Holds the running DoH test server and keeps temp cert files alive.
 struct DohTestServer {
     port: u16,
+    /// PEM of the certificate the server presents, for clients that verify it.
+    cert_pem: String,
     _cert_dir: tempfile::TempDir,
 }
 
@@ -197,8 +200,47 @@ async fn start_doh(engine: Engine) -> DohTestServer {
 
     DohTestServer {
         port,
+        cert_pem: std::fs::read_to_string(&cert_path).expect("read cert pem"),
         _cert_dir: dir,
     }
+}
+
+/// Raw TLS connection to the server, verified against its own certificate.
+/// For tests that must control the HTTP bytes themselves (partial headers,
+/// partial or chunked bodies); reqwest only ever sends complete requests.
+async fn raw_tls_connect(
+    server: &DohTestServer,
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from_pem_slice(server.cert_pem.as_bytes()).expect("parse cert pem"))
+        .expect("add root");
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+        .await
+        .expect("tcp connect");
+    connector
+        .connect(ServerName::try_from("localhost").unwrap(), tcp)
+        .await
+        .expect("tls handshake")
+}
+
+/// Read one HTTP response head from a raw connection and return its status line.
+async fn read_status_line<S: AsyncReadExt + Unpin>(stream: &mut S) -> String {
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    while !buf.ends_with(b"\r\n\r\n") {
+        let n = stream.read(&mut byte).await.expect("read response");
+        assert!(n > 0, "connection closed before a response head arrived");
+        buf.push(byte[0]);
+    }
+    let head = String::from_utf8(buf).expect("ascii response head");
+    head.lines().next().unwrap_or_default().to_string()
 }
 
 fn doh_url(port: u16) -> String {
@@ -400,6 +442,91 @@ async fn test_doh_post_short_body() {
 
     // The server checks dns_wire.len() < 12 → returns BAD_REQUEST
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+// ============================================================================
+// POST body limit tests: reject before buffering (RFC 8484 §4.1 message size)
+// ============================================================================
+
+/// A declared Content-Length over the limit is refused from the headers alone:
+/// the 413 arrives while the client has sent only a fraction of the body.
+#[tokio::test]
+async fn test_doh_post_oversized_content_length_rejected_before_body() {
+    let server = start_doh(make_nxdomain_engine()).await;
+    let mut stream = raw_tls_connect(&server).await;
+
+    // Declare 1 MiB but send only 16 KiB, then wait for the answer.
+    let declared = 1024 * 1024;
+    let head = format!(
+        "POST /dns-query HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+         Content-Type: application/dns-message\r\nContent-Length: {declared}\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).await.expect("write head");
+    stream
+        .write_all(&vec![0xAAu8; 16 * 1024])
+        .await
+        .expect("write partial body");
+
+    let status = tokio::time::timeout(Duration::from_secs(5), read_status_line(&mut stream))
+        .await
+        .expect("server must answer without waiting for the rest of the body");
+    assert_eq!(status, "HTTP/1.1 413 Payload Too Large");
+}
+
+/// Without Content-Length the body is capped while it streams: the 413 arrives
+/// once the chunks exceed the limit, before the terminating chunk is sent.
+#[tokio::test]
+async fn test_doh_post_oversized_chunked_body_rejected_while_streaming() {
+    let server = start_doh(make_nxdomain_engine()).await;
+    let mut stream = raw_tls_connect(&server).await;
+
+    let head = "POST /dns-query HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                Content-Type: application/dns-message\r\nTransfer-Encoding: chunked\r\n\r\n";
+    stream.write_all(head.as_bytes()).await.expect("write head");
+
+    // 5 × 16 KiB = 80 KiB of chunks, over the 64 KiB limit; no final chunk.
+    let chunk = vec![0xAAu8; 16 * 1024];
+    for _ in 0..5 {
+        stream
+            .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+            .await
+            .expect("write chunk size");
+        stream.write_all(&chunk).await.expect("write chunk");
+        stream.write_all(b"\r\n").await.expect("write chunk end");
+    }
+
+    let status = tokio::time::timeout(Duration::from_secs(5), read_status_line(&mut stream))
+        .await
+        .expect("server must answer without waiting for the terminating chunk");
+    assert_eq!(status, "HTTP/1.1 413 Payload Too Large");
+}
+
+/// A body of exactly the limit is still accepted (the limit is inclusive, as
+/// before): it reaches the engine and gets a DNS answer, not a 413.
+#[tokio::test]
+async fn test_doh_post_body_at_limit_still_processed() {
+    let server = start_doh(make_nxdomain_engine()).await;
+    let client = make_https_client();
+
+    let at_limit = vec![0xAAu8; 64 * 1024];
+
+    let resp = client
+        .post(doh_url(server.port))
+        .header("content-type", "application/dns-message")
+        .body(at_limit)
+        .send()
+        .await
+        .expect("POST request");
+
+    // 64 KiB of 0xAA is not a parseable query, so the engine answers SERVFAIL;
+    // what matters here is that the size guard let it through.
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.bytes().await.expect("read body");
+    assert_eq!(
+        body[3] & 0x0F,
+        0x02,
+        "RCODE = SERVFAIL for unparseable wire"
+    );
 }
 
 // ============================================================================

@@ -18,7 +18,8 @@ use bytes::Bytes;
 use hickory_proto::op::{Message, ResponseCode};
 #[cfg(test)]
 use hickory_proto::serialize::binary::BinDecodable;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use hyper::body::Body;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -109,16 +110,30 @@ async fn handle_doh_request(
     // RFC 8484 §4.1: POST with application/dns-message
     // RFC 8484 §4.1.5: GET with ?dns=base64url
     let dns_wire = match (req.method(), req.uri().path()) {
-        (&Method::POST, path) if path == doh_path => match req.into_body().collect().await {
-            Ok(collected) => {
-                let body = collected.to_bytes();
-                if body.len() > MAX_DNS_MESSAGE {
+        (&Method::POST, path) if path == doh_path => {
+            // 先看 Content-Length：声明超限的请求一个字节都不读；再用 Limited 给
+            // body 本身封顶，分块传输或与声明不符的发送方也只能让服务端缓冲
+            // MAX_DNS_MESSAGE 字节。此前 body 先被整个收进内存再比较长度。
+            // Check Content-Length first so a request that declares an oversized
+            // body is refused without reading any of it, then cap the body itself
+            // so chunked or lying senders cannot make the server buffer more than
+            // MAX_DNS_MESSAGE. Previously the whole body was collected before the
+            // length was compared.
+            let declared = req.body().size_hint().exact();
+            if declared.is_some_and(|len| len > MAX_DNS_MESSAGE as u64) {
+                return Ok(error_response(StatusCode::PAYLOAD_TOO_LARGE));
+            }
+            match Limited::new(req.into_body(), MAX_DNS_MESSAGE)
+                .collect()
+                .await
+            {
+                Ok(collected) => collected.to_bytes(),
+                Err(err) if err.is::<LengthLimitError>() => {
                     return Ok(error_response(StatusCode::PAYLOAD_TOO_LARGE));
                 }
-                body
+                Err(_) => return Ok(error_response(StatusCode::BAD_REQUEST)),
             }
-            Err(_) => return Ok(error_response(StatusCode::BAD_REQUEST)),
-        },
+        }
         (&Method::GET, path) if path == doh_path => {
             match extract_get_dns_param(req.uri().query().unwrap_or("")) {
                 Some(data) => data,
