@@ -41,6 +41,15 @@ fn unix_time_millis() -> u64 {
         })
 }
 
+/// Least budget worth spending on a transparent retry over a fresh connection.
+/// A retry has to reconnect (SYN, plus a TLS handshake for DoT and DoH) and
+/// then wait for an answer; with less than this left it cannot complete on a
+/// realistic path and would only add a second failure after the caller's
+/// deadline. The caller's deadline itself is never extended.
+/// 值得为透明重试花的最小剩余预算。重试要先重连（SYN，DoT/DoH 还有 TLS 握手）再等应答，
+/// 剩余不足这个值时现实路径上跑不完，只会在调用方截止后再失败一次。绝不延长调用方的截止。
+const MIN_RETRY_BUDGET: Duration = Duration::from_millis(50);
+
 /// Type alias for UDP inflight request tracking
 /// ID -> (OriginalID, ExpectedAddr, SentQuery, Sender)
 /// The sent query (ID already rewritten) stays in the entry so the reader can
@@ -840,36 +849,25 @@ impl TcpMuxClient {
         match self.send_attempt(packet, timeout_dur).await {
             Ok(res) => Ok(res),
             Err(err) => {
-                // TRANSPARENT RETRY: If connection was reused and failed with transport error, retry once with fresh connection
-                // 透明重试：如果连接是复用的并且因传输错误失败，则使用新连接重试一次
+                // TRANSPARENT RETRY: If connection was reused and failed with transport error,
+                // retry once with a fresh connection, within what is left of the budget
+                // 透明重试：如果连接是复用的并且因传输错误失败，则在剩余预算内用新连接重试一次
                 if is_reused {
-                    let elapsed = start.elapsed();
-                    // Calculate remaining budget, but ensure at least 1.5s for the fresh attempt
-                    // 计算剩余预算，但确认为新尝试保留至少 1.5s
-                    let remaining = if timeout_dur > elapsed {
-                        timeout_dur - elapsed
-                    } else {
-                        Duration::from_millis(0)
-                    };
+                    let remaining = timeout_dur.saturating_sub(start.elapsed());
+                    if remaining < MIN_RETRY_BUDGET {
+                        return Err(err);
+                    }
 
-                    // Only retry if we have budget OR if we decide reliability > strict timeout
-                    // Strategy: If剩余时间 < 1s, we grant a "grace period" of 1s to save the query
-                    let retry_timeout = if remaining.as_millis() < 1000 {
-                        Duration::from_millis(1500)
-                    } else {
-                        remaining
-                    };
-
-                    tracing::warn!(
+                    debug!(
                         upstream = %self.upstream,
                         error = %err,
-                        retry_timeout_ms = retry_timeout.as_millis(),
+                        retry_timeout_ms = remaining.as_millis() as u64,
                         "Connection reuse failed, performing transparent retry with fresh connection"
                     );
 
                     // Connection should have been reset by send_attempt already upon error
                     // send_attempt 出错时连接应该已经被重置
-                    return self.send_attempt(packet, retry_timeout).await;
+                    return self.send_attempt(packet, remaining).await;
                 }
                 Err(err)
             }
@@ -1335,21 +1333,17 @@ impl DohClient {
                 // record_error() 可能先重建连接池，重试时加载新客户端（新连接）。
                 let rebuilt = self.record_error(upstream);
                 let remaining = timeout_dur.saturating_sub(start.elapsed());
-                // Mirror TcpMuxClient: guarantee >= 1.5s budget for the fresh attempt.
-                // 对齐 TcpMuxClient：为新尝试保证至少 1.5s 预算
-                let retry_timeout = if remaining < Duration::from_secs(1) {
-                    Duration::from_millis(1500)
-                } else {
-                    remaining
-                };
-                warn!(
+                if remaining < MIN_RETRY_BUDGET {
+                    return Err(err);
+                }
+                debug!(
                     upstream = upstream,
                     error = %err,
                     pool_rebuilt = rebuilt,
-                    retry_timeout_ms = retry_timeout.as_millis() as u64,
+                    retry_timeout_ms = remaining.as_millis() as u64,
                     "DoH transport error, performing transparent retry"
                 );
-                self.send_once(packet, &url, host, retry_timeout).await
+                self.send_once(packet, &url, host, remaining).await
             }
             Err(e) => Err(e),
         }
@@ -1857,24 +1851,17 @@ impl DotMuxClient {
             Ok(res) => Ok(res),
             Err(err) => {
                 if is_reused {
-                    let elapsed = start.elapsed();
-                    let remaining = if timeout_dur > elapsed {
-                        timeout_dur - elapsed
-                    } else {
-                        Duration::from_millis(0)
-                    };
-                    let retry_timeout = if remaining.as_millis() < 1000 {
-                        Duration::from_millis(1500)
-                    } else {
-                        remaining
-                    };
-                    tracing::warn!(
+                    let remaining = timeout_dur.saturating_sub(start.elapsed());
+                    if remaining < MIN_RETRY_BUDGET {
+                        return Err(err);
+                    }
+                    debug!(
                         upstream = %self.upstream,
                         error = %err,
-                        retry_timeout_ms = retry_timeout.as_millis(),
+                        retry_timeout_ms = remaining.as_millis() as u64,
                         "DoT reuse failed, retrying with fresh connection"
                     );
-                    return self.send_attempt(packet, retry_timeout).await;
+                    return self.send_attempt(packet, remaining).await;
                 }
                 Err(err)
             }
@@ -3252,6 +3239,72 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "gave up after {:?}",
             started.elapsed()
+        );
+    }
+
+    /// TCP upstream that answers the very first query it ever receives
+    /// (echoing the frame with QR set) and then swallows everything, on that
+    /// connection and on any later one.
+    /// 只应答收到的第一个查询（回显帧并置 QR 位），之后无论旧连接还是新连接一律吞掉的
+    /// TCP 上游。
+    async fn answer_once_then_stall_tcp_upstream() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalling upstream");
+        let addr = listener
+            .local_addr()
+            .expect("read stalling upstream address");
+        let answered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let answered = Arc::clone(&answered);
+                tokio::spawn(async move {
+                    let mut len = [0u8; 2];
+                    if stream.read_exact(&mut len).await.is_err() {
+                        return;
+                    }
+                    let mut frame = vec![0u8; u16::from_be_bytes(len) as usize];
+                    if stream.read_exact(&mut frame).await.is_err() {
+                        return;
+                    }
+                    if !answered.swap(true, Ordering::SeqCst) {
+                        frame[2] |= 0x80;
+                        let _ = stream.write_all(&len).await;
+                        let _ = stream.write_all(&frame).await;
+                    }
+                    let mut sink = [0u8; 512];
+                    while stream.read(&mut sink).await.is_ok_and(|n| n > 0) {}
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn tcp_retry_does_not_exceed_the_request_budget() {
+        // The transparent retry over a fresh connection used to be granted a
+        // 1.5 s floor even when the caller's budget was already spent, so a
+        // 200 ms request took about 1.7 s on a stalled reused connection.
+        // 复用连接失败后的透明重试曾无条件给 1.5 s 保底：预算 200 ms 的请求在卡住的
+        // 复用连接上要跑约 1.7 s。
+        let addr = answer_once_then_stall_tcp_upstream().await;
+        let client =
+            TcpMuxClient::new(Arc::from(addr.to_string()), Arc::new(PermitManager::new(1)));
+        let query = [0x12, 0x34, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+        client
+            .send(&query, Duration::from_millis(500))
+            .await
+            .expect("first query on a fresh connection is answered");
+
+        let started = tokio::time::Instant::now();
+        let err = client
+            .send(&query, Duration::from_millis(200))
+            .await
+            .expect_err("stalled upstream cannot answer the second query");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "second query took {elapsed:?} on a 200 ms budget: {err:#}"
         );
     }
 
