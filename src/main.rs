@@ -822,6 +822,16 @@ async fn run_tcp(listener: TcpListener, engine: Engine) -> anyhow::Result<()> {
     }
 }
 
+/// 入站 TCP 连接等待下一条消息、或等待当前消息剩余字节的时限。RFC 7766 §6.2.3
+/// 建议服务端对空闲连接设数秒量级的超时：只建立连接却不发数据的客户端不应长期
+/// 占用一个任务和一个文件描述符，而正常客户端在一个 RTT 内就会发完一条消息。
+/// Time an inbound TCP connection may take to send the next message, or the rest
+/// of the current one. RFC 7766 §6.2.3 recommends a server idle timeout in the
+/// order of seconds: a client that connects without sending should not pin a
+/// task and a file descriptor, while a normal client finishes a message within
+/// one round trip.
+const TCP_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn handle_tcp_conn(
     mut stream: TcpStream,
     peer: SocketAddr,
@@ -839,11 +849,17 @@ async fn handle_tcp_conn(
     let mut buf = bytes::BytesMut::with_capacity(MAX_TCP_FRAME);
 
     loop {
-        if let Err(err) = stream.read_exact(&mut len_buf).await {
-            if err.kind() != std::io::ErrorKind::UnexpectedEof {
-                return Err(err.into());
+        match tokio::time::timeout(TCP_READ_TIMEOUT, stream.read_exact(&mut len_buf)).await {
+            // 空闲超时：关闭连接，释放任务与文件描述符 / Idle timeout: close the
+            // connection and release the task and the file descriptor.
+            Err(_) => return Ok(()),
+            Ok(Err(err)) => {
+                if err.kind() != std::io::ErrorKind::UnexpectedEof {
+                    return Err(err.into());
+                }
+                return Ok(());
             }
-            return Ok(());
+            Ok(Ok(_)) => {}
         }
         let frame_len = u16::from_be_bytes(len_buf) as usize;
         if frame_len == 0 || frame_len > MAX_TCP_FRAME {
@@ -854,7 +870,13 @@ async fn handle_tcp_conn(
         // resize() is safe and efficient - it only initializes new bytes if growing
         buf.clear();
         buf.resize(frame_len, 0);
-        if stream.read_exact(&mut buf).await.is_err() {
+        // 半截消息同样受限，发送方停在长度前缀之后不会让连接一直挂着
+        // A half-sent message is bounded too: a sender that stops after the
+        // length prefix cannot keep the connection hanging.
+        if !matches!(
+            tokio::time::timeout(TCP_READ_TIMEOUT, stream.read_exact(&mut buf)).await,
+            Ok(Ok(_))
+        ) {
             return Ok(());
         }
 
@@ -1246,6 +1268,32 @@ mod tests {
 
         worker.abort();
         blackhole_task.abort();
+    }
+
+    /// 只连接不发数据的客户端此前可以永久占用一个任务和一个文件描述符；
+    /// 现在服务端在空闲超时后关闭连接。
+    /// A client that connects without sending used to pin a task and a file
+    /// descriptor forever; the server now closes the connection when the idle
+    /// timeout expires.
+    #[tokio::test]
+    async fn tcp_idle_connection_is_closed_after_the_read_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_tcp_conn(stream, peer, static_engine()).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        // 实际等待一次 TCP_READ_TIMEOUT：这条路径没有可注入的时钟。
+        // Waits one real TCP_READ_TIMEOUT; this path has no injectable clock.
+        let read = tokio::time::timeout(TCP_READ_TIMEOUT * 3, client.read(&mut buf))
+            .await
+            .expect("server must close the idle connection instead of waiting forever")
+            .expect("read after close");
+        assert_eq!(read, 0, "an idle connection must be closed by the server");
+        server.await.unwrap().expect("connection handler");
     }
 
     #[tokio::test]
