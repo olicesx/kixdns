@@ -1346,8 +1346,6 @@ impl std::error::Error for DohHttpStatusError {}
 /// 单个 DoH 上游的状态：独立的 reqwest 客户端（连接池）和连续传输错误计数。连续失败后
 /// 重建连接池只影响该上游，其它 DoH 上游的 keep-alive 连接不受牵连。
 /// 超过这个数量后，新增上游时顺带清理长期不用的条目
-/// Past this many entries, looking an upstream up also prunes the idle ones
-const DOH_UPSTREAM_PRUNE_AT: usize = 32;
 /// 多久没被用过就算可以清理 / How long an entry must sit unused to be pruned
 const DOH_UPSTREAM_IDLE: Duration = Duration::from_secs(600);
 /// 两次清理之间的最小间隔 / Shortest gap between two prunes
@@ -1460,10 +1458,16 @@ impl DohClient {
         if now.saturating_sub(last_prune) < prune_every {
             return;
         }
-        if self.upstreams.len() <= DOH_UPSTREAM_PRUNE_AT {
-            return;
-        }
-        // 只让一个调用者真正执行这一轮 / Only one caller runs this round
+        // 先占下这一轮：CAS 成功的调用者负责扫描，其它调用者立刻返回。时间戳在
+        // 扫描之前就推后，所以无论这轮删没删掉东西，热路径都要再等一个间隔才会
+        // 走到这里——之前的数量门槛放在 CAS 之前，不满足时直接 return 而不推后
+        // 时间戳，于是每一次查询都要付一次 DashMap::len()（逐分片取读锁）。
+        // Claim the round first: the caller that wins the CAS does the scan and
+        // the others return. The timestamp moves before the scan, so whether or
+        // not this round drops anything the hot path waits another interval to
+        // get here. The entry-count gate used to sit before the CAS and return
+        // without moving the timestamp, so every lookup paid a DashMap::len(),
+        // which takes a read lock on every shard.
         if self
             .last_prune_millis
             .compare_exchange(last_prune, now, Ordering::AcqRel, Ordering::Relaxed)
@@ -3682,14 +3686,13 @@ mod tests {
         );
     }
 
-    /// 热重载换掉的上游此前会一直留着自己的连接池；超过清理阈值后，
-    /// 长期不用的条目会被清掉。
+    /// 热重载换掉的上游此前会一直留着自己的连接池；现在长期不用的条目会被清掉。
     /// Upstreams a reload replaced used to keep their connection pools forever;
-    /// past the prune threshold, entries nothing has used are dropped.
+    /// entries nothing has used are now dropped.
     #[test]
     fn doh_prunes_upstreams_nothing_has_used() {
         let client = DohClient::new(8, 3).expect("build doh client");
-        for idx in 0..=DOH_UPSTREAM_PRUNE_AT {
+        for idx in 0..4 {
             client
                 .upstream(&format!("https://{idx}.example/dns-query"))
                 .expect("create upstream");
@@ -3721,7 +3724,7 @@ mod tests {
     #[test]
     fn doh_prunes_idle_upstreams_without_new_keys() {
         let client = DohClient::new(8, 3).expect("build doh client");
-        for idx in 0..=DOH_UPSTREAM_PRUNE_AT {
+        for idx in 0..4 {
             client
                 .upstream(&format!("https://{idx}.example/dns-query"))
                 .expect("create upstream");
@@ -3738,6 +3741,36 @@ mod tests {
             client.upstreams.len() <= 2,
             "idle upstreams must be pruned without a new key, {} left",
             client.upstreams.len()
+        );
+        assert!(
+            client.upstreams.contains_key(live),
+            "an upstream in use must never be pruned"
+        );
+    }
+
+    /// 节流窗口过期、但这一轮没有任何条目可清时，时间戳同样要推后；否则每一次
+    /// 查询都会重新走到扫描前的检查上——正常配置的上游数很少，这条路径原先永远
+    /// 命中，等于每个 DoH 查询白付一次全分片的 DashMap::len()。
+    /// When the interval has lapsed but the round drops nothing, the timestamp
+    /// must still move. Otherwise every later lookup walks back into the check
+    /// before the scan, and since a normal deployment has only a handful of
+    /// upstreams that used to happen on every single DoH query.
+    #[test]
+    fn doh_prune_round_is_claimed_even_when_nothing_expires() {
+        let client = DohClient::new(8, 3).expect("build doh client");
+        let live = "https://live.example/dns-query";
+        client.upstream(live).expect("create upstream");
+
+        // 窗口过期，但条目都是刚用过的 / interval lapsed, every entry just used
+        let lapsed =
+            unix_time_millis().saturating_sub(DOH_UPSTREAM_PRUNE_EVERY.as_millis() as u64 * 2);
+        client.last_prune_millis.store(lapsed, Ordering::Relaxed);
+
+        client.upstream(live).expect("look up upstream");
+
+        assert!(
+            client.last_prune_millis.load(Ordering::Relaxed) > lapsed,
+            "a lapsed interval must be claimed even when nothing is dropped"
         );
         assert!(
             client.upstreams.contains_key(live),
