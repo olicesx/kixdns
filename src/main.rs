@@ -59,20 +59,21 @@ fn main() -> anyhow::Result<()> {
     // Defensively close fds inherited from the startup chain: the OPNsense boot sequence
     // (daemon/configd/build processes) can leak tens of thousands of inherited fds into the
     // process (2026-08-30 incident: 28180 fds pointing to deleted build artifacts held for 3 days).
-    // 注意：closefrom 必须先于 tokio runtime 创建执行——runtime 的 kqueue/定时器 fd 也从 4 号起
-    // 分配，晚关会误杀。因此这里不能使用 #[tokio::main]，手动构建 runtime。
+    // 注意：closefrom 必须先于 tokio runtime 创建执行——runtime 的 kqueue/定时器 fd 从 3 号
+    // （closefrom 后的最低可用号）起分配，晚关会误杀。因此这里不能使用 #[tokio::main]，手动构建 runtime。
     // Note: closefrom must run before the tokio runtime is created (its kqueue/timer fds are
-    // allocated from 4 upward as well), so #[tokio::main] cannot be used here; build manually.
+    // allocated from 3, the lowest free fd after closefrom), so #[tokio::main] cannot be used here; build manually.
     #[cfg(target_os = "freebsd")]
     unsafe {
-        // 保留 0/1/2 stdio；closefrom(2) 在 FreeBSD 为原生系统调用。/ Keep stdio only; closefrom(2) is a native FreeBSD syscall.
+        // 保留 0/1/2 stdio；closefrom 为 FreeBSD 原生系统调用（手册页 closefrom(2)）。
+        // Keep stdio only; closefrom is a native FreeBSD syscall (see man closefrom(2)).
         libc::closefrom(3);
     }
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("build tokio runtime")
+        .context("build tokio runtime")?
         .block_on(async_main())
 }
 
