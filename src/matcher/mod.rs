@@ -364,6 +364,24 @@ impl RuntimePipelineConfig {
         if cfg.settings.cache_capacity == 0 {
             anyhow::bail!("cache_capacity must be greater than 0");
         }
+        // cache_max_ttl = 0 会让每条应答的缓存 TTL 归零，等于静默关掉缓存，
+        // 与 cache_capacity = 0 同样不是有效配置。
+        // cache_max_ttl = 0 clamps every entry's TTL to zero, silently disabling
+        // the cache, which is no more a valid configuration than cache_capacity = 0.
+        if cfg.settings.cache_max_ttl == 0 {
+            anyhow::bail!("cache_max_ttl must be greater than 0");
+        }
+        // 阈值是剩余 TTL 的百分比，超过 100 时每次缓存命中都会触发后台刷新，
+        // 上游负载等于客户端负载；要关闭刷新请用 cache_background_refresh。
+        // The threshold is a percentage of the remaining TTL; above 100 every
+        // cache hit triggers a background refresh and the upstream carries the
+        // client's full load. Use cache_background_refresh to turn it off.
+        if cfg.settings.cache_refresh_threshold_percent > 100 {
+            anyhow::bail!(
+                "cache_refresh_threshold_percent must be between 0 and 100, got {}",
+                cfg.settings.cache_refresh_threshold_percent
+            );
+        }
         let shards = cfg.settings.dashmap_shards;
         if shards > 0 && !shards.is_power_of_two() {
             anyhow::bail!("dashmap_shards must be a power of two");
@@ -1513,6 +1531,45 @@ mod tests {
         },
     };
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn settings_config(overrides: serde_json::Value) -> crate::config::PipelineConfig {
+        serde_json::from_value(serde_json::json!({ "settings": overrides }))
+            .expect("parse settings")
+    }
+
+    /// 这两个值此前没有校验：cache_max_ttl = 0 静默关掉缓存，
+    /// threshold_percent > 100 让每次缓存命中都触发后台刷新。
+    /// Neither value was validated: cache_max_ttl = 0 silently disabled the
+    /// cache and a threshold above 100 made every cache hit refresh upstream.
+    #[test]
+    fn cache_settings_outside_their_range_are_rejected() {
+        let zero_ttl = settings_config(serde_json::json!({ "cache_max_ttl": 0 }));
+        let error = RuntimePipelineConfig::from_config(zero_ttl)
+            .expect_err("cache_max_ttl = 0 must be rejected");
+        assert!(
+            error.to_string().contains("cache_max_ttl"),
+            "unexpected error: {error}"
+        );
+
+        let over_100 = settings_config(serde_json::json!({
+            "cache_refresh_threshold_percent": 250
+        }));
+        let error = RuntimePipelineConfig::from_config(over_100)
+            .expect_err("a refresh threshold above 100% must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("cache_refresh_threshold_percent"),
+            "unexpected error: {error}"
+        );
+
+        // 边界值仍然合法 / The boundary values stay valid
+        RuntimePipelineConfig::from_config(settings_config(serde_json::json!({
+            "cache_max_ttl": 1,
+            "cache_refresh_threshold_percent": 100
+        })))
+        .expect("boundary values must stay valid");
+    }
 
     #[test]
     fn overlapping_geoip_tag_reaches_all_runtime_matchers() {
