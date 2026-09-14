@@ -655,16 +655,26 @@ impl GeoSiteManager {
         // Without that the index keeps this file's own stale entries, so the tag
         // survives but matches data that was deleted. When several files declare
         // the same tag the last load wins, as with a full load.
+        // 先按提供者分组再读：同一个文件顶上多少个 tag 都只解析一次，代价与被删
+        // 的 tag 数无关。写锁是整个匹配器共享的，这里多读一遍就是多停顿一次查询。
+        // Group by provider before reading: one parse per file however many tags
+        // it takes over, so the cost no longer scales with the number of dropped
+        // tags. The write lock is shared with matching, so every extra read here
+        // is another stall for queries.
+        let mut takeovers: FxHashMap<PathBuf, Vec<String>> = FxHashMap::default();
         for tag in previous {
             if tags.contains(&tag) {
                 continue;
             }
             match self.other_source_providing(&key, &tag) {
-                Some(other) => self.reload_tag_from(&other, &tag),
+                Some(other) => takeovers.entry(other).or_default().push(tag),
                 None => {
                     self.database.remove(&tag);
                 }
             }
+        }
+        for (path, wanted) in takeovers {
+            self.reload_tags_from(&path, &wanted);
         }
 
         let loaded_count = tags.len();
@@ -693,25 +703,29 @@ impl GeoSiteManager {
     /// Re-read a single tag from another data file; leave the index as it is when
     /// that fails and let the other file's own reload fix it, which beats leaving
     /// the tag empty.
-    fn reload_tag_from(&mut self, path: &Path, tag: &str) {
-        let wanted = [tag.to_string()];
-        match Self::parse_dat_file_selective(path, &wanted) {
+    fn reload_tags_from(&mut self, path: &Path, wanted: &[String]) {
+        match Self::parse_dat_file_selective(path, wanted) {
             Ok(parsed) => {
-                if let Some((_, matchers)) = parsed.into_iter().find(|(name, _)| name == tag) {
-                    self.database.insert(tag.to_string(), matchers);
-                    return;
+                let mut taken = 0usize;
+                for (tag, matchers) in parsed {
+                    if wanted.contains(&tag) {
+                        self.database.insert(tag, matchers);
+                        taken += 1;
+                    }
                 }
-                warn!(
-                    target = "geosite",
-                    path = %path.display(), tag,
-                    "data file no longer contains a tag it was recorded as providing"
-                );
+                if taken < wanted.len() {
+                    warn!(
+                        target = "geosite",
+                        path = %path.display(), wanted = wanted.len(), taken,
+                        "data file no longer contains every tag it was recorded as providing"
+                    );
+                }
             }
             Err(e) => {
                 warn!(
                     target = "geosite",
-                    path = %path.display(), tag, error = %e,
-                    "failed to re-read a shared tag, keeping the current entries"
+                    path = %path.display(), tags = wanted.len(), error = %e,
+                    "failed to re-read shared tags, keeping the current entries"
                 );
             }
         }
@@ -1673,6 +1687,64 @@ mod tests {
             !manager.matches("ads", "www.ads.example"),
             "entries from the file that dropped the tag must not survive"
         );
+    }
+
+    /// 一次删掉多个共享 tag 时，顶上来的数据必须逐个正确——分组重读不能把
+    /// 某个 tag 漏掉或串到别的 tag 上。
+    /// When several shared tags are dropped at once, every one of them must come
+    /// back with the right data: grouping the re-read must not skip a tag or mix
+    /// one tag's entries into another.
+    #[test]
+    fn dropping_several_shared_tags_reloads_each_of_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.dat");
+        let b = dir.path().join("b.dat");
+        std::fs::write(
+            &a,
+            build_dat(&[
+                build_geosite("ADS", &[build_domain(2, "doubleclick.net", &[])]),
+                build_geosite("TRACK", &[build_domain(2, "scorecard.net", &[])]),
+            ]),
+        )
+        .unwrap();
+        std::fs::write(
+            &b,
+            build_dat(&[
+                build_geosite("ADS", &[build_domain(2, "ads.example", &[])]),
+                build_geosite("TRACK", &[build_domain(2, "track.example", &[])]),
+                build_geosite("ONLY-B", &[build_domain(2, "only-b.example", &[])]),
+            ]),
+        )
+        .unwrap();
+
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_dat_file(&a).unwrap();
+        manager.load_from_dat_file(&b).unwrap();
+        assert!(manager.matches("ads", "www.ads.example"));
+        assert!(manager.matches("track", "www.track.example"));
+
+        // b.dat 一次去掉两个共享 tag / both shared tags leave b.dat at once
+        std::fs::write(
+            &b,
+            build_dat(&[build_geosite(
+                "ONLY-B",
+                &[build_domain(2, "only-b.example", &[])],
+            )]),
+        )
+        .unwrap();
+        manager.load_from_dat_file(&b).unwrap();
+
+        assert!(
+            manager.matches("ads", "www.doubleclick.net"),
+            "ads must come back from a.dat"
+        );
+        assert!(
+            manager.matches("track", "www.scorecard.net"),
+            "track must come back from a.dat too"
+        );
+        assert!(!manager.matches("ads", "www.ads.example"));
+        assert!(!manager.matches("track", "www.track.example"));
+        assert!(manager.matches("only-b", "www.only-b.example"));
     }
 
     /// 截断的文件（写入中断）必须整份拒绝，而不是把读到的部分当成完整版本。
