@@ -83,7 +83,14 @@ fn inject_ecs(packet: &[u8], addr: IpAddr, source_prefix: u8) -> Vec<u8> {
         }
     };
 
-    let subnet = ClientSubnet::new(addr, source_prefix, 0);
+    // RFC 7871 §6: ADDRESS carries only SOURCE PREFIX-LENGTH bits, zero-padded
+    // to the last octet. hickory emits ceil(prefix / 8) octets of the address
+    // as given, so a prefix that is not a multiple of 8 would leak the client's
+    // extra bits and produce an option strict upstreams reject as FORMERR.
+    // RFC 7871 §6：ADDRESS 只能带 SOURCE PREFIX-LENGTH 位，其余零填充。hickory 按
+    // 原样输出 ceil(prefix/8) 字节，非 8 的倍数前缀会泄露客户端多余位，且严格的
+    // 上游会回 FORMERR。
+    let subnet = ClientSubnet::new(mask_ip(addr, source_prefix), source_prefix, 0);
 
     // Insert or replace ECS option in the EDNS extensions.
     // hickory-proto 0.26 OPT uses Vec (not HashMap): insert() always pushes,
@@ -279,6 +286,23 @@ impl EcsKey {
     }
 }
 
+/// `addr` with every bit beyond `prefix` cleared (RFC 7871 §6 ADDRESS form).
+/// 清零 `prefix` 之后所有位的地址（RFC 7871 §6 的 ADDRESS 形式）。
+fn mask_ip(addr: IpAddr, prefix: u8) -> IpAddr {
+    match addr {
+        IpAddr::V4(v4) => {
+            let mut octets = v4.octets();
+            mask_address(&mut octets, prefix.min(32), 32);
+            IpAddr::V4(octets.into())
+        }
+        IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            mask_address(&mut octets, prefix.min(128), 128);
+            IpAddr::V6(octets.into())
+        }
+    }
+}
+
 /// Mask an address buffer to the given prefix length (in-place).
 /// 将地址缓冲区掩码到指定前缀长度（原地操作）。
 fn mask_address(addr: &mut [u8], prefix: u8, total_bits: u8) {
@@ -465,6 +489,51 @@ mod tests {
         let (addr, prefix, _) = extract_ecs_info(&result).unwrap();
         assert_eq!(addr, IpAddr::V4("203.0.113.0".parse().unwrap()));
         assert_eq!(prefix, 24);
+    }
+
+    #[test]
+    fn test_apply_ecs_masks_unaligned_v4_prefix() {
+        // RFC 7871 §6: ADDRESS is truncated to SOURCE PREFIX-LENGTH bits and
+        // zero-padded to the last octet. hickory only truncates whole octets,
+        // so the bits past a /20 must be cleared here: 203.0.113.255/20 is
+        // 203.0.112.0, not 203.0.113.0 (113 = 0x71 keeps its high nibble).
+        // RFC 7871 §6：ADDRESS 必须按 SOURCE PREFIX-LENGTH 截断并零填充到字节边界。
+        // hickory 只按整字节截断，非对齐的 /20 需要在这里清掉多余位。
+        let query = make_query("example.com", 0x2001);
+        let mode = EcsMode::FromClientIp {
+            prefix_v4: 20,
+            prefix_v6: 56,
+        };
+        let modified = apply_ecs(&query, &mode, IpAddr::V4("203.0.113.255".parse().unwrap()));
+
+        let (addr, src_prefix, _) = extract_ecs_info(&modified).unwrap();
+        assert_eq!(src_prefix, 20);
+        assert_eq!(
+            addr,
+            IpAddr::V4("203.0.112.0".parse().unwrap()),
+            "bits beyond the /20 must be zero"
+        );
+    }
+
+    #[test]
+    fn test_apply_ecs_masks_unaligned_v6_prefix() {
+        // Same for IPv6 through the Static path: 2001:db8:abcd:ef01::1/52 is
+        // 2001:db8:abcd:e000::, the low nibble of 0xef must go.
+        // IPv6 走 Static 路径同样处理：/52 之后的位必须清零。
+        let query = make_query("example.com", 0x2002);
+        let mode = EcsMode::Static {
+            ip: "2001:db8:abcd:ef01::1".to_string(),
+            prefix: 52,
+        };
+        let modified = apply_ecs(&query, &mode, IpAddr::V4("192.0.2.1".parse().unwrap()));
+
+        let (addr, src_prefix, _) = extract_ecs_info(&modified).unwrap();
+        assert_eq!(src_prefix, 52);
+        assert_eq!(
+            addr,
+            IpAddr::V6("2001:db8:abcd:e000::".parse().unwrap()),
+            "bits beyond the /52 must be zero"
+        );
     }
 
     #[test]
