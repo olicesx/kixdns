@@ -286,14 +286,6 @@ impl PermitManager {
             );
         }
     }
-
-    /// Simulate permit leakage for testing purposes / 模拟permit泄漏用于测试
-    /// This is a test-only method that should not be used in production code
-    /// 这是一个仅用于测试的方法，不应在生产代码中使用
-    #[cfg(any(test, debug_assertions))]
-    pub fn simulate_leak(&self, count: usize) {
-        self.active_permits.fetch_add(count, Ordering::Release);
-    }
 }
 
 /// RAII guard for automatic permit release / RAII 守卫用于自动 permit 释放

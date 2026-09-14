@@ -89,58 +89,57 @@ struct UdpSocketState {
 pub struct UdpClient {
     /// IPv4 sockets, one ephemeral port each. / IPv4 socket，各占一个临时端口。
     pool: Vec<UdpSocketState>,
-    /// IPv6 sockets (IPV6_V6ONLY), same size as `pool`; empty when the host has
-    /// no IPv6 support. / IPv6 socket（IPV6_V6ONLY），与 `pool` 同规模；主机不支持 IPv6 时为空。
-    pool_v6: Vec<UdpSocketState>,
+    /// IPv6 sockets (IPV6_V6ONLY), built on the first query to an IPv6 upstream
+    /// so a deployment without one pays for nothing.
+    /// IPv6 socket（IPV6_V6ONLY），第一次查询 IPv6 上游时才建立，
+    /// 没有 IPv6 上游的部署不付出任何代价。
+    pool_v6: tokio::sync::OnceCell<Vec<UdpSocketState>>,
+    pool_size: usize,
 }
 
 impl UdpClient {
     pub fn new(size: usize) -> anyhow::Result<Self> {
         // Prevent port exhaustion by enforcing minimum pool size
         let effective_size = if size == 0 { 1 } else { size };
-        let mut pool = Vec::with_capacity(effective_size);
-        for idx in 0..effective_size {
-            pool.push(Self::spawn_socket(
-                idx,
+        Ok(Self {
+            pool: Self::build_pool(
+                effective_size,
                 Domain::IPV4,
                 SocketAddr::from(([0, 0, 0, 0], 0)),
-            )?);
-        }
-
-        // IPv6 上游需要自己的 socket：AF_INET 的 socket 发往 IPv6 地址只会得到
-        // EAFNOSUPPORT，请求最终变成 SERVFAIL。主机没有 IPv6 时保持空池，
-        // 行为与只有 IPv4 池时一致。
-        // IPv6 upstreams need their own sockets: an AF_INET socket sending to an
-        // IPv6 address only yields EAFNOSUPPORT and the query ends as SERVFAIL.
-        // On a host without IPv6 the pool stays empty and nothing else changes.
-        let mut pool_v6 = Vec::with_capacity(effective_size);
-        for idx in 0..effective_size {
-            match Self::spawn_socket(
-                idx,
-                Domain::IPV6,
-                SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
-            ) {
-                Ok(state) => pool_v6.push(state),
-                Err(err) => {
-                    info!(
-                        error = %err,
-                        "IPv6 UDP pool unavailable, IPv6 upstreams over UDP will be rejected"
-                    );
-                    pool_v6.clear();
-                    break;
-                }
-            }
-        }
-
-        Ok(Self { pool, pool_v6 })
+            )?,
+            pool_v6: tokio::sync::OnceCell::new(),
+            pool_size: effective_size,
+        })
     }
 
-    /// 建立一个池内 socket 并启动它的接收任务 / Create one pool socket and start its reader
-    fn spawn_socket(
-        idx: usize,
+    /// 建立一个地址族的完整 socket 池 / Build the whole socket pool of one family
+    ///
+    /// 先把所有 socket 建出来，全部成功之后才启动接收任务：中途失败时已经建好的
+    /// socket 随错误一起丢弃，不会留下收不回的 fd 与任务。
+    /// Every socket is created first and the readers start only once they have
+    /// all succeeded: on a failure part way through, the sockets created so far
+    /// are dropped with the error, leaving no unreachable descriptors or tasks.
+    fn build_pool(
+        size: usize,
         domain: Domain,
         bind_addr: SocketAddr,
-    ) -> anyhow::Result<UdpSocketState> {
+    ) -> anyhow::Result<Vec<UdpSocketState>> {
+        let mut sockets = Vec::with_capacity(size);
+        for _ in 0..size {
+            sockets.push(Self::create_socket(domain, bind_addr)?);
+        }
+        Ok(sockets
+            .into_iter()
+            .enumerate()
+            .map(|(idx, socket)| Self::spawn_reader(idx, socket))
+            .collect())
+    }
+
+    /// 建立一个池内 socket，不启动接收任务 / Create one pool socket without its reader
+    fn create_socket(
+        domain: Domain,
+        bind_addr: SocketAddr,
+    ) -> anyhow::Result<Arc<tokio::net::UdpSocket>> {
         // Use socket2 to set buffer sizes
         let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
             .context("create UDP pool socket")?;
@@ -167,9 +166,13 @@ impl UdpClient {
             .context("set UDP pool socket nonblocking")?;
 
         let std_sock: std::net::UdpSocket = socket.into();
-        let socket = Arc::new(
+        Ok(Arc::new(
             tokio::net::UdpSocket::from_std(std_sock).context("create Tokio UDP pool socket")?,
-        );
+        ))
+    }
+
+    /// 为一个建好的 socket 启动接收任务 / Start the reader task of a ready socket
+    fn spawn_reader(idx: usize, socket: Arc<tokio::net::UdpSocket>) -> UdpSocketState {
         let inflight = Arc::new(DashMap::with_hasher(FxBuildHasher));
 
         let state = UdpSocketState {
@@ -265,7 +268,7 @@ impl UdpClient {
             }
         });
 
-        Ok(state)
+        state
     }
 
     #[inline]
@@ -279,15 +282,21 @@ impl UdpClient {
         // 按目标地址族选池：IPv4 路径只多一次判别
         // Pick the pool by address family; the IPv4 path only gains one check.
         let pool = if addr.is_ipv6() {
-            &self.pool_v6
+            self.pool_v6
+                .get_or_try_init(|| async {
+                    Self::build_pool(
+                        self.pool_size,
+                        Domain::IPV6,
+                        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
+                    )
+                })
+                .await
+                .context("create the IPv6 UDP pool")?
         } else {
             &self.pool
         };
         if pool.is_empty() {
-            return Err(anyhow::anyhow!(
-                "UDP pool not initialized for {}",
-                if addr.is_ipv6() { "IPv6" } else { "IPv4" }
-            ));
+            return Err(anyhow::anyhow!("UDP pool not initialized"));
         }
 
         // RFC 5452 §4.3 / §9.2: neither the transaction ID nor the source port
@@ -565,7 +574,7 @@ impl TcpMultiplexer {
                 let threshold = client.health_threshold.load(Ordering::Acquire);
                 let errors = client.consecutive_errors.fetch_add(1, Ordering::Release) + 1;
 
-                if errors >= threshold {
+                if threshold > 0 && errors >= threshold {
                     warn!(
                         upstream = %client.upstream,
                         consecutive_errors = errors,
@@ -807,6 +816,10 @@ impl TcpMuxClient {
     /// 当错误阈值超过时，连接会被重置，错误计数器会被清零以避免下次错误时立即重新触发。
     async fn record_error(&self) -> bool {
         let errors = self.consecutive_errors.fetch_add(1, Ordering::Release) + 1;
+        // 阈值 0 表示禁用健康检查（README 与 config.rs 如此描述），
+        // 而不是"每次错误都重置连接"。
+        // A threshold of 0 disables the health check, as README and config.rs
+        // describe, rather than resetting the connection on every error.
         let threshold = self.health_threshold.load(Ordering::Acquire);
 
         debug!(
@@ -817,7 +830,7 @@ impl TcpMuxClient {
         );
 
         // Check if threshold exceeded / 检查是否超过阈值
-        if errors >= threshold {
+        if threshold > 0 && errors >= threshold {
             warn!(
                 upstream = %self.upstream,
                 consecutive_errors = errors,
@@ -1332,6 +1345,12 @@ impl std::error::Error for DohHttpStatusError {}
 /// upstreams keep their keep-alive connections.
 /// 单个 DoH 上游的状态：独立的 reqwest 客户端（连接池）和连续传输错误计数。连续失败后
 /// 重建连接池只影响该上游，其它 DoH 上游的 keep-alive 连接不受牵连。
+/// 超过这个数量后，新增上游时顺带清理长期不用的条目
+/// Past this many entries, adding an upstream also prunes the idle ones
+const DOH_UPSTREAM_PRUNE_AT: usize = 32;
+/// 多久没被用过就算可以清理 / How long an entry must sit unused to be pruned
+const DOH_UPSTREAM_IDLE: Duration = Duration::from_secs(600);
+
 struct DohUpstream {
     /// Hot-swappable reqwest client (its connection pool). Replacing it drops the
     /// old pool, which is the only way to evict half-open/dead connections that
@@ -1343,6 +1362,9 @@ struct DohUpstream {
     /// Consecutive transport errors; cleared by a success or a rebuild.
     /// 连续传输错误数；成功或重建后清零。
     consecutive_errors: AtomicUsize,
+    /// 最近一次使用的时刻，用于清理热重载换掉的旧上游
+    /// When the entry was last used, so upstreams dropped by a reload can be pruned
+    last_used_millis: AtomicU64,
 }
 
 pub struct DohClient {
@@ -1383,20 +1405,43 @@ impl DohClient {
     /// the hot path; the key is allocated once per upstream.
     /// `upstream` 的状态，首次遇到时创建。热路径每查询一次 map 读取；key 每个上游只分配一次。
     fn upstream(&self, upstream: &str) -> anyhow::Result<Arc<DohUpstream>> {
+        let now = unix_time_millis();
         if let Some(state) = self.upstreams.get(upstream) {
+            state.last_used_millis.store(now, Ordering::Relaxed);
             return Ok(Arc::clone(&state));
         }
         match self.upstreams.entry(Arc::from(upstream)) {
-            entry::Entry::Occupied(existing) => Ok(Arc::clone(existing.get())),
+            entry::Entry::Occupied(existing) => {
+                existing
+                    .get()
+                    .last_used_millis
+                    .store(now, Ordering::Relaxed);
+                Ok(Arc::clone(existing.get()))
+            }
             entry::Entry::Vacant(slot) => {
                 let state = Arc::new(DohUpstream {
                     client: ArcSwap::from_pointee(Self::build_client(self.pool_max_idle_per_host)?),
                     consecutive_errors: AtomicUsize::new(0),
+                    last_used_millis: AtomicU64::new(now),
                 });
                 slot.insert(Arc::clone(&state));
+                self.prune_idle_upstreams(now);
                 Ok(state)
             }
         }
+    }
+
+    /// 清理长期不用的上游条目，让热重载换掉的上游不会一直占着连接池
+    /// Drop entries nothing has used for a while, so upstreams a reload replaced
+    /// do not keep their connection pools for the life of the process
+    fn prune_idle_upstreams(&self, now: u64) {
+        if self.upstreams.len() <= DOH_UPSTREAM_PRUNE_AT {
+            return;
+        }
+        let idle_millis = u64::try_from(DOH_UPSTREAM_IDLE.as_millis()).unwrap_or(u64::MAX);
+        self.upstreams.retain(|_, state| {
+            now.saturating_sub(state.last_used_millis.load(Ordering::Relaxed)) < idle_millis
+        });
     }
 
     pub async fn send(
@@ -1510,7 +1555,7 @@ impl DohClient {
             }
         };
         let count = state.consecutive_errors.fetch_add(1, Ordering::AcqRel) + 1;
-        if count >= self.health_error_threshold {
+        if self.health_error_threshold > 0 && count >= self.health_error_threshold {
             match Self::build_client(self.pool_max_idle_per_host) {
                 Ok(new_client) => {
                     // Swap in a fresh client; the old pool is released once in-flight
@@ -1869,7 +1914,7 @@ impl DotMuxClient {
         let errors = self.consecutive_errors.fetch_add(1, Ordering::Release) + 1;
         let threshold = self.health_threshold.load(Ordering::Acquire);
 
-        if errors >= threshold {
+        if threshold > 0 && errors >= threshold {
             warn!(
                 upstream = %self.upstream,
                 consecutive_errors = errors,
@@ -2534,7 +2579,7 @@ impl DoqMuxClient {
     async fn record_error(&self) -> bool {
         let errors = self.consecutive_errors.fetch_add(1, Ordering::Release) + 1;
         let threshold = self.health_threshold.load(Ordering::Acquire);
-        if errors >= threshold {
+        if threshold > 0 && errors >= threshold {
             warn!(
                 upstream = %self.upstream,
                 consecutive_errors = errors,
@@ -3418,6 +3463,46 @@ mod tests {
         Some(addr.to_string())
     }
 
+    /// v6 池此前无条件预建：默认 udp_pool_size=64 时，哪怕一个 IPv6 上游都没有
+    /// 也要多占 64 个 socket 和 64 个任务。
+    /// The v6 pool used to be built unconditionally: with the default
+    /// udp_pool_size of 64 a deployment without a single IPv6 upstream still
+    /// paid for 64 sockets and 64 tasks.
+    #[tokio::test]
+    async fn udp_ipv6_pool_is_built_only_when_an_ipv6_upstream_is_used() {
+        let client = UdpClient::new(4).expect("create UDP client");
+        assert!(
+            client.pool_v6.get().is_none(),
+            "no IPv6 socket may be created before an IPv6 upstream is used"
+        );
+
+        let upstream_v4 = spawn_udp_echo_upstream("127.0.0.1:0")
+            .await
+            .expect("IPv4 loopback");
+        let query = [0x12, 0x34, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+        client
+            .send(&query, &upstream_v4, Duration::from_secs(2))
+            .await
+            .expect("IPv4 upstream reachable");
+        assert!(
+            client.pool_v6.get().is_none(),
+            "IPv4 traffic must not build the IPv6 pool"
+        );
+
+        let Some(upstream_v6) = spawn_udp_echo_upstream("[::1]:0").await else {
+            eprintln!("IPv6 loopback unavailable, skipping the second half");
+            return;
+        };
+        client
+            .send(&query, &upstream_v6, Duration::from_secs(2))
+            .await
+            .expect("IPv6 upstream reachable");
+        assert!(
+            client.pool_v6.get().is_some(),
+            "the IPv6 pool must appear once an IPv6 upstream is used"
+        );
+    }
+
     #[tokio::test]
     async fn udp_send_reaches_an_ipv6_upstream() {
         // The pool only ever created AF_INET sockets, so an IPv6 UDP upstream
@@ -3516,6 +3601,72 @@ mod tests {
         assert!(parse_doq_target("doq://223.5.5.5:853").is_err());
         assert!(parse_doq_target("doq://223.5.5.5:853?sni=alidns.com").is_ok());
         assert!(parse_doq_target("doq://dns.alidns.com:853").is_ok());
+    }
+
+    /// README 与 config.rs 都写明阈值 0 表示禁用健康检查，而 `count >= threshold`
+    /// 会让 0 变成"每次错误都重建连接池"，正好相反。
+    /// README and config.rs both state that a threshold of 0 disables the health
+    /// check, while `count >= threshold` turns 0 into a rebuild on every single
+    /// error, the exact opposite.
+    #[test]
+    fn doh_record_error_treats_a_zero_threshold_as_disabled() {
+        let client = DohClient::new(8, 0).expect("build doh client");
+        let upstream = "doh:8.8.8.8";
+        let ptr_before =
+            Arc::as_ptr(&client.upstream(upstream).unwrap().client.load_full()) as usize;
+
+        for attempt in 1..=5 {
+            assert!(
+                !client.record_error(upstream),
+                "a disabled health check must never rebuild (error {attempt})"
+            );
+        }
+        assert_eq!(
+            Arc::as_ptr(&client.upstream(upstream).unwrap().client.load_full()) as usize,
+            ptr_before,
+            "the connection pool must survive a disabled health check"
+        );
+    }
+
+    /// 热重载换掉的上游此前会一直留着自己的连接池；超过清理阈值后，
+    /// 长期不用的条目会被清掉。
+    /// Upstreams a reload replaced used to keep their connection pools forever;
+    /// past the prune threshold, entries nothing has used are dropped.
+    #[test]
+    fn doh_prunes_upstreams_nothing_has_used() {
+        let client = DohClient::new(8, 3).expect("build doh client");
+        for idx in 0..=DOH_UPSTREAM_PRUNE_AT {
+            client
+                .upstream(&format!("https://{idx}.example/dns-query"))
+                .expect("create upstream");
+        }
+        let live = "https://live.example/dns-query";
+        client.upstream(live).expect("create live upstream");
+
+        // 把除 live 之外的条目标记为长期未使用 / Age every entry except live
+        let stale = unix_time_millis().saturating_sub(DOH_UPSTREAM_IDLE.as_millis() as u64 * 2);
+        for entry in client.upstreams.iter() {
+            if entry.key().as_ref() != live {
+                entry
+                    .value()
+                    .last_used_millis
+                    .store(stale, Ordering::Relaxed);
+            }
+        }
+
+        client
+            .upstream("https://new.example/dns-query")
+            .expect("create upstream");
+
+        assert!(
+            client.upstreams.len() <= 2,
+            "idle upstreams must be pruned, {} left",
+            client.upstreams.len()
+        );
+        assert!(
+            client.upstreams.contains_key(live),
+            "an upstream in use must never be pruned"
+        );
     }
 
     #[test]
