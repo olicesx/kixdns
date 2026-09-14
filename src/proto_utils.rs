@@ -223,6 +223,50 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     })
 }
 
+/// Whether `response` answers `query`: RFC 5452 §9.1 requires the question
+/// section of a reply to match the query before the reply is accepted, in
+/// addition to the ID and the source address. The name is compared ignoring
+/// ASCII case so 0x20 case-randomizing upstreams still match; QTYPE and QCLASS
+/// must be identical.
+///
+/// A reply with no question section is accepted only when it carries no
+/// records at all (ANCOUNT, NSCOUNT and ARCOUNT all zero): some upstreams
+/// answer FORMERR or NOTIMP that way, and such a reply cannot poison anything
+/// because there is nothing in it to cache, so the fast failure is kept. A
+/// reply that omits the question but carries records has no legitimate reason
+/// to and is rejected.
+/// Zero-copy: two name walks and a bounded byte comparison, no allocation.
+/// 判断 `response` 是否应答 `query`：RFC 5452 §9.1 要求应答的 question 段与查询一致
+/// 才能接受（ID 和源地址之外的第三道校验）。名称比较忽略 ASCII 大小写（兼容 0x20
+/// 随机化的上游），QTYPE/QCLASS 必须相同。
+///
+/// 没有 question 段的应答仅在不携带任何记录（ANCOUNT/NSCOUNT/ARCOUNT 全为 0）时
+/// 接受：有些上游对 FORMERR/NOTIMP 这样回，这种应答无记录可入缓存、无法投毒，
+/// 保留它就保留了上游快速报错的路径；不回显 question 却带记录的应答没有正当理由，拒绝。
+/// 零拷贝：两次名称遍历加一次有界字节比较，无分配。
+pub(crate) fn question_matches(query: &[u8], response: &[u8]) -> bool {
+    if response.len() < 12 {
+        return false;
+    }
+    match u16::from_be_bytes([response[4], response[5]]) {
+        0 => return response[6..12].iter().all(|&count| count == 0),
+        1 => {}
+        _ => return false,
+    }
+    let (Some(query_name_end), Some(response_name_end)) =
+        (skip_name(query, 12), skip_name(response, 12))
+    else {
+        return false;
+    };
+    let query_end = query_name_end + 4;
+    let response_end = response_name_end + 4;
+    query_end <= query.len()
+        && response_end <= response.len()
+        && query_name_end == response_name_end
+        && query[query_name_end..query_end] == response[response_name_end..response_end]
+        && query[12..query_name_end].eq_ignore_ascii_case(&response[12..response_name_end])
+}
+
 /// 跳过 DNS 名称并返回下一个位置 / Skip DNS name and return next position
 #[inline]
 fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
@@ -1195,5 +1239,64 @@ mod tests {
     fn saturating_u64_to_u32_caps_large_values() {
         assert_eq!(saturating_u64_to_u32(42), 42);
         assert_eq!(saturating_u64_to_u32(u64::MAX), u32::MAX);
+    }
+
+    // ---- question_matches ----
+
+    fn question_matches_query(name: &str) -> Vec<u8> {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RecordType};
+        use std::str::FromStr;
+        let mut msg = Message::new(0x1234, MessageType::Query, OpCode::Query);
+        msg.add_query(Query::query(Name::from_str(name).unwrap(), RecordType::A));
+        msg.to_vec().unwrap()
+    }
+
+    #[test]
+    fn question_matches_ignores_ascii_case_only() {
+        let query = question_matches_query("example.com.");
+        let mut response = question_matches_query("ExAmPlE.CoM.");
+        response[2] |= 0x80;
+        assert!(question_matches(&query, &response), "0x20 case must match");
+
+        let mut other = question_matches_query("example.org.");
+        other[2] |= 0x80;
+        assert!(
+            !question_matches(&query, &other),
+            "different name must not match"
+        );
+
+        let mut other_type = response.clone();
+        let type_pos = other_type.len() - 4;
+        other_type[type_pos + 1] = 28; // AAAA
+        assert!(
+            !question_matches(&query, &other_type),
+            "different QTYPE must not match"
+        );
+    }
+
+    #[test]
+    fn question_matches_reply_without_question_only_when_empty() {
+        let query = question_matches_query("example.com.");
+        // Header-only FORMERR with QDCOUNT = 0 and no records: accepted, it
+        // cannot poison anything and keeps the upstream's fast failure.
+        let mut bare_error = query[..12].to_vec();
+        bare_error[2] |= 0x80;
+        bare_error[3] = 0x01; // RCODE = FORMERR
+        bare_error[5] = 0;
+        assert!(
+            question_matches(&query, &bare_error),
+            "record-less reply without a question must be accepted"
+        );
+        // QDCOUNT = 0 but ANCOUNT = 1: records without a question, rejected.
+        let mut with_records = bare_error.clone();
+        with_records[3] = 0x00;
+        with_records[7] = 1;
+        assert!(
+            !question_matches(&query, &with_records),
+            "reply carrying records without a question must be rejected"
+        );
+        // Truncated question
+        assert!(!question_matches(&query, &query[..20]));
     }
 }

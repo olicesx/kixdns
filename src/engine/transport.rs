@@ -42,9 +42,20 @@ fn unix_time_millis() -> u64 {
 }
 
 /// Type alias for UDP inflight request tracking
-/// ID -> (OriginalID, ExpectedAddr, Sender)
-type UdpInflightMap =
-    DashMap<u16, (u16, SocketAddr, oneshot::Sender<anyhow::Result<Bytes>>), FxBuildHasher>;
+/// ID -> (OriginalID, ExpectedAddr, SentQuery, Sender)
+/// The sent query (ID already rewritten) stays in the entry so the reader can
+/// match the answer's question section against it (RFC 5452 §9.1).
+/// 条目保留已改写 ID 的查询报文，供 reader 比对应答的 question 段（RFC 5452 §9.1）。
+type UdpInflightMap = DashMap<
+    u16,
+    (
+        u16,
+        SocketAddr,
+        Bytes,
+        oneshot::Sender<anyhow::Result<Bytes>>,
+    ),
+    FxBuildHasher,
+>;
 
 /// RAII Guard to ensure inflight entries are removed even on cancellation/panic
 /// RAII Guard 确保即使在取消或 panic 时也能移除 inflight 条目
@@ -61,7 +72,7 @@ impl Drop for InflightGuard {
 
 struct UdpSocketState {
     socket: Arc<tokio::net::UdpSocket>,
-    /// Inflight map: ID -> (OriginalID, ExpectedAddr, Sender)
+    /// Inflight map: ID -> (OriginalID, ExpectedAddr, SentQuery, Sender)
     /// Note: Using FxBuildHasher for performance
     inflight: Arc<UdpInflightMap>,
 }
@@ -132,9 +143,30 @@ impl UdpClient {
                                 // 修复：使用 Entry API 原子操作，避免 remove-then-insert 导致的竞态条件
                                 // Fix: Use Entry API for atomic operations to avoid remove-then-insert race condition
                                 if let entry::Entry::Occupied(entry) = inflight_clone.entry(id) {
-                                    let (_, expected_addr, _) = entry.get();
-                                    if src == *expected_addr {
-                                        let (_, (original_id, _, tx)) = entry.remove_entry();
+                                    let (_, expected_addr, query, _) = entry.get();
+                                    if src != *expected_addr {
+                                        // Address mismatch: keep entry and wait for correct response
+                                        // 地址不匹配：保留条目等待正确响应（可能是网络攻击或路由异常）
+                                        tracing::warn!(
+                                            socket_idx = idx,
+                                            response_id = id,
+                                            expected_addr = %expected_addr,
+                                            actual_addr = %src,
+                                            "UDP response address mismatch, possible spoofing or routing anomaly"
+                                        );
+                                    } else if !crate::proto_utils::question_matches(query, &buf) {
+                                        // RFC 5452 §9.1: matching ID and address are not enough,
+                                        // the question must match too. Keep waiting for the real one.
+                                        // RFC 5452 §9.1：ID 和地址相符还不够，question 段也必须一致；
+                                        // 保留条目继续等待真正的应答。
+                                        tracing::warn!(
+                                            socket_idx = idx,
+                                            response_id = id,
+                                            upstream = %src,
+                                            "UDP response question mismatch, possible spoofing"
+                                        );
+                                    } else {
+                                        let (_, (original_id, _, _, tx)) = entry.remove_entry();
 
                                         // Restore original TXID
                                         let orig_bytes = original_id.to_be_bytes();
@@ -162,16 +194,6 @@ impl UdpClient {
                                                 "UDP response sent successfully"
                                             );
                                         }
-                                    } else {
-                                        // Address mismatch: keep entry and wait for correct response
-                                        // 地址不匹配：保留条目等待正确响应（可能是网络攻击或路由异常）
-                                        tracing::warn!(
-                                            socket_idx = idx,
-                                            response_id = id,
-                                            expected_addr = %expected_addr,
-                                            actual_addr = %src,
-                                            "UDP response address mismatch, possible spoofing or routing anomaly"
-                                        );
                                     }
                                 }
                             }
@@ -216,6 +238,12 @@ impl UdpClient {
         }
         let original_id = u16::from_be_bytes([packet[0], packet[1]]);
 
+        // Copy the packet once so the ID can be rewritten; the same buffer is
+        // sent and kept in the inflight entry for the answer's question check.
+        // 只拷贝一次报文用于改写 ID；同一份缓冲既用于发送，也留在在途条目里供应答比对。
+        let mut new_packet = BytesMut::with_capacity(packet.len());
+        new_packet.extend_from_slice(packet);
+
         // Claim a free ID using the atomic entry API; on a collision with an
         // in-flight query draw a fresh random ID rather than the next one.
         // 使用原子 Entry API 占用空闲 ID；与在途查询冲突时重新随机，而不是取下一个。
@@ -223,11 +251,13 @@ impl UdpClient {
         let mut new_id = draw as u16;
         let (tx, rx) = oneshot::channel();
 
-        loop {
+        let new_packet = loop {
             match state.inflight.entry(new_id) {
                 entry::Entry::Vacant(e) => {
-                    e.insert((original_id, addr, tx));
-                    break;
+                    new_packet[0..2].copy_from_slice(&new_id.to_be_bytes());
+                    let new_packet = new_packet.freeze();
+                    e.insert((original_id, addr, new_packet.clone(), tx));
+                    break new_packet;
                 }
                 entry::Entry::Occupied(_) => {
                     new_id = rand::random();
@@ -244,7 +274,7 @@ impl UdpClient {
                     }
                 }
             }
-        }
+        };
 
         // RAII Guard: ensures entry is removed from map when guard is dropped
         // (e.g. timeout, cancel, early return)
@@ -253,13 +283,6 @@ impl UdpClient {
             inflight: state.inflight.clone(),
             id: new_id,
         };
-
-        // Rewrite packet with new ID using BytesMut to avoid full copy
-        let mut new_packet = BytesMut::with_capacity(packet.len());
-        new_packet.extend_from_slice(packet);
-        let id_bytes = new_id.to_be_bytes();
-        new_packet[0] = id_bytes[0];
-        new_packet[1] = id_bytes[1];
 
         if let Err(e) = state.socket.send_to(&new_packet, addr).await {
             // Guard will remove inflight entry automatically
@@ -2895,10 +2918,12 @@ mod tests {
     use tokio::time::timeout;
 
     /// UDP "upstream" for UdpClient tests: records the (transaction id, source
-    /// port) of every query it receives and answers with `reply(query)`.
-    /// UdpClient 测试用的 UDP "上游"：记录每个查询的 (TXID, 源端口)，用 reply(query) 应答。
+    /// port) of every query it receives and answers with each datagram of
+    /// `reply(query)`, in order.
+    /// UdpClient 测试用的 UDP "上游"：记录每个查询的 (TXID, 源端口)，按序发回
+    /// reply(query) 给出的每个数据报。
     async fn spawn_udp_upstream(
-        reply: impl Fn(&[u8]) -> Vec<u8> + Send + 'static,
+        reply: impl Fn(&[u8]) -> Vec<Vec<u8>> + Send + 'static,
     ) -> (String, Arc<std::sync::Mutex<Vec<(u16, u16)>>>) {
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
@@ -2912,7 +2937,9 @@ mod tests {
                 let query = &buf[..n];
                 let id = u16::from_be_bytes([query[0], query[1]]);
                 recorder.lock().unwrap().push((id, src.port()));
-                let _ = socket.send_to(&reply(query), src).await;
+                for datagram in reply(query) {
+                    let _ = socket.send_to(&datagram, src).await;
+                }
             }
         });
         (addr.to_string(), seen)
@@ -2937,6 +2964,19 @@ mod tests {
         response
     }
 
+    /// Response to `query` whose question section names `name` instead.
+    fn udp_response_with_question(query: &[u8], name: &str) -> Vec<u8> {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RecordType};
+        let id = u16::from_be_bytes([query[0], query[1]]);
+        let mut msg = Message::new(id, MessageType::Response, OpCode::Query);
+        msg.add_query(Query::query(
+            Name::from_ascii(name).expect("parse test name"),
+            RecordType::A,
+        ));
+        msg.to_vec().expect("encode test response")
+    }
+
     #[tokio::test]
     async fn udp_send_randomizes_transaction_id_and_source_port() {
         // RFC 5452 §4.3 / §9.2: neither the ID nor the source port may be
@@ -2945,7 +2985,7 @@ mod tests {
         // pairs was fully predictable.
         // RFC 5452 §4.3/§9.2：TXID 和源端口都不能可预测。此前每个 socket 的 ID 从
         // 0 顺序递增、socket 轮询选择，(ID, 端口) 序列完全可预测。
-        let (upstream, seen) = spawn_udp_upstream(udp_echo_response).await;
+        let (upstream, seen) = spawn_udp_upstream(|query| vec![udp_echo_response(query)]).await;
         let client = UdpClient::new(4).expect("create UDP client");
         let sends = 16;
         for _ in 0..sends {
@@ -2977,6 +3017,102 @@ mod tests {
                 .enumerate()
                 .any(|(i, port)| *port != ports[i % 4]),
             "source ports cycle round-robin: {ports:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_send_ignores_answer_whose_question_differs() {
+        // RFC 5452 §9.1: an answer is only accepted when its question section
+        // matches the query; a matching ID and source address are not enough.
+        // RFC 5452 §9.1：question 段不匹配的应答必须忽略，ID 和源地址相符不够。
+        let (upstream, _seen) =
+            spawn_udp_upstream(|query| vec![udp_response_with_question(query, "evil.example.")])
+                .await;
+        let client = UdpClient::new(1).expect("create UDP client");
+        let err = client
+            .send(
+                &udp_test_query("id.example."),
+                &upstream,
+                Duration::from_millis(300),
+            )
+            .await
+            .expect_err("an answer for a different question must not be delivered");
+        assert!(
+            err.to_string().contains("timeout"),
+            "expected the query to time out, got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_send_accepts_case_randomized_question() {
+        // DNS 0x20 upstreams answer with the query name's case scrambled; the
+        // match must ignore ASCII case.
+        // 0x20 大小写随机化的应答要能匹配：比较忽略 ASCII 大小写。
+        let (upstream, _seen) =
+            spawn_udp_upstream(|query| vec![udp_response_with_question(query, "Id.ExAmPlE.")])
+                .await;
+        let client = UdpClient::new(1).expect("create UDP client");
+        let response = client
+            .send(
+                &udp_test_query("id.example."),
+                &upstream,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("case-scrambled answer must be accepted");
+        assert_eq!(&response[0..2], &[0x12, 0x34], "original ID restored");
+    }
+
+    #[tokio::test]
+    async fn udp_send_accepts_record_less_error_without_question() {
+        // Some upstreams answer FORMERR/NOTIMP with QDCOUNT = 0. Such a reply
+        // carries nothing cacheable, so it is delivered as the fast failure it
+        // is instead of being treated as forged and waited out.
+        // 有些上游对 FORMERR/NOTIMP 回 QDCOUNT=0：没有可缓存内容，按快速失败投递，
+        // 而不是当作伪造等到超时。
+        let (upstream, _seen) = spawn_udp_upstream(|query| {
+            let mut header_only = query[..12].to_vec();
+            header_only[2] |= 0x80;
+            header_only[3] = 0x01; // FORMERR
+            header_only[5] = 0; // QDCOUNT = 0
+            vec![header_only]
+        })
+        .await;
+        let client = UdpClient::new(1).expect("create UDP client");
+        let response = client
+            .send(
+                &udp_test_query("id.example."),
+                &upstream,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("record-less FORMERR must be delivered");
+        assert_eq!(response.len(), 12);
+        assert_eq!(response[3] & 0x0F, 0x01, "RCODE = FORMERR");
+    }
+
+    #[tokio::test]
+    async fn udp_send_keeps_waiting_after_mismatched_answer() {
+        // A mismatched answer must not consume the in-flight entry: the genuine
+        // answer arriving right after it is still delivered.
+        // 不匹配的应答不能消耗在途条目：紧随其后的真应答仍被投递。
+        let (upstream, _seen) = spawn_udp_upstream(|query| {
+            vec![
+                udp_response_with_question(query, "evil.example."),
+                udp_echo_response(query),
+            ]
+        })
+        .await;
+        let client = UdpClient::new(1).expect("create UDP client");
+        let query = udp_test_query("id.example.");
+        let response = client
+            .send(&query, &upstream, Duration::from_secs(2))
+            .await
+            .expect("genuine answer after a bogus one must be delivered");
+        assert_eq!(
+            &response[12..],
+            &query[12..],
+            "delivered answer is the genuine one"
         );
     }
 
