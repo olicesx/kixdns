@@ -320,14 +320,18 @@ impl Engine {
 
                 let load_result = if is_dat {
                     // 使用按需加载 / Use selective loading
-                    // parking_lot::RwLock::write() 返回 guard 直接，不会中毒
-                    let mut manager = geosite_manager.write();
                     if used_geosite_tags.is_empty() {
                         // 没有使用 GeoSite 标签，跳过加载 / No GeoSite tags used, skip loading
                         info!("No GeoSite tags used in config, skipping GeoSite data loading");
                         Ok(0)
                     } else {
-                        manager.load_from_dat_file_selective(&path, &used_geosite_tags)
+                        // 在锁外解析，只在替换数据时持写锁
+                        // Parse outside the lock, hold the write lock only for the swap
+                        crate::matcher::geosite::GeoSiteManager::parse_dat_file_selective(
+                            &path,
+                            &used_geosite_tags,
+                        )
+                        .map(|parsed| geosite_manager.write().apply_source(&path, parsed))
                     }
                 } else {
                     // JSON 格式：全量加载 / JSON format: load all
