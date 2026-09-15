@@ -2401,6 +2401,45 @@ pub struct DoqConnectionPool {
 ///
 /// 参考 RFC 9250 (DNS over Dedicated QUIC Connections) 实现
 /// Implements RFC 9250 (DNS over Dedicated QUIC Connections)
+/// DoQ 一次尝试的失败原因，按类型保留 quinn 的原始错误
+/// Why one DoQ attempt failed, keeping quinn's own error by type
+///
+/// 此前内层每一步都被 `.context()` 包过，而 `anyhow::Error::to_string()` 只
+/// 输出最外层那一句，所以判定 0-RTT 是否被拒绝时拿到的永远只是那几个固定
+/// 短语，quinn 说的话根本到不了。把原始错误原样带出来，判定就能落在类型上。
+/// Every step used to be wrapped in `.context()`, and
+/// `anyhow::Error::to_string()` renders only the outermost one, so the check
+/// for a rejected 0-RTT attempt never saw anything but a handful of fixed
+/// phrases and never quinn's own words. Carrying the error out untouched lets
+/// the decision rest on types.
+enum DoqFailure {
+    /// `open_bi` 失败：连接已经不可用 / the connection is already unusable
+    OpenStream(quinn::ConnectionError),
+    /// 写查询失败 / writing the query failed
+    Write(quinn::WriteError),
+    /// 读应答失败 / reading the answer failed
+    Read(quinn::ReadToEndError),
+    /// 应答本身不合协议，与 0-RTT 无关 / the answer itself is malformed
+    Protocol(String),
+}
+
+impl std::fmt::Display for DoqFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OpenStream(err) => write!(f, "doq open stream failed: {err}"),
+            Self::Write(err) => write!(f, "doq send query failed: {err}"),
+            Self::Read(err) => write!(f, "doq read response failed: {err}"),
+            Self::Protocol(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<DoqFailure> for anyhow::Error {
+    fn from(failure: DoqFailure) -> Self {
+        anyhow::anyhow!("{failure}")
+    }
+}
+
 pub struct DoqClient {
     pools: DashMap<Arc<str>, Arc<DoqConnectionPool>, FxBuildHasher>,
     pool_size: usize,
@@ -2692,8 +2731,14 @@ impl DoqMuxClient {
             // RFC 9250 §4.2: QUIC 流上的 DNS 消息必须使用 2 字节长度前缀，
             // 后跟 DNS 消息内容。每个查询使用单独的双向流；消息边界由 FIN 信号标识。
             let resp = timeout(timeout_dur, async {
-                let (mut send, mut recv) = conn.open_bi().await
-                    .context("doq open stream failed")?;
+                // 内层返回带类型的失败，而不是 anyhow：每一步都被 context 包过
+                // 之后，anyhow 的 to_string 只剩最外层那一句，quinn 的原始错误
+                // 到不了判定处。
+                // The inner block yields a typed failure rather than anyhow:
+                // once every step is wrapped in context, anyhow's to_string
+                // leaves only the outermost sentence and quinn's own error never
+                // reaches the decision.
+                let (mut send, mut recv) = conn.open_bi().await.map_err(DoqFailure::OpenStream)?;
 
                 // RFC 9250 §4.2: DNS messages sent over QUIC streams MUST be prefixed
                 // with a 2-octet length field, followed by the DNS message content.
@@ -2712,7 +2757,7 @@ impl DoqMuxClient {
                 frame[2] = 0; // Message ID = 0 (RFC 9250 §4.2.1) / 消息 ID = 0
                 frame[3] = 0;
 
-                send.write_all(&frame).await.context("doq send query failed")?;
+                send.write_all(&frame).await.map_err(DoqFailure::Write)?;
                 let _ = send.finish();
 
                 // Read response: 2-byte length prefix followed by DNS message
@@ -2721,24 +2766,30 @@ impl DoqMuxClient {
                 // We need to read all data until FIN, then parse the length prefix
                 // 注意：服务器发送响应后用 FIN 关闭流
                 // 我们需要读取所有数据直到 FIN，然后解析长度前缀
-                let mut all_data = match recv.read_to_end(MAX_DNS_MESSAGE_SIZE + 2).await {
-                    Ok(data) => data,
-                    Err(e) => {
-                        // Check if this is a connection closed error
-                        // 检查是否是连接关闭错误
-                        if e.to_string().contains("closed by peer") || e.to_string().contains("connection lost") {
-                            anyhow::bail!("doq connection closed by server (possible protocol error or server does not support DoQ)");
-                        }
-                        return Err(e).context("doq read response failed");
-                    }
-                };
+                // 连接被对端关掉的判断此前靠字符串，而且那个判断把所有原因都
+                // 折叠成同一句话；现在原样把 quinn 的错误带出去，由
+                // zero_rtt_likely_rejected 按类型判定。
+                // Detecting a peer-closed connection used to go through strings,
+                // and that check folded every cause into one sentence. The quinn
+                // error is now carried out as it is and
+                // zero_rtt_likely_rejected decides by type.
+                let mut all_data = recv
+                    .read_to_end(MAX_DNS_MESSAGE_SIZE + 2)
+                    .await
+                    .map_err(DoqFailure::Read)?;
 
                 if all_data.is_empty() {
-                    anyhow::bail!("doq received empty response (server closed stream without sending data)");
+                    return Err(DoqFailure::Protocol(
+                        "doq received empty response (server closed stream without sending data)"
+                            .to_string(),
+                    ));
                 }
 
                 if all_data.len() < 2 {
-                    anyhow::bail!("doq response too short: {} bytes", all_data.len());
+                    return Err(DoqFailure::Protocol(format!(
+                        "doq response too short: {} bytes",
+                        all_data.len()
+                    )));
                 }
 
                 let msg_len = u16::from_be_bytes([all_data[0], all_data[1]]) as usize;
@@ -2746,11 +2797,13 @@ impl DoqMuxClient {
                 // idoq-style length validation: response length must match length prefix
                 // idoq 风格的长度验证：响应长度必须匹配长度前缀
                 if all_data.len() != 2 + msg_len {
-                    anyhow::bail!(
+                    return Err(DoqFailure::Protocol(format!(
                         "doq length mismatch: expected {} bytes (2 + {}), got {} bytes. \
                         This may indicate data corruption or server protocol violation.",
-                        2 + msg_len, msg_len, all_data.len()
-                    );
+                        2 + msg_len,
+                        msg_len,
+                        all_data.len()
+                    )));
                 }
 
                 let buf = &all_data[2..2 + msg_len];
@@ -2759,7 +2812,9 @@ impl DoqMuxClient {
                     // Also prevents all_data[2..4] index out of bounds when msg_len < 2.
                     // DNS 消息必须至少 2 字节才能恢复 TXID。
                     // 同时防止 msg_len < 2 时 all_data[2..4] 越界。
-                    anyhow::bail!("doq DNS message too short: {} bytes", msg_len);
+                    return Err(DoqFailure::Protocol(format!(
+                        "doq DNS message too short: {msg_len} bytes"
+                    )));
                 }
                 // Restore original DNS Message ID in-place (Vec<u8> is mutable).
                 // Bytes::from(Vec) takes ownership of the heap allocation (zero-copy).
@@ -2768,38 +2823,41 @@ impl DoqMuxClient {
                 // Bytes::from(Vec) 接管堆分配（零拷贝）。
                 // slice(2..) 返回跳过长度前缀的视图（零拷贝，共享分配）。
                 all_data[2..4].copy_from_slice(&original_id.to_be_bytes());
-                Ok(Bytes::from(all_data).slice(2..))
-            }).await;
+                Ok::<Bytes, DoqFailure>(Bytes::from(all_data).slice(2..))
+            })
+            .await;
 
             match resp {
                 Ok(Ok(bytes)) => {
                     self.record_success();
                     return Ok(bytes);
                 }
-                Ok(Err(err)) => {
-                    let err_str = err.to_string();
+                Ok(Err(failure)) => {
                     let already_reset = self.record_error().await;
                     if !already_reset {
                         // Only reset if record_error() didn't already reset (below threshold)
                         self.reset_connection().await;
                     }
-                    if allow_retry && used_0rtt && self.should_retry_without_0rtt(target, &err_str)
+                    if allow_retry
+                        && used_0rtt
+                        && self.zero_rtt_retry_allowed(target)
+                        && Self::zero_rtt_likely_rejected(&failure)
                     {
                         self.disable_zero_rtt();
                         let remaining = timeout_dur.saturating_sub(start.elapsed());
                         if remaining.is_zero() {
-                            return Err(err);
+                            return Err(failure.into());
                         }
                         warn!(
                             upstream = %self.upstream,
-                            error = %err,
-                            "DoQ 0-RTT likely rejected (connection closed/stream error), retrying without 0-RTT"
+                            error = %failure,
+                            "DoQ 0-RTT likely rejected, retrying without 0-RTT"
                         );
                         allow_retry = false;
                         timeout_dur = remaining;
                         continue;
                     }
-                    return Err(err);
+                    return Err(failure.into());
                 }
                 Err(_) => {
                     if allow_retry && used_0rtt {
@@ -2831,9 +2889,14 @@ impl DoqMuxClient {
                             .store(true, std::sync::atomic::Ordering::Relaxed);
                         warn!(
                             upstream = %self.upstream,
+                            // 粘滞位绕不过去：connect_new 用的是
+                            // enable_0rtt && !was_rejected，所以 ?0rtt=true 也
+                            // 不会让它重新启用，只能重启进程。
+                            // The sticky bit cannot be bypassed: connect_new
+                            // takes enable_0rtt && !was_rejected, so ?0rtt=true
+                            // does not re-enable it either; only a restart does.
                             "DoQ 0-RTT timeout detected, automatically disabling 0-RTT for this upstream. \
-                            Future connections will use normal handshake. This status is cached until restart. \
-                            To re-enable 0-RTT, restart the server or use ?0rtt=true in the upstream URL."
+                            Future connections will use normal handshake. This status is cached until a restart."
                         );
                     }
                     let already_reset = self.record_error().await;
@@ -2846,23 +2909,52 @@ impl DoqMuxClient {
         }
     }
 
-    fn should_retry_without_0rtt(&self, target: &DoqTarget, err: &str) -> bool {
-        let enable_0rtt = target.enable_0rtt.unwrap_or(self.runtime.enable_0rtt);
-        if !enable_0rtt {
-            return false;
+    /// 这次失败是否像 0-RTT 被拒绝，值得关掉 0-RTT 再试一次
+    /// Whether this failure looks like a rejected 0-RTT attempt and is worth one
+    /// retry with 0-RTT off
+    ///
+    /// 两类算数：quinn 明确报告 `ZeroRttRejected`；或者连接被对端关闭、重置、
+    /// 丢失——服务器拒绝 0-RTT 数据时常常直接关连接，而不是报那个专门的错误。
+    /// 本地关闭、超时、协议层面的问题都不算，它们和 0-RTT 无关。
+    ///
+    /// 纯函数，不吃 `&self`，所以测试可以直接拿 quinn 的错误值驱动它。
+    /// Two things count: quinn saying `ZeroRttRejected` outright, and the
+    /// connection being closed, reset or lost by the peer, since a server that
+    /// refuses 0-RTT data often just closes instead of raising that specific
+    /// error. A local close, a timeout and any protocol-level problem do not,
+    /// having nothing to do with 0-RTT. It takes no `&self`, so a test can drive
+    /// it with real quinn error values.
+    fn zero_rtt_likely_rejected(failure: &DoqFailure) -> bool {
+        fn peer_ended_it(err: &quinn::ConnectionError) -> bool {
+            matches!(
+                err,
+                quinn::ConnectionError::ApplicationClosed(_)
+                    | quinn::ConnectionError::ConnectionClosed(_)
+                    | quinn::ConnectionError::Reset
+            )
         }
-        if self
-            .zero_rtt_rejected
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return false;
+
+        match failure {
+            DoqFailure::OpenStream(err) => peer_ended_it(err),
+            DoqFailure::Write(quinn::WriteError::ZeroRttRejected) => true,
+            DoqFailure::Write(quinn::WriteError::ConnectionLost(err)) => peer_ended_it(err),
+            DoqFailure::Read(quinn::ReadToEndError::Read(err)) => match err {
+                quinn::ReadError::ZeroRttRejected => true,
+                quinn::ReadError::ConnectionLost(err) => peer_ended_it(err),
+                _ => false,
+            },
+            _ => false,
         }
-        err.contains("doq connection closed by server")
-            || err.contains("closed by peer")
-            || err.contains("connection lost")
-            || err.contains("stream reset")
-            || err.contains("ConnectionClosed")
-            || err.contains("reset by peer")
+    }
+
+    /// 在这条连接上是否还允许关掉 0-RTT 重试：配置开着、且还没被标记过拒绝
+    /// Whether a 0-RTT retry is still allowed here: enabled by configuration and
+    /// not already marked as rejected
+    fn zero_rtt_retry_allowed(&self, target: &DoqTarget) -> bool {
+        target.enable_0rtt.unwrap_or(self.runtime.enable_0rtt)
+            && !self
+                .zero_rtt_rejected
+                .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn disable_zero_rtt(&self) {
@@ -3070,6 +3162,66 @@ fn parse_doq_target(upstream: &str) -> anyhow::Result<DoqTarget> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0-RTT 判定必须按类型走。此前它比对 `anyhow::Error::to_string()`，而内层
+    /// 每一步都被 `.context()` 包过，那个字符串永远只是三句固定短语之一或一条
+    /// bail 文本，于是 quinn 明说的 `ZeroRttRejected` 从来没有被识别过：判定
+    /// 返回 false，0-RTT 不被禁用，下次连接又用 0-RTT，该上游一直失败到重启。
+    /// The 0-RTT decision has to go by type. It used to compare
+    /// `anyhow::Error::to_string()`, and since every inner step was wrapped in
+    /// `.context()` that string was only ever one of three fixed phrases or a
+    /// bail text, so quinn saying `ZeroRttRejected` outright was never
+    /// recognised: the check returned false, 0-RTT stayed on, the next
+    /// connection used it again and the upstream kept failing until a restart.
+    #[test]
+    fn doq_zero_rtt_rejection_is_classified_by_type() {
+        use quinn::{ConnectionError, ReadError, ReadToEndError, WriteError};
+
+        // quinn 明说被拒绝 / quinn says so outright
+        assert!(DoqMuxClient::zero_rtt_likely_rejected(&DoqFailure::Write(
+            WriteError::ZeroRttRejected
+        )));
+        assert!(DoqMuxClient::zero_rtt_likely_rejected(&DoqFailure::Read(
+            ReadToEndError::Read(ReadError::ZeroRttRejected)
+        )));
+
+        // 对端直接关掉连接：拒绝 0-RTT 数据的服务器常常这样做
+        // The peer just closes: what a server refusing 0-RTT data often does
+        let closed = || {
+            ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code: quinn::VarInt::from_u32(0),
+                reason: bytes::Bytes::new(),
+            })
+        };
+        assert!(DoqMuxClient::zero_rtt_likely_rejected(
+            &DoqFailure::OpenStream(closed())
+        ));
+        assert!(DoqMuxClient::zero_rtt_likely_rejected(&DoqFailure::Read(
+            ReadToEndError::Read(ReadError::ConnectionLost(closed()))
+        )));
+        assert!(DoqMuxClient::zero_rtt_likely_rejected(&DoqFailure::Write(
+            WriteError::ConnectionLost(ConnectionError::Reset)
+        )));
+
+        // 与 0-RTT 无关的失败不该触发重试
+        // Failures that have nothing to do with 0-RTT must not trigger a retry
+        assert!(!DoqMuxClient::zero_rtt_likely_rejected(
+            &DoqFailure::OpenStream(ConnectionError::TimedOut)
+        ));
+        assert!(!DoqMuxClient::zero_rtt_likely_rejected(
+            &DoqFailure::OpenStream(ConnectionError::LocallyClosed)
+        ));
+        assert!(!DoqMuxClient::zero_rtt_likely_rejected(&DoqFailure::Read(
+            ReadToEndError::TooLong
+        )));
+        assert!(!DoqMuxClient::zero_rtt_likely_rejected(&DoqFailure::Read(
+            ReadToEndError::Read(ReadError::ClosedStream)
+        )));
+        assert!(!DoqMuxClient::zero_rtt_likely_rejected(
+            &DoqFailure::Protocol("doq response too short: 1 bytes".to_string())
+        ));
+    }
+
     use futures::future::join_all;
     use std::time::Duration;
     use tokio::time::timeout;
