@@ -863,10 +863,6 @@ async fn handle_tcp_conn(
     const MAX_TCP_FRAME: usize = 64 * 1024;
     let mut len_buf = [0u8; 2];
 
-    // ✅ 获取整体请求超时（包含 hedge + TCP fallback）
-    // ✅ Get overall request timeout (including hedge + TCP fallback)
-    let timeout_ms = engine.get_request_timeout_ms();
-
     // Reusable buffer to avoid per-frame heap allocation / 可复用缓冲区，避免每帧堆分配
     // 使用 BytesMut 以支持零拷贝操作 / Use BytesMut for zero-copy operations
     let mut buf = bytes::BytesMut::with_capacity(MAX_TCP_FRAME);
@@ -911,6 +907,14 @@ async fn handle_tcp_conn(
         if !is_standard_query_header(&packet_bytes) {
             return Ok(());
         }
+        // 每帧重新取整体请求超时（含 hedge 与 TCP fallback）。RFC 7766 的客户端会
+        // 把一条连接用很久，热重载改了 request_timeout 之后，这条连接上的后续查询
+        // 必须跟着新值走；UDP 路径本来就是每请求读一次。
+        // Re-read the overall request timeout (hedge and TCP fallback included)
+        // per frame. An RFC 7766 client keeps one connection open for a long
+        // time, so queries that follow a reload must use the new
+        // request_timeout; the UDP path already reads it per request.
+        let timeout_ms = engine.get_request_timeout_ms();
         let timeout_dur = Duration::from_millis(timeout_ms);
 
         let resp = match engine.handle_packet_fast(&packet_bytes, peer) {
@@ -1176,13 +1180,18 @@ mod tests {
     }
 
     fn doh_timeout_engine(upstream: &str) -> Engine {
+        Engine::new(doh_timeout_config(upstream, 50), "test".to_string())
+            .expect("initialize engine")
+    }
+
+    fn doh_timeout_config(upstream: &str, timeout_ms: u64) -> RuntimePipelineConfig {
         use kixdns::config::PipelineConfig;
 
         let config: PipelineConfig = serde_json::from_value(serde_json::json!({
             "settings": {
                 "default_upstream": upstream,
-                "upstream_timeout_ms": 50,
-                "request_timeout_ms": 50
+                "upstream_timeout_ms": timeout_ms,
+                "request_timeout_ms": timeout_ms
             },
             "pipelines": [{
                 "id": "p",
@@ -1198,8 +1207,7 @@ mod tests {
             }]
         }))
         .expect("parse config");
-        let runtime = RuntimePipelineConfig::from_config(config).expect("build runtime config");
-        Engine::new(runtime, "test".to_string()).expect("initialize engine")
+        RuntimePipelineConfig::from_config(config).expect("build runtime config")
     }
 
     #[tokio::test]
@@ -1317,6 +1325,84 @@ mod tests {
             .expect("read after close");
         assert_eq!(read, 0, "an idle connection must be closed by the server");
         server.await.unwrap().expect("connection handler");
+    }
+
+    /// 长连接上的查询必须跟着热重载后的 request_timeout 走。此前超时值在进入
+    /// 循环前只读一次，运维调大超时之后，已有连接上的查询继续按旧值失败，
+    /// 直到客户端自己重连。RFC 7766 的客户端正是长期复用一条连接。
+    /// Queries on a long-lived connection must follow the request_timeout a
+    /// reload installed. The value used to be read once before the loop, so
+    /// after an operator raised the timeout the queries on an existing
+    /// connection kept failing on the old budget until the client reconnected.
+    /// An RFC 7766 client reuses one connection for exactly that long.
+    #[tokio::test]
+    async fn tcp_request_timeout_follows_a_reload_on_an_open_connection() {
+        // 只接不答的上游，让每条查询都跑满整体请求超时
+        // An upstream that accepts and never answers, so every query runs the
+        // whole request timeout
+        let blackhole = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let blackhole_addr = blackhole.local_addr().unwrap();
+        let blackhole_task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = blackhole.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let upstream = format!("https://{blackhole_addr}/dns-query");
+        const BEFORE_MS: u64 = 120;
+        const AFTER_MS: u64 = 900;
+        let engine = Engine::new(doh_timeout_config(&upstream, BEFORE_MS), "test".to_string())
+            .expect("initialize engine");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(listener_addr).await.unwrap();
+        let (server_stream, peer) = listener.accept().await.unwrap();
+        let server_task = tokio::spawn(handle_tcp_conn(server_stream, peer, engine.clone()));
+
+        let first = time_one_tcp_query(&mut client).await;
+        assert!(
+            first < Duration::from_millis(AFTER_MS / 2),
+            "the first query must use the configured {BEFORE_MS} ms budget, took {first:?}"
+        );
+
+        engine.reload(doh_timeout_config(&upstream, AFTER_MS));
+
+        // 同一条连接上的第二次查询 / A second query on the same connection
+        let second = time_one_tcp_query(&mut client).await;
+        assert!(
+            second >= Duration::from_millis(AFTER_MS / 2),
+            "a query after the reload must use the new {AFTER_MS} ms budget, took {second:?}"
+        );
+
+        server_task.abort();
+        blackhole_task.abort();
+    }
+
+    /// 在一条已建立的连接上发一次查询并读回完整应答，返回耗时
+    /// Send one query on an established connection, read the whole answer back
+    /// and return how long it took
+    async fn time_one_tcp_query(client: &mut TcpStream) -> Duration {
+        let query = dns_query();
+        let mut frame = Vec::with_capacity(2 + query.len());
+        frame.extend_from_slice(&(query.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&query);
+
+        let start = std::time::Instant::now();
+        client.write_all(&frame).await.unwrap();
+        let mut len_buf = [0u8; 2];
+        client
+            .read_exact(&mut len_buf)
+            .await
+            .expect("length prefix");
+        let mut response = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+        client.read_exact(&mut response).await.expect("dns frame");
+        let elapsed = start.elapsed();
+
+        let message = Message::from_bytes(&response).unwrap();
+        assert_eq!(message.metadata.response_code, ResponseCode::ServFail);
+        elapsed
     }
 
     #[tokio::test]
