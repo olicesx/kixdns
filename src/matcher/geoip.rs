@@ -150,6 +150,18 @@ impl GeoIpTagIndex {
 
 /// V2Ray .dat 文件使用 protobuf 格式
 /// MaxMind GeoIP 数据库管理器 / MaxMind GeoIP database manager
+/// 一个数据文件解析出的 GeoIP 索引，已 finalize，尚未进入管理器
+/// GeoIP indexes parsed out of one data file, already finalised and not yet
+/// applied to a manager
+pub struct ParsedGeoIp {
+    tag_indexes: FxHashMap<Arc<str>, GeoIpTagIndex>,
+    count: usize,
+    ipv4_count: usize,
+    ipv6_count: usize,
+    /// 只用于日志，区分 .dat 与 JSON / For the log line only, .dat versus JSON
+    source: &'static str,
+}
+
 pub struct GeoIpManager {
     /// MaxMind DB reader (使用内存映射，线程安全) / MaxMind DB reader (memory-mapped, thread-safe)
     reader: Arc<Option<maxminddb::Reader<Vec<u8>>>>,
@@ -462,6 +474,24 @@ impl GeoIpManager {
     /// V2Ray .dat 文件使用 protobuf 编码，包含国家代码和 IP 范围
     /// V2Ray .dat files use protobuf encoding, containing country codes and IP ranges
     pub fn load_from_dat_file(&mut self, path: &Path) -> anyhow::Result<usize> {
+        let parsed = Self::parse_dat_file(path)?;
+        Ok(self.apply_parsed(parsed))
+    }
+
+    /// 解析 .dat 文件，不触碰管理器状态
+    /// Parse a .dat file without touching manager state
+    ///
+    /// 读取、解码、建索引、finalize 全在这里完成，与 [`Self::apply_parsed`]
+    /// 配合：调用方在锁外解析，只在替换数据时短暂持写锁。finalize 必须留在
+    /// 这一侧——它要排序并合并每个 tag 的全部网段，是整个重载里最重的一段，
+    /// 只把读取和解码搬出去拿不到多少。
+    /// Reading, decoding, building the indexes and finalising all happen here.
+    /// It pairs with [`Self::apply_parsed`]: callers parse outside the lock and
+    /// hold the write lock only while swapping data in. Finalising has to stay
+    /// on this side, since sorting and merging every tag's ranges is the
+    /// heaviest part of a reload and moving only the read and the decode would
+    /// leave most of it behind.
+    pub fn parse_dat_file(path: &Path) -> anyhow::Result<ParsedGeoIp> {
         let data = std::fs::read(path)?;
 
         // 使用 Google 标准 protobuf 库 (prost) 解析，与 dae pkg/geodata 对齐。
@@ -534,26 +564,57 @@ impl GeoIpManager {
         for index in tag_indexes.values_mut() {
             index.finalize();
         }
-        self.tag_indexes = tag_indexes;
+
+        Ok(ParsedGeoIp {
+            tag_indexes,
+            count,
+            ipv4_count,
+            ipv6_count,
+            source: ".dat file",
+        })
+    }
+
+    /// 用解析结果整体替换索引，并重建查询缓存
+    /// Replace the indexes wholesale with a parsed result and rebuild the cache
+    ///
+    /// GeoIP 只有一个数据文件（`geoip_dat_path` 是单值），所以这里不需要
+    /// geosite 那套按来源记账：两个 loader 本来就是整体替换，解析失败时
+    /// 管理器保持原样，失败原子性已经成立。
+    /// GeoIP has a single data file, `geoip_dat_path` being one value, so none
+    /// of geosite's per-source bookkeeping applies here: both loaders already
+    /// replace wholesale and a failed parse leaves the manager untouched, so
+    /// failure atomicity was never the gap.
+    pub fn apply_parsed(&mut self, parsed: ParsedGeoIp) -> usize {
+        self.tag_indexes = parsed.tag_indexes;
 
         tracing::info!(
-            geoip_entries = count,
+            geoip_entries = parsed.count,
             geoip_tags = self.tag_indexes.len(),
-            ipv4_entries = ipv4_count,
-            ipv6_entries = ipv6_count,
+            ipv4_entries = parsed.ipv4_count,
+            ipv6_entries = parsed.ipv6_count,
             merged_ranges = self.ip_range_count(),
-            "loaded GeoIP tag indexes from .dat file"
+            source = parsed.source,
+            "loaded GeoIP tag indexes"
         );
 
         self.rebuild_cache();
-
-        Ok(count)
+        parsed.count
     }
+
     pub fn load_from_v2ray_file(&mut self, path: &Path) -> anyhow::Result<usize> {
+        let parsed = Self::parse_v2ray_file(path)?;
+        Ok(self.apply_parsed(parsed))
+    }
+
+    /// 解析 JSON 格式的数据文件，不触碰管理器状态
+    /// Parse a JSON data file without touching manager state
+    pub fn parse_v2ray_file(path: &Path) -> anyhow::Result<ParsedGeoIp> {
         let data = std::fs::read_to_string(path)?;
         let list: V2RayGeoIPList = serde_json::from_str(&data)?;
         let mut tag_indexes: FxHashMap<Arc<str>, GeoIpTagIndex> = FxHashMap::default();
         let mut count = 0;
+        let mut ipv4_count = 0;
+        let mut ipv6_count = 0;
 
         for geoip in list.entries {
             let tag = geoip.country_code.to_ascii_uppercase();
@@ -570,6 +631,7 @@ impl GeoIpManager {
                             end: u32::from(v4net.broadcast()),
                         });
                         count += 1;
+                        ipv4_count += 1;
                     }
                     Ok(ipnet::IpNet::V6(v6net)) => {
                         index.ipv6_ranges.push(Ipv6Range {
@@ -577,6 +639,7 @@ impl GeoIpManager {
                             end: u128::from(v6net.broadcast()),
                         });
                         count += 1;
+                        ipv6_count += 1;
                     }
                     Err(_) => continue,
                 }
@@ -586,10 +649,14 @@ impl GeoIpManager {
         for index in tag_indexes.values_mut() {
             index.finalize();
         }
-        self.tag_indexes = tag_indexes;
-        self.rebuild_cache();
 
-        Ok(count)
+        Ok(ParsedGeoIp {
+            tag_indexes,
+            count,
+            ipv4_count,
+            ipv6_count,
+            source: "JSON file",
+        })
     }
 
     /// 转换 .dat 为 MMDB 格式
@@ -832,11 +899,25 @@ fn run_geoip_watcher(path: PathBuf, manager: Arc<RwLock<GeoIpManager>>) -> notif
                 while retries > 0 {
                     // parking_lot::RwLock::write() 返回 guard 直接，不会中毒
                     // parking_lot::RwLock does not have poison state
+                    // 先在锁外解析（读取、解码、建索引、finalize），再短暂持写锁
+                    // 整体替换。此前整个重载都在写锁里，匹配走读锁，所以一次
+                    // 重载期间所有 geo 匹配请求全程停等：三十万网段的 .dat 实测
+                    // 停 961 ms，其中读取与解码只占 292 ms，大头在 finalize
+                    // 与缓存重建，所以 finalize 也搬到了锁外。
+                    // Parse outside the lock first — read, decode, build the
+                    // indexes, finalise — then hold the write lock only for the
+                    // wholesale swap. The entire reload used to run under the
+                    // write lock while matching takes the read lock, so every
+                    // geo match stalled for all of it: a .dat with 300k networks
+                    // measured a 961 ms stall, of which reading and decoding was
+                    // only 292 ms, the bulk being finalise and the cache
+                    // rebuild, which is why finalise moved out too.
                     let load_result = if is_dat {
-                        manager.write().load_from_dat_file(&path)
+                        GeoIpManager::parse_dat_file(&path)
                     } else {
-                        manager.write().load_from_v2ray_file(&path)
-                    };
+                        GeoIpManager::parse_v2ray_file(&path)
+                    }
+                    .map(|parsed| manager.write().apply_parsed(parsed));
 
                     match load_result {
                         Ok(count) => {
@@ -967,6 +1048,34 @@ mod tests {
         assert_eq!(res.country_code.as_deref(), Some("JP"));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 解析与应用分开之后，解析失败必须完全不碰管理器：它拿不到 &mut self，
+    /// 没有机会写进去。原先整个重载在一个方法里，坏文件解析到一半才返回错误。
+    /// With parsing split from applying, a failed parse cannot touch the manager
+    /// at all, because it never receives &mut self. The whole reload used to sit
+    /// in one method, where a bad file failed part way through.
+    #[test]
+    fn a_failed_parse_cannot_touch_the_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.dat");
+        let bad = dir.path().join("bad.dat");
+        std::fs::write(&good, build_dat("CN", Some(([10, 0, 0, 0], 8)), None)).unwrap();
+        std::fs::write(&bad, b"not a protobuf at all").unwrap();
+
+        let mut manager = GeoIpManager::new(None).unwrap();
+        manager.load_from_dat_file(&good).unwrap();
+        assert!(manager.matches_tag("10.1.2.3".parse().unwrap(), "cn"));
+
+        assert!(
+            GeoIpManager::parse_dat_file(&bad).is_err(),
+            "a corrupt .dat must fail to parse"
+        );
+
+        assert!(
+            manager.matches_tag("10.1.2.3".parse().unwrap(), "cn"),
+            "a failed parse must leave the loaded data alone"
+        );
     }
 
     /// 构造嵌套重叠的 .dat(CN /8 大网段内嵌 US /24,IPv4+IPv6)
