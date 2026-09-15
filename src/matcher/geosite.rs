@@ -413,21 +413,7 @@ impl GeoSiteManager {
     /// ```
     pub fn load_from_v2ray_file<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<usize> {
         let path = path.as_ref();
-
-        // 检测文件格式：.dat 或 .json / Detect file format: .dat or .json
-        let is_dat = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|s| s.eq_ignore_ascii_case("dat"))
-            .unwrap_or(false);
-
-        if is_dat {
-            // 加载 .dat 格式 / Load .dat format
-            return self.load_from_dat_file(path);
-        }
-
-        // 加载 JSON 格式 / Load JSON format
-        let parsed = Self::parse_json_file(path)?;
+        let parsed = Self::parse_file(path, &[])?;
         Ok(self.apply_source(path, parsed))
     }
 
@@ -609,6 +595,36 @@ impl GeoSiteManager {
             .collect())
     }
 
+    /// 按扩展名选择解析器解析一个数据文件，不触碰管理器状态
+    /// Parse a data file with the parser its extension selects, without
+    /// touching manager state
+    ///
+    /// `.dat` 走 V2Ray 二进制解析器，其余按 JSON 读。`tags` 只对 `.dat` 有意义
+    /// （二进制格式可以只解出需要的 tag）；JSON 一次读完整份，由调用方挑选。
+    /// 格式分派集中在这里：登记进 `sources` 的文件后续会被 `apply_source` 和
+    /// `reload_tags_from` 再次读取，三处必须用同一套判定，否则会拿错解析器。
+    /// `.dat` uses the V2Ray binary parser and anything else is read as JSON.
+    /// `tags` only means something for `.dat`, where the binary format allows
+    /// decoding just the wanted tags; JSON is read whole and the caller picks.
+    /// Keeping the dispatch in one place matters because a file registered in
+    /// `sources` is read again later by `apply_source` and `reload_tags_from`,
+    /// and all of them have to agree on which parser a path needs.
+    pub fn parse_file<P: AsRef<Path>>(path: P, tags: &[String]) -> anyhow::Result<ParsedGeoSite> {
+        let path = path.as_ref();
+        let is_dat = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("dat"));
+        if !is_dat {
+            return Self::parse_json_file(path);
+        }
+        if tags.is_empty() {
+            Self::parse_dat_file(path)
+        } else {
+            Self::parse_dat_file_selective(path, tags)
+        }
+    }
+
     /// 用一个数据文件的解析结果替换该文件此前贡献的 tag
     /// Replace the tags a data file contributed with its freshly parsed content
     ///
@@ -685,7 +701,7 @@ impl GeoSiteManager {
     /// that fails and let the other file's own reload fix it, which beats leaving
     /// the tag empty.
     fn reload_tags_from(&mut self, path: &Path, wanted: &[String]) {
-        match Self::parse_dat_file_selective(path, wanted) {
+        match Self::parse_file(path, wanted) {
             Ok(parsed) => {
                 let mut taken = 0usize;
                 for (tag, matchers) in parsed {
@@ -1335,41 +1351,23 @@ fn run_geosite_watcher(
                     None => continue,
                 };
 
-                // 检测文件格式 / Detect file format
-                let is_dat = path
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.eq_ignore_ascii_case("dat"))
-                    .unwrap_or(false);
-
                 // 简单的重试机制来处理文件写入竞争 / Simple retry mechanism to handle file write races
                 let mut retries = 5;
                 while retries > 0 {
                     // parking_lot::RwLock::write() 返回 guard 直接，不会中毒
                     // parking_lot::RwLock does not have poison state
-                    let load_result = if is_dat {
-                        // 加载 .dat 格式：先在锁外解析，再短暂持写锁替换，
-                        // 免得整个文件的读取与解析期间匹配请求全部停等。
-                        // Load .dat format: parse outside the lock and hold the
-                        // write lock only for the swap, so matching requests do
-                        // not stall for the whole read and parse.
-                        if tags.is_empty() {
-                            GeoSiteManager::parse_dat_file(&path)
-                        } else {
-                            GeoSiteManager::parse_dat_file_selective(&path, &tags)
-                        }
-                        .map(|parsed| manager.write().apply_source(&path, parsed))
-                    } else {
-                        // 加载 JSON 格式：与 .dat 走同一条路，锁外解析后按来源替换。
-                        // 此前这里是整库重载，会把另一个 .dat 贡献的 tag 连同它的
-                        // 来源记录一起清空。
-                        // Load JSON format down the same path as .dat: parse
-                        // outside the lock, then replace by source. This used to
-                        // reload the whole database, which wiped the tags another
-                        // .dat contributed along with its source record.
-                        GeoSiteManager::parse_json_file(&path)
-                            .map(|parsed| manager.write().apply_source(&path, parsed))
-                    };
+                    // 两种格式走同一条路：按扩展名选解析器，在锁外读完，再短暂
+                    // 持写锁按来源替换。此前 JSON 分支是整库重载，会把别的文件
+                    // 贡献的 tag 连同来源记录一起清空，而且整个文件的读取与解析
+                    // 都在写锁内。
+                    // Both formats take one path: the extension picks the parser,
+                    // the file is read outside the lock, and the write lock is
+                    // held only for the replace-by-source. The JSON branch used
+                    // to reload the whole database, wiping the tags other files
+                    // contributed along with their source records, and it read
+                    // and parsed the whole file under the write lock.
+                    let load_result = GeoSiteManager::parse_file(&path, &tags)
+                        .map(|parsed| manager.write().apply_source(&path, parsed));
 
                     match load_result {
                         Ok(loaded_count) => {
@@ -1715,6 +1713,86 @@ mod tests {
         assert!(
             !manager.matches("ads", "www.ads.example"),
             "entries from the file that dropped the tag must not survive"
+        );
+    }
+
+    /// 顶替共享 tag 时必须按扩展名选解析器。JSON 登记进来源表之后，写死的
+    /// .dat 解析器会把它读成"截断的 .dat"，落进"保留现有条目"的告警分支——
+    /// 被删掉的那份数据继续命中，比彻底丢掉这个 tag 更糟。
+    /// Taking a shared tag over has to pick the parser by extension. Once JSON
+    /// files are registered as sources, a hardcoded .dat parser reads one as a
+    /// truncated .dat and lands in the "keep the current entries" warning, so
+    /// the data that was just deleted goes on matching, which is worse than
+    /// losing the tag outright.
+    #[test]
+    fn a_json_file_can_take_a_shared_tag_over_from_a_dat_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = dir.path().join("a.json");
+        let dat = dir.path().join("b.dat");
+        std::fs::write(
+            &json,
+            r#"{"entries":[{"tag":"cn","domains":["domain:json.example"]}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &dat,
+            build_dat(&[build_geosite("CN", &[build_domain(2, "baidu.com", &[])])]),
+        )
+        .unwrap();
+
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_v2ray_file(&json).unwrap();
+        manager.load_from_v2ray_file(&dat).unwrap();
+        assert!(manager.matches("cn", "www.baidu.com"));
+
+        // .dat 交出 cn，只剩 JSON 在提供 / the .dat drops cn, only the JSON provides it
+        std::fs::write(&dat, build_dat(&[])).unwrap();
+        manager.load_from_v2ray_file(&dat).unwrap();
+
+        assert!(
+            manager.matches("cn", "json.example"),
+            "the JSON file's data must take the tag over"
+        );
+        assert!(
+            !manager.matches("cn", "www.baidu.com"),
+            "the entries the .dat just dropped must not survive"
+        );
+    }
+
+    /// 两个 JSON 共享一个 tag 是更常见的布局，同样不能用 .dat 解析器去顶替。
+    /// Two JSON files sharing a tag is the more common layout and must not go
+    /// through the .dat parser either.
+    #[test]
+    fn a_json_file_can_take_a_shared_tag_over_from_another_json_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("a.json");
+        let second = dir.path().join("b.json");
+        std::fs::write(
+            &first,
+            r#"{"entries":[{"tag":"ads","domains":["domain:first.example"]}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &second,
+            r#"{"entries":[{"tag":"ads","domains":["domain:second.example"]}]}"#,
+        )
+        .unwrap();
+
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_v2ray_file(&first).unwrap();
+        manager.load_from_v2ray_file(&second).unwrap();
+        assert!(manager.matches("ads", "second.example"));
+
+        std::fs::write(&second, r#"{"entries":[]}"#).unwrap();
+        manager.load_from_v2ray_file(&second).unwrap();
+
+        assert!(
+            manager.matches("ads", "first.example"),
+            "the remaining JSON file's data must take the tag over"
+        );
+        assert!(
+            !manager.matches("ads", "second.example"),
+            "the entries the other JSON just dropped must not survive"
         );
     }
 
