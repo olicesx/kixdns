@@ -874,19 +874,56 @@ mod tests {
         msg.to_vec().expect("encode dns query")
     }
 
+    /// 在同一个端口上绑好 UDP 与 TCP，返回两者与它们共用的地址
+    /// Bind UDP and TCP on one port and return both along with the shared address
+    ///
+    /// 两个 socket 必须是同一个端口，不能各绑各的：TCP 回退连的就是 upstream 的
+    /// host:port，测试正是靠"有没有连到这个端口"来判断有没有回退。别顺手把它
+    /// 简化成两个独立端口。
+    /// The two sockets have to share one port rather than bind independently:
+    /// TCP fallback dials the upstream's own host:port, and the test detects a
+    /// fallback precisely by whether that port is connected to. Do not simplify
+    /// this into two separate ports.
+    ///
+    /// 顺序是先 UDP 后 TCP。反过来会偶发 EADDRINUSE：TCP 的临时端口分配器不看
+    /// UDP 占用，而整套测试并行跑时各 engine 的上游池都持有临时 UDP socket，
+    /// TCP 拿到的端口可能已经被其中一个占着，第二个 UDP 绑上去就是 errno 98。
+    /// 先拿 UDP 端口则把冲突面缩到"同进程的 TCP listener"，这套件里基本只有一个。
+    /// UDP first, then TCP. The other order flakes with EADDRINUSE: the TCP
+    /// ephemeral allocator does not look at UDP occupancy, and with the suite
+    /// running in parallel every engine's upstream pool holds ephemeral UDP
+    /// sockets, so the port TCP hands out may already be taken and the second
+    /// UDP bind returns errno 98. Taking the UDP port first narrows the conflict
+    /// to this process's own TCP listeners, of which there is essentially one.
+    async fn bind_udp_and_tcp_on_one_port() -> (
+        tokio::net::UdpSocket,
+        tokio::net::TcpListener,
+        std::net::SocketAddr,
+    ) {
+        // 第二道防线：那个端口偶尔也可能正被别的 TCP listener 占着，重绑即可。
+        // 这不是替代上面的顺序，只是兜住剩下的那一小类。
+        // Second line of defence: that port can still be held by another TCP
+        // listener now and then, so rebind. It does not replace the ordering
+        // above, it only covers the small class that is left.
+        for _ in 0..16 {
+            let udp = tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind udp");
+            let addr = udp.local_addr().expect("udp addr");
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(tcp) => return (udp, tcp, addr),
+                Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(err) => panic!("bind tcp on the udp port: {err}"),
+            }
+        }
+        panic!("could not find a port free for both udp and tcp after 16 attempts");
+    }
+
     #[tokio::test]
     async fn udp_truncated_response_does_not_fallback_to_tcp_when_disallowed() {
         let _ = ring::default_provider().install_default();
 
-        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind tcp");
-        let tcp_addr = tcp_listener.local_addr().expect("tcp addr");
-
-        let udp_socket = tokio::net::UdpSocket::bind(tcp_addr)
-            .await
-            .expect("bind udp");
-        let upstream_addr = udp_socket.local_addr().expect("udp addr");
+        let (udp_socket, tcp_listener, upstream_addr) = bind_udp_and_tcp_on_one_port().await;
 
         let tcp_hits = Arc::new(AtomicUsize::new(0));
         let tcp_hits_clone = Arc::clone(&tcp_hits);
