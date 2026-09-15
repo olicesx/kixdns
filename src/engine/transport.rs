@@ -543,52 +543,6 @@ impl TcpMultiplexer {
         let idx = pool.next_idx.fetch_add(1, Ordering::Relaxed) % pool.clients.len();
         pool.clients[idx].send(packet, timeout_dur).await
     }
-
-    /// Record external timeout, incrementing error counters for all connections of the upstream
-    /// 记录外部超时，增加该上游所有连接的错误计数
-    ///
-    /// # Design / 设计
-    ///
-    /// This method is called from sync context when TCP worker external timeout occurs.
-    /// Since we cannot identify which specific connection had the timeout, we increment
-    /// the error counter for all connections in the pool. The actual connection reset
-    /// will be triggered on the next use via `record_error()` or `check_connection_health()`.
-    ///
-    /// 此方法在 TCP worker 外部超时时从同步上下文调用。
-    /// 由于无法确定是哪个连接超时，我们对池中所有连接增加错误计数。
-    /// 实际的连接重置会在下次使用时通过 `record_error()` 或 `check_connection_health()` 触发。
-    ///
-    /// # Thread Safety / 线程安全
-    ///
-    /// The health threshold is only set once during initialization and never modified
-    /// at runtime, so reading it once per loop iteration is safe.
-    ///
-    /// 健康检查阈值仅在初始化时设置一次，运行时不会修改，因此每次循环读取一次是安全的。
-    pub(crate) fn mark_timeout(&self, upstream: &str) {
-        if let Some(pool) = self.pools.get(upstream) {
-            // Record errors for all connections (since we don't know which specific one timed out)
-            // 对所有连接记录错误（因为我们不知道具体是哪个超时）
-            for client in &pool.clients {
-                // Read threshold once: safe because it's only set during initialization
-                // 读取一次阈值：安全，因为它仅在初始化时设置
-                let threshold = client.health_threshold.load(Ordering::Acquire);
-                let errors = client.consecutive_errors.fetch_add(1, Ordering::Release) + 1;
-
-                if threshold > 0 && errors >= threshold {
-                    warn!(
-                        upstream = %client.upstream,
-                        consecutive_errors = errors,
-                        threshold = threshold,
-                        "TCP external timeout threshold exceeded, connection will be reset on next use"
-                    );
-                    // Note: Cannot call async reset_conn here. The error count has been recorded,
-                    // and the connection will be reset on the next send() call via record_error().
-                    // 注意：这里无法调用 async reset_conn。错误计数已记录，
-                    // 连接会在下次 send() 调用时通过 record_error() 重置。
-                }
-            }
-        }
-    }
 }
 
 pub struct TcpMuxClient {

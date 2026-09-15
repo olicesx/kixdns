@@ -252,15 +252,6 @@ impl Engine {
         (total, failures, rate)
     }
 
-    /// Mark TCP external timeout for a specific upstream
-    /// 标记特定上游的 TCP 外部超时
-    ///
-    /// 当 TCP worker 发生外部超时时调用此方法，记录错误并可能触发连接重置
-    /// Call this method when TCP worker external timeout occurs, recording errors and possibly triggering connection reset
-    pub fn mark_tcp_timeout(&self, upstream: &str) {
-        self.tcp_mux.mark_timeout(upstream);
-    }
-
     /// Increment total_requests counter using simple atomic operation
     #[inline]
     fn incr_total_requests(&self) {
