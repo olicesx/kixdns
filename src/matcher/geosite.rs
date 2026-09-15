@@ -93,7 +93,6 @@ pub struct GeoSiteManager {
     // Tag -> Domain matchers
     database: FxHashMap<String, Vec<DomainMatcher>>,
     // Suffix index for O(1) lookup
-    suffix_index: FxHashMap<String, Vec<String>>,
     // Query cache: hash(tag, domain) -> bool (零分配优化 / zero-allocation optimization)
     cache: MokaCache<u64, bool>,
     // 每个数据文件贡献的 tag，重载时据此只替换该文件的条目
@@ -117,7 +116,6 @@ impl GeoSiteManager {
         // 初始时创建一个小缓存，加载数据后会根据实际条数重建
         Self {
             database: FxHashMap::default(),
-            suffix_index: FxHashMap::default(),
             cache: MokaCache::builder().max_capacity(1000).build(),
             sources: FxHashMap::default(),
         }
@@ -146,19 +144,7 @@ impl GeoSiteManager {
     pub fn add_entry(&mut self, entry: GeoSiteEntry) {
         // 在添加时自动标准化 / Auto-normalize on add
         let normalized = entry.normalized();
-        let tag = normalized.tag.clone();
-
-        // Build suffix index
-        for matcher in &normalized.matchers {
-            if let DomainMatcher::Suffix(suffix) = matcher {
-                self.suffix_index
-                    .entry(suffix.clone())
-                    .or_default()
-                    .push(tag.clone());
-            }
-        }
-
-        self.database.insert(tag, normalized.matchers);
+        self.database.insert(normalized.tag, normalized.matchers);
     }
 
     /// 检查域名是否匹配指定的 GeoSite 标签 / Check if domain matches specified GeoSite tag
