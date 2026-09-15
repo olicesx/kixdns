@@ -1339,18 +1339,17 @@ impl std::fmt::Display for DohHttpStatusError {
 
 impl std::error::Error for DohHttpStatusError {}
 
+/// 多久没被用过就算可以清理 / How long an entry must sit unused to be pruned
+const DOH_UPSTREAM_IDLE: Duration = Duration::from_secs(600);
+/// 两次清理之间的最小间隔 / Shortest gap between two prunes
+const DOH_UPSTREAM_PRUNE_EVERY: Duration = Duration::from_secs(60);
+
 /// One DoH upstream's state: its own reqwest client (connection pool) and its
 /// consecutive transport-error count. Rebuilding a pool after repeated
 /// failures therefore only evicts that upstream's connections; the other DoH
 /// upstreams keep their keep-alive connections.
 /// 单个 DoH 上游的状态：独立的 reqwest 客户端（连接池）和连续传输错误计数。连续失败后
 /// 重建连接池只影响该上游，其它 DoH 上游的 keep-alive 连接不受牵连。
-/// 超过这个数量后，新增上游时顺带清理长期不用的条目
-/// 多久没被用过就算可以清理 / How long an entry must sit unused to be pruned
-const DOH_UPSTREAM_IDLE: Duration = Duration::from_secs(600);
-/// 两次清理之间的最小间隔 / Shortest gap between two prunes
-const DOH_UPSTREAM_PRUNE_EVERY: Duration = Duration::from_secs(60);
-
 struct DohUpstream {
     /// Hot-swappable reqwest client (its connection pool). Replacing it drops the
     /// old pool, which is the only way to evict half-open/dead connections that
@@ -1452,7 +1451,11 @@ impl DohClient {
     /// whole set of upstreams and no new one ever appears again, the old entries
     /// still go at the next interval instead of waiting for another new key.
     fn prune_idle_upstreams(&self, now: u64) {
-        // 热路径上只剩一次 relaxed 读 / A single relaxed load on the hot path
+        // 节流窗口没到时，这个函数只花一次 relaxed 读就返回；每次查询本身仍有
+        // 一次取时钟和一次查表，那是 upstream() 的固有代价。
+        // Inside the throttle window this function costs one relaxed load and
+        // returns. The per-query clock read and table lookup belong to
+        // upstream() itself and are unchanged.
         let last_prune = self.last_prune_millis.load(Ordering::Relaxed);
         let prune_every = u64::try_from(DOH_UPSTREAM_PRUNE_EVERY.as_millis()).unwrap_or(u64::MAX);
         if now.saturating_sub(last_prune) < prune_every {
