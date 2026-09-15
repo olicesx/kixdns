@@ -1716,6 +1716,76 @@ mod tests {
         );
     }
 
+    /// watcher 路径：JSON 文件变更触发的重载，不能带走 .dat 贡献的 tag。
+    /// 此前 watcher 的 JSON 分支走整库重载，会把数据表和来源记录一起清空；
+    /// 这条用例直接驱动真实的 watcher 线程，而不是绕开它调加载函数。
+    /// The watcher path: a reload triggered by a JSON file changing must not
+    /// take the tags a .dat contributed with it. The watcher's JSON branch used
+    /// to reload the whole database, clearing the table and the source records
+    /// together. This drives the real watcher thread instead of going around it
+    /// through the loader.
+    #[test]
+    fn the_watcher_reloading_json_keeps_the_tags_a_dat_file_provides() {
+        let dir = tempfile::tempdir().unwrap();
+        let dat = dir.path().join("a.dat");
+        let json = dir.path().join("b.json");
+        std::fs::write(
+            &dat,
+            build_dat(&[build_geosite("CN", &[build_domain(2, "baidu.com", &[])])]),
+        )
+        .unwrap();
+        std::fs::write(
+            &json,
+            r#"{"entries":[{"tag":"ads","domains":["domain:before.example"]}]}"#,
+        )
+        .unwrap();
+
+        let manager = Arc::new(RwLock::new(GeoSiteManager::new()));
+        {
+            let mut guard = manager.write();
+            guard.load_from_v2ray_file(&dat).unwrap();
+            guard.load_from_v2ray_file(&json).unwrap();
+        }
+        assert!(manager.read().matches("cn", "www.baidu.com"));
+
+        spawn_geosite_watcher(
+            vec![dat.clone(), json.clone()],
+            Arc::clone(&manager),
+            Vec::new(),
+        );
+
+        // watcher 监视父目录，先让它把 watch 装上再写文件
+        // The watcher watches the parent directory; let it install the watch
+        // before the file changes.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::fs::write(
+            &json,
+            r#"{"entries":[{"tag":"ads","domains":["domain:after.example"]}]}"#,
+        )
+        .unwrap();
+
+        // 轮询到重载生效为止，命中即退出；只有 watcher 真的坏了才会等满
+        // Poll until the reload lands and leave as soon as it does; only a
+        // broken watcher waits the whole deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if manager.read().matches("ads", "after.example") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        let guard = manager.read();
+        assert!(
+            guard.matches("ads", "after.example"),
+            "the watcher must reload the changed JSON file"
+        );
+        assert!(
+            guard.matches("cn", "www.baidu.com"),
+            "a watcher JSON reload must not take the .dat file's tags with it"
+        );
+    }
+
     /// 顶替共享 tag 时必须按扩展名选解析器。JSON 登记进来源表之后，写死的
     /// .dat 解析器会把它读成"截断的 .dat"，落进"保留现有条目"的告警分支——
     /// 被删掉的那份数据继续命中，比彻底丢掉这个 tag 更糟。
