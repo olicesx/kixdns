@@ -15,7 +15,7 @@ use rustls::{ClientConfig, RootCertStore};
 use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{
@@ -549,6 +549,9 @@ pub struct TcpMuxClient {
     pub upstream: Arc<str>,
     /// Write half protected by Mutex - serves as both connection storage and write serialization
     conn: Arc<Mutex<Option<OwnedWriteHalf>>>,
+    /// 上一次写入被取消，下次使用前需要完整 reset
+    /// A write was cancelled; the connection needs a full reset before reuse
+    write_cancelled: AtomicBool,
     pending: Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
     next_id: AtomicU16,
     /// Per-upstream permit manager for TCP connection-level control
@@ -622,13 +625,26 @@ impl Drop for TcpPendingGuard {
 /// one stack construction and one boolean store.
 struct TcpWriteGuard<'a> {
     slot: &'a mut Option<OwnedWriteHalf>,
+    /// 取消时置位，交给下一次 `ensure_connection` 做完整 reset
+    /// Set on cancellation so the next `ensure_connection` does a full reset
+    needs_reset: &'a AtomicBool,
     armed: bool,
 }
 
 impl Drop for TcpWriteGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
+            // 立刻丢掉写半边，半条帧不会再被别人续写；`reset()` 还要取消 reader
+            // 的 token 并释放连接级 permit，那两件事不能在 Drop 里 await，所以
+            // 置位让下一次 `ensure_connection` 顺着既有的 `errors > 0` 那条路
+            // 一起收口。
+            // Drop the write half at once so nothing can append to half a frame.
+            // A full `reset()` also cancels the reader's token and releases the
+            // connection permit, neither of which can await inside Drop, so this
+            // flags the next `ensure_connection` to take the existing
+            // `errors > 0` path and finish the job in one place.
             *self.slot = None;
+            self.needs_reset.store(true, Ordering::Release);
         }
     }
 }
@@ -638,6 +654,7 @@ impl TcpMuxClient {
         Self {
             upstream,
             conn: Arc::new(Mutex::new(None)),
+            write_cancelled: AtomicBool::new(false),
             pending: Arc::new(dashmap::DashMap::with_hasher(FxBuildHasher)),
             next_id: AtomicU16::new(1),
             permit_manager,
@@ -1002,6 +1019,7 @@ impl TcpMuxClient {
             // if the write is cancelled, so half a frame cannot stay pooled
             let mut write_guard = TcpWriteGuard {
                 slot: &mut guard,
+                needs_reset: &self.write_cancelled,
                 armed: true,
             };
             let writer = write_guard
@@ -1135,13 +1153,20 @@ impl TcpMuxClient {
         // First, check if we need to reconnect based on error state
         // 首先，根据错误状态检查是否需要重连
         let errors = self.consecutive_errors.load(Ordering::Acquire);
-        let needs_reset = errors > 0;
+        // 写入被取消过：写半边已经在 Drop 里丢掉了，这里补齐 reader token 与
+        // 连接级 permit，让清理和普通错误路径完全对称。
+        // A cancelled write already dropped the write half in Drop; this picks
+        // up the reader token and the connection permit so the cleanup matches
+        // the ordinary error path exactly.
+        let write_cancelled = self.write_cancelled.swap(false, Ordering::AcqRel);
+        let needs_reset = errors > 0 || write_cancelled;
 
         if needs_reset {
             debug!(
                 upstream = %self.upstream,
                 consecutive_errors = errors,
-                "TCP connection has errors, resetting before ensure"
+                write_cancelled,
+                "TCP connection needs a reset before ensure"
             );
             self.reset().await;
         }
@@ -3305,6 +3330,22 @@ mod tests {
             client.conn.lock().await.is_none(),
             "a write cancelled part way through must drop the connection instead of \
              leaving a possibly half-written frame in the pool"
+        );
+        assert!(
+            client.write_cancelled.load(Ordering::Acquire),
+            "the next ensure_connection must be told to finish the cleanup that \
+             Drop cannot await: the reader token and the connection permit"
+        );
+
+        // 下一次建连要真的走完整 reset，并把标志清掉
+        // The next connect must take the full reset path and clear the flag
+        client
+            .ensure_connection(Duration::from_secs(2))
+            .await
+            .expect("reconnect after a cancelled write");
+        assert!(
+            !client.write_cancelled.load(Ordering::Acquire),
+            "the flag must be consumed, not left to reset a healthy connection later"
         );
 
         peer.abort();
