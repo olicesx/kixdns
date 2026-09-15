@@ -595,6 +595,44 @@ impl Drop for TcpPendingGuard {
     }
 }
 
+/// 写入期间被取消时丢弃这条连接
+/// Drops the connection if the write is cancelled part way through
+///
+/// 与 [`TcpPendingGuard`] 是同一个取消点：`send_attempt` 可以在任意 await 处
+/// 被丢弃——外层请求超时先到（`validate_timeouts` 只要求 request >= upstream，
+/// 取等时就会），或者双发路径上 UDP 先返回导致 `tcp_task.abort()`。待处理表
+/// 那一侧已经由 `TcpPendingGuard` 兜住，写入这一侧此前没有：`write_all` 只写
+/// 进去一部分就被丢弃时，连接仍然留在池里，下一个请求把自己的帧接在半条帧
+/// 后面，对端按长度前缀读就会错位，而且不计错误也不重置，只能等下一次失败
+/// 才自愈。
+///
+/// 这里把连接置空即可，下一次 `ensure_connection` 会重建。代价是热路径上多
+/// 一次栈上构造和一次布尔写。
+///
+/// The same cancellation point as [`TcpPendingGuard`]: `send_attempt` can be
+/// dropped at any await, either because the outer request timeout fires first
+/// (`validate_timeouts` only requires request >= upstream, so equality allows
+/// it) or because UDP answered first on the dual-send path and aborted the TCP
+/// task. The pending-map side was already covered by `TcpPendingGuard`; the
+/// write side was not. A `write_all` dropped after a partial write leaves the
+/// connection in the pool, the next request appends its frame to half a frame,
+/// and a peer reading by length prefix desynchronises, with nothing counting an
+/// error or resetting it until a later request fails. Clearing the slot is
+/// enough, since the next `ensure_connection` rebuilds it. The hot path pays
+/// one stack construction and one boolean store.
+struct TcpWriteGuard<'a> {
+    slot: &'a mut Option<OwnedWriteHalf>,
+    armed: bool,
+}
+
+impl Drop for TcpWriteGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            *self.slot = None;
+        }
+    }
+}
+
 impl TcpMuxClient {
     fn new(upstream: Arc<str>, permit_manager: Arc<PermitManager>) -> Self {
         Self {
@@ -951,14 +989,32 @@ impl TcpMuxClient {
             // Connection must exist (ensure_connection was called earlier)
             // 连接必须存在（ensure_connection 已在之前调用）
             // Pre-flight check: if writer is closed or broken, fail fast
-            let writer = guard.as_mut().context("tcp write half missing")?;
+            if guard.is_none() {
+                anyhow::bail!("tcp write half missing");
+            }
 
             // Note: OwnedWriteHalf doesn't support peek/checking error directly easily without shared socket access.
             // But if the previous read failed, guard should be None (reset).
             // The fact we are here means 'guard' is Some, so we think connection is alive.
             // Writing to a closed socket usually triggers error immediately on Linux/BSD.
 
-            if let Err(e) = writer.write_all(&new_packet).await {
+            // 写入期间被取消时丢弃连接，避免半条帧留在池里 / Drop the connection
+            // if the write is cancelled, so half a frame cannot stay pooled
+            let mut write_guard = TcpWriteGuard {
+                slot: &mut guard,
+                armed: true,
+            };
+            let writer = write_guard
+                .slot
+                .as_mut()
+                .expect("connection presence checked above");
+            let result = writer.write_all(&new_packet).await;
+            // 走到这里说明写入已经结束：成功则帧是完整的，失败则下面会 reset。
+            // Reaching here means the write finished: complete on success, and
+            // the caller resets on failure.
+            write_guard.armed = false;
+
+            if let Err(e) = result {
                 return Err(anyhow::anyhow!(e).context("tcp write failed"));
             }
             Ok::<(), anyhow::Error>(())
@@ -3173,6 +3229,77 @@ mod tests {
     /// bail text, so quinn saying `ZeroRttRejected` outright was never
     /// recognised: the check returned false, 0-RTT stayed on, the next
     /// connection used it again and the upstream kept failing until a restart.
+    /// 写入中途被取消时，这条池化连接必须被丢弃。取消点与 TcpPendingGuard
+    /// 兜的是同一个：外层请求超时先到，或者双发路径上 UDP 先返回导致
+    /// tcp_task.abort()。此前只有待处理表那一侧被清理，连接仍然留在池里，
+    /// 下一个请求会把自己的帧接在可能只写了一半的帧后面。
+    /// A pooled connection has to be dropped when the write is cancelled part
+    /// way through. The cancellation point is the one TcpPendingGuard already
+    /// covers: the outer request timeout firing first, or the dual-send path
+    /// aborting the TCP task once UDP answered. Only the pending-map side used
+    /// to be cleaned up, leaving the connection pooled for the next request to
+    /// append its frame to a possibly half-written one.
+    #[tokio::test]
+    async fn a_cancelled_write_drops_the_pooled_connection() {
+        use tokio::io::AsyncWriteExt as _;
+
+        // 对端只 accept 不读，发送缓冲区会被填满，写入因此停在 await 上
+        // The peer accepts and never reads, so the send buffer fills and the
+        // write parks on an await
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (held, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(held);
+        });
+
+        let client = Arc::new(TcpMuxClient::new(
+            Arc::from(addr.to_string().as_str()),
+            Arc::new(PermitManager::new_unlimited()),
+        ));
+
+        // 直接建连，不走查询——查询超时会自己 reset 掉连接
+        // Connect directly: a query would time out and reset the connection
+        let query = [0u8; 12];
+        client
+            .ensure_connection(Duration::from_secs(2))
+            .await
+            .expect("connect to the test peer");
+        assert!(
+            client.conn.lock().await.is_some(),
+            "the connection must be pooled before the test can mean anything"
+        );
+
+        // 把发送缓冲区填满，让后续写入必然停在 await 上
+        // Fill the send buffer so any later write must park on an await
+        {
+            let mut guard = client.conn.lock().await;
+            let writer = guard.as_mut().unwrap();
+            let chunk = vec![0u8; 65536];
+            while tokio::time::timeout(Duration::from_millis(300), writer.write_all(&chunk))
+                .await
+                .is_ok()
+            {}
+        }
+
+        // 写入停在 await 上时取消这次发送
+        // Cancel the send while the write is parked
+        let sender = Arc::clone(&client);
+        let task = tokio::spawn(async move { sender.send(&query, Duration::from_secs(30)).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        task.abort();
+        let _ = task.await;
+
+        assert!(
+            client.conn.lock().await.is_none(),
+            "a write cancelled part way through must drop the connection instead of \
+             leaving a possibly half-written frame in the pool"
+        );
+
+        peer.abort();
+    }
+
     #[test]
     fn doq_zero_rtt_rejection_is_classified_by_type() {
         use quinn::{ConnectionError, ReadError, ReadToEndError, WriteError};
