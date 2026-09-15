@@ -992,8 +992,26 @@ impl Engine {
                     .is_some();
 
                 if has_stale {
+                    // 等待上限取客户端等待与上游超时中的较小者：后台刷新最多跑满
+                    // 一次上游超时就会失败，等得更久是纯空转，还会把手上这份过期
+                    // 应答拖到被外层请求超时砍掉，客户端反而拿到 SERVFAIL。
+                    // upstream_timeout_ms 两条来路都保证大于零：
+                    // RuntimePipelineConfig::from_config 会拒绝 0，直接构造时
+                    // GlobalSettings::default() 给的是 9000。所以这里取 min
+                    // 不会退化成不等待。
+                    // Bound the wait by the smaller of the client wait and the
+                    // upstream timeout: a background refresh fails after at most
+                    // one upstream timeout, so waiting longer is dead time that
+                    // can push the stale answer we already hold past the outer
+                    // request timeout, leaving the client with SERVFAIL instead.
+                    // Both routes keep upstream_timeout_ms above zero: from_config
+                    // rejects 0 and GlobalSettings::default() yields 9000 for a
+                    // directly built config, so this min never degrades into
+                    // "do not wait".
                     let client_timeout = std::time::Duration::from_millis(
-                        cfg.settings.serve_stale_client_timeout_ms,
+                        cfg.settings
+                            .serve_stale_client_timeout_ms
+                            .min(cfg.settings.upstream_timeout_ms),
                     );
                     let poll_interval = std::time::Duration::from_millis(5);
                     let wait_start = Instant::now();
@@ -1057,7 +1075,8 @@ impl Engine {
                             event = "serve_stale_on_client_timeout",
                             qname = %qname_ref,
                             qtype = ?qtype,
-                            timeout_ms = cfg.settings.serve_stale_client_timeout_ms,
+                            waited_ms = client_timeout.as_millis() as u64,
+                            configured_timeout_ms = cfg.settings.serve_stale_client_timeout_ms,
                             client_ip = %peer.ip(),
                             pipeline = %pipeline_id,
                             "RFC 8767: client timeout expired, serving stale"
@@ -2916,6 +2935,78 @@ mod tests {
         assert!(
             engine.cache.get(&dedupe_hash).is_none(),
             "Cache entry should be removed after expiration check"
+        );
+    }
+
+    /// 客户端等待时间设得比上游超时大时，过期应答不该被拖到那么久。后台刷新
+    /// 最多跑满一次上游超时就失败，之后的轮询是纯空转，还会把手上这份过期应答
+    /// 拖过外层请求超时，客户端反而拿到 SERVFAIL。
+    /// A client wait longer than the upstream timeout must not delay the stale
+    /// answer that long. The background refresh fails after at most one upstream
+    /// timeout and the polling after that is dead time, which can push the stale
+    /// answer we already hold past the outer request timeout and leave the
+    /// client with SERVFAIL instead.
+    #[tokio::test]
+    async fn a_client_wait_longer_than_the_upstream_timeout_does_not_delay_stale() {
+        const UPSTREAM_TIMEOUT_MS: u64 = 200;
+        const CLIENT_WAIT_MS: u64 = 1500;
+
+        let engine = build_test_engine();
+        engine.reload(RuntimePipelineConfig {
+            settings: GlobalSettings {
+                // TEST-NET-1：可路由地发出去、永远没有应答
+                // TEST-NET-1: the datagram leaves and nothing ever answers
+                default_upstream: "192.0.2.1:53".to_string(),
+                serve_stale: true,
+                serve_stale_client_timeout_ms: CLIENT_WAIT_MS,
+                upstream_timeout_ms: UPSTREAM_TIMEOUT_MS,
+                ..Default::default()
+            },
+            pipeline_select: Vec::new(),
+            pipelines: Vec::new(),
+            pipeline_id_index: FxHashMap::default(),
+        });
+
+        let pipeline_id: Arc<str> = Arc::from("default");
+        let qname = "stale.com";
+        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(
+            engine.state.load().cache_namespace(&pipeline_id),
+            &pipeline_id,
+            qname.as_bytes(),
+            RecordType::A,
+            DNSClass::IN,
+            None,
+        );
+        engine.cache.insert(
+            dedupe_hash,
+            Arc::new(CacheEntry {
+                bytes: Bytes::from_static(b"old_resp"),
+                rcode: ResponseCode::NoError,
+                upstream: None,
+                qname: Arc::from(qname),
+                pipeline_id: pipeline_id.clone(),
+                qtype: u16::from(RecordType::A),
+                inserted_at: Instant::now() - Duration::from_secs(10),
+                original_ttl: 5,
+                refresh_ttl: 5,
+            }),
+        );
+
+        let mut packet = vec![0u8; 12];
+        packet[0] = 0xAA;
+        packet[1] = 0xBB;
+        packet[5] = 1;
+        packet.extend_from_slice(b"\x05stale\x03com\x00\x00\x01\x00\x01");
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        let start = Instant::now();
+        let _ = engine.handle_packet(&packet, peer).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(CLIENT_WAIT_MS / 2),
+            "the wait must be bounded by the {UPSTREAM_TIMEOUT_MS} ms upstream timeout, \
+             not the {CLIENT_WAIT_MS} ms client wait; took {elapsed:?}"
         );
     }
 
