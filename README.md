@@ -232,7 +232,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | doh_tls_key | null | PEM private-key path; required with bind_doh. |
 | doh_path | /dns-query | Inbound DoH request path. |
 | default_upstream | 1.1.1.1:53 | Default upstream. A comma-separated list is accepted. |
-| upstream_timeout_ms | 9000 | Timeout for one upstream operation. |
+| upstream_timeout_ms | 9000 | Timeout for one upstream operation; must be greater than zero. |
 | request_timeout_ms | null | Overall request timeout. When null, it is upstream_timeout_ms * 2.5. It must be at least upstream_timeout_ms. |
 | response_jump_limit | 10 | Maximum response-phase pipeline jumps. |
 | udp_pool_size | 64 | Outbound UDP socket-pool size. |

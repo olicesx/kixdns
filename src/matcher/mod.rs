@@ -385,6 +385,15 @@ impl RuntimePipelineConfig {
                 cfg.settings.cache_refresh_threshold_percent
             );
         }
+        // upstream_timeout_ms = 0 让每次上游请求在发出的同一刻就超时，任何查询
+        // 都不可能拿到应答。它没有"不限时"的含义，那是 request_timeout_ms 留空
+        // 时的自动推导在管的事。
+        // upstream_timeout_ms = 0 expires every upstream request the instant it
+        // is issued, so no query can ever be answered. It does not mean "no
+        // limit"; leaving request_timeout_ms unset is what derives a budget.
+        if cfg.settings.upstream_timeout_ms == 0 {
+            anyhow::bail!("upstream_timeout_ms must be greater than 0");
+        }
         let shards = cfg.settings.dashmap_shards;
         if shards > 0 && !shards.is_power_of_two() {
             anyhow::bail!("dashmap_shards must be a power of two");
@@ -1538,6 +1547,24 @@ mod tests {
     fn settings_config(overrides: serde_json::Value) -> crate::config::PipelineConfig {
         serde_json::from_value(serde_json::json!({ "settings": overrides }))
             .expect("parse settings")
+    }
+
+    /// upstream_timeout_ms = 0 让每次上游请求在发出的同一刻超时，配置能通过
+    /// 但没有任何查询能被应答。
+    /// upstream_timeout_ms = 0 expires every upstream request as it is issued:
+    /// the configuration loads and then no query can ever be answered.
+    #[test]
+    fn a_zero_upstream_timeout_is_rejected() {
+        let zero = settings_config(serde_json::json!({ "upstream_timeout_ms": 0 }));
+        let error = RuntimePipelineConfig::from_config(zero)
+            .expect_err("upstream_timeout_ms = 0 must be rejected");
+        assert!(
+            error.to_string().contains("upstream_timeout_ms"),
+            "unexpected error: {error}"
+        );
+
+        let one = settings_config(serde_json::json!({ "upstream_timeout_ms": 1 }));
+        RuntimePipelineConfig::from_config(one).expect("a one millisecond timeout stays valid");
     }
 
     /// 这两个值此前没有校验：cache_max_ttl = 0 静默关掉缓存，
