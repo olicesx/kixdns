@@ -201,7 +201,7 @@ Without a prefix, an omitted transport means UDP. DoH URLs without a path use /d
 
 DoT uses port 853 when no port is supplied. Its optional TLS name is supplied with sni or servername and it must not contain a DNS path.
 
-DoQ uses port 853 when no port is supplied. Its optional query parameters are sni/servername and 0rtt/enable_0rtt. A DoQ upstream written with an IP literal requires an explicit SNI. 0-RTT is enabled globally by default, can be overridden per upstream, and is disabled for that upstream after a rejection or timeout until the process restarts.
+DoQ uses port 853 when no port is supplied. Its optional query parameters are sni/servername and 0rtt/enable_0rtt. A DoQ upstream written with an IP literal requires an explicit SNI. 0-RTT is enabled globally by default, can be overridden per upstream, and is disabled for that upstream until the process restarts after a timeout or a rejection, counting both an explicit rejection and the peer closing or resetting the connection, which is how a server refusing early data often answers.
 
 When UDP forwarding fails, or when an upstream UDP response is truncated, TCP fallback is enabled by default and can be disabled with settings.enable_tcp_fallback. The fallback is applied by the forwarding path; it is not an additional listener.
 

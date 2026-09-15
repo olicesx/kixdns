@@ -200,7 +200,7 @@ upstream 支持字符串、逗号分隔字符串或 JSON 字符串数组。多�
 
 DoT 未提供端口时使用 853。可通过 sni 或 servername 查询参数设置 TLS 名称，且 DoT 上游不能包含 DNS path。
 
-DoQ 未提供端口时使用 853。可通过 sni/servername 和 0rtt/enable_0rtt 查询参数配置。使用 IP 字面量的 DoQ 上游必须显式设置 SNI。0-RTT 默认全局启用，也可以按上游覆盖；某个上游被拒绝或超时后，会在进程重启前对该上游禁用 0-RTT。
+DoQ 未提供端口时使用 853。可通过 sni/servername 和 0rtt/enable_0rtt 查询参数配置。使用 IP 字面量的 DoQ 上游必须显式设置 SNI。0-RTT 默认全局启用，也可以按上游覆盖；某个上游超时或被拒绝后，会在进程重启前对该上游禁用 0-RTT。被拒绝既包括明确报告拒绝，也包括对端直接关闭或重置连接——拒收早期数据的服务器常常是这么回应的。
 
 UDP 转发失败或 UDP 响应被截断时，TCP fallback 默认启用，可通过 settings.enable_tcp_fallback 禁用。该 fallback 属于转发路径，不是额外监听器。
 

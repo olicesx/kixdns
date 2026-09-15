@@ -2468,6 +2468,7 @@ pub struct DoqConnectionPool {
 /// for a rejected 0-RTT attempt never saw anything but a handful of fixed
 /// phrases and never quinn's own words. Carrying the error out untouched lets
 /// the decision rest on types.
+#[derive(Debug)]
 enum DoqFailure {
     /// `open_bi` 失败：连接已经不可用 / the connection is already unusable
     OpenStream(quinn::ConnectionError),
@@ -2490,9 +2491,18 @@ impl std::fmt::Display for DoqFailure {
     }
 }
 
-impl From<DoqFailure> for anyhow::Error {
-    fn from(failure: DoqFailure) -> Self {
-        anyhow::anyhow!("{failure}")
+impl std::error::Error for DoqFailure {
+    /// 保住 quinn 的 source 链：类型化到这里就被拍平成字符串的话，日志里就只
+    /// 剩 Display 那一行了。
+    /// Keeps quinn's source chain: flattening to a string at this boundary
+    /// would leave the log with nothing but the Display line.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::OpenStream(err) => Some(err),
+            Self::Write(err) => Some(err),
+            Self::Read(err) => Some(err),
+            Self::Protocol(_) => None,
+        }
     }
 }
 
@@ -2902,7 +2912,7 @@ impl DoqMuxClient {
                         self.disable_zero_rtt();
                         let remaining = timeout_dur.saturating_sub(start.elapsed());
                         if remaining.is_zero() {
-                            return Err(failure.into());
+                            return Err(anyhow::Error::new(failure));
                         }
                         warn!(
                             upstream = %self.upstream,
@@ -2913,7 +2923,7 @@ impl DoqMuxClient {
                         timeout_dur = remaining;
                         continue;
                     }
-                    return Err(failure.into());
+                    return Err(anyhow::Error::new(failure));
                 }
                 Err(_) => {
                     if allow_retry && used_0rtt {
