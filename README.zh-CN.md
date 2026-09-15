@@ -231,7 +231,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | doh_tls_key | null | PEM 私钥路径；设置 bind_doh 时必需。 |
 | doh_path | /dns-query | 入站 DoH 请求路径。 |
 | default_upstream | 1.1.1.1:53 | 默认上游；支持逗号分隔列表。 |
-| upstream_timeout_ms | 9000 | 单次上游操作超时。 |
+| upstream_timeout_ms | 9000 | 单次上游操作超时；必须大于 0。 |
 | request_timeout_ms | null | 整体请求超时；为 null 时使用 upstream_timeout_ms * 2.5，且不能小于 upstream_timeout_ms。 |
 | response_jump_limit | 10 | 响应阶段 Pipeline 跳转上限。 |
 | udp_pool_size | 64 | 出站 UDP socket 池大小。 |
@@ -253,16 +253,16 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | flow_control_latency_threshold_ms | 100 | 自适应流控使用的延迟阈值。 |
 | flow_control_adjustment_interval_secs | 5 | permits 调整间隔。 |
 | cache_capacity | 10000 | DNS 响应缓存最大条目数；必须大于 0。 |
-| cache_max_ttl | 86400 | DNS 缓存条目的最大生存时间，单位秒。 |
+| cache_max_ttl | 86400 | DNS 缓存条目的最大生存时间，单位秒；必须大于 0。 |
 | dashmap_shards | 0 | 内部分片设置；0 使用 DashMap 默认值，否则必须是 2 的幂。 |
 | cache_background_refresh | false | 在 TTL 过期前刷新条目。 |
-| cache_refresh_threshold_percent | 10 | 按剩余 TTL 百分比触发刷新。 |
+| cache_refresh_threshold_percent | 10 | 按剩余 TTL 百分比触发刷新；必须小于 100，取 100 时每次缓存命中都会刷新上游。 |
 | cache_refresh_min_ttl | 5 | 参与后台刷新的最小 TTL。 |
 | serve_stale | false | 按 RFC 8767 行为保留并返回过期条目。 |
 | serve_stale_ttl | 30 | 过期响应中写入的 TTL。 |
 | serve_stale_expire_ttl | 86400 | 允许返回过期条目的最大时间，单位秒；0 表示不限制过期时间。 |
 | serve_stale_ttl_reset | true | 返回过期数据时重置过期时间窗口。 |
-| serve_stale_client_timeout_ms | 0 | 0 表示立即返回过期数据；大于 0 时先尝试上游指定毫秒数。 |
+| serve_stale_client_timeout_ms | 0 | 0 表示立即返回过期数据；大于 0 时先尝试上游最多指定毫秒数，并受 request_timeout_ms 剩余预算截断，保证过期应答来得及返回。 |
 | geoip_db_path | null | MaxMind MMDB 路径。 |
 | geoip_dat_path | null | V2Ray GeoIP 数据文件路径：可以是 protobuf `.dat`，也可以是下文说明的兼容 JSON。 |
 | geosite_data_paths | [] | V2Ray GeoSite .dat 或 JSON 路径列表；支持多个文件。 |
@@ -520,7 +520,7 @@ Pipeline 级 ecs 会改变缓存键，使不同客户端子网的响应可以隔
 
 DNS 响应缓存使用上游响应的最小 TTL；配置 min_ttl 时会将其提高到该下限，并受 cache_max_ttl 和 cache_capacity 限制。否定响应在存在 SOA 时使用 SOA 负缓存 TTL。相同的进行中缓存未命中会共享一次上游操作。
 
-启用 cache_background_refresh 后，接近过期的条目可以触发异步刷新；刷新失败会保留现有条目。启用 serve_stale 后，可以返回过期条目，并使用 serve_stale_ttl 作为响应 TTL，同时受 serve_stale_expire_ttl 和 serve_stale_client_timeout_ms 限制。
+启用 cache_background_refresh 后，接近过期的条目可以触发异步刷新；刷新失败会保留现有条目。启用 serve_stale 后，可以返回过期条目，并使用 serve_stale_ttl 作为响应 TTL，同时受 serve_stale_expire_ttl 和 serve_stale_client_timeout_ms 限制。该客户端等待还会被本次请求 request_timeout_ms 的剩余预算截断，配得比请求预算还长也不会把过期应答拖过截止时刻。
 
 主配置 watcher 使用按 Pipeline 划分的缓存命名空间重载有效 JSON。发生变化的 Pipeline 会立即停止访问旧配置产生的响应缓存、规则缓存和进行中请求；未变化的 Pipeline 会保留热缓存。任意全局设置变化都会轮换所有 Pipeline 的缓存命名空间。旧命名空间中的条目不会被同步删除，而是继续受现有缓存容量和 TTL 策略限制。包括后台刷新和响应阶段跳转在内，每个请求都会保持选择其缓存命名空间时的配置快照，因此重载前启动的任务无法写入当前生效的缓存代际。无效的重载会保留旧配置。
 

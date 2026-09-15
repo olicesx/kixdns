@@ -263,7 +263,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | serve_stale_ttl | 30 | TTL written into a stale response. |
 | serve_stale_expire_ttl | 86400 | Maximum stale age in seconds; 0 means no stale-age limit. |
 | serve_stale_ttl_reset | true | Reset the stale-age window when stale data is served. |
-| serve_stale_client_timeout_ms | 0 | 0 serves stale immediately; a positive value tries the upstream for this many milliseconds first. |
+| serve_stale_client_timeout_ms | 0 | 0 serves stale immediately; a positive value tries the upstream for up to this many milliseconds first, bounded by what is left of request_timeout_ms so the stale answer still goes out in time. |
 | geoip_db_path | null | MaxMind MMDB path. |
 | geoip_dat_path | null | V2Ray GeoIP data path: either a protobuf `.dat` file or the compatible JSON format described below. |
 | geosite_data_paths | [] | V2Ray GeoSite .dat or JSON paths; multiple files are accepted. |
@@ -521,7 +521,7 @@ A pipeline-level ecs object changes the cache key so responses can be isolated b
 
 The DNS response cache uses the upstream response's minimum TTL, raised to min_ttl when configured, and is capped by cache_max_ttl and cache_capacity. Negative responses use the SOA negative-cache TTL when an SOA is present. Identical in-flight cache misses share one upstream operation.
 
-When cache_background_refresh is enabled, entries near expiry can trigger an asynchronous refresh. A failed refresh leaves the existing entry in place. When serve_stale is enabled, an expired entry can be returned with serve_stale_ttl, subject to serve_stale_expire_ttl and serve_stale_client_timeout_ms.
+When cache_background_refresh is enabled, entries near expiry can trigger an asynchronous refresh. A failed refresh leaves the existing entry in place. When serve_stale is enabled, an expired entry can be returned with serve_stale_ttl, subject to serve_stale_expire_ttl and serve_stale_client_timeout_ms. That client wait is additionally bounded by the remaining request_timeout_ms budget, so a wait configured longer than the request budget cannot push the stale answer past the deadline.
 
 The main configuration watcher reloads a valid JSON file using per-pipeline cache namespaces. A changed pipeline immediately stops addressing response-cache, rule-cache, and in-flight entries created by its previous configuration; an unchanged pipeline keeps its warm caches. A change to global settings rotates every pipeline namespace. Old namespace entries are not synchronously deleted and remain bounded by the existing cache capacity and TTL policies. Each request, including background refresh and response-phase jumps, keeps the configuration snapshot that selected its namespace, so work started before a reload cannot write into the active generation. Invalid reloads leave the previous configuration active.
 

@@ -105,6 +105,30 @@ use super::pipeline::{PipelineSelectionContext, RuleEvaluationContext, select_pi
 // Refreshing Bitmap Helpers / 刷新位图辅助函数
 // ============================================================================
 
+/// 留给"取出过期条目、改写 TXID、写回客户端"的余量。等待上限从本次请求的
+/// 剩余预算里扣掉它，免得刚好等到截止时刻才去组装应答，被外层超时抢先。
+/// Reserved for pulling the stale entry, patching the TXID and writing the
+/// answer back. It comes off the remaining request budget so the wait never
+/// runs right up to the deadline and loses the race with the outer timeout.
+const STALE_SERVE_RESERVE: Duration = Duration::from_millis(20);
+
+/// 整体请求超时：显式配置优先，否则按 upstream_timeout_ms 的 2.5 倍推导
+/// （hedge 1/3 + 全量 1 倍 + TCP 回落 1 倍，再留一点余量）。
+/// The overall request timeout: the configured value when set, otherwise 2.5
+/// times upstream_timeout_ms (hedge at a third, a full attempt, a TCP fallback
+/// and a little margin).
+///
+/// 单独成函数是为了让持有配置快照的调用方按同一份快照推导，不必再 load 一次
+/// 状态，也不会出现两处各算一遍而慢慢算岔。
+/// It is a function so a caller already holding a config snapshot derives from
+/// that same snapshot instead of loading state again, and so the derivation
+/// never drifts between two copies.
+fn request_timeout_ms(settings: &crate::config::GlobalSettings) -> u64 {
+    settings
+        .request_timeout_ms
+        .unwrap_or(settings.upstream_timeout_ms * 5 / 2)
+}
+
 impl Engine {
     /// Reload configuration and update compiled pipelines / 重新加载配置并更新编译后的管线
     ///
@@ -208,24 +232,7 @@ impl Engine {
     /// Otherwise auto-calculate as upstream_timeout_ms * 2.5
     #[inline]
     pub fn get_request_timeout_ms(&self) -> u64 {
-        let state = self.state.load();
-        let settings = &state.pipeline.settings;
-
-        // 如果用户显式配置了 request_timeout，使用配置值
-        // If user explicitly configured request_timeout, use that value
-        if let Some(timeout) = settings.request_timeout_ms {
-            timeout
-        } else {
-            // 自动计算：hedge(1/3) + full(1x) + tcp_fallback(1x) + 余量
-            // - hedge 通常提前返回，不计入最大时间
-            // - 实际路径：hedge 尝试 → full 尝试 → tcp fallback
-            // - 最大时间：upstream * 2.5（保守估计）
-            // Auto-calculate: hedge(1/3) + full(1x) + tcp_fallback(1x) + margin
-            // - hedge usually returns early, not counted in max time
-            // - Actual path: hedge attempt → full attempt → tcp fallback
-            // - Max time: upstream * 2.5 (conservative estimate)
-            settings.upstream_timeout_ms * 5 / 2 // * 2.5
-        }
+        request_timeout_ms(&self.state.load().pipeline.settings)
     }
 
     /// Get parse_quick failure statistics
@@ -992,27 +999,31 @@ impl Engine {
                     .is_some();
 
                 if has_stale {
-                    // 等待上限取客户端等待与上游超时中的较小者：后台刷新最多跑满
-                    // 一次上游超时就会失败，等得更久是纯空转，还会把手上这份过期
-                    // 应答拖到被外层请求超时砍掉，客户端反而拿到 SERVFAIL。
-                    // upstream_timeout_ms 两条来路都保证大于零：
-                    // RuntimePipelineConfig::from_config 会拒绝 0，直接构造时
-                    // GlobalSettings::default() 给的是 9000。所以这里取 min
-                    // 不会退化成不等待。
-                    // Bound the wait by the smaller of the client wait and the
-                    // upstream timeout: a background refresh fails after at most
-                    // one upstream timeout, so waiting longer is dead time that
-                    // can push the stale answer we already hold past the outer
-                    // request timeout, leaving the client with SERVFAIL instead.
-                    // Both routes keep upstream_timeout_ms above zero: from_config
-                    // rejects 0 and GlobalSettings::default() yields 9000 for a
-                    // directly built config, so this min never degrades into
-                    // "do not wait".
-                    let client_timeout = std::time::Duration::from_millis(
-                        cfg.settings
-                            .serve_stale_client_timeout_ms
-                            .min(cfg.settings.upstream_timeout_ms),
-                    );
+                    // 等待上限取客户端等待与本次请求剩余预算中的较小者。手上这份
+                    // 过期应答只有赶在外层请求超时之前返回才有意义，否则客户端拿到
+                    // 的是 SERVFAIL，而那条本可以立刻给出的应答被丢掉。
+                    //
+                    // 上界不能取单次上游超时：后台刷新没有外层包裹，UDP 链是
+                    // hedge(T/3) + 全量(T) + TCP 回落(T)，最坏约 2.33T，按 T 截断
+                    // 会把本来能成功的刷新提前掐掉，白白把新鲜应答降级成过期应答。
+                    //
+                    // Bound the wait by the smaller of the client wait and what is
+                    // left of this request's budget. The stale answer in hand is
+                    // only worth anything if it goes out before the outer request
+                    // timeout; past that the client gets SERVFAIL and an answer
+                    // that was ready is dropped. One upstream timeout is the wrong
+                    // bound: a background refresh has no outer wrapper and its UDP
+                    // chain is hedge at T/3, a full attempt at T and a TCP fallback
+                    // at T, so roughly 2.33T in the worst case. Cutting at T ends
+                    // refreshes that would have landed and downgrades a fresh
+                    // answer to a stale one for nothing.
+                    let budget = Duration::from_millis(request_timeout_ms(&cfg.settings));
+                    let client_timeout =
+                        Duration::from_millis(cfg.settings.serve_stale_client_timeout_ms).min(
+                            budget
+                                .saturating_sub(start.elapsed())
+                                .saturating_sub(STALE_SERVE_RESERVE),
+                        );
                     let poll_interval = std::time::Duration::from_millis(5);
                     let wait_start = Instant::now();
 
@@ -2938,16 +2949,17 @@ mod tests {
         );
     }
 
-    /// 客户端等待时间设得比上游超时大时，过期应答不该被拖到那么久。后台刷新
-    /// 最多跑满一次上游超时就失败，之后的轮询是纯空转，还会把手上这份过期应答
-    /// 拖过外层请求超时，客户端反而拿到 SERVFAIL。
-    /// A client wait longer than the upstream timeout must not delay the stale
-    /// answer that long. The background refresh fails after at most one upstream
-    /// timeout and the polling after that is dead time, which can push the stale
-    /// answer we already hold past the outer request timeout and leave the
-    /// client with SERVFAIL instead.
+    /// 等待上限必须是本次请求的剩余预算，两头都要卡住：等过头会让过期应答被
+    /// 外层请求超时砍掉，客户端拿到 SERVFAIL；而按单次上游超时截断又太狠，
+    /// 后台刷新没有外层包裹，UDP 链最坏约 2.33 倍上游超时，按 1 倍砍会把本来
+    /// 能成功的刷新提前掐掉。
+    /// The wait has to be bounded by what is left of this request's budget, and
+    /// pinned from both sides: waiting too long lets the outer request timeout
+    /// kill the stale answer and hand the client SERVFAIL, while cutting at one
+    /// upstream timeout is too harsh, because a background refresh has no outer
+    /// wrapper and its UDP chain runs to roughly 2.33 upstream timeouts.
     #[tokio::test]
-    async fn a_client_wait_longer_than_the_upstream_timeout_does_not_delay_stale() {
+    async fn the_serve_stale_wait_is_bounded_by_the_remaining_request_budget() {
         const UPSTREAM_TIMEOUT_MS: u64 = 200;
         const CLIENT_WAIT_MS: u64 = 1500;
 
@@ -3003,10 +3015,24 @@ mod tests {
         let _ = engine.handle_packet(&packet, peer).await;
         let elapsed = start.elapsed();
 
+        // request_timeout_ms 未配置，按 upstream * 2.5 推导为 500 ms
+        // request_timeout_ms is unset, so it derives to 500 ms as upstream * 2.5
+        let budget = Duration::from_millis(UPSTREAM_TIMEOUT_MS * 5 / 2);
         assert!(
             elapsed < Duration::from_millis(CLIENT_WAIT_MS / 2),
-            "the wait must be bounded by the {UPSTREAM_TIMEOUT_MS} ms upstream timeout, \
+            "the wait must be bounded by the {budget:?} request budget, \
              not the {CLIENT_WAIT_MS} ms client wait; took {elapsed:?}"
+        );
+        // 明显高于一次上游超时、明显低于预算，才能把"按 T 截断"和"按预算截断"
+        // 区分开：前者约 200 ms，后者约 480 ms。
+        // Sits well above one upstream timeout and well below the budget, which
+        // is what separates cutting at T (about 200 ms) from cutting at the
+        // budget (about 480 ms).
+        let cut_at_one_upstream_timeout = Duration::from_millis(UPSTREAM_TIMEOUT_MS * 7 / 4);
+        assert!(
+            elapsed >= cut_at_one_upstream_timeout,
+            "the wait must not be cut at one {UPSTREAM_TIMEOUT_MS} ms upstream timeout, \
+             which would end refreshes that still had budget left; took {elapsed:?}"
         );
     }
 
