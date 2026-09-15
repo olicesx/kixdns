@@ -2949,6 +2949,39 @@ mod tests {
         );
     }
 
+    /// flow_control_initial_permits 曾在构造 Engine 时被下一行的天花板当场覆盖，
+    /// 配置项完全不生效：开了流控的部署从天花板起步，而不是文档写的初始值。
+    /// flow_control_initial_permits used to be overwritten by the ceiling on the
+    /// very next line when the Engine was built, so the setting never applied and
+    /// a flow-controlled deployment started at the ceiling instead of the
+    /// documented initial value.
+    #[tokio::test]
+    async fn flow_control_starts_at_the_configured_initial_permits() {
+        let engine = Engine::new(
+            RuntimePipelineConfig {
+                settings: GlobalSettings {
+                    default_upstream: TEST_UPSTREAM.to_string(),
+                    flow_control_enabled: true,
+                    flow_control_min_permits: 100,
+                    flow_control_initial_permits: 500,
+                    flow_control_max_permits: 800,
+                    ..Default::default()
+                },
+                pipeline_select: Vec::new(),
+                pipelines: Vec::new(),
+                pipeline_id_index: FxHashMap::default(),
+            },
+            "lbl".to_string(),
+        )
+        .expect("initialize engine");
+
+        assert_eq!(
+            engine.permit_manager.max_permits(),
+            500,
+            "the current limit must start at flow_control_initial_permits, not the ceiling"
+        );
+    }
+
     /// 等待上限必须是本次请求的剩余预算，两头都要卡住：等过头会让过期应答被
     /// 外层请求超时砍掉，客户端拿到 SERVFAIL；而按单次上游超时截断又太狠，
     /// 后台刷新没有外层包裹，UDP 链最坏约 2.33 倍上游超时，按 1 倍砍会把本来

@@ -362,8 +362,18 @@ impl Engine {
         // 如果禁用流控，使用usize::MAX作为max_permits，实现"无限制"模式
         // When flow control is disabled, use usize::MAX as max_permits for "unlimited" mode
         let (permit_manager, flow_control_state) = if flow_control_enabled {
+            // PermitManager.max_permits 是"当前上限"，FlowControlState.max_permits
+            // 是天花板。此前紧接着的一行把当前上限直接写成天花板，
+            // flow_control_initial_permits 当场失效，开了流控的部署实际从 800
+            // 起步而不是文档写的 500。现在按初始值起步，由 adjust 往天花板爬。
+            // PermitManager.max_permits is the *current* limit while
+            // FlowControlState.max_permits is the ceiling. The next line used to
+            // overwrite the current limit with the ceiling, which made
+            // flow_control_initial_permits dead on arrival and started a
+            // flow-controlled deployment at 800 rather than the documented 500.
+            // It now starts at the initial value and adjust climbs toward the
+            // ceiling.
             let pm = Arc::new(PermitManager::new(flow_control_initial_permits));
-            pm.set_max_permits(flow_control_max_permits);
             (
                 pm,
                 Some(Arc::new(FlowControlState {

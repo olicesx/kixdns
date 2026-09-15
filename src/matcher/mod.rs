@@ -394,6 +394,25 @@ impl RuntimePipelineConfig {
         if cfg.settings.upstream_timeout_ms == 0 {
             anyhow::bail!("upstream_timeout_ms must be greater than 0");
         }
+        // 三个 permits 设置必须能构成一条可用的调整区间：初始值是起点，
+        // adjust 在 [min, max] 之间上下爬。初始值落在区间外时流控从一开始就
+        // 停在一个自己永远调不回去的位置，所以三者一起校验，而不是只看
+        // min <= max ——那样会漏掉初始值。
+        // The three permit settings have to form a usable range: the initial
+        // value is where the climb starts and adjust moves inside [min, max].
+        // An initial value outside that range parks flow control where it can
+        // never return from, so all three are checked together rather than just
+        // min <= max, which would miss the initial value.
+        if cfg.settings.flow_control_enabled {
+            let min = cfg.settings.flow_control_min_permits;
+            let initial = cfg.settings.flow_control_initial_permits;
+            let max = cfg.settings.flow_control_max_permits;
+            if !(min <= initial && initial <= max) {
+                anyhow::bail!(
+                    "flow control permits must satisfy flow_control_min_permits <= flow_control_initial_permits <= flow_control_max_permits, got {min} <= {initial} <= {max}"
+                );
+            }
+        }
         let shards = cfg.settings.dashmap_shards;
         if shards > 0 && !shards.is_power_of_two() {
             anyhow::bail!("dashmap_shards must be a power of two");
@@ -1547,6 +1566,56 @@ mod tests {
     fn settings_config(overrides: serde_json::Value) -> crate::config::PipelineConfig {
         serde_json::from_value(serde_json::json!({ "settings": overrides }))
             .expect("parse settings")
+    }
+
+    /// 初始值落在 [min, max] 之外时，流控从一开始就停在自己调不回去的位置，
+    /// 所以三者一起校验；只看 min <= max 会漏掉初始值。
+    /// An initial value outside [min, max] parks flow control where it can never
+    /// return from, so all three are checked together; min <= max alone would
+    /// miss the initial value.
+    #[test]
+    fn flow_control_permits_outside_their_range_are_rejected() {
+        let above = settings_config(serde_json::json!({
+            "flow_control_enabled": true,
+            "flow_control_min_permits": 100,
+            "flow_control_initial_permits": 900,
+            "flow_control_max_permits": 800
+        }));
+        let error = RuntimePipelineConfig::from_config(above)
+            .expect_err("an initial value above the ceiling must be rejected");
+        assert!(
+            error.to_string().contains("flow_control_initial_permits"),
+            "unexpected error: {error}"
+        );
+
+        let below = settings_config(serde_json::json!({
+            "flow_control_enabled": true,
+            "flow_control_min_permits": 600,
+            "flow_control_initial_permits": 500,
+            "flow_control_max_permits": 800
+        }));
+        RuntimePipelineConfig::from_config(below)
+            .expect_err("an initial value below the floor must be rejected");
+
+        let ordered = settings_config(serde_json::json!({
+            "flow_control_enabled": true,
+            "flow_control_min_permits": 100,
+            "flow_control_initial_permits": 500,
+            "flow_control_max_permits": 800
+        }));
+        RuntimePipelineConfig::from_config(ordered).expect("the documented defaults stay valid");
+
+        // 流控关闭时这三个值不生效，不该因此拒绝配置
+        // The three values do nothing while flow control is off, so a
+        // configuration must not be rejected for them
+        let disabled = settings_config(serde_json::json!({
+            "flow_control_enabled": false,
+            "flow_control_min_permits": 100,
+            "flow_control_initial_permits": 900,
+            "flow_control_max_permits": 800
+        }));
+        RuntimePipelineConfig::from_config(disabled)
+            .expect("values that do nothing must not block startup");
     }
 
     /// upstream_timeout_ms = 0 让每次上游请求在发出的同一刻超时，配置能通过
