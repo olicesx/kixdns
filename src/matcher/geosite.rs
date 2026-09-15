@@ -254,21 +254,6 @@ impl GeoSiteManager {
         }
     }
 
-    /// 重新加载数据库 / Reload database
-    ///
-    /// # 参数 / Parameters
-    /// - `entries`: 新的 GeoSite 条目列表 / New GeoSite entries
-    pub fn reload(&mut self, entries: Vec<GeoSiteEntry>) {
-        self.database.clear();
-        self.suffix_index.clear();
-        self.sources.clear();
-        self.cache.invalidate_all();
-
-        for entry in entries {
-            self.add_entry(entry);
-        }
-    }
-
     /// 获取已加载的标签列表 / Get list of loaded tags
     #[inline]
     pub fn tags(&self) -> Vec<String> {
@@ -456,21 +441,8 @@ impl GeoSiteManager {
         }
 
         // 加载 JSON 格式 / Load JSON format
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("read geosite file: {}", path.display()))?;
-
-        let v2ray_data: V2RayGeoSiteList =
-            serde_json::from_str(&content).with_context(|| "parse V2Ray GeoSite JSON format")?;
-
-        let count = v2ray_data.entries.len();
-
-        let entries = self.convert_v2ray_to_entries(v2ray_data);
-
-        for entry in entries {
-            self.add_entry(entry);
-        }
-
-        Ok(count)
+        let parsed = Self::parse_json_file(path)?;
+        Ok(self.apply_source(path, parsed))
     }
 
     /// 从 .dat 文件按需加载指定的 GeoSite tags / Load specified GeoSite tags from .dat file on-demand
@@ -626,6 +598,29 @@ impl GeoSiteManager {
             "loaded GeoSite data from V2Ray .dat file"
         );
         Ok(parsed)
+    }
+
+    /// 解析 JSON 格式的数据文件，不触碰管理器状态
+    /// Parse a JSON data file without touching manager state
+    ///
+    /// 与 [`Self::parse_dat_file`] 对称，同样与 [`Self::apply_source`] 配合：
+    /// 调用方在锁外解析，只在替换数据时短暂持写锁。
+    /// The counterpart of [`Self::parse_dat_file`], pairing with
+    /// [`Self::apply_source`] the same way: callers parse outside the lock and
+    /// hold the write lock only while swapping data in.
+    pub fn parse_json_file<P: AsRef<Path>>(path: P) -> anyhow::Result<ParsedGeoSite> {
+        let path = path.as_ref();
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("read geosite file: {}", path.display()))?;
+        let v2ray_data: V2RayGeoSiteList =
+            serde_json::from_str(&content).with_context(|| "parse V2Ray GeoSite JSON format")?;
+        Ok(Self::convert_v2ray_to_entries(v2ray_data)
+            .into_iter()
+            .map(|entry| {
+                let normalized = entry.normalized();
+                (normalized.tag, normalized.matchers)
+            })
+            .collect())
     }
 
     /// 用一个数据文件的解析结果替换该文件此前贡献的 tag
@@ -1190,7 +1185,7 @@ impl GeoSiteManager {
 
         let count = v2ray_data.entries.len();
 
-        let entries = self.convert_v2ray_to_entries(v2ray_data);
+        let entries = Self::convert_v2ray_to_entries(v2ray_data);
 
         // 逐个添加条目，保留现有数据 / Add entries one by one, preserving existing data
         for entry in entries {
@@ -1204,7 +1199,7 @@ impl GeoSiteManager {
     }
 
     /// 转换 V2Ray 格式为 GeoSiteEntry 列表 / Convert V2Ray format to GeoSiteEntry list
-    fn convert_v2ray_to_entries(&self, v2ray_data: V2RayGeoSiteList) -> Vec<GeoSiteEntry> {
+    fn convert_v2ray_to_entries(v2ray_data: V2RayGeoSiteList) -> Vec<GeoSiteEntry> {
         v2ray_data
             .entries
             .into_iter()
@@ -1379,20 +1374,15 @@ fn run_geosite_watcher(
                         }
                         .map(|parsed| manager.write().apply_source(&path, parsed))
                     } else {
-                        // 加载 JSON 格式 / Load JSON format
-                        std::fs::read_to_string(&path)
-                            .with_context(|| format!("read GeoSite file: {}", path.display()))
-                            .and_then(|json_str| {
-                                serde_json::from_str::<V2RayGeoSiteList>(&json_str)
-                                    .with_context(|| "parse V2Ray GeoSite JSON format")
-                            })
-                            .map(|v2ray_data| {
-                                let mut guard = manager.write();
-                                let entries = guard.convert_v2ray_to_entries(v2ray_data);
-                                let loaded_count = entries.len();
-                                guard.reload(entries);
-                                loaded_count
-                            })
+                        // 加载 JSON 格式：与 .dat 走同一条路，锁外解析后按来源替换。
+                        // 此前这里是整库重载，会把另一个 .dat 贡献的 tag 连同它的
+                        // 来源记录一起清空。
+                        // Load JSON format down the same path as .dat: parse
+                        // outside the lock, then replace by source. This used to
+                        // reload the whole database, which wiped the tags another
+                        // .dat contributed along with its source record.
+                        GeoSiteManager::parse_json_file(&path)
+                            .map(|parsed| manager.write().apply_source(&path, parsed))
                     };
 
                     match load_result {
@@ -1598,6 +1588,59 @@ mod tests {
             "the same file under another spelling must count as the same source"
         );
         assert!(manager.matches("cn", "www.qq.com"));
+    }
+
+    /// 同时配置 .dat 和 .json 时，重载 JSON 不能清掉 .dat 贡献的 tag。此前
+    /// JSON 走的是整库重载，会把数据表和来源记录一起清空——tag 消失之外，来源
+    /// 记录也没了，下一次 .dat 重载连"删掉已移除 tag"的能力都失效。
+    /// With a .dat and a .json configured together, reloading the JSON must not
+    /// wipe the tags the .dat contributed. The JSON path used to reload the
+    /// whole database, clearing both the table and the source records, so the
+    /// tag vanished and the next .dat reload also lost its ability to drop tags
+    /// the file had removed.
+    #[test]
+    fn reloading_a_json_file_keeps_the_tags_a_dat_file_provides() {
+        let dir = tempfile::tempdir().unwrap();
+        let dat = dir.path().join("a.dat");
+        let json = dir.path().join("b.json");
+        std::fs::write(
+            &dat,
+            build_dat(&[build_geosite("CN", &[build_domain(2, "baidu.com", &[])])]),
+        )
+        .unwrap();
+        let json_body = |domain: &str| {
+            format!(r#"{{"entries":[{{"tag":"ads","domains":["domain:{domain}"]}}]}}"#)
+        };
+        std::fs::write(&json, json_body("doubleclick.net")).unwrap();
+
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_v2ray_file(&dat).unwrap();
+        manager.load_from_v2ray_file(&json).unwrap();
+        assert!(manager.matches("cn", "www.baidu.com"));
+        assert!(manager.matches("ads", "doubleclick.net"));
+
+        // 只有 JSON 变了 / only the JSON changed
+        std::fs::write(&json, json_body("ads.example")).unwrap();
+        manager.load_from_v2ray_file(&json).unwrap();
+
+        assert!(
+            manager.matches("cn", "www.baidu.com"),
+            "a JSON reload must not take the .dat file's tags with it"
+        );
+        assert!(manager.matches("ads", "ads.example"));
+        assert!(
+            !manager.matches("ads", "doubleclick.net"),
+            "the JSON file's own removed domain must be gone"
+        );
+
+        // 来源记录还在，所以 .dat 仍然能删掉自己移除的 tag
+        // The source record survives, so the .dat can still drop a tag it removed
+        std::fs::write(&dat, build_dat(&[])).unwrap();
+        manager.load_from_v2ray_file(&dat).unwrap();
+        assert!(
+            !manager.has_tag("cn"),
+            "the .dat source record must survive a JSON reload"
+        );
     }
 
     /// 两个文件都声明同一个 tag 时，重载其中一个不能把另一个的数据带走。
