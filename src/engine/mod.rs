@@ -7,6 +7,7 @@ pub mod phases;
 pub mod pipeline;
 pub mod refresh;
 pub mod response;
+pub(crate) mod response_log;
 pub mod rules;
 pub mod transport;
 pub mod types;

@@ -120,6 +120,17 @@ GeoIP 转换选项：
 
 日志订阅器默认输出文本，时间戳使用 RFC 3339 格式并跟随系统本地时区。默认过滤级别是 error；--debug 或 RUST_LOG 环境变量可以改变它。代码没有配置 JSON 日志输出。
 
+响应统计可启用 `RUST_LOG=warn,kixdns::engine::phases=info`。
+`event="dns_response"` 对每个已解析客户端查询生成的应答记录一次，覆盖快速路径、
+新鲜/过期缓存、静态应答及并发合并应答；它不证明客户端已收到报文。
+内部后台刷新和中间转发尝试不计入此事件。`cache_hit` 仅在响应缓存提供应答时为真，
+`cache` 是同义兼容字段，不再表示“结果可缓存”。RCODE 取自实际应答。
+失败或取消且没有应答的请求使用 `event="dns_request_finished"` 和 `status`，不猜测 RCODE。
+并发合并的跟随请求标为 `upstream="inflight"`，因为共享结果不携带原请求的上游身份。
+
+旧日志没有 `cache_hit`，其中 `cache=true` 可能表示上游应答可缓存，部分响应路径也未记录。
+不能把新旧日志混合后宣称得到准确的历史命中率或完整请求量。
+
 ### systemd
 
 创建 /etc/systemd/system/kixdns.service：

@@ -431,7 +431,7 @@ pub(crate) async fn apply_response_actions_observed(
                 forward_attempts += 1;
                 if forward_attempts > MAX_RESPONSE_FORWARDS {
                     warn!(
-                        event = "dns_response",
+                        event = "response_action_limit",
                         qname = %ctx.qname,
                         qtype = ?ctx.qtype,
                         client_ip = %ctx.client_ip,
@@ -471,7 +471,7 @@ pub(crate) async fn apply_response_actions_observed(
                     Ok(result) => result,
                     Err(err) => {
                         warn!(
-                            event = "dns_response",
+                            event = "response_action_failure",
                             upstream = %upstream_addr,
                             qname = %ctx.qname,
                             qtype = ?ctx.qtype,
@@ -560,6 +560,7 @@ pub(crate) struct ResponseJumpContext<'a> {
 pub(crate) async fn process_response_jump(
     engine: &Engine,
     context: ResponseJumpContext<'_>,
+    response: &mut crate::engine::response_log::ResponseInfo,
 ) -> anyhow::Result<Bytes> {
     let ResponseJumpContext {
         state,
@@ -612,6 +613,8 @@ pub(crate) async fn process_response_jump(
     let mut cleanup_guards: Vec<InflightCleanupGuard> = Vec::new();
 
     loop {
+        response.pipeline = Some(pipeline_id.clone());
+        response.upstream = None;
         if remaining_jumps == 0 {
             let resp_bytes = engine_helpers::build_servfail_response(req)?;
             for g in &mut cleanup_guards {
@@ -680,6 +683,7 @@ pub(crate) async fn process_response_jump(
                     return Ok(resp_bytes);
                 }
                 pipeline_id = pipeline;
+                response.pipeline = Some(pipeline_id.clone());
                 local_jumps -= 1;
                 if let Some(next_pipeline) = cfg
                     .pipeline_id_index
@@ -735,6 +739,7 @@ pub(crate) async fn process_response_jump(
 
         match decision {
             Decision::Static { rcode, answers } => {
+                response.upstream = Some(Arc::from("static"));
                 let resp_bytes = build_response(req, rcode, answers)?;
                 let entry = CacheEntry {
                     bytes: resp_bytes.clone(),
@@ -770,6 +775,7 @@ pub(crate) async fn process_response_jump(
                 continue_on_miss: _,
                 allow_reuse,
             } => {
+                response.upstream = Some(upstream.clone());
                 let resp = if allow_reuse {
                     if let Some(ctx) = reused_response.take() {
                         Ok((ctx.raw, ctx.upstream.to_string()))
@@ -826,6 +832,7 @@ pub(crate) async fn process_response_jump(
                                                 for h in &inflight_hashes {
                                                     engine.notify_inflight_waiters(*h, bytes).await;
                                                 }
+                                                response.upstream = Some(Arc::from("inflight"));
                                                 return Ok(resp_bytes);
                                             }
                                             Err(e) => return Err(anyhow::anyhow!("{}", e)),
@@ -904,6 +911,7 @@ pub(crate) async fn process_response_jump(
                                             for h in &inflight_hashes {
                                                 engine.notify_inflight_waiters(*h, bytes).await;
                                             }
+                                            response.upstream = Some(Arc::from("inflight"));
                                             return Ok(resp_bytes);
                                         }
                                         Err(e) => return Err(anyhow::anyhow!("{}", e)),
@@ -929,6 +937,7 @@ pub(crate) async fn process_response_jump(
 
                 match resp {
                     Ok((raw, actual_upstream)) => {
+                        response.upstream = Some(Arc::from(actual_upstream.as_str()));
                         let msg = Message::from_bytes(&raw).context("parse upstream response")?;
                         // Extract TTL for cache entry (use min for RFC 1035 compliance)
                         // 提取 TTL 用于缓存条目 (使用最小值符合 RFC 1035)
@@ -1108,6 +1117,7 @@ pub(crate) async fn process_response_jump(
                                 for h in &inflight_hashes {
                                     engine.notify_inflight_waiters(*h, &ctx.raw).await;
                                 }
+                                response.upstream = Some(ctx.upstream);
                                 return Ok(ctx.raw);
                             }
                             ResponseActionResult::Static { bytes, .. } => {
@@ -1117,6 +1127,7 @@ pub(crate) async fn process_response_jump(
                                 for h in &inflight_hashes {
                                     engine.notify_inflight_waiters(*h, &bytes).await;
                                 }
+                                response.upstream = Some(Arc::from("static"));
                                 return Ok(bytes);
                             }
                             ResponseActionResult::Jump {
