@@ -19,7 +19,7 @@ use hickory_proto::serialize::binary::BinDecodable;
 
 use kixdns::config::{Transport, parse_config};
 use kixdns::doh_server::run_doh_with_listener;
-use kixdns::engine::{Engine, FastPathResponse};
+use kixdns::engine::{Engine, FastPathResponse, PreParsedData};
 use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::observe::{
     CacheHit, CacheHitKind, ConfigLoaded, ConfigReloadFailed, DecisionDetail, DecisionKind,
@@ -157,6 +157,18 @@ enum Event {
 #[derive(Default)]
 struct Recorder {
     events: Mutex<Vec<Event>>,
+    /// `request_finished` payloads, kept apart from `events` so the lifecycle
+    /// sequences asserted elsewhere stay unchanged.
+    /// request_finished 的载荷，与 events 分开记录，其他用例断言的生命周期序列保持不变。
+    outcomes: Mutex<Vec<Outcome>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Outcome {
+    id: u64,
+    status: RequestStatus,
+    response: Option<Vec<u8>>,
+    error: Option<String>,
 }
 
 impl Recorder {
@@ -166,6 +178,15 @@ impl Recorder {
 
     fn events(&self) -> Vec<Event> {
         self.events.lock().unwrap().clone()
+    }
+
+    fn outcome(&self, id: u64) -> Outcome {
+        let outcomes = self.outcomes.lock().unwrap();
+        outcomes
+            .iter()
+            .find(|outcome| outcome.id == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no request_finished for {id}: {outcomes:#?}"))
     }
 
     /// Remove and return everything recorded so far.
@@ -199,10 +220,16 @@ impl EngineObserver for Recorder {
         });
     }
 
-    fn request_finished(&self, ctx: &RequestContext<'_>, outcome: &RequestOutcome) {
+    fn request_finished(&self, ctx: &RequestContext<'_>, outcome: &RequestOutcome<'_>) {
         self.push(Event::Finished {
             id: ctx.request_id,
             status: outcome.status,
+        });
+        self.outcomes.lock().unwrap().push(Outcome {
+            id: ctx.request_id,
+            status: outcome.status,
+            response: outcome.response.map(<[u8]>::to_vec),
+            error: outcome.error.map(str::to_string),
         });
     }
 
@@ -1633,6 +1660,144 @@ async fn cancelled_request_is_reported() {
         }),
         "{mine:#?}"
     );
+    drop(silent);
+}
+
+#[tokio::test]
+async fn request_finished_lends_the_response_the_engine_produced() {
+    // Static rule, answered on the slow path and on the fast path.
+    // 静态规则，分别由慢路径与快速路径应答。
+    let (engine, recorder) = observed_engine(&static_config("192.0.2.7"));
+    let slow = engine
+        .handle_packet(&query("slow.example"), peer())
+        .await
+        .unwrap();
+    let Some(FastPathResponse::Direct(fast)) = engine
+        .handle_packet_fast(&query("fast.example"), peer())
+        .unwrap()
+    else {
+        panic!("a static rule must answer on the fast path");
+    };
+    let events = recorder.events();
+    for (qname, sent) in [("slow.example", &slow[..]), ("fast.example", &fast[..])] {
+        let outcome = recorder.outcome(request_id_for(&events, qname));
+        assert_eq!(outcome.status, RequestStatus::Completed);
+        assert_eq!(outcome.response.as_deref(), Some(sent), "{qname}");
+        assert_eq!(outcome.error, None, "{qname}");
+    }
+
+    // Upstream answer, then a fresh cache hit on the fast path, which is
+    // lent as stored.
+    // 上游应答，随后快速路径的新鲜缓存命中按存储原样出借。
+    let (upstream, task) = spawn_echo_upstream(300).await;
+    let raw = serde_json::json!({
+        "settings": { "default_upstream": upstream, "enable_tcp_fallback": false },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "fwd",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    let answered = engine
+        .handle_packet(&query("cached.example"), peer())
+        .await
+        .unwrap();
+    let Some(FastPathResponse::CacheHit { cached, .. }) = engine
+        .handle_packet_fast(&query("cached.example"), peer())
+        .unwrap()
+    else {
+        panic!("the second query must be a fast-path cache hit");
+    };
+    let events = recorder.events();
+    let ids: Vec<u64> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Started { id, qname, .. } if qname == "cached.example" => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 2, "{events:#?}");
+    let first = recorder.outcome(ids[0]);
+    assert_eq!(first.response.as_deref(), Some(&answered[..]));
+    assert_eq!(
+        rcode_of(first.response.as_deref().unwrap()),
+        ResponseCode::NoError
+    );
+    assert_eq!(
+        recorder.outcome(ids[1]).response.as_deref(),
+        Some(&cached[..])
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn failed_and_cancelled_requests_lend_no_response() {
+    // A listener hands a query the fast path deferred to the async path with
+    // its pre-parsed fields. A request whose header announces an additional
+    // record it does not carry passes that quick parse; the static decision
+    // then parses the whole message and fails the request.
+    // 监听器把快速路径推迟的查询连同预解析字段交给异步路径。头部声明了附加记录却没有
+    // 携带的请求能通过快速解析；静态决策随后完整解析报文失败，请求因此失败。
+    let (engine, recorder) = observed_engine(&static_config("192.0.2.7"));
+    let mut packet = query("broken.example");
+    packet[11] = 1; // ARCOUNT = 1, no additional record follows / ARCOUNT 为 1 但没有附加记录
+    let pre_parsed = PreParsedData::new(
+        "broken.example".to_string(),
+        u16::from(RecordType::A),
+        1,
+        0x1234,
+        false,
+        Arc::from("main"),
+        None,
+    );
+    let error = engine
+        .handle_packet_internal_with_pre_parsed(&packet, peer(), false, pre_parsed)
+        .await
+        .expect_err("a request the engine cannot parse fails");
+    let failed = recorder.outcome(request_id_for(&recorder.events(), "broken.example"));
+    assert_eq!(failed.status, RequestStatus::Failed);
+    assert_eq!(failed.response, None);
+    assert_eq!(failed.error, Some(format!("{error:#}")));
+
+    // A dropped request never produced a message and did not fail.
+    // 被丢弃的请求既没有产出应答，也不算失败。
+    let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let upstream = silent.local_addr().unwrap().to_string();
+    let raw = serde_json::json!({
+        "settings": {
+            "default_upstream": "127.0.0.1:9",
+            "upstream_timeout_ms": 5000,
+            "enable_tcp_fallback": false
+        },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "fwd",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(100),
+        engine.handle_packet(&query("dropped.example"), peer()),
+    )
+    .await;
+    assert!(
+        dropped.is_err(),
+        "the listener timeout must drop the request"
+    );
+    let cancelled = recorder.outcome(request_id_for(&recorder.events(), "dropped.example"));
+    assert_eq!(cancelled.status, RequestStatus::Cancelled);
+    assert_eq!(cancelled.response, None);
+    assert_eq!(cancelled.error, None);
     drop(silent);
 }
 

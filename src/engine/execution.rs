@@ -338,6 +338,7 @@ impl Engine {
         ctx: &RequestContext<'_>,
         pipeline_id: &str,
         answer: FastPathAnswer<'_>,
+        response: &[u8],
     ) {
         observer.request_started(ctx);
         observer.pipeline_selected(ctx, pipeline_id);
@@ -417,6 +418,8 @@ impl Engine {
             &RequestOutcome {
                 latency: start.elapsed(),
                 status: RequestStatus::Completed,
+                response: Some(response),
+                error: None,
             },
         );
     }
@@ -605,6 +608,7 @@ impl Engine {
                                 original_ttl: hit.original_ttl,
                                 elapsed_secs,
                             },
+                            &hit.bytes,
                         );
                     }
                     let mut log = ResponseLog::new(
@@ -657,6 +661,7 @@ impl Engine {
                             rcode,
                             answers: answers.len(),
                         },
+                        &resp,
                     );
                 }
                 let mut log = ResponseLog::new(
@@ -716,6 +721,7 @@ impl Engine {
                             &self.fast_path_context(peer, qname_str, qtype, qclass),
                             &pipeline_id,
                             FastPathAnswer::CachedRules { record: &record },
+                            &resp,
                         );
                     }
                     let mut log = ResponseLog::new(
@@ -1426,11 +1432,7 @@ impl Engine {
         .await;
         response_log.finish(&result);
         if let Some(observed) = observed.as_mut() {
-            observed.set_status(if result.is_ok() {
-                RequestStatus::Completed
-            } else {
-                RequestStatus::Failed
-            });
+            observed.finish(&result);
         }
         result
     }

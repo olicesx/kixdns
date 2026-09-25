@@ -79,7 +79,7 @@ pub trait EngineObserver: Send + Sync + 'static {
     /// [`RequestStatus::Cancelled`].
     ///
     /// [`request_started`]: EngineObserver::request_started
-    fn request_finished(&self, ctx: &RequestContext<'_>, outcome: &RequestOutcome) {}
+    fn request_finished(&self, ctx: &RequestContext<'_>, outcome: &RequestOutcome<'_>) {}
 
     /// A pipeline was chosen for the request: once after pipeline selection
     /// and again for every `jump_to_pipeline` decision.
@@ -182,11 +182,26 @@ pub struct RequestContext<'a> {
 /// How a request ended.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
-pub struct RequestOutcome {
+pub struct RequestOutcome<'a> {
     /// Wall-clock time between `request_started` and `request_finished`.
     pub latency: Duration,
     /// Completion status.
     pub status: RequestStatus,
+    /// The DNS message the engine produced for the client, in wire format.
+    /// Set exactly when [`status`] is [`RequestStatus::Completed`]; a failed
+    /// or cancelled request never produced one. The engine lends the bytes
+    /// it already holds and parses nothing; an observer that wants the
+    /// response code or the records parses them itself. A fresh cache hit on
+    /// the synchronous fast path is lent as stored: the listener still
+    /// rewrites its transaction id and ages its TTLs before sending.
+    ///
+    /// [`status`]: RequestOutcome::status
+    pub response: Option<&'a [u8]>,
+    /// Why the engine failed the request, with its cause chain. Set exactly
+    /// when [`status`] is [`RequestStatus::Failed`].
+    ///
+    /// [`status`]: RequestOutcome::status
+    pub error: Option<&'a str>,
 }
 
 /// Completion status of a request.
@@ -451,6 +466,15 @@ pub struct TracingObserver;
 
 const TRACE_TARGET: &str = "kixdns::observe";
 
+/// Response code from a DNS header: the low four bits of byte 3. The
+/// extended bits an OPT record may carry are not read; this is a log field,
+/// not a parser.
+fn header_rcode(message: &[u8]) -> Option<ResponseCode> {
+    message
+        .get(3)
+        .map(|flags| ResponseCode::from(0, flags & 0x0F))
+}
+
 impl EngineObserver for TracingObserver {
     fn request_started(&self, ctx: &RequestContext<'_>) {
         tracing::debug!(
@@ -467,13 +491,16 @@ impl EngineObserver for TracingObserver {
         );
     }
 
-    fn request_finished(&self, ctx: &RequestContext<'_>, outcome: &RequestOutcome) {
+    fn request_finished(&self, ctx: &RequestContext<'_>, outcome: &RequestOutcome<'_>) {
         tracing::debug!(
             target: TRACE_TARGET,
             event = "request_finished",
             request_id = ctx.request_id,
             status = ?outcome.status,
             latency_us = outcome.latency.as_micros() as u64,
+            rcode = outcome.response.and_then(header_rcode).map(tracing::field::display),
+            response_bytes = outcome.response.map(<[u8]>::len),
+            error = outcome.error,
             "request finished"
         );
     }
@@ -625,6 +652,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn header_rcode_reads_the_low_four_bits_of_byte_three() {
+        assert_eq!(
+            header_rcode(&[0x12, 0x34, 0x81, 0x83]),
+            Some(ResponseCode::NXDomain)
+        );
+        assert_eq!(
+            header_rcode(&[0x12, 0x34, 0x85, 0xF0]),
+            Some(ResponseCode::NoError)
+        );
+        assert_eq!(header_rcode(&[0x12, 0x34, 0x81]), None);
+    }
+
+    #[test]
     fn built_in_observers_accept_every_event() {
         let ctx = RequestContext {
             request_id: 7,
@@ -709,11 +749,25 @@ mod tests {
                     error: Some(&error),
                 },
             );
+            // A SERVFAIL header, so the tracing observer reads a response code.
+            // 一个 SERVFAIL 头部，让 tracing 观察者读到响应码。
+            let servfail = [0x12, 0x34, 0x81, 0x82, 0, 1, 0, 0, 0, 0, 0, 0];
             observer.request_finished(
                 &ctx,
                 &RequestOutcome {
                     latency: Duration::from_millis(4),
                     status: RequestStatus::Completed,
+                    response: Some(&servfail),
+                    error: None,
+                },
+            );
+            observer.request_finished(
+                &ctx,
+                &RequestOutcome {
+                    latency: Duration::from_millis(4),
+                    status: RequestStatus::Failed,
+                    response: None,
+                    error: Some("parse request for static: unexpected end of input"),
                 },
             );
             observer.config_loaded(&ConfigLoaded {

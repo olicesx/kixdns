@@ -6,6 +6,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Bytes;
+
 use crate::config::{Action, Transport};
 use crate::engine::rules::Decision;
 use crate::engine::upstream::has_transport_prefix;
@@ -30,6 +32,13 @@ pub(crate) struct ObservedRequest<'a> {
     pub ctx: RequestContext<'a>,
     start: Instant,
     status: RequestStatus,
+    /// The response lent to `request_finished`; a cheap reference-counted
+    /// clone of the bytes the engine returns.
+    /// 交给 request_finished 的应答；是引擎返回字节的引用计数克隆，不复制内容。
+    response: Option<Bytes>,
+    /// The failure reason, formatted once and only when the request failed.
+    /// 失败原因；只在请求失败时格式化一次。
+    error: Option<String>,
 }
 
 impl<'a> ObservedRequest<'a> {
@@ -39,11 +48,24 @@ impl<'a> ObservedRequest<'a> {
             ctx,
             start,
             status: RequestStatus::Cancelled,
+            response: None,
+            error: None,
         }
     }
 
-    pub fn set_status(&mut self, status: RequestStatus) {
-        self.status = status;
+    /// Record how the request ended: the response it produced, or why it failed.
+    /// 记录请求的结局：产出的应答，或失败的原因。
+    pub fn finish(&mut self, result: &anyhow::Result<Bytes>) {
+        match result {
+            Ok(response) => {
+                self.status = RequestStatus::Completed;
+                self.response = Some(response.clone());
+            }
+            Err(error) => {
+                self.status = RequestStatus::Failed;
+                self.error = Some(format!("{error:#}"));
+            }
+        }
     }
 }
 
@@ -54,6 +76,8 @@ impl Drop for ObservedRequest<'_> {
             &RequestOutcome {
                 latency: self.start.elapsed(),
                 status: self.status,
+                response: self.response.as_deref(),
+                error: self.error.as_deref(),
             },
         );
     }
