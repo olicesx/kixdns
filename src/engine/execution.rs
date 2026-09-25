@@ -31,7 +31,7 @@ use crate::observe::{
 };
 use crate::proto_utils::parse_quick;
 
-use super::observation::{ObservedRequest, report_decision, report_matched_rules};
+use super::observation::{ObservedRequest, cached_source, report_decision, report_matched_rules};
 use super::response::build_fast_static_response;
 use super::response_log::ResponseLog;
 use super::rules::RuleCacheRecord;
@@ -84,6 +84,7 @@ enum FastPathAnswer<'a> {
     Cache {
         original_ttl: u32,
         elapsed_secs: u32,
+        source: Option<&'a str>,
     },
     /// Compiled static rule matched directly / 编译后的静态规则直接命中
     StaticRule {
@@ -347,6 +348,7 @@ impl Engine {
             FastPathAnswer::Cache {
                 original_ttl,
                 elapsed_secs,
+                source,
             } => observer.cache_hit(
                 ctx,
                 &CacheHit {
@@ -355,6 +357,7 @@ impl Engine {
                         original_ttl.saturating_sub(elapsed_secs) as u64,
                     )),
                     original_ttl: Some(Duration::from_secs(original_ttl as u64)),
+                    source,
                 },
             ),
             FastPathAnswer::StaticRule {
@@ -607,6 +610,7 @@ impl Engine {
                             FastPathAnswer::Cache {
                                 original_ttl: hit.original_ttl,
                                 elapsed_secs,
+                                source: cached_source(hit.upstream.as_deref()),
                             },
                             &hit.bytes,
                         );

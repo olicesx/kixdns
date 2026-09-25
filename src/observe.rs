@@ -123,7 +123,7 @@ pub trait EngineObserver: Send + Sync + 'static {
     /// request's [`cache_lookup`].
     ///
     /// [`cache_lookup`]: EngineObserver::cache_lookup
-    fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit) {}
+    fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit<'_>) {}
 
     /// The response cache had no usable entry. Always paired with the
     /// request's [`cache_lookup`].
@@ -335,13 +335,16 @@ pub enum DecisionKind {
 /// The response cache answered a request.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
-pub struct CacheHit {
+pub struct CacheHit<'a> {
     /// Which kind of entry answered.
     pub kind: CacheHitKind,
     /// Time left before the entry's TTL expires; `None` for stale hits.
     pub remaining_ttl: Option<Duration>,
     /// TTL the entry was cached with, when known.
     pub original_ttl: Option<Duration>,
+    /// Upstream whose answer was cached, as recorded when the entry was
+    /// stored; `None` when a rule synthesised the cached answer.
+    pub source: Option<&'a str>,
 }
 
 /// Which kind of cached response answered a request.
@@ -576,7 +579,7 @@ impl EngineObserver for TracingObserver {
         );
     }
 
-    fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit) {
+    fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit<'_>) {
         tracing::debug!(
             target: TRACE_TARGET,
             event = "cache_hit",
@@ -584,6 +587,7 @@ impl EngineObserver for TracingObserver {
             kind = ?event.kind,
             remaining_ttl_s = event.remaining_ttl.map(|ttl| ttl.as_secs()),
             original_ttl_s = event.original_ttl.map(|ttl| ttl.as_secs()),
+            source = event.source,
             "cache hit"
         );
     }
@@ -697,6 +701,7 @@ mod tests {
                     kind: CacheHitKind::Fresh,
                     remaining_ttl: Some(Duration::from_secs(30)),
                     original_ttl: Some(Duration::from_secs(60)),
+                    source: Some("1.1.1.1:53"),
                 },
             );
             observer.cache_miss(&ctx);

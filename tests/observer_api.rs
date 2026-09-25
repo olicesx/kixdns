@@ -161,6 +161,9 @@ struct Recorder {
     /// sequences asserted elsewhere stay unchanged.
     /// request_finished 的载荷，与 events 分开记录，其他用例断言的生命周期序列保持不变。
     outcomes: Mutex<Vec<Outcome>>,
+    /// `CacheHit::source` per request, kept apart for the same reason.
+    /// 每个请求的 CacheHit::source，同样分开记录。
+    cache_sources: Mutex<Vec<(u64, Option<String>)>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -187,6 +190,10 @@ impl Recorder {
             .find(|outcome| outcome.id == id)
             .cloned()
             .unwrap_or_else(|| panic!("no request_finished for {id}: {outcomes:#?}"))
+    }
+
+    fn cache_sources(&self) -> Vec<(u64, Option<String>)> {
+        self.cache_sources.lock().unwrap().clone()
     }
 
     /// Remove and return everything recorded so far.
@@ -284,7 +291,11 @@ impl EngineObserver for Recorder {
         self.push(Event::CacheLookup { id: ctx.request_id });
     }
 
-    fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit) {
+    fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit<'_>) {
+        self.cache_sources
+            .lock()
+            .unwrap()
+            .push((ctx.request_id, event.source.map(str::to_string)));
         self.push(Event::CacheHit {
             id: ctx.request_id,
             kind: event.kind,
@@ -1799,6 +1810,79 @@ async fn failed_and_cancelled_requests_lend_no_response() {
     assert_eq!(cancelled.response, None);
     assert_eq!(cancelled.error, None);
     drop(silent);
+}
+
+#[tokio::test]
+async fn cache_hits_name_the_upstream_whose_answer_was_cached() {
+    let (upstream, task) = spawn_echo_upstream(300).await;
+    let raw = serde_json::json!({
+        "settings": { "default_upstream": upstream, "enable_tcp_fallback": false },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "fwd",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    engine
+        .handle_packet(&query("cached.example"), peer())
+        .await
+        .unwrap();
+    // A cache hit on the async path, then one on the fast path.
+    // 先是异步路径的缓存命中，再是快速路径的。
+    engine
+        .handle_packet(&query("cached.example"), peer())
+        .await
+        .unwrap();
+    assert!(matches!(
+        engine.handle_packet_fast(&query("cached.example"), peer()),
+        Ok(Some(FastPathResponse::CacheHit { .. }))
+    ));
+    let sources = recorder.cache_sources();
+    assert_eq!(sources.len(), 2, "{sources:#?}");
+    // The same address `upstream_result` reported, without the transport prefix.
+    // 与 upstream_result 报告的地址相同，不带传输前缀。
+    assert!(
+        sources
+            .iter()
+            .all(|(_, source)| source.as_deref() == Some(upstream.as_str())),
+        "{sources:#?}"
+    );
+    assert!(recorder.events().contains(&Event::UpstreamAttempt {
+        id: request_id_for(&recorder.events(), "cached.example"),
+        upstream: upstream.clone(),
+        transport: Transport::Udp,
+    }));
+    task.abort();
+
+    // A rule's answer is cached too when min_ttl allows; it has no upstream.
+    // min_ttl 允许时规则的应答也会进缓存；它没有上游。
+    let raw = serde_json::json!({
+        "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 60 },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "static",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "static_ip_response", "ip": "192.0.2.7" }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    for _ in 0..2 {
+        engine
+            .handle_packet(&query("static.example"), peer())
+            .await
+            .unwrap();
+    }
+    let sources = recorder.cache_sources();
+    assert_eq!(sources.len(), 1, "{sources:#?}");
+    assert_eq!(sources[0].1, None);
 }
 
 #[tokio::test]

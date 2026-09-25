@@ -83,6 +83,16 @@ impl Drop for ObservedRequest<'_> {
     }
 }
 
+/// Address of the upstream a cache entry was filled from, in the form
+/// [`crate::observe::UpstreamResult::upstream`] uses. The entry records the
+/// label `forward_upstream` builds, `{transport}:{address}`, whose transport
+/// part never contains a colon; rule-synthesised entries record none.
+/// 缓存条目来源上游的地址，写法与 UpstreamResult::upstream 一致。条目记录的是
+/// forward_upstream 拼出的 `{传输}:{地址}`，传输部分不含冒号；规则生成的条目没有来源。
+pub(crate) fn cached_source(upstream: Option<&str>) -> Option<&str> {
+    upstream.map(|label| label.split_once(':').map_or(label, |(_, address)| address))
+}
+
 /// Kind of a request-phase decision.
 pub(crate) fn decision_kind(decision: &Decision) -> DecisionKind {
     match decision {
@@ -201,5 +211,24 @@ pub(crate) fn report_matched_rules(
                 fast_path,
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cached_source;
+
+    #[test]
+    fn cached_source_drops_only_the_transport_label() {
+        assert_eq!(cached_source(Some("udp:1.1.1.1:53")), Some("1.1.1.1:53"));
+        assert_eq!(
+            cached_source(Some("tcp:[2606:4700::1111]:53")),
+            Some("[2606:4700::1111]:53")
+        );
+        assert_eq!(
+            cached_source(Some("doh:https://dns.google/dns-query")),
+            Some("https://dns.google/dns-query")
+        );
+        assert_eq!(cached_source(None), None);
     }
 }
