@@ -600,6 +600,9 @@ pub(crate) async fn handle_forward_decision_logged(
                 if let Some(mut rx) = rx
                     && rx.changed().await.is_ok()
                 {
+                    if let Some((observer, ctx)) = observed {
+                        observer.inflight_joined(ctx);
+                    }
                     let result = rx.borrow().clone();
                     match &result {
                         Ok(bytes) => {
@@ -650,6 +653,9 @@ pub(crate) async fn handle_forward_decision_logged(
             if let Some(mut rx) = rx
                 && rx.changed().await.is_ok()
             {
+                if let Some((observer, ctx)) = observed {
+                    observer.inflight_joined(ctx);
+                }
                 let result = rx.borrow().clone();
                 match &result {
                     Ok(bytes) => {

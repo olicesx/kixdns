@@ -4,7 +4,7 @@
 //! tests assert the events the engine reports for static rules (slow and
 //! fast path), response cache hits and misses (fresh and stale), rule cache
 //! lookups and replays, rule evaluation and decisions, upstream attempts,
-//! cancelled requests and configuration reloads.
+//! shared in-flight queries, cancelled requests and configuration reloads.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -126,6 +126,9 @@ enum Event {
         original_ttl: Option<Duration>,
     },
     CacheMiss {
+        id: u64,
+    },
+    InflightJoined {
         id: u64,
     },
     UpstreamAttempt {
@@ -308,6 +311,10 @@ impl EngineObserver for Recorder {
         self.push(Event::CacheMiss { id: ctx.request_id });
     }
 
+    fn inflight_joined(&self, ctx: &RequestContext<'_>) {
+        self.push(Event::InflightJoined { id: ctx.request_id });
+    }
+
     fn upstream_attempt(&self, ctx: &RequestContext<'_>, event: &UpstreamAttempt<'_>) {
         self.push(Event::UpstreamAttempt {
             id: ctx.request_id,
@@ -381,6 +388,21 @@ fn rcode_of(bytes: &[u8]) -> ResponseCode {
     Message::from_bytes(bytes).unwrap().metadata.response_code
 }
 
+/// One A record of the given TTL for the query's question.
+/// 为查询的问题生成一条给定 TTL 的 A 记录应答。
+fn echo_answer(query: &[u8], ttl: u32) -> Option<Vec<u8>> {
+    let request = Message::from_bytes(query).ok()?;
+    let question = request.queries.first()?.clone();
+    let mut response = Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+    response.add_query(question.clone());
+    response.add_answer(Record::from_rdata(
+        question.name().clone(),
+        ttl,
+        RData::A(A(std::net::Ipv4Addr::LOCALHOST)),
+    ));
+    response.to_vec().ok()
+}
+
 /// Minimal UDP upstream that answers every query with one A record of the
 /// given TTL. Aborting the returned task closes its socket.
 /// 最小 UDP 上游：以给定 TTL 的一条 A 记录应答所有查询；中止返回的任务即关闭其 socket。
@@ -390,24 +412,77 @@ async fn spawn_echo_upstream(ttl: u32) -> (String, tokio::task::JoinHandle<()>) 
     let task = tokio::spawn(async move {
         let mut buf = [0u8; 1500];
         while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
-            let Ok(request) = Message::from_bytes(&buf[..n]) else {
-                continue;
-            };
-            let Some(question) = request.queries.first().cloned() else {
-                continue;
-            };
-            let mut response =
-                Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
-            response.add_query(question.clone());
-            response.add_answer(Record::from_rdata(
-                question.name().clone(),
-                ttl,
-                RData::A(A(std::net::Ipv4Addr::LOCALHOST)),
-            ));
-            let _ = socket.send_to(&response.to_vec().unwrap(), peer).await;
+            if let Some(response) = echo_answer(&buf[..n], ttl) {
+                let _ = socket.send_to(&response, peer).await;
+            }
         }
     });
     (addr, task)
+}
+
+/// UDP upstream that holds every answer until `release` fires, then answers
+/// what it holds and everything after. It counts the queries it receives.
+/// 扣住所有应答直到 `release` 触发，之后应答已收到的和此后的查询；统计收到的查询数。
+struct HeldUpstream {
+    addr: String,
+    queries: Arc<std::sync::atomic::AtomicUsize>,
+    release: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl HeldUpstream {
+    async fn spawn() -> Self {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap().to_string();
+        let queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (release, mut released) = tokio::sync::oneshot::channel::<()>();
+        let counter = queries.clone();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            let mut open = false;
+            let mut buf = [0u8; 1500];
+            loop {
+                tokio::select! {
+                    received = socket.recv_from(&mut buf) => {
+                        let Ok((n, peer)) = received else { return };
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let Some(response) = echo_answer(&buf[..n], 60) else { continue };
+                        if open {
+                            let _ = socket.send_to(&response, peer).await;
+                        } else {
+                            held.push((response, peer));
+                        }
+                    }
+                    _ = &mut released, if !open => {
+                        open = true;
+                        for (response, peer) in held.drain(..) {
+                            let _ = socket.send_to(&response, peer).await;
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            addr,
+            queries,
+            release: Some(release),
+            task,
+        }
+    }
+
+    fn release(&mut self) {
+        let _ = self.release.take().unwrap().send(());
+    }
+
+    fn queries(&self) -> usize {
+        self.queries.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for HeldUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// Request id of the first `Started` event whose query name matches.
@@ -437,6 +512,7 @@ fn events_of(events: &[Event], request_id: u64) -> Vec<Event> {
             | Event::CacheLookup { id }
             | Event::CacheHit { id, .. }
             | Event::CacheMiss { id }
+            | Event::InflightJoined { id }
             | Event::UpstreamAttempt { id, .. }
             | Event::UpstreamResult { id, .. } => *id == request_id,
             Event::ConfigLoaded { .. } | Event::ConfigReloadFailed { .. } => false,
@@ -1983,4 +2059,211 @@ async fn hot_reload_reports_success_and_failure() {
         "a rejected configuration must not be reported as loaded"
     );
     assert_eq!(engine.config_generation(), generation_after_success);
+}
+
+/// Two clients the inflight tests tell apart: `LEADER` sends first.
+/// inflight 测试区分的两个客户端：`LEADER` 先发。
+const LEADER: &str = "127.0.0.1:53000";
+const FOLLOWER: &str = "127.0.0.2:53000";
+
+/// Request id of the `Started` event from `client`.
+fn request_id_from(events: &[Event], client: &str) -> u64 {
+    let client: SocketAddr = client.parse().unwrap();
+    events
+        .iter()
+        .find_map(|event| match event {
+            Event::Started { id, client: c, .. } if *c == client => Some(*id),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no request_started from {client}: {events:#?}"))
+}
+
+/// Send the query to the held upstream with a `forward` or an `allow`
+/// action (`allow` forwards to the default upstream), either straight from
+/// the entry pipeline or after a response jump. With the jump, each client has
+/// its own entry pipeline, so the two requests only meet in "shared".
+/// 用 `forward` 或 `allow`（`allow` 转发到默认上游）把查询发往扣住应答的上游：
+/// 或直接在入口 pipeline，或经响应跳转之后。
+/// 跳转时两个客户端各有自己的入口 pipeline，两个请求只在 "shared" 相遇。
+fn inflight_config(held: &str, echo: &str, action: &str, via_jump: bool) -> String {
+    let held_action = if action == "forward" {
+        serde_json::json!({ "type": "forward", "upstream": held, "transport": "udp" })
+    } else {
+        serde_json::json!({ "type": action })
+    };
+    let settings = serde_json::json!({
+        "default_upstream": held,
+        "upstream_timeout_ms": 5000,
+        "enable_tcp_fallback": false
+    });
+    let held_rule = serde_json::json!({
+        "name": "held",
+        "matchers": [{ "type": "any" }],
+        "actions": [held_action]
+    });
+    if !via_jump {
+        return serde_json::json!({
+            "settings": settings,
+            "pipelines": [{ "id": "main", "rules": [held_rule] }]
+        })
+        .to_string();
+    }
+    let entry = |id: &str| {
+        serde_json::json!({
+            "id": id,
+            "rules": [{
+                "name": "echo-then-jump",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": echo, "transport": "udp" }],
+                "response_matchers": [{ "type": "upstream_equals", "value": echo }],
+                "response_actions_on_match": [
+                    { "type": "jump_to_pipeline", "pipeline": "shared" }
+                ]
+            }]
+        })
+    };
+    serde_json::json!({
+        "settings": settings,
+        "pipeline_select": [
+            {
+                "pipeline": "first",
+                "matchers": [{ "type": "client_ip", "cidr": "127.0.0.1/32" }]
+            },
+            { "pipeline": "second", "matchers": [{ "type": "any" }] }
+        ],
+        "pipelines": [
+            entry("first"),
+            entry("second"),
+            { "id": "shared", "rules": [held_rule] }
+        ]
+    })
+    .to_string()
+}
+
+/// Send the same query from `LEADER`, then from `FOLLOWER` once the leader's
+/// query is at the held upstream and the follower has had time to reach it.
+/// 先由 `LEADER` 发出查询，待其到达上游、且跟随者有时间赶上后，再由 `FOLLOWER` 发同一查询。
+async fn start_leader_and_follower(
+    engine: &Engine,
+    recorder: &Recorder,
+    held: &HeldUpstream,
+) -> (
+    tokio::task::JoinHandle<anyhow::Result<bytes::Bytes>>,
+    tokio::task::JoinHandle<anyhow::Result<bytes::Bytes>>,
+) {
+    let send = |client: &str| {
+        let engine = engine.clone();
+        let client: SocketAddr = client.parse().unwrap();
+        tokio::spawn(async move { engine.handle_packet(&query("shared.example"), client).await })
+    };
+    let leader = send(LEADER);
+    let at_upstream = recorder
+        .wait_for(Duration::from_secs(2), |events| {
+            events.iter().any(|event| {
+                matches!(event, Event::UpstreamAttempt { upstream, .. } if *upstream == held.addr)
+            })
+        })
+        .await;
+    assert!(at_upstream, "{:#?}", recorder.events());
+    let follower = send(FOLLOWER);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    (leader, follower)
+}
+
+#[tokio::test]
+async fn a_request_that_takes_an_inflight_result_reports_joining_it() {
+    let (echo, echo_task) = spawn_echo_upstream(60).await;
+    // Each row reaches a different place the engine shares in-flight results:
+    // `forward` and `allow`, from the entry pipeline and after a response jump.
+    // 每行对应引擎共享 in-flight 结果的一处：`forward` 与 `allow`，入口 pipeline 与响应跳转之后。
+    for (action, via_jump) in [
+        ("forward", false),
+        ("allow", false),
+        ("forward", true),
+        ("allow", true),
+    ] {
+        let mut held = HeldUpstream::spawn().await;
+        let raw = inflight_config(&held.addr, &echo, action, via_jump);
+        let (engine, recorder) = observed_engine(&raw);
+        let (leader, follower) = start_leader_and_follower(&engine, &recorder, &held).await;
+        held.release();
+        let leader = leader.await.unwrap().unwrap();
+        let follower = follower.await.unwrap().unwrap();
+        assert_eq!(rcode_of(&leader), ResponseCode::NoError);
+        assert_eq!(rcode_of(&follower), ResponseCode::NoError);
+
+        let case = format!("{action} via_jump={via_jump}");
+        assert_eq!(held.queries(), 1, "{case}: one query reached the upstream");
+        let events = recorder.events();
+        let leader_events = events_of(&events, request_id_from(&events, LEADER));
+        let follower_id = request_id_from(&events, FOLLOWER);
+        let follower_events = events_of(&events, follower_id);
+        assert!(
+            !leader_events.contains(&Event::InflightJoined {
+                id: request_id_from(&events, LEADER)
+            }),
+            "{case}: {leader_events:#?}"
+        );
+        assert!(
+            follower_events.contains(&Event::InflightJoined { id: follower_id }),
+            "{case}: {follower_events:#?}"
+        );
+        assert!(
+            !follower_events.iter().any(|event| {
+                matches!(event, Event::UpstreamAttempt { upstream, .. } if *upstream == held.addr)
+            }),
+            "{case}: the follower sent no query of its own: {follower_events:#?}"
+        );
+        assert_eq!(
+            follower_events.last(),
+            Some(&finished(follower_id)),
+            "{case}"
+        );
+    }
+    echo_task.abort();
+}
+
+#[tokio::test]
+async fn a_request_whose_inflight_query_is_dropped_queries_by_itself() {
+    let mut held = HeldUpstream::spawn().await;
+    let raw = inflight_config(&held.addr, "127.0.0.1:9", "forward", false);
+    let (engine, recorder) = observed_engine(&raw);
+    let (leader, follower) = start_leader_and_follower(&engine, &recorder, &held).await;
+    // The leader goes away before its query is answered.
+    // 领头的请求在其查询得到应答之前离开。
+    leader.abort();
+    let leader_gone = recorder
+        .wait_for(Duration::from_secs(2), |events| {
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    Event::Finished {
+                        status: RequestStatus::Cancelled,
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+    assert!(leader_gone, "{:#?}", recorder.events());
+    held.release();
+    let follower = follower.await.unwrap().unwrap();
+    assert_eq!(rcode_of(&follower), ResponseCode::NoError);
+
+    assert_eq!(held.queries(), 2, "the follower sent its own query");
+    let events = recorder.events();
+    let follower_id = request_id_from(&events, FOLLOWER);
+    let follower_events = events_of(&events, follower_id);
+    assert!(
+        !follower_events.contains(&Event::InflightJoined { id: follower_id }),
+        "{follower_events:#?}"
+    );
+    assert!(
+        follower_events.contains(&Event::UpstreamAttempt {
+            id: follower_id,
+            upstream: held.addr.clone(),
+            transport: Transport::Udp,
+        }),
+        "{follower_events:#?}"
+    );
 }

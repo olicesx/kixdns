@@ -131,6 +131,16 @@ pub trait EngineObserver: Send + Sync + 'static {
     /// [`cache_lookup`]: EngineObserver::cache_lookup
     fn cache_miss(&self, ctx: &RequestContext<'_>) {}
 
+    /// An identical query was already in flight, and the request took that
+    /// query's answer instead of forwarding its own. Reported when the answer
+    /// arrives, in place of the [`upstream_attempt`]s this forward would
+    /// have made. If the query it waited for ends without an answer (it
+    /// failed or was cancelled), the request forwards by itself and this is
+    /// not reported.
+    ///
+    /// [`upstream_attempt`]: EngineObserver::upstream_attempt
+    fn inflight_joined(&self, ctx: &RequestContext<'_>) {}
+
     /// A query is about to be sent to an upstream server. Every attempt is
     /// followed by exactly one [`upstream_result`], including attempts that
     /// lose a concurrent race ([`UpstreamOutcome::Aborted`]).
@@ -601,6 +611,15 @@ impl EngineObserver for TracingObserver {
         );
     }
 
+    fn inflight_joined(&self, ctx: &RequestContext<'_>) {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            event = "inflight_joined",
+            request_id = ctx.request_id,
+            "joined an in-flight query"
+        );
+    }
+
     fn upstream_attempt(&self, ctx: &RequestContext<'_>, event: &UpstreamAttempt<'_>) {
         tracing::debug!(
             target: TRACE_TARGET,
@@ -734,6 +753,7 @@ mod tests {
                     },
                 },
             );
+            observer.inflight_joined(&ctx);
             observer.upstream_attempt(
                 &ctx,
                 &UpstreamAttempt {
