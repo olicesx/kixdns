@@ -322,6 +322,7 @@ impl Engine {
             request_id: self.request_id_counter.fetch_add(1, Ordering::Relaxed),
             listener_label: &self.listener_label,
             client: peer,
+            transport: self.client_transport,
             qname,
             qtype,
             qclass,
@@ -929,6 +930,13 @@ impl Engine {
                     request_id,
                     listener_label: &self.listener_label,
                     client: peer,
+                    // A refresh is the engine's own query, whichever listener's request scheduled it.
+                    // 刷新是引擎自己的查询，与安排它的请求来自哪个监听器无关。
+                    transport: if skip_cache {
+                        None
+                    } else {
+                        self.client_transport
+                    },
                     qname: qname_ref,
                     qtype,
                     qclass,

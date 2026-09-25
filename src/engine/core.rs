@@ -13,6 +13,7 @@ use tracing::{info, warn};
 
 use super::utils::{extract_geosite_tags_from_config, uses_geoip_matchers};
 use crate::cache::{CacheEntry, DnsCache, new_cache};
+use crate::config::Transport;
 use crate::lock::RwLock;
 use crate::matcher::RuntimePipelineConfig;
 use crate::matcher::advanced_rule::compile_pipelines;
@@ -35,6 +36,9 @@ pub struct Engine {
     pub(crate) dot_mux: Arc<DotMultiplexer>,
     pub(crate) doq_client: Arc<DoqClient>,
     pub listener_label: Arc<str>,
+    // Transport this handle's requests arrive over, set by the listener that owns the handle.
+    // 本句柄的请求经由的传输，由持有该句柄的监听器设置。
+    pub(crate) client_transport: Option<Transport>,
     // Optional event sink; None keeps the request path free of event construction.
     // 可选事件接收器；None 时请求路径不构造任何事件。
     pub(crate) observer: Option<Arc<dyn EngineObserver>>,
@@ -155,6 +159,17 @@ impl Engine {
     /// `Engine::builder(cfg).listener_label(listener_label).build()`.
     pub fn new(cfg: RuntimePipelineConfig, listener_label: String) -> anyhow::Result<Self> {
         Self::builder(cfg).listener_label(listener_label).build()
+    }
+
+    /// Tag this handle with the transport its requests arrive over, reported
+    /// to observers as [`RequestContext::transport`]. Each listener tags a
+    /// handle of its own; the engine behind it (configuration, caches,
+    /// metrics, observer) stays shared, and pipeline selection is unaffected.
+    ///
+    /// [`RequestContext::transport`]: crate::observe::RequestContext::transport
+    pub fn with_client_transport(mut self, transport: Transport) -> Self {
+        self.client_transport = Some(transport);
+        self
     }
 
     fn build(
@@ -441,6 +456,7 @@ impl Engine {
             dot_mux,
             doq_client,
             listener_label: Arc::from(listener_label),
+            client_transport: None,
             observer,
             config_generation: Arc::new(AtomicU64::new(1)),
             reload_lock: Arc::new(Mutex::new(())),

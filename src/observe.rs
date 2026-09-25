@@ -178,6 +178,14 @@ pub struct RequestContext<'a> {
     pub listener_label: &'a str,
     /// Client address as seen by the listener.
     pub client: SocketAddr,
+    /// Transport the query arrived over: [`Transport::Udp`],
+    /// [`Transport::Tcp`] or [`Transport::Doh`] from the built-in listeners.
+    /// `None` for background refreshes, and for requests handed to an engine
+    /// handle that no listener tagged (see
+    /// [`Engine::with_client_transport`]).
+    ///
+    /// [`Engine::with_client_transport`]: crate::engine::Engine::with_client_transport
+    pub transport: Option<Transport>,
     /// Query name, lower-cased, without a trailing dot.
     pub qname: &'a str,
     /// Query type.
@@ -496,6 +504,7 @@ impl EngineObserver for TracingObserver {
             request_id = ctx.request_id,
             listener = ctx.listener_label,
             client = %ctx.client,
+            transport = ctx.transport.map(tracing::field::debug),
             qname = ctx.qname,
             qtype = ?ctx.qtype,
             qclass = ?ctx.qclass,
@@ -693,6 +702,7 @@ mod tests {
             request_id: 7,
             listener_label: "default",
             client: "127.0.0.1:53000".parse().unwrap(),
+            transport: Some(Transport::Udp),
             qname: "example.com",
             qtype: RecordType::A,
             qclass: DNSClass::IN,

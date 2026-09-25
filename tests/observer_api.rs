@@ -78,6 +78,7 @@ enum Event {
         qname: String,
         listener: String,
         client: SocketAddr,
+        transport: Option<Transport>,
         background: bool,
     },
     Finished {
@@ -226,6 +227,7 @@ impl EngineObserver for Recorder {
             qname: ctx.qname.to_string(),
             listener: ctx.listener_label.to_string(),
             client: ctx.client,
+            transport: ctx.transport,
             background: ctx.background_refresh,
         });
     }
@@ -527,6 +529,7 @@ fn started(id: u64, qname: &str) -> Event {
         qname: qname.into(),
         listener: "edge".into(),
         client: peer(),
+        transport: None,
         background: false,
     }
 }
@@ -1122,6 +1125,10 @@ async fn background_refresh_reports_no_cache_events() {
     })
     .to_string();
     let (engine, recorder) = observed_engine(&raw);
+    // The stale request arrives through a listener's handle; the refresh it
+    // schedules is the engine's own query and names no transport.
+    // 过期请求经由监听器的句柄到达；它安排的刷新是引擎自己的查询，不带传输。
+    let engine = engine.with_client_transport(Transport::Udp);
 
     engine
         .handle_packet(&query("stale.example"), peer())
@@ -1169,6 +1176,14 @@ async fn background_refresh_reports_no_cache_events() {
         })
         .expect("background refresh request");
     assert_ne!(foreground, background);
+    let transport_of = |request| {
+        events.iter().find_map(|event| match event {
+            Event::Started { id, transport, .. } if *id == request => Some(*transport),
+            _ => None,
+        })
+    };
+    assert_eq!(transport_of(foreground), Some(Some(Transport::Udp)));
+    assert_eq!(transport_of(background), Some(None));
 
     let foreground_events = events_of(&events, foreground);
     assert!(foreground_events.contains(&Event::CacheLookup { id: foreground }));
@@ -1545,12 +1560,16 @@ async fn doh_listener_reports_the_same_lifecycle_as_in_process_requests() {
     let id = request_id_for(&events, "doh.example");
     let mine = events_of(&events, id);
     let Some(Event::Started {
-        qname, background, ..
+        qname,
+        transport,
+        background,
+        ..
     }) = mine.first()
     else {
         panic!("first event must be request_started: {mine:#?}");
     };
     assert_eq!(qname, "doh.example");
+    assert_eq!(*transport, Some(Transport::Doh));
     assert!(!background);
     assert_eq!(
         mine[1..],
@@ -1628,7 +1647,13 @@ async fn doh_listener_reports_the_same_lifecycle_as_in_process_requests() {
     let events = recorder.drain();
     let id = request_id_for(&events, "doh.example");
     let mine = events_of(&events, id);
-    assert!(matches!(mine.first(), Some(Event::Started { .. })));
+    assert!(matches!(
+        mine.first(),
+        Some(Event::Started {
+            transport: Some(Transport::Doh),
+            ..
+        })
+    ));
     assert_eq!(
         mine[1..],
         [
@@ -2265,5 +2290,44 @@ async fn a_request_whose_inflight_query_is_dropped_queries_by_itself() {
             transport: Transport::Udp,
         }),
         "{follower_events:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_tagged_handle_reports_its_transport_on_both_paths() {
+    let (engine, recorder) = observed_engine(&static_config("192.0.2.1"));
+    let tcp = engine.clone().with_client_transport(Transport::Tcp);
+
+    tcp.handle_packet(&query("tagged.example"), peer())
+        .await
+        .unwrap();
+    assert!(matches!(
+        tcp.handle_packet_fast(&query("tagged.example"), peer()),
+        Ok(Some(FastPathResponse::Direct(_)))
+    ));
+    // The handle it was cloned from is untouched.
+    // 被克隆的原句柄不受影响。
+    engine
+        .handle_packet(&query("untagged.example"), peer())
+        .await
+        .unwrap();
+
+    let transports: Vec<(String, Option<Transport>)> = recorder
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Started {
+                qname, transport, ..
+            } => Some((qname, transport)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        transports,
+        [
+            ("tagged.example".to_string(), Some(Transport::Tcp)),
+            ("tagged.example".to_string(), Some(Transport::Tcp)),
+            ("untagged.example".to_string(), None),
+        ]
     );
 }
