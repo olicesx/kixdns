@@ -25,6 +25,7 @@ pub(crate) struct ResponseLog<'a> {
     start: Instant,
     enabled: bool,
     rcode: Option<ResponseCode>,
+    answered: bool,
     status: &'static str,
 }
 
@@ -50,6 +51,7 @@ impl<'a> ResponseLog<'a> {
                 && tracing::enabled!(target: "kixdns::engine::phases", tracing::Level::INFO),
             // No response exists yet; never infer an RCODE from a dropped future.
             rcode: None,
+            answered: false,
             status: "cancelled",
         }
     }
@@ -65,6 +67,8 @@ impl<'a> ResponseLog<'a> {
                     .ok()
                     .map(|message| message.metadata.response_code)
             });
+        // An answer exists even if it does not parse as DNS.
+        self.answered = true;
         self.status = "completed";
     }
 
@@ -85,14 +89,13 @@ impl Drop for ResponseLog<'_> {
         // Keep the existing target so deployed RUST_LOG filters still work.
         tracing::info!(
             target: "kixdns::engine::phases",
-            event = if rcode.is_some() { "dns_response" } else { "dns_request_finished" },
+            event = if self.answered { "dns_response" } else { "dns_request_finished" },
             qname = %self.qname,
             qtype = ?self.qtype,
             client_ip = %self.peer.ip(),
             pipeline = self.info.pipeline.as_deref().unwrap_or(""),
             upstream = self.info.upstream.as_deref().unwrap_or(""),
             rcode = rcode.as_deref(),
-            cache = self.info.cache_hit,
             cache_hit = self.info.cache_hit,
             latency_ms = self.start.elapsed().as_millis() as u64,
             status = self.status,

@@ -121,8 +121,12 @@ async fn forwarded_response_is_not_a_cache_hit() {
     let responses = log.responses();
     assert_eq!(responses.len(), 1);
     assert_eq!(
-        responses[0]["cache"], false,
+        responses[0]["cache_hit"], false,
         "a cacheable upstream answer is not a cache hit"
+    );
+    assert!(
+        responses[0].get("cache").is_none(),
+        "the flipped `cache` alias is gone"
     );
 }
 
@@ -149,15 +153,11 @@ async fn info_logs_include_fast_and_slow_cache_hits() {
     assert_eq!(
         responses
             .iter()
-            .map(|r| r["cache"].clone())
+            .map(|r| r["cache_hit"].clone())
             .collect::<Vec<_>>(),
         vec![json!(false), json!(true), json!(true)]
     );
-    assert!(
-        responses
-            .iter()
-            .all(|r| r["cache"] == r["cache_hit"] && r["status"] == "completed")
-    );
+    assert!(responses.iter().all(|r| r["status"] == "completed"));
 }
 
 #[tokio::test]
@@ -282,4 +282,108 @@ async fn cancelled_request_does_not_invent_a_response_or_rcode() {
     assert_eq!(finished.len(), 1);
     assert_eq!(finished[0]["status"], "cancelled");
     assert!(finished[0].get("rcode").is_none());
+}
+
+fn truncated(request: &Message) -> Vec<u8> {
+    let mut response = Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+    response.add_query(request.queries[0].clone());
+    response.metadata.truncation = true;
+    response.to_vec().unwrap()
+}
+
+/// UDP always answers TC=1; the Nth TCP request (0-based) gets `tcp(n, request)`.
+async fn truncating_upstream(
+    tcp: fn(usize, &[u8]) -> Vec<u8>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // UDP first so the shared-port bind does not flake.
+    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = udp.local_addr().unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let task = tokio::spawn(async move {
+        tokio::spawn(async move {
+            let mut buf = [0; 1500];
+            while let Ok((n, peer)) = udp.recv_from(&mut buf).await {
+                let request = Message::from_bytes(&buf[..n]).unwrap();
+                let _ = udp.send_to(&truncated(&request), peer).await;
+            }
+        });
+        let seen = Arc::new(AtomicUsize::new(0));
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut len = [0; 2];
+                while stream.read_exact(&mut len).await.is_ok() {
+                    let mut request = vec![0; u16::from_be_bytes(len) as usize];
+                    stream.read_exact(&mut request).await.unwrap();
+                    let body = tcp(seen.fetch_add(1, Ordering::SeqCst), &request);
+                    let mut out = (body.len() as u16).to_be_bytes().to_vec();
+                    out.extend_from_slice(&body);
+                    let _ = stream.write_all(&out).await;
+                }
+            });
+        }
+    });
+    (addr, task)
+}
+
+fn udp_forwarder(addr: SocketAddr) -> Engine {
+    configured(json!({
+        "settings": {"default_upstream": "127.0.0.1:9"},
+        "pipelines": [{"id": "main", "rules": [{
+            "name": "fwd", "matchers": [{"type": "any"}],
+            "actions": [{"type": "forward", "upstream": addr.to_string(), "transport": "udp"}]
+        }]}]
+    }))
+}
+
+#[tokio::test]
+async fn tcp_fallback_answer_is_labelled_with_the_transport_that_carried_it() {
+    let log = Log::default();
+    let _capture = log.capture();
+    let (addr, task) = truncating_upstream(|_, request| {
+        let request = Message::from_bytes(request).unwrap();
+        let mut response = Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+        response.add_query(request.queries[0].clone());
+        response.to_vec().unwrap()
+    })
+    .await;
+    udp_forwarder(addr)
+        .handle_packet(&query(), peer())
+        .await
+        .unwrap();
+    task.abort();
+    let responses = log.responses();
+    assert_eq!(responses.len(), 1, "{responses:?}");
+    assert_eq!(responses[0]["upstream"], format!("tcp:{addr}"));
+}
+
+#[tokio::test]
+async fn unparsable_answer_delivered_to_the_client_is_still_a_response() {
+    let log = Log::default();
+    let _capture = log.capture();
+    // The first TCP answer is truncated again, so the engine retries over TCP
+    // and relays the second, non-DNS body as-is.
+    let (addr, task) = truncating_upstream(|n, request| {
+        if n == 0 {
+            truncated(&Message::from_bytes(request).unwrap())
+        } else {
+            let mut body = request[..2].to_vec();
+            body.extend_from_slice(&[0xff; 11]);
+            body
+        }
+    })
+    .await;
+    let answer = udp_forwarder(addr)
+        .handle_packet(&query(), peer())
+        .await
+        .unwrap();
+    task.abort();
+    assert_eq!(answer.len(), 13, "the client receives the non-DNS body");
+    assert!(log.events("dns_request_finished").is_empty());
+    let responses = log.responses();
+    assert_eq!(responses.len(), 1, "{responses:?}");
+    assert_eq!(responses[0]["status"], "completed");
+    assert!(responses[0].get("rcode").is_none());
 }

@@ -48,6 +48,8 @@ pub struct CacheLookupContext<'a> {
     pub observed: Observed<'a>,
 }
 
+/// Does not emit the `dns_response` record; only the engine request path logs it.
+/// 不输出 `dns_response` 记录；该记录只由引擎请求路径输出。
 pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<Bytes> {
     check_cache_logged(engine, context, &mut ResponseInfo::default())
 }
@@ -290,6 +292,9 @@ pub(crate) fn check_cache_logged(
 ///
 /// `kind` names the stale-serving path for the observer (client timeout or
 /// upstream failure). / `kind` 标明过期服务的路径（客户端超时或上游失败），用于上报观察者。
+///
+/// Does not emit the `dns_response` record; only the engine request path logs it.
+/// 不输出 `dns_response` 记录；该记录只由引擎请求路径输出。
 pub fn check_stale_cache(
     engine: &Engine,
     context: &CacheLookupContext<'_>,
@@ -501,6 +506,8 @@ pub struct ForwardDecisionContext<'a> {
     pub observed: Observed<'a>,
 }
 
+/// Does not emit the `dns_response` record; only the engine request path logs it.
+/// 不输出 `dns_response` 记录；该记录只由引擎请求路径输出。
 pub async fn handle_forward_decision(
     engine: &Engine,
     context: ForwardDecisionContext<'_>,

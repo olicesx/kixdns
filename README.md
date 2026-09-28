@@ -122,12 +122,15 @@ GeoIP conversion options:
 The logging subscriber is text formatted by default, with RFC 3339 timestamps following the system's local timezone. The default filter is error unless --debug or the RUST_LOG environment variable changes it. The code does not configure JSON log output.
 
 For response statistics, enable `RUST_LOG=warn,kixdns::engine::phases=info`.
-`event="dns_response"` records one answer produced for a parsed client query,
+`event="dns_response"` records one answer produced by the engine,
 including fast-path, fresh/stale cache, static and singleflight answers. It is
-not proof of network delivery. Internal background refreshes and intermediate
-forwarding attempts are excluded. `cache_hit` is true only when the response
-cache supplied the answer; `cache` is a compatibility alias with the same meaning,
-not a cache-insertion flag. RCODE is read from the answer. A failed or cancelled
+not proof of network delivery. Overload SERVFAILs sent directly by the listener
+when its concurrency permits run out bypass the engine and are not recorded.
+Internal background refreshes and intermediate forwarding attempts are excluded.
+`cache_hit` is true only when the response cache supplied the answer. The old
+`cache` field is removed: it meant "cacheable", and reusing the name would have
+silently flipped its meaning. RCODE is read from the answer and omitted when the
+answer does not parse as DNS. A failed or cancelled
 request without an answer uses `event="dns_request_finished"` and `status`, with
 no inferred RCODE. Singleflight followers use `upstream="inflight"` because the
 shared result does not carry the leader's upstream identity.

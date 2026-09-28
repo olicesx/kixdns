@@ -238,6 +238,9 @@ jobs:
       - name: Run DoH integration tests
         run: cargo test --test doh_integration
 
+      - name: Run response log tests
+        run: cargo test --test response_log
+
   lint-linux:
     name: Lint (clippy + fmt)
     runs-on: ubuntu-24.04
