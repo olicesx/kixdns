@@ -433,6 +433,8 @@ pub struct StaticDecisionContext<'a> {
 
 /// Handles Decision::Static.
 /// Parses request, builds response, updates cache, and returns bytes.
+/// Does not emit the `dns_response` record; only the engine request path logs it.
+/// 不输出 `dns_response` 记录；该记录只由引擎请求路径输出。
 pub fn handle_static_decision(
     engine: &Engine,
     context: &StaticDecisionContext<'_>,
