@@ -3,6 +3,7 @@ use crate::cache::CacheEntry;
 use crate::config::{Action, Transport};
 use crate::engine::observation::{Observed, response_decision_kind};
 use crate::engine::response::{extract_ttl, extract_ttl_for_refresh};
+use crate::engine::response_log::ResponseInfo;
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
 use crate::engine::types::EngineInner;
 use crate::engine::upstream::UpstreamFailure;
@@ -17,7 +18,7 @@ use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::{DNSClass, Record, RecordType};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Result of the Forward phase
 pub enum ForwardResult {
@@ -47,7 +48,17 @@ pub struct CacheLookupContext<'a> {
     pub observed: Observed<'a>,
 }
 
+/// Does not emit the `dns_response` record; only the engine request path logs it.
+/// 不输出 `dns_response` 记录；该记录只由引擎请求路径输出。
 pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<Bytes> {
+    check_cache_logged(engine, context, &mut ResponseInfo::default())
+}
+
+pub(crate) fn check_cache_logged(
+    engine: &Engine,
+    context: &CacheLookupContext<'_>,
+    response: &mut ResponseInfo,
+) -> Option<Bytes> {
     let CacheLookupContext {
         state,
         qname: qname_ref,
@@ -56,7 +67,7 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
         pipeline_id,
         dedupe_hash,
         tx_id,
-        start,
+        start: _,
         peer,
         observed,
     } = *context;
@@ -185,10 +196,12 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
                         },
                     );
                 }
+                response.cache_hit = true;
+                response.upstream =
+                    Some(hit.upstream.clone().unwrap_or_else(|| Arc::from("static")));
                 return Some(resp_bytes.freeze());
             } else {
                 // Cache hit is valid
-                let latency = start.elapsed();
 
                 // clone bytes and rewrite transaction ID to match requester / 克隆字节并重写事务 ID 以匹配请求者
                 let mut resp_bytes = BytesMut::with_capacity(hit.bytes.len());
@@ -249,21 +262,9 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
                     );
                 }
 
-                debug!(
-                    event = "dns_response",
-                    upstream = %hit.source(),
-                    qname = %qname_ref,
-                    qtype = ?qtype,
-                    rcode = ?hit.rcode,
-                    original_ttl = hit.original_ttl,
-                    refresh_ttl = hit.refresh_ttl,
-                    elapsed_secs = elapsed,
-                    latency_ms = latency.as_millis() as u64,
-                    client_ip = %peer.ip(),
-                    pipeline = %pipeline_id,
-                    cache = true,
-                    "cache hit"
-                );
+                response.cache_hit = true;
+                response.upstream =
+                    Some(hit.upstream.clone().unwrap_or_else(|| Arc::from("static")));
 
                 if let Some((observer, ctx)) = observed {
                     observer.cache_hit(
@@ -291,10 +292,22 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
 ///
 /// `kind` names the stale-serving path for the observer (client timeout or
 /// upstream failure). / `kind` 标明过期服务的路径（客户端超时或上游失败），用于上报观察者。
+///
+/// Does not emit the `dns_response` record; only the engine request path logs it.
+/// 不输出 `dns_response` 记录；该记录只由引擎请求路径输出。
 pub fn check_stale_cache(
     engine: &Engine,
     context: &CacheLookupContext<'_>,
     kind: CacheHitKind,
+) -> Option<Bytes> {
+    check_stale_cache_logged(engine, context, kind, &mut ResponseInfo::default())
+}
+
+pub(crate) fn check_stale_cache_logged(
+    engine: &Engine,
+    context: &CacheLookupContext<'_>,
+    kind: CacheHitKind,
+    response: &mut ResponseInfo,
 ) -> Option<Bytes> {
     let CacheLookupContext {
         state,
@@ -396,6 +409,8 @@ pub fn check_stale_cache(
                     },
                 );
             }
+            response.cache_hit = true;
+            response.upstream = Some(hit.upstream.clone().unwrap_or_else(|| Arc::from("static")));
             return Some(resp_bytes.freeze());
         }
     }
@@ -418,6 +433,8 @@ pub struct StaticDecisionContext<'a> {
 
 /// Handles Decision::Static.
 /// Parses request, builds response, updates cache, and returns bytes.
+/// Does not emit the `dns_response` record; only the engine request path logs it.
+/// 不输出 `dns_response` 记录；该记录只由引擎请求路径输出。
 pub fn handle_static_decision(
     engine: &Engine,
     context: &StaticDecisionContext<'_>,
@@ -431,8 +448,8 @@ pub fn handle_static_decision(
         pipeline_id: current_pipeline_id,
         dedupe_hash,
         min_ttl,
-        start,
-        peer,
+        start: _,
+        peer: _,
         uses_client_ip,
     } = *context;
     // Need full request for building response / 需要完整请求来构建响应
@@ -458,19 +475,6 @@ pub fn handle_static_decision(
         );
     }
 
-    let latency = start.elapsed();
-    info!(
-        event = "dns_response",
-        upstream = "static",
-        qname = %qname,
-        qtype = ?qtype,
-        rcode = ?rcode,
-        latency_ms = latency.as_millis() as u64,
-        client_ip = %peer.ip(),
-        pipeline = %current_pipeline_id,
-        cache = false,
-        "static response"
-    );
     Ok(resp_bytes)
 }
 
@@ -504,9 +508,19 @@ pub struct ForwardDecisionContext<'a> {
     pub observed: Observed<'a>,
 }
 
+/// Does not emit the `dns_response` record; only the engine request path logs it.
+/// 不输出 `dns_response` 记录；该记录只由引擎请求路径输出。
 pub async fn handle_forward_decision(
     engine: &Engine,
     context: ForwardDecisionContext<'_>,
+) -> anyhow::Result<ForwardResult> {
+    handle_forward_decision_logged(engine, context, &mut ResponseInfo::default()).await
+}
+
+pub(crate) async fn handle_forward_decision_logged(
+    engine: &Engine,
+    context: ForwardDecisionContext<'_>,
+    response: &mut ResponseInfo,
 ) -> anyhow::Result<ForwardResult> {
     let ForwardDecisionContext {
         state,
@@ -535,6 +549,7 @@ pub async fn handle_forward_decision(
         observed,
     } = context;
 
+    response.upstream = Some(Arc::from(upstream));
     // ECS request rewriting (RFC 7871): modify outgoing packet before forwarding.
     // Only runs on cache-miss path — cache hits and static responses are unaffected.
     //
@@ -591,6 +606,7 @@ pub async fn handle_forward_decision(
                                 resp_mut[0] = id_bytes[0];
                                 resp_mut[1] = id_bytes[1];
                             }
+                            response.upstream = Some(Arc::from("inflight"));
                             return Ok(ForwardResult::Success(resp_mut.freeze()));
                         }
                         Err(e) => return Err(anyhow::anyhow!("{}", e)),
@@ -640,6 +656,7 @@ pub async fn handle_forward_decision(
                             resp_mut[0] = id_bytes[0];
                             resp_mut[1] = id_bytes[1];
                         }
+                        response.upstream = Some(Arc::from("inflight"));
                         return Ok(ForwardResult::Success(resp_mut.freeze()));
                     }
                     Err(e) => return Err(anyhow::anyhow!("{}", e)),
@@ -660,6 +677,7 @@ pub async fn handle_forward_decision(
 
     match resp {
         Ok((raw, actual_upstream)) => {
+            response.upstream = Some(Arc::from(actual_upstream.as_str()));
             let (rcode, ttl_secs_cache, ttl_secs_refresh, msg_opt, truncated) = if response_matchers
                 .is_empty()
                 && response_actions_on_match.is_empty()
@@ -704,7 +722,7 @@ pub async fn handle_forward_decision(
             let enable_tcp_fallback = state.pipeline.settings.enable_tcp_fallback;
             if truncated && transport == Some(Transport::Udp) && enable_tcp_fallback {
                 tracing::debug!(event = "tc_flag_retry", upstream = %upstream, "response truncated, retrying with tcp");
-                let (tcp_resp, _) = crate::engine::upstream::forward_upstream(
+                let (tcp_resp, tcp_upstream) = crate::engine::upstream::forward_upstream(
                     engine,
                     packet,
                     upstream,
@@ -718,6 +736,7 @@ pub async fn handle_forward_decision(
                     guard.defuse();
                     engine.notify_inflight_waiters(dedupe_hash, &tcp_resp).await;
                 }
+                response.upstream = Some(Arc::from(tcp_upstream));
                 return Ok(ForwardResult::Success(tcp_resp));
             }
 
@@ -837,21 +856,6 @@ pub async fn handle_forward_decision(
                 }
                 engine.notify_inflight_waiters(dedupe_hash, &raw).await;
 
-                info!(
-                    event = "dns_response",
-                    upstream = %actual_upstream,
-                    qname = %qname,
-                    qtype = ?qtype,
-                    rcode = ?rcode,
-                    latency_ms = start.elapsed().as_millis() as u64,
-                    client_ip = %peer.ip(),
-                    pipeline = %pipeline_id,
-                    cache = effective_ttl > Duration::from_secs(0),
-                    resp_match = resp_match_ok,
-                    transport = ?transport,
-                    "forwarded"
-                );
-
                 return Ok(ForwardResult::Success(raw));
             }
 
@@ -920,6 +924,7 @@ pub async fn handle_forward_decision(
                         g.defuse();
                     }
                     engine.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
+                    response.upstream = Some(ctx.upstream);
                     Ok(ForwardResult::Success(ctx.raw))
                 }
                 ResponseActionResult::Static { bytes, rcode, .. } => {
@@ -942,6 +947,7 @@ pub async fn handle_forward_decision(
                         g.defuse();
                     }
                     engine.notify_inflight_waiters(dedupe_hash, &bytes).await;
+                    response.upstream = Some(Arc::from("static"));
                     Ok(ForwardResult::Success(bytes))
                 }
                 ResponseActionResult::Jump {
@@ -970,6 +976,7 @@ pub async fn handle_forward_decision(
                             skip_cache,
                             observed,
                         },
+                        response,
                     )
                     .await?;
 
@@ -1019,7 +1026,7 @@ pub async fn handle_forward_decision(
 
                 // RFC 8767: Try to serve stale cache entry before returning SERVFAIL
                 // RFC 8767: 在返回 SERVFAIL 之前尝试提供过期缓存
-                if let Some(stale_bytes) = check_stale_cache(
+                if let Some(stale_bytes) = check_stale_cache_logged(
                     engine,
                     &CacheLookupContext {
                         state,
@@ -1036,6 +1043,7 @@ pub async fn handle_forward_decision(
                         observed: if skip_cache { None } else { observed },
                     },
                     CacheHitKind::StaleUpstreamFailure,
+                    response,
                 ) {
                     warn!(
                         event = "serve_stale_on_upstream_failure",
@@ -1058,7 +1066,7 @@ pub async fn handle_forward_decision(
 
                 let rcode = ResponseCode::ServFail;
                 warn!(
-                   event = "dns_response",
+                   event = "upstream_failure",
                    upstream = %upstream,
                    qname = %qname,
                    qtype = ?qtype,
@@ -1150,6 +1158,7 @@ pub async fn handle_forward_decision(
                             g.defuse();
                         }
                         engine.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
+                        response.upstream = Some(ctx.upstream);
                         Ok(ForwardResult::Success(ctx.raw))
                     }
                     ResponseActionResult::Static { bytes, rcode, .. } => {
@@ -1172,6 +1181,7 @@ pub async fn handle_forward_decision(
                             g.defuse();
                         }
                         engine.notify_inflight_waiters(dedupe_hash, &bytes).await;
+                        response.upstream = Some(Arc::from("static"));
                         Ok(ForwardResult::Success(bytes))
                     }
                     ResponseActionResult::Jump {
@@ -1209,6 +1219,7 @@ pub async fn handle_forward_decision(
                                 skip_cache,
                                 observed,
                             },
+                            response,
                         )
                         .await?;
 

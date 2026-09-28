@@ -294,7 +294,7 @@ pub async fn forward_upstream(
         let (res, proto, via): (anyhow::Result<Bytes>, &str, Transport) = match transport_for_addr {
             Transport::Udp => {
                 match forward_udp_smart_via(engine, packet, addr, timeout_dur, true).await {
-                    Ok((bytes, via)) => (Ok(bytes), "udp", via),
+                    Ok((bytes, via)) => (Ok(bytes), via_label(via), via),
                     Err(err) => (Err(err), "udp", Transport::Udp),
                 }
             }
@@ -444,7 +444,7 @@ pub async fn forward_upstream(
                     )
                     .await
                     {
-                        Ok((bytes, via)) => ("udp", Ok(bytes), via),
+                        Ok((bytes, via)) => (via_label(via), Ok(bytes), via),
                         Err(err) => ("udp", Err(err), Transport::Udp),
                     }
                 }
@@ -611,6 +611,11 @@ fn report_aborted(observed: Observed<'_>, pending: &[(String, Transport, std::ti
             );
         }
     }
+}
+
+/// Label for the transport that carried a UDP-path answer (TC fallback may use TCP) / UDP 路径应答实际承载传输的标签（TC 回退可能走 TCP）
+fn via_label(via: Transport) -> &'static str {
+    if via == Transport::Tcp { "tcp" } else { "udp" }
 }
 
 /// Transport named by a `tcp_udp` race label / `tcp_udp` 竞争标签对应的传输

@@ -33,6 +33,7 @@ use crate::proto_utils::parse_quick;
 
 use super::observation::{ObservedRequest, report_decision, report_matched_rules};
 use super::response::build_fast_static_response;
+use super::response_log::ResponseLog;
 use super::rules::RuleCacheRecord;
 use super::types::{EngineInner, FastPathResponse, build_cache_namespaces};
 use super::utils::{engine_helpers, is_refreshing};
@@ -447,6 +448,7 @@ impl Engine {
         packet: &[u8],
         peer: SocketAddr,
     ) -> anyhow::Result<Option<FastPathResponse>> {
+        let log_start = Instant::now();
         // Quick parsing, avoiding full Message parsing and massive allocations / 快速解析，避免完整 Message 解析和大量分配
         // Use stack buffer to avoid String allocation / 使用栈上缓冲区避免 String 分配
         let mut qname_buf = [0u8; 256];
@@ -605,6 +607,18 @@ impl Engine {
                             },
                         );
                     }
+                    let mut log = ResponseLog::new(
+                        qname_str,
+                        qtype,
+                        peer,
+                        pipeline_id.clone(),
+                        log_start,
+                        false,
+                    );
+                    log.info.cache_hit = true;
+                    log.info.upstream =
+                        Some(hit.upstream.clone().unwrap_or_else(|| Arc::from("static")));
+                    log.answered(&hit.bytes);
                     return Ok(Some(FastPathResponse::CacheHit {
                         cached: hit.bytes.clone(),
                         tx_id: q.tx_id,
@@ -645,6 +659,16 @@ impl Engine {
                         },
                     );
                 }
+                let mut log = ResponseLog::new(
+                    qname_str,
+                    qtype,
+                    peer,
+                    pipeline_id.clone(),
+                    log_start,
+                    false,
+                );
+                log.info.upstream = Some(Arc::from("static"));
+                log.answered(&resp);
                 return Ok(Some(FastPathResponse::Direct(resp)));
             }
         }
@@ -694,6 +718,16 @@ impl Engine {
                             FastPathAnswer::CachedRules { record: &record },
                         );
                     }
+                    let mut log = ResponseLog::new(
+                        qname_str,
+                        qtype,
+                        peer,
+                        pipeline_id.clone(),
+                        log_start,
+                        false,
+                    );
+                    log.info.upstream = Some(Arc::from("static"));
+                    log.answered(&resp);
                     return Ok(Some(FastPathResponse::Direct(resp)));
                 }
             }
@@ -864,6 +898,14 @@ impl Engine {
 
         let qname_ref = &qname_cow;
         let start = std::time::Instant::now();
+        let mut response_log = ResponseLog::new(
+            qname_ref,
+            qtype,
+            peer,
+            pipeline_id.clone(),
+            start,
+            skip_cache,
+        );
 
         // Observer handle for this request: borrows the parsed query and
         // reports request_finished when dropped, so cancelled requests
@@ -942,7 +984,7 @@ impl Engine {
                 if let Some(observed) = &observed {
                     observed.observer.cache_lookup(&observed.ctx);
                 }
-                if let Some(resp_bytes) = phases::check_cache(
+                if let Some(resp_bytes) = phases::check_cache_logged(
                     self,
                     &phases::CacheLookupContext {
                         state: &state,
@@ -956,6 +998,7 @@ impl Engine {
                         peer: &peer,
                         observed: observed_ctx,
                     },
+                    &mut response_log.info,
                 ) {
                     return Ok(resp_bytes);
                 }
@@ -1029,7 +1072,7 @@ impl Engine {
                         if fresh_hit.inserted_at.elapsed().as_secs() < fresh_hit.original_ttl as u64
                         {
                             // Fresh data available! Serve it.
-                            if let Some(fresh_bytes) = phases::check_cache(
+                            if let Some(fresh_bytes) = phases::check_cache_logged(
                                 self,
                                 &phases::CacheLookupContext {
                                     state: &state,
@@ -1043,6 +1086,7 @@ impl Engine {
                                     peer: &peer,
                                     observed: observed_ctx,
                                 },
+                                &mut response_log.info,
                             ) {
                                 tracing::debug!(
                                     event = "serve_fresh_after_client_wait",
@@ -1057,7 +1101,7 @@ impl Engine {
 
                     // Client timeout expired - serve stale response
                     // 客户端超时 - 返回过期缓存响应
-                    if let Some(stale_bytes) = phases::check_stale_cache(
+                    if let Some(stale_bytes) = phases::check_stale_cache_logged(
                         self,
                         &phases::CacheLookupContext {
                             state: &state,
@@ -1072,6 +1116,7 @@ impl Engine {
                             observed: observed_ctx,
                         },
                         CacheHitKind::StaleClientTimeout,
+                        &mut response_log.info,
                     ) {
                         tracing::debug!(
                             event = "serve_stale_on_client_timeout",
@@ -1197,6 +1242,7 @@ impl Engine {
                     if let Some(&idx) = cfg.pipeline_id_index.get(pipeline.as_ref()) {
                         let p = &cfg.pipelines[idx];
                         current_pipeline_id = p.id.clone();
+                        response_log.info.pipeline = Some(current_pipeline_id.clone());
                         current_uses_client_ip = p.uses_client_ip;
                         if let Some(observed) = &observed {
                             observed
@@ -1248,6 +1294,7 @@ impl Engine {
                         anyhow::bail!("unresolved pipeline jump");
                     }
                     Decision::Static { rcode, answers } => {
+                        response_log.info.upstream = Some(Arc::from("static"));
                         return phases::handle_static_decision(
                             self,
                             &phases::StaticDecisionContext {
@@ -1279,7 +1326,7 @@ impl Engine {
                         continue_on_miss: _,
                         allow_reuse,
                     } => {
-                        let res = phases::handle_forward_decision(
+                        let res = phases::handle_forward_decision_logged(
                             self,
                             phases::ForwardDecisionContext {
                                 state: &state,
@@ -1307,6 +1354,7 @@ impl Engine {
                                 reused_response: &mut reused_response,
                                 observed: observed_ctx,
                             },
+                            &mut response_log.info,
                         )
                         .await;
 
@@ -1376,6 +1424,7 @@ impl Engine {
             }
         }
         .await;
+        response_log.finish(&result);
         if let Some(observed) = observed.as_mut() {
             observed.set_status(if result.is_ok() {
                 RequestStatus::Completed
