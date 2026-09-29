@@ -2332,3 +2332,91 @@ async fn a_tagged_handle_reports_its_transport_on_both_paths() {
         ]
     );
 }
+
+/// A query whose dotted name is 256 bytes long. The fast path's own parser
+/// accepts it, but hickory rejects the name when the response is built: a
+/// name is at most 255 bytes on the wire.
+/// 点分形式 256 字节的查询名。快速路径自己的解析器接受它，构造应答时 hickory 拒绝：
+/// 名字在线格式里最多 255 字节。
+fn overlong_query() -> (Vec<u8>, String) {
+    let labels = [
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(51),
+        "blocked".to_string(),
+        "test".to_string(),
+    ];
+    let name = labels.join(".");
+    assert_eq!(name.len(), 256);
+    let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in &labels {
+        packet.push(label.len() as u8);
+        packet.extend_from_slice(label.as_bytes());
+    }
+    packet.extend_from_slice(&[0, 0, 1, 0, 1]); // root, QTYPE A, QCLASS IN
+    (packet, name)
+}
+
+#[tokio::test]
+async fn a_fast_path_answer_that_cannot_be_built_is_reported_as_failed() {
+    let raw = serde_json::json!({
+        "settings": { "default_upstream": "127.0.0.1:9" },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "block",
+                "matchers": [{ "type": "domain_suffix", "value": "blocked.test" }],
+                "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    let (packet, name) = overlong_query();
+
+    // The listener answers SERVFAIL by itself; the engine still reports the
+    // request, up to the decision it made and the reason it failed.
+    // 由监听器自己回 SERVFAIL；引擎照样上报这个请求：做到哪一步的决策，以及失败原因。
+    let error = engine
+        .handle_packet_fast(&packet, peer())
+        .expect_err("hickory rejects a name longer than 255 bytes");
+    let events = recorder.drain();
+    let id = request_id_for(&events, &name);
+    assert_eq!(
+        events_of(&events, id),
+        vec![
+            started(id, &name),
+            Event::Pipeline {
+                id,
+                pipeline: "main".into()
+            },
+            Event::CacheLookup { id },
+            Event::CacheMiss { id },
+            Event::Rule {
+                id,
+                pipeline: "main".into(),
+                rule: "block".into(),
+                phase: RulePhase::Request,
+                decision: DecisionKind::Static,
+                fast_path: true,
+            },
+            Event::Decision {
+                id,
+                pipeline: "main".into(),
+                rule: Some("block".into()),
+                detail: Detail::Static {
+                    rcode: ResponseCode::NXDomain,
+                    answers: 0,
+                },
+            },
+            Event::Finished {
+                id,
+                status: RequestStatus::Failed,
+            },
+        ]
+    );
+    let failed = recorder.outcome(id);
+    assert_eq!(failed.response, None);
+    assert_eq!(failed.error, Some(format!("{error:#}")));
+}

@@ -332,7 +332,10 @@ impl Engine {
 
     /// Report a request that `handle_packet_fast` answered without the async
     /// path: the whole lifecycle is emitted in one batch at the answering site.
+    /// `response` is the answer, or the error that stopped the engine from
+    /// building one; the listener then answers SERVFAIL by itself.
     /// 上报由 handle_packet_fast 直接应答的请求：整个生命周期在应答处一次性上报。
+    /// `response` 是应答，或者引擎没能构造出应答的错误；此时由监听器自己回 SERVFAIL。
     fn observe_fast_path(
         &self,
         observer: &dyn EngineObserver,
@@ -340,7 +343,7 @@ impl Engine {
         ctx: &RequestContext<'_>,
         pipeline_id: &str,
         answer: FastPathAnswer<'_>,
-        response: &[u8],
+        response: Result<&[u8], &anyhow::Error>,
     ) {
         observer.request_started(ctx);
         observer.pipeline_selected(ctx, pipeline_id);
@@ -417,13 +420,18 @@ impl Engine {
                 );
             }
         }
+        let error = response.as_ref().err().map(|error| format!("{error:#}"));
         observer.request_finished(
             ctx,
             &RequestOutcome {
                 latency: start.elapsed(),
-                status: RequestStatus::Completed,
-                response: Some(response),
-                error: None,
+                status: if error.is_some() {
+                    RequestStatus::Failed
+                } else {
+                    RequestStatus::Completed
+                },
+                response: response.ok(),
+                error: error.as_deref(),
             },
         );
     }
@@ -613,7 +621,7 @@ impl Engine {
                                 elapsed_secs,
                                 source: cached_source(hit.upstream.as_deref()),
                             },
-                            &hit.bytes,
+                            Ok(&hit.bytes),
                         );
                     }
                     let mut log = ResponseLog::new(
@@ -651,10 +659,12 @@ impl Engine {
                     q.edns_present,
                 )
             {
-                let resp = build_fast_static_response(
+                // Report before `?`: a response that cannot be built still ends the
+                // request here, and the listener answers SERVFAIL by itself.
+                // 在 `?` 之前上报：构造不出应答的请求也在这里结束，由监听器自己回 SERVFAIL。
+                let built = build_fast_static_response(
                     q.tx_id, qname_str, q.qtype, q.qclass, rcode, &answers,
-                )?;
-                self.incr_fastpath_hits();
+                );
                 if let Some((observer, start)) = observed {
                     self.observe_fast_path(
                         observer,
@@ -666,9 +676,11 @@ impl Engine {
                             rcode,
                             answers: answers.len(),
                         },
-                        &resp,
+                        built.as_deref(),
                     );
                 }
+                let resp = built?;
+                self.incr_fastpath_hits();
                 let mut log = ResponseLog::new(
                     qname_str,
                     qtype,
@@ -715,10 +727,11 @@ impl Engine {
                     include_ip_in_hash,
                 ) && let Decision::Static { rcode, answers } = entry.decision.as_ref()
                 {
-                    let resp = build_fast_static_response(
+                    // Report before `?`, as for the compiled static rule above.
+                    // 在 `?` 之前上报，同上面的编译静态规则。
+                    let built = build_fast_static_response(
                         q.tx_id, qname_str, q.qtype, q.qclass, *rcode, answers,
-                    )?;
-                    self.incr_fastpath_hits();
+                    );
                     if let Some((observer, start)) = observed {
                         self.observe_fast_path(
                             observer,
@@ -726,9 +739,11 @@ impl Engine {
                             &self.fast_path_context(peer, qname_str, qtype, qclass),
                             &pipeline_id,
                             FastPathAnswer::CachedRules { record: &record },
-                            &resp,
+                            built.as_deref(),
                         );
                     }
+                    let resp = built?;
+                    self.incr_fastpath_hits();
                     let mut log = ResponseLog::new(
                         qname_str,
                         qtype,
