@@ -1,7 +1,7 @@
 use super::Engine;
 use crate::cache::CacheEntry;
 use crate::config::{Action, Transport};
-use crate::engine::observation::{Observed, response_decision_kind};
+use crate::engine::observation::{Observed, cached_source, response_decision_kind};
 use crate::engine::response::{extract_ttl, extract_ttl_for_refresh};
 use crate::engine::response_log::ResponseInfo;
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
@@ -193,6 +193,7 @@ pub(crate) fn check_cache_logged(
                             kind: CacheHitKind::Stale,
                             remaining_ttl: None,
                             original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
+                            source: cached_source(hit.upstream.as_deref()),
                         },
                     );
                 }
@@ -275,6 +276,7 @@ pub(crate) fn check_cache_logged(
                                 hit.original_ttl.saturating_sub(elapsed) as u64,
                             )),
                             original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
+                            source: cached_source(hit.upstream.as_deref()),
                         },
                     );
                 }
@@ -406,6 +408,7 @@ pub(crate) fn check_stale_cache_logged(
                         kind,
                         remaining_ttl: None,
                         original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
+                        source: cached_source(hit.upstream.as_deref()),
                     },
                 );
             }
@@ -597,6 +600,9 @@ pub(crate) async fn handle_forward_decision_logged(
                 if let Some(mut rx) = rx
                     && rx.changed().await.is_ok()
                 {
+                    if let Some((observer, ctx)) = observed {
+                        observer.inflight_joined(ctx);
+                    }
                     let result = rx.borrow().clone();
                     match &result {
                         Ok(bytes) => {
@@ -647,6 +653,9 @@ pub(crate) async fn handle_forward_decision_logged(
             if let Some(mut rx) = rx
                 && rx.changed().await.is_ok()
             {
+                if let Some((observer, ctx)) = observed {
+                    observer.inflight_joined(ctx);
+                }
                 let result = rx.borrow().clone();
                 match &result {
                     Ok(bytes) => {

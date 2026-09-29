@@ -4,7 +4,7 @@
 //! tests assert the events the engine reports for static rules (slow and
 //! fast path), response cache hits and misses (fresh and stale), rule cache
 //! lookups and replays, rule evaluation and decisions, upstream attempts,
-//! cancelled requests and configuration reloads.
+//! shared in-flight queries, cancelled requests and configuration reloads.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -19,12 +19,13 @@ use hickory_proto::serialize::binary::BinDecodable;
 
 use kixdns::config::{Transport, parse_config};
 use kixdns::doh_server::run_doh_with_listener;
-use kixdns::engine::{Engine, FastPathResponse};
+use kixdns::engine::{Engine, FastPathResponse, PreParsedData};
 use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::observe::{
-    CacheHit, CacheHitKind, ConfigLoaded, ConfigReloadFailed, DecisionDetail, DecisionKind,
-    DecisionMade, EngineObserver, RequestContext, RequestOutcome, RequestStatus, RuleCacheLookup,
-    RuleEvaluated, RuleMatched, RulePhase, UpstreamAttempt, UpstreamOutcome, UpstreamResult,
+    CacheHit, CacheHitKind, ClientTransport, ConfigLoaded, ConfigReloadFailed, DecisionDetail,
+    DecisionKind, DecisionMade, EngineObserver, RequestContext, RequestOutcome, RequestStatus,
+    RuleCacheLookup, RuleEvaluated, RuleMatched, RulePhase, UpstreamAttempt, UpstreamOutcome,
+    UpstreamResult,
 };
 
 #[ctor::ctor]
@@ -78,6 +79,7 @@ enum Event {
         qname: String,
         listener: String,
         client: SocketAddr,
+        transport: Option<ClientTransport>,
         background: bool,
     },
     Finished {
@@ -128,6 +130,9 @@ enum Event {
     CacheMiss {
         id: u64,
     },
+    InflightJoined {
+        id: u64,
+    },
     UpstreamAttempt {
         id: u64,
         upstream: String,
@@ -157,6 +162,21 @@ enum Event {
 #[derive(Default)]
 struct Recorder {
     events: Mutex<Vec<Event>>,
+    /// `request_finished` payloads, kept apart from `events` so the lifecycle
+    /// sequences asserted elsewhere stay unchanged.
+    /// request_finished 的载荷，与 events 分开记录，其他用例断言的生命周期序列保持不变。
+    outcomes: Mutex<Vec<Outcome>>,
+    /// `CacheHit::source` per request, kept apart for the same reason.
+    /// 每个请求的 CacheHit::source，同样分开记录。
+    cache_sources: Mutex<Vec<(u64, Option<String>)>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Outcome {
+    id: u64,
+    status: RequestStatus,
+    response: Option<Vec<u8>>,
+    error: Option<String>,
 }
 
 impl Recorder {
@@ -166,6 +186,19 @@ impl Recorder {
 
     fn events(&self) -> Vec<Event> {
         self.events.lock().unwrap().clone()
+    }
+
+    fn outcome(&self, id: u64) -> Outcome {
+        let outcomes = self.outcomes.lock().unwrap();
+        outcomes
+            .iter()
+            .find(|outcome| outcome.id == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no request_finished for {id}: {outcomes:#?}"))
+    }
+
+    fn cache_sources(&self) -> Vec<(u64, Option<String>)> {
+        self.cache_sources.lock().unwrap().clone()
     }
 
     /// Remove and return everything recorded so far.
@@ -195,14 +228,21 @@ impl EngineObserver for Recorder {
             qname: ctx.qname.to_string(),
             listener: ctx.listener_label.to_string(),
             client: ctx.client,
+            transport: ctx.transport,
             background: ctx.background_refresh,
         });
     }
 
-    fn request_finished(&self, ctx: &RequestContext<'_>, outcome: &RequestOutcome) {
+    fn request_finished(&self, ctx: &RequestContext<'_>, outcome: &RequestOutcome<'_>) {
         self.push(Event::Finished {
             id: ctx.request_id,
             status: outcome.status,
+        });
+        self.outcomes.lock().unwrap().push(Outcome {
+            id: ctx.request_id,
+            status: outcome.status,
+            response: outcome.response.map(<[u8]>::to_vec),
+            error: outcome.error.map(str::to_string),
         });
     }
 
@@ -257,7 +297,11 @@ impl EngineObserver for Recorder {
         self.push(Event::CacheLookup { id: ctx.request_id });
     }
 
-    fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit) {
+    fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit<'_>) {
+        self.cache_sources
+            .lock()
+            .unwrap()
+            .push((ctx.request_id, event.source.map(str::to_string)));
         self.push(Event::CacheHit {
             id: ctx.request_id,
             kind: event.kind,
@@ -268,6 +312,10 @@ impl EngineObserver for Recorder {
 
     fn cache_miss(&self, ctx: &RequestContext<'_>) {
         self.push(Event::CacheMiss { id: ctx.request_id });
+    }
+
+    fn inflight_joined(&self, ctx: &RequestContext<'_>) {
+        self.push(Event::InflightJoined { id: ctx.request_id });
     }
 
     fn upstream_attempt(&self, ctx: &RequestContext<'_>, event: &UpstreamAttempt<'_>) {
@@ -343,6 +391,21 @@ fn rcode_of(bytes: &[u8]) -> ResponseCode {
     Message::from_bytes(bytes).unwrap().metadata.response_code
 }
 
+/// One A record of the given TTL for the query's question.
+/// 为查询的问题生成一条给定 TTL 的 A 记录应答。
+fn echo_answer(query: &[u8], ttl: u32) -> Option<Vec<u8>> {
+    let request = Message::from_bytes(query).ok()?;
+    let question = request.queries.first()?.clone();
+    let mut response = Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+    response.add_query(question.clone());
+    response.add_answer(Record::from_rdata(
+        question.name().clone(),
+        ttl,
+        RData::A(A(std::net::Ipv4Addr::LOCALHOST)),
+    ));
+    response.to_vec().ok()
+}
+
 /// Minimal UDP upstream that answers every query with one A record of the
 /// given TTL. Aborting the returned task closes its socket.
 /// 最小 UDP 上游：以给定 TTL 的一条 A 记录应答所有查询；中止返回的任务即关闭其 socket。
@@ -352,24 +415,77 @@ async fn spawn_echo_upstream(ttl: u32) -> (String, tokio::task::JoinHandle<()>) 
     let task = tokio::spawn(async move {
         let mut buf = [0u8; 1500];
         while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
-            let Ok(request) = Message::from_bytes(&buf[..n]) else {
-                continue;
-            };
-            let Some(question) = request.queries.first().cloned() else {
-                continue;
-            };
-            let mut response =
-                Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
-            response.add_query(question.clone());
-            response.add_answer(Record::from_rdata(
-                question.name().clone(),
-                ttl,
-                RData::A(A(std::net::Ipv4Addr::LOCALHOST)),
-            ));
-            let _ = socket.send_to(&response.to_vec().unwrap(), peer).await;
+            if let Some(response) = echo_answer(&buf[..n], ttl) {
+                let _ = socket.send_to(&response, peer).await;
+            }
         }
     });
     (addr, task)
+}
+
+/// UDP upstream that holds every answer until `release` fires, then answers
+/// what it holds and everything after. It counts the queries it receives.
+/// 扣住所有应答直到 `release` 触发，之后应答已收到的和此后的查询；统计收到的查询数。
+struct HeldUpstream {
+    addr: String,
+    queries: Arc<std::sync::atomic::AtomicUsize>,
+    release: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl HeldUpstream {
+    async fn spawn() -> Self {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap().to_string();
+        let queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (release, mut released) = tokio::sync::oneshot::channel::<()>();
+        let counter = queries.clone();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            let mut open = false;
+            let mut buf = [0u8; 1500];
+            loop {
+                tokio::select! {
+                    received = socket.recv_from(&mut buf) => {
+                        let Ok((n, peer)) = received else { return };
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let Some(response) = echo_answer(&buf[..n], 60) else { continue };
+                        if open {
+                            let _ = socket.send_to(&response, peer).await;
+                        } else {
+                            held.push((response, peer));
+                        }
+                    }
+                    _ = &mut released, if !open => {
+                        open = true;
+                        for (response, peer) in held.drain(..) {
+                            let _ = socket.send_to(&response, peer).await;
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            addr,
+            queries,
+            release: Some(release),
+            task,
+        }
+    }
+
+    fn release(&mut self) {
+        let _ = self.release.take().unwrap().send(());
+    }
+
+    fn queries(&self) -> usize {
+        self.queries.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for HeldUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// Request id of the first `Started` event whose query name matches.
@@ -399,6 +515,7 @@ fn events_of(events: &[Event], request_id: u64) -> Vec<Event> {
             | Event::CacheLookup { id }
             | Event::CacheHit { id, .. }
             | Event::CacheMiss { id }
+            | Event::InflightJoined { id }
             | Event::UpstreamAttempt { id, .. }
             | Event::UpstreamResult { id, .. } => *id == request_id,
             Event::ConfigLoaded { .. } | Event::ConfigReloadFailed { .. } => false,
@@ -413,6 +530,7 @@ fn started(id: u64, qname: &str) -> Event {
         qname: qname.into(),
         listener: "edge".into(),
         client: peer(),
+        transport: None,
         background: false,
     }
 }
@@ -1008,6 +1126,10 @@ async fn background_refresh_reports_no_cache_events() {
     })
     .to_string();
     let (engine, recorder) = observed_engine(&raw);
+    // The stale request arrives through a listener's handle; the refresh it
+    // schedules is the engine's own query and names no transport.
+    // 过期请求经由监听器的句柄到达；它安排的刷新是引擎自己的查询，不带传输。
+    let engine = engine.with_client_transport(ClientTransport::Udp);
 
     engine
         .handle_packet(&query("stale.example"), peer())
@@ -1055,6 +1177,14 @@ async fn background_refresh_reports_no_cache_events() {
         })
         .expect("background refresh request");
     assert_ne!(foreground, background);
+    let transport_of = |request| {
+        events.iter().find_map(|event| match event {
+            Event::Started { id, transport, .. } if *id == request => Some(*transport),
+            _ => None,
+        })
+    };
+    assert_eq!(transport_of(foreground), Some(Some(ClientTransport::Udp)));
+    assert_eq!(transport_of(background), Some(None));
 
     let foreground_events = events_of(&events, foreground);
     assert!(foreground_events.contains(&Event::CacheLookup { id: foreground }));
@@ -1431,12 +1561,16 @@ async fn doh_listener_reports_the_same_lifecycle_as_in_process_requests() {
     let id = request_id_for(&events, "doh.example");
     let mine = events_of(&events, id);
     let Some(Event::Started {
-        qname, background, ..
+        qname,
+        transport,
+        background,
+        ..
     }) = mine.first()
     else {
         panic!("first event must be request_started: {mine:#?}");
     };
     assert_eq!(qname, "doh.example");
+    assert_eq!(*transport, Some(ClientTransport::Doh));
     assert!(!background);
     assert_eq!(
         mine[1..],
@@ -1514,7 +1648,13 @@ async fn doh_listener_reports_the_same_lifecycle_as_in_process_requests() {
     let events = recorder.drain();
     let id = request_id_for(&events, "doh.example");
     let mine = events_of(&events, id);
-    assert!(matches!(mine.first(), Some(Event::Started { .. })));
+    assert!(matches!(
+        mine.first(),
+        Some(Event::Started {
+            transport: Some(ClientTransport::Doh),
+            ..
+        })
+    ));
     assert_eq!(
         mine[1..],
         [
@@ -1637,6 +1777,217 @@ async fn cancelled_request_is_reported() {
 }
 
 #[tokio::test]
+async fn request_finished_lends_the_response_the_engine_produced() {
+    // Static rule, answered on the slow path and on the fast path.
+    // 静态规则，分别由慢路径与快速路径应答。
+    let (engine, recorder) = observed_engine(&static_config("192.0.2.7"));
+    let slow = engine
+        .handle_packet(&query("slow.example"), peer())
+        .await
+        .unwrap();
+    let Some(FastPathResponse::Direct(fast)) = engine
+        .handle_packet_fast(&query("fast.example"), peer())
+        .unwrap()
+    else {
+        panic!("a static rule must answer on the fast path");
+    };
+    let events = recorder.events();
+    for (qname, sent) in [("slow.example", &slow[..]), ("fast.example", &fast[..])] {
+        let outcome = recorder.outcome(request_id_for(&events, qname));
+        assert_eq!(outcome.status, RequestStatus::Completed);
+        assert_eq!(outcome.response.as_deref(), Some(sent), "{qname}");
+        assert_eq!(outcome.error, None, "{qname}");
+    }
+
+    // Upstream answer, then a fresh cache hit on the fast path, which is
+    // lent as stored.
+    // 上游应答，随后快速路径的新鲜缓存命中按存储原样出借。
+    let (upstream, task) = spawn_echo_upstream(300).await;
+    let raw = serde_json::json!({
+        "settings": { "default_upstream": upstream, "enable_tcp_fallback": false },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "fwd",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    let answered = engine
+        .handle_packet(&query("cached.example"), peer())
+        .await
+        .unwrap();
+    let Some(FastPathResponse::CacheHit { cached, .. }) = engine
+        .handle_packet_fast(&query("cached.example"), peer())
+        .unwrap()
+    else {
+        panic!("the second query must be a fast-path cache hit");
+    };
+    let events = recorder.events();
+    let ids: Vec<u64> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Started { id, qname, .. } if qname == "cached.example" => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 2, "{events:#?}");
+    let first = recorder.outcome(ids[0]);
+    assert_eq!(first.response.as_deref(), Some(&answered[..]));
+    assert_eq!(
+        rcode_of(first.response.as_deref().unwrap()),
+        ResponseCode::NoError
+    );
+    assert_eq!(
+        recorder.outcome(ids[1]).response.as_deref(),
+        Some(&cached[..])
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn failed_and_cancelled_requests_lend_no_response() {
+    // A listener hands a query the fast path deferred to the async path with
+    // its pre-parsed fields. A request whose header announces an additional
+    // record it does not carry passes that quick parse; the static decision
+    // then parses the whole message and fails the request.
+    // 监听器把快速路径推迟的查询连同预解析字段交给异步路径。头部声明了附加记录却没有
+    // 携带的请求能通过快速解析；静态决策随后完整解析报文失败，请求因此失败。
+    let (engine, recorder) = observed_engine(&static_config("192.0.2.7"));
+    let mut packet = query("broken.example");
+    packet[11] = 1; // ARCOUNT = 1, no additional record follows / ARCOUNT 为 1 但没有附加记录
+    let pre_parsed = PreParsedData::new(
+        "broken.example".to_string(),
+        u16::from(RecordType::A),
+        1,
+        0x1234,
+        false,
+        Arc::from("main"),
+        None,
+    );
+    let error = engine
+        .handle_packet_internal_with_pre_parsed(&packet, peer(), false, pre_parsed)
+        .await
+        .expect_err("a request the engine cannot parse fails");
+    let failed = recorder.outcome(request_id_for(&recorder.events(), "broken.example"));
+    assert_eq!(failed.status, RequestStatus::Failed);
+    assert_eq!(failed.response, None);
+    assert_eq!(failed.error, Some(format!("{error:#}")));
+
+    // A dropped request never produced a message and did not fail.
+    // 被丢弃的请求既没有产出应答，也不算失败。
+    let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let upstream = silent.local_addr().unwrap().to_string();
+    let raw = serde_json::json!({
+        "settings": {
+            "default_upstream": "127.0.0.1:9",
+            "upstream_timeout_ms": 5000,
+            "enable_tcp_fallback": false
+        },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "fwd",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(100),
+        engine.handle_packet(&query("dropped.example"), peer()),
+    )
+    .await;
+    assert!(
+        dropped.is_err(),
+        "the listener timeout must drop the request"
+    );
+    let cancelled = recorder.outcome(request_id_for(&recorder.events(), "dropped.example"));
+    assert_eq!(cancelled.status, RequestStatus::Cancelled);
+    assert_eq!(cancelled.response, None);
+    assert_eq!(cancelled.error, None);
+    drop(silent);
+}
+
+#[tokio::test]
+async fn cache_hits_name_the_upstream_whose_answer_was_cached() {
+    let (upstream, task) = spawn_echo_upstream(300).await;
+    let raw = serde_json::json!({
+        "settings": { "default_upstream": upstream, "enable_tcp_fallback": false },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "fwd",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    engine
+        .handle_packet(&query("cached.example"), peer())
+        .await
+        .unwrap();
+    // A cache hit on the async path, then one on the fast path.
+    // 先是异步路径的缓存命中，再是快速路径的。
+    engine
+        .handle_packet(&query("cached.example"), peer())
+        .await
+        .unwrap();
+    assert!(matches!(
+        engine.handle_packet_fast(&query("cached.example"), peer()),
+        Ok(Some(FastPathResponse::CacheHit { .. }))
+    ));
+    let sources = recorder.cache_sources();
+    assert_eq!(sources.len(), 2, "{sources:#?}");
+    // The same address `upstream_result` reported, without the transport prefix.
+    // 与 upstream_result 报告的地址相同，不带传输前缀。
+    assert!(
+        sources
+            .iter()
+            .all(|(_, source)| source.as_deref() == Some(upstream.as_str())),
+        "{sources:#?}"
+    );
+    assert!(recorder.events().contains(&Event::UpstreamAttempt {
+        id: request_id_for(&recorder.events(), "cached.example"),
+        upstream: upstream.clone(),
+        transport: Transport::Udp,
+    }));
+    task.abort();
+
+    // A rule's answer is cached too when min_ttl allows; it has no upstream.
+    // min_ttl 允许时规则的应答也会进缓存；它没有上游。
+    let raw = serde_json::json!({
+        "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 60 },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "static",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "static_ip_response", "ip": "192.0.2.7" }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    for _ in 0..2 {
+        engine
+            .handle_packet(&query("static.example"), peer())
+            .await
+            .unwrap();
+    }
+    let sources = recorder.cache_sources();
+    assert_eq!(sources.len(), 1, "{sources:#?}");
+    assert_eq!(sources[0].1, None);
+}
+
+#[tokio::test]
 async fn hot_reload_reports_success_and_failure() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pipeline.json");
@@ -1734,4 +2085,338 @@ async fn hot_reload_reports_success_and_failure() {
         "a rejected configuration must not be reported as loaded"
     );
     assert_eq!(engine.config_generation(), generation_after_success);
+}
+
+/// Two clients the inflight tests tell apart: `LEADER` sends first.
+/// inflight 测试区分的两个客户端：`LEADER` 先发。
+const LEADER: &str = "127.0.0.1:53000";
+const FOLLOWER: &str = "127.0.0.2:53000";
+
+/// Request id of the `Started` event from `client`.
+fn request_id_from(events: &[Event], client: &str) -> u64 {
+    let client: SocketAddr = client.parse().unwrap();
+    events
+        .iter()
+        .find_map(|event| match event {
+            Event::Started { id, client: c, .. } if *c == client => Some(*id),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no request_started from {client}: {events:#?}"))
+}
+
+/// Send the query to the held upstream with a `forward` or an `allow`
+/// action (`allow` forwards to the default upstream), either straight from
+/// the entry pipeline or after a response jump. With the jump, each client has
+/// its own entry pipeline, so the two requests only meet in "shared".
+/// 用 `forward` 或 `allow`（`allow` 转发到默认上游）把查询发往扣住应答的上游：
+/// 或直接在入口 pipeline，或经响应跳转之后。
+/// 跳转时两个客户端各有自己的入口 pipeline，两个请求只在 "shared" 相遇。
+fn inflight_config(held: &str, echo: &str, action: &str, via_jump: bool) -> String {
+    let held_action = if action == "forward" {
+        serde_json::json!({ "type": "forward", "upstream": held, "transport": "udp" })
+    } else {
+        serde_json::json!({ "type": action })
+    };
+    let settings = serde_json::json!({
+        "default_upstream": held,
+        "upstream_timeout_ms": 5000,
+        "enable_tcp_fallback": false
+    });
+    let held_rule = serde_json::json!({
+        "name": "held",
+        "matchers": [{ "type": "any" }],
+        "actions": [held_action]
+    });
+    if !via_jump {
+        return serde_json::json!({
+            "settings": settings,
+            "pipelines": [{ "id": "main", "rules": [held_rule] }]
+        })
+        .to_string();
+    }
+    let entry = |id: &str| {
+        serde_json::json!({
+            "id": id,
+            "rules": [{
+                "name": "echo-then-jump",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": echo, "transport": "udp" }],
+                "response_matchers": [{ "type": "upstream_equals", "value": echo }],
+                "response_actions_on_match": [
+                    { "type": "jump_to_pipeline", "pipeline": "shared" }
+                ]
+            }]
+        })
+    };
+    serde_json::json!({
+        "settings": settings,
+        "pipeline_select": [
+            {
+                "pipeline": "first",
+                "matchers": [{ "type": "client_ip", "cidr": "127.0.0.1/32" }]
+            },
+            { "pipeline": "second", "matchers": [{ "type": "any" }] }
+        ],
+        "pipelines": [
+            entry("first"),
+            entry("second"),
+            { "id": "shared", "rules": [held_rule] }
+        ]
+    })
+    .to_string()
+}
+
+/// Send the same query from `LEADER`, then from `FOLLOWER` once the leader's
+/// query is at the held upstream and the follower has had time to reach it.
+/// 先由 `LEADER` 发出查询，待其到达上游、且跟随者有时间赶上后，再由 `FOLLOWER` 发同一查询。
+async fn start_leader_and_follower(
+    engine: &Engine,
+    recorder: &Recorder,
+    held: &HeldUpstream,
+) -> (
+    tokio::task::JoinHandle<anyhow::Result<bytes::Bytes>>,
+    tokio::task::JoinHandle<anyhow::Result<bytes::Bytes>>,
+) {
+    let send = |client: &str| {
+        let engine = engine.clone();
+        let client: SocketAddr = client.parse().unwrap();
+        tokio::spawn(async move { engine.handle_packet(&query("shared.example"), client).await })
+    };
+    let leader = send(LEADER);
+    let at_upstream = recorder
+        .wait_for(Duration::from_secs(2), |events| {
+            events.iter().any(|event| {
+                matches!(event, Event::UpstreamAttempt { upstream, .. } if *upstream == held.addr)
+            })
+        })
+        .await;
+    assert!(at_upstream, "{:#?}", recorder.events());
+    let follower = send(FOLLOWER);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    (leader, follower)
+}
+
+#[tokio::test]
+async fn a_request_that_takes_an_inflight_result_reports_joining_it() {
+    let (echo, echo_task) = spawn_echo_upstream(60).await;
+    // Each row reaches a different place the engine shares in-flight results:
+    // `forward` and `allow`, from the entry pipeline and after a response jump.
+    // 每行对应引擎共享 in-flight 结果的一处：`forward` 与 `allow`，入口 pipeline 与响应跳转之后。
+    for (action, via_jump) in [
+        ("forward", false),
+        ("allow", false),
+        ("forward", true),
+        ("allow", true),
+    ] {
+        let mut held = HeldUpstream::spawn().await;
+        let raw = inflight_config(&held.addr, &echo, action, via_jump);
+        let (engine, recorder) = observed_engine(&raw);
+        let (leader, follower) = start_leader_and_follower(&engine, &recorder, &held).await;
+        held.release();
+        let leader = leader.await.unwrap().unwrap();
+        let follower = follower.await.unwrap().unwrap();
+        assert_eq!(rcode_of(&leader), ResponseCode::NoError);
+        assert_eq!(rcode_of(&follower), ResponseCode::NoError);
+
+        let case = format!("{action} via_jump={via_jump}");
+        assert_eq!(held.queries(), 1, "{case}: one query reached the upstream");
+        let events = recorder.events();
+        let leader_events = events_of(&events, request_id_from(&events, LEADER));
+        let follower_id = request_id_from(&events, FOLLOWER);
+        let follower_events = events_of(&events, follower_id);
+        assert!(
+            !leader_events.contains(&Event::InflightJoined {
+                id: request_id_from(&events, LEADER)
+            }),
+            "{case}: {leader_events:#?}"
+        );
+        assert!(
+            follower_events.contains(&Event::InflightJoined { id: follower_id }),
+            "{case}: {follower_events:#?}"
+        );
+        assert!(
+            !follower_events.iter().any(|event| {
+                matches!(event, Event::UpstreamAttempt { upstream, .. } if *upstream == held.addr)
+            }),
+            "{case}: the follower sent no query of its own: {follower_events:#?}"
+        );
+        assert_eq!(
+            follower_events.last(),
+            Some(&finished(follower_id)),
+            "{case}"
+        );
+    }
+    echo_task.abort();
+}
+
+#[tokio::test]
+async fn a_request_whose_inflight_query_is_dropped_queries_by_itself() {
+    let mut held = HeldUpstream::spawn().await;
+    let raw = inflight_config(&held.addr, "127.0.0.1:9", "forward", false);
+    let (engine, recorder) = observed_engine(&raw);
+    let (leader, follower) = start_leader_and_follower(&engine, &recorder, &held).await;
+    // The leader goes away before its query is answered.
+    // 领头的请求在其查询得到应答之前离开。
+    leader.abort();
+    let leader_gone = recorder
+        .wait_for(Duration::from_secs(2), |events| {
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    Event::Finished {
+                        status: RequestStatus::Cancelled,
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+    assert!(leader_gone, "{:#?}", recorder.events());
+    held.release();
+    let follower = follower.await.unwrap().unwrap();
+    assert_eq!(rcode_of(&follower), ResponseCode::NoError);
+
+    assert_eq!(held.queries(), 2, "the follower sent its own query");
+    let events = recorder.events();
+    let follower_id = request_id_from(&events, FOLLOWER);
+    let follower_events = events_of(&events, follower_id);
+    assert!(
+        !follower_events.contains(&Event::InflightJoined { id: follower_id }),
+        "{follower_events:#?}"
+    );
+    assert!(
+        follower_events.contains(&Event::UpstreamAttempt {
+            id: follower_id,
+            upstream: held.addr.clone(),
+            transport: Transport::Udp,
+        }),
+        "{follower_events:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_tagged_handle_reports_its_transport_on_both_paths() {
+    let (engine, recorder) = observed_engine(&static_config("192.0.2.1"));
+    let tcp = engine.clone().with_client_transport(ClientTransport::Tcp);
+
+    tcp.handle_packet(&query("tagged.example"), peer())
+        .await
+        .unwrap();
+    assert!(matches!(
+        tcp.handle_packet_fast(&query("tagged.example"), peer()),
+        Ok(Some(FastPathResponse::Direct(_)))
+    ));
+    // The handle it was cloned from is untouched.
+    // 被克隆的原句柄不受影响。
+    engine
+        .handle_packet(&query("untagged.example"), peer())
+        .await
+        .unwrap();
+
+    let transports: Vec<(String, Option<ClientTransport>)> = recorder
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Started {
+                qname, transport, ..
+            } => Some((qname, transport)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        transports,
+        [
+            ("tagged.example".to_string(), Some(ClientTransport::Tcp)),
+            ("tagged.example".to_string(), Some(ClientTransport::Tcp)),
+            ("untagged.example".to_string(), None),
+        ]
+    );
+}
+
+/// A query whose dotted name is 256 bytes long. The fast path's own parser
+/// accepts it, but hickory rejects the name when the response is built: a
+/// name is at most 255 bytes on the wire.
+/// 点分形式 256 字节的查询名。快速路径自己的解析器接受它，构造应答时 hickory 拒绝：
+/// 名字在线格式里最多 255 字节。
+fn overlong_query() -> (Vec<u8>, String) {
+    let labels = [
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(51),
+        "blocked".to_string(),
+        "test".to_string(),
+    ];
+    let name = labels.join(".");
+    assert_eq!(name.len(), 256);
+    let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in &labels {
+        packet.push(label.len() as u8);
+        packet.extend_from_slice(label.as_bytes());
+    }
+    packet.extend_from_slice(&[0, 0, 1, 0, 1]); // root, QTYPE A, QCLASS IN
+    (packet, name)
+}
+
+#[tokio::test]
+async fn a_fast_path_answer_that_cannot_be_built_is_reported_as_failed() {
+    let raw = serde_json::json!({
+        "settings": { "default_upstream": "127.0.0.1:9" },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "block",
+                "matchers": [{ "type": "domain_suffix", "value": "blocked.test" }],
+                "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    let (packet, name) = overlong_query();
+
+    // The listener answers SERVFAIL by itself; the engine still reports the
+    // request, up to the decision it made and the reason it failed.
+    // 由监听器自己回 SERVFAIL；引擎照样上报这个请求：做到哪一步的决策，以及失败原因。
+    let error = engine
+        .handle_packet_fast(&packet, peer())
+        .expect_err("hickory rejects a name longer than 255 bytes");
+    let events = recorder.drain();
+    let id = request_id_for(&events, &name);
+    assert_eq!(
+        events_of(&events, id),
+        vec![
+            started(id, &name),
+            Event::Pipeline {
+                id,
+                pipeline: "main".into()
+            },
+            Event::CacheLookup { id },
+            Event::CacheMiss { id },
+            Event::Rule {
+                id,
+                pipeline: "main".into(),
+                rule: "block".into(),
+                phase: RulePhase::Request,
+                decision: DecisionKind::Static,
+                fast_path: true,
+            },
+            Event::Decision {
+                id,
+                pipeline: "main".into(),
+                rule: Some("block".into()),
+                detail: Detail::Static {
+                    rcode: ResponseCode::NXDomain,
+                    answers: 0,
+                },
+            },
+            Event::Finished {
+                id,
+                status: RequestStatus::Failed,
+            },
+        ]
+    );
+    let failed = recorder.outcome(id);
+    assert_eq!(failed.response, None);
+    assert_eq!(failed.error, Some(format!("{error:#}")));
 }

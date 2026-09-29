@@ -79,7 +79,7 @@ pub trait EngineObserver: Send + Sync + 'static {
     /// [`RequestStatus::Cancelled`].
     ///
     /// [`request_started`]: EngineObserver::request_started
-    fn request_finished(&self, ctx: &RequestContext<'_>, outcome: &RequestOutcome) {}
+    fn request_finished(&self, ctx: &RequestContext<'_>, outcome: &RequestOutcome<'_>) {}
 
     /// A pipeline was chosen for the request: once after pipeline selection
     /// and again for every `jump_to_pipeline` decision.
@@ -123,13 +123,28 @@ pub trait EngineObserver: Send + Sync + 'static {
     /// request's [`cache_lookup`].
     ///
     /// [`cache_lookup`]: EngineObserver::cache_lookup
-    fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit) {}
+    fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit<'_>) {}
 
     /// The response cache had no usable entry. Always paired with the
     /// request's [`cache_lookup`].
     ///
     /// [`cache_lookup`]: EngineObserver::cache_lookup
     fn cache_miss(&self, ctx: &RequestContext<'_>) {}
+
+    /// An identical query was already in flight, and the request took that
+    /// query's answer instead of forwarding its own. Reported when the answer
+    /// arrives, in place of the [`upstream_attempt`]s this forward would
+    /// have made.
+    ///
+    /// An upstream failure still ends with an answer: the engine synthesises
+    /// SERVFAIL (or serves a stale entry) and shares it, so the request
+    /// reports this event and completes with that answer. Only when the query
+    /// it waited for ends without one (the engine returned an error, or the
+    /// query was cancelled) does the request forward by itself, and then this
+    /// is not reported.
+    ///
+    /// [`upstream_attempt`]: EngineObserver::upstream_attempt
+    fn inflight_joined(&self, ctx: &RequestContext<'_>) {}
 
     /// A query is about to be sent to an upstream server. Every attempt is
     /// followed by exactly one [`upstream_result`], including attempts that
@@ -168,6 +183,13 @@ pub struct RequestContext<'a> {
     pub listener_label: &'a str,
     /// Client address as seen by the listener.
     pub client: SocketAddr,
+    /// Transport the query arrived over, as tagged by the listener that
+    /// received it. `None` for background refreshes, and for requests handed
+    /// to an engine handle that no listener tagged (see
+    /// [`Engine::with_client_transport`]).
+    ///
+    /// [`Engine::with_client_transport`]: crate::engine::Engine::with_client_transport
+    pub transport: Option<ClientTransport>,
     /// Query name, lower-cased, without a trailing dot.
     pub qname: &'a str,
     /// Query type.
@@ -179,14 +201,49 @@ pub struct RequestContext<'a> {
     pub background_refresh: bool,
 }
 
+/// Transport a client query arrived over. Distinct from the upstream
+/// [`Transport`], which also covers ways of sending (`TcpUdp`, DoT, DoQ) that
+/// no built-in listener accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ClientTransport {
+    /// Plain DNS over UDP.
+    Udp,
+    /// Plain DNS over TCP.
+    Tcp,
+    /// DNS over HTTPS.
+    Doh,
+}
+
 /// How a request ended.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
-pub struct RequestOutcome {
+pub struct RequestOutcome<'a> {
     /// Wall-clock time between `request_started` and `request_finished`.
     pub latency: Duration,
     /// Completion status.
     pub status: RequestStatus,
+    /// The DNS message the engine produced for the client, in wire format.
+    /// Set exactly when [`status`] is [`RequestStatus::Completed`]; a failed
+    /// or cancelled request never produced one. The engine lends the bytes
+    /// it already holds and parses nothing; an observer that wants the
+    /// response code or the records parses them itself.
+    ///
+    /// These are the bytes before the listener's own rewriting, so they can
+    /// differ from what the client receives. A fresh cache hit on the
+    /// synchronous fast path is lent as stored: the listener still rewrites
+    /// its transaction id and ages its TTLs. A UDP response larger than the
+    /// client's limit is truncated by the listener: it sets TC, drops the
+    /// records that do not fit and lowers the advertised EDNS payload size to
+    /// the client's. The response code is not changed.
+    ///
+    /// [`status`]: RequestOutcome::status
+    pub response: Option<&'a [u8]>,
+    /// Why the engine failed the request, with its cause chain. Set exactly
+    /// when [`status`] is [`RequestStatus::Failed`].
+    ///
+    /// [`status`]: RequestOutcome::status
+    pub error: Option<&'a str>,
 }
 
 /// Completion status of a request.
@@ -320,13 +377,16 @@ pub enum DecisionKind {
 /// The response cache answered a request.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
-pub struct CacheHit {
+pub struct CacheHit<'a> {
     /// Which kind of entry answered.
     pub kind: CacheHitKind,
     /// Time left before the entry's TTL expires; `None` for stale hits.
     pub remaining_ttl: Option<Duration>,
     /// TTL the entry was cached with, when known.
     pub original_ttl: Option<Duration>,
+    /// Upstream whose answer was cached, as recorded when the entry was
+    /// stored; `None` when a rule synthesised the cached answer.
+    pub source: Option<&'a str>,
 }
 
 /// Which kind of cached response answered a request.
@@ -451,6 +511,15 @@ pub struct TracingObserver;
 
 const TRACE_TARGET: &str = "kixdns::observe";
 
+/// Response code from a DNS header: the low four bits of byte 3. The
+/// extended bits an OPT record may carry are not read; this is a log field,
+/// not a parser.
+fn header_rcode(message: &[u8]) -> Option<ResponseCode> {
+    message
+        .get(3)
+        .map(|flags| ResponseCode::from(0, flags & 0x0F))
+}
+
 impl EngineObserver for TracingObserver {
     fn request_started(&self, ctx: &RequestContext<'_>) {
         tracing::debug!(
@@ -459,6 +528,7 @@ impl EngineObserver for TracingObserver {
             request_id = ctx.request_id,
             listener = ctx.listener_label,
             client = %ctx.client,
+            transport = ctx.transport.map(tracing::field::debug),
             qname = ctx.qname,
             qtype = ?ctx.qtype,
             qclass = ?ctx.qclass,
@@ -467,13 +537,16 @@ impl EngineObserver for TracingObserver {
         );
     }
 
-    fn request_finished(&self, ctx: &RequestContext<'_>, outcome: &RequestOutcome) {
+    fn request_finished(&self, ctx: &RequestContext<'_>, outcome: &RequestOutcome<'_>) {
         tracing::debug!(
             target: TRACE_TARGET,
             event = "request_finished",
             request_id = ctx.request_id,
             status = ?outcome.status,
             latency_us = outcome.latency.as_micros() as u64,
+            rcode = outcome.response.and_then(header_rcode).map(tracing::field::display),
+            response_bytes = outcome.response.map(<[u8]>::len),
+            error = outcome.error,
             "request finished"
         );
     }
@@ -549,7 +622,7 @@ impl EngineObserver for TracingObserver {
         );
     }
 
-    fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit) {
+    fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit<'_>) {
         tracing::debug!(
             target: TRACE_TARGET,
             event = "cache_hit",
@@ -557,6 +630,7 @@ impl EngineObserver for TracingObserver {
             kind = ?event.kind,
             remaining_ttl_s = event.remaining_ttl.map(|ttl| ttl.as_secs()),
             original_ttl_s = event.original_ttl.map(|ttl| ttl.as_secs()),
+            source = event.source,
             "cache hit"
         );
     }
@@ -567,6 +641,15 @@ impl EngineObserver for TracingObserver {
             event = "cache_miss",
             request_id = ctx.request_id,
             "cache miss"
+        );
+    }
+
+    fn inflight_joined(&self, ctx: &RequestContext<'_>) {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            event = "inflight_joined",
+            request_id = ctx.request_id,
+            "joined an in-flight query"
         );
     }
 
@@ -625,11 +708,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn header_rcode_reads_the_low_four_bits_of_byte_three() {
+        assert_eq!(
+            header_rcode(&[0x12, 0x34, 0x81, 0x83]),
+            Some(ResponseCode::NXDomain)
+        );
+        assert_eq!(
+            header_rcode(&[0x12, 0x34, 0x85, 0xF0]),
+            Some(ResponseCode::NoError)
+        );
+        assert_eq!(header_rcode(&[0x12, 0x34, 0x81]), None);
+    }
+
+    #[test]
     fn built_in_observers_accept_every_event() {
         let ctx = RequestContext {
             request_id: 7,
             listener_label: "default",
             client: "127.0.0.1:53000".parse().unwrap(),
+            transport: Some(ClientTransport::Udp),
             qname: "example.com",
             qtype: RecordType::A,
             qclass: DNSClass::IN,
@@ -657,6 +754,7 @@ mod tests {
                     kind: CacheHitKind::Fresh,
                     remaining_ttl: Some(Duration::from_secs(30)),
                     original_ttl: Some(Duration::from_secs(60)),
+                    source: Some("1.1.1.1:53"),
                 },
             );
             observer.cache_miss(&ctx);
@@ -689,6 +787,7 @@ mod tests {
                     },
                 },
             );
+            observer.inflight_joined(&ctx);
             observer.upstream_attempt(
                 &ctx,
                 &UpstreamAttempt {
@@ -709,11 +808,25 @@ mod tests {
                     error: Some(&error),
                 },
             );
+            // A SERVFAIL header, so the tracing observer reads a response code.
+            // 一个 SERVFAIL 头部，让 tracing 观察者读到响应码。
+            let servfail = [0x12, 0x34, 0x81, 0x82, 0, 1, 0, 0, 0, 0, 0, 0];
             observer.request_finished(
                 &ctx,
                 &RequestOutcome {
                     latency: Duration::from_millis(4),
                     status: RequestStatus::Completed,
+                    response: Some(&servfail),
+                    error: None,
+                },
+            );
+            observer.request_finished(
+                &ctx,
+                &RequestOutcome {
+                    latency: Duration::from_millis(4),
+                    status: RequestStatus::Failed,
+                    response: None,
+                    error: Some("parse request for static: unexpected end of input"),
                 },
             );
             observer.config_loaded(&ConfigLoaded {

@@ -812,6 +812,9 @@ pub(crate) async fn process_response_jump(
                                 // watch channel 使用 changed() 等待更新
                                 match rx.changed().await {
                                     Ok(_) => {
+                                        if let Some((observer, ctx)) = observed {
+                                            observer.inflight_joined(ctx);
+                                        }
                                         // Clone result to avoid holding RwLockReadGuard across await
                                         // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
                                         let result = rx.borrow().clone();
@@ -891,6 +894,9 @@ pub(crate) async fn process_response_jump(
                             // watch channel 使用 changed() 等待更新
                             match rx.changed().await {
                                 Ok(_) => {
+                                    if let Some((observer, ctx)) = observed {
+                                        observer.inflight_joined(ctx);
+                                    }
                                     // Clone result to avoid holding RwLockReadGuard across await
                                     // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
                                     let result = rx.borrow().clone();
