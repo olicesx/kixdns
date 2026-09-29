@@ -183,14 +183,13 @@ pub struct RequestContext<'a> {
     pub listener_label: &'a str,
     /// Client address as seen by the listener.
     pub client: SocketAddr,
-    /// Transport the query arrived over: [`Transport::Udp`],
-    /// [`Transport::Tcp`] or [`Transport::Doh`] from the built-in listeners.
-    /// `None` for background refreshes, and for requests handed to an engine
-    /// handle that no listener tagged (see
+    /// Transport the query arrived over, as tagged by the listener that
+    /// received it. `None` for background refreshes, and for requests handed
+    /// to an engine handle that no listener tagged (see
     /// [`Engine::with_client_transport`]).
     ///
     /// [`Engine::with_client_transport`]: crate::engine::Engine::with_client_transport
-    pub transport: Option<Transport>,
+    pub transport: Option<ClientTransport>,
     /// Query name, lower-cased, without a trailing dot.
     pub qname: &'a str,
     /// Query type.
@@ -200,6 +199,20 @@ pub struct RequestContext<'a> {
     /// `true` when the request is an internal cache refresh rather than a
     /// client query. Refresh requests bypass the cache lookup.
     pub background_refresh: bool,
+}
+
+/// Transport a client query arrived over. Distinct from the upstream
+/// [`Transport`], which also covers ways of sending (`TcpUdp`, DoT, DoQ) that
+/// no built-in listener accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ClientTransport {
+    /// Plain DNS over UDP.
+    Udp,
+    /// Plain DNS over TCP.
+    Tcp,
+    /// DNS over HTTPS.
+    Doh,
 }
 
 /// How a request ended.
@@ -713,7 +726,7 @@ mod tests {
             request_id: 7,
             listener_label: "default",
             client: "127.0.0.1:53000".parse().unwrap(),
-            transport: Some(Transport::Udp),
+            transport: Some(ClientTransport::Udp),
             qname: "example.com",
             qtype: RecordType::A,
             qclass: DNSClass::IN,

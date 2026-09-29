@@ -22,9 +22,10 @@ use kixdns::doh_server::run_doh_with_listener;
 use kixdns::engine::{Engine, FastPathResponse, PreParsedData};
 use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::observe::{
-    CacheHit, CacheHitKind, ConfigLoaded, ConfigReloadFailed, DecisionDetail, DecisionKind,
-    DecisionMade, EngineObserver, RequestContext, RequestOutcome, RequestStatus, RuleCacheLookup,
-    RuleEvaluated, RuleMatched, RulePhase, UpstreamAttempt, UpstreamOutcome, UpstreamResult,
+    CacheHit, CacheHitKind, ClientTransport, ConfigLoaded, ConfigReloadFailed, DecisionDetail,
+    DecisionKind, DecisionMade, EngineObserver, RequestContext, RequestOutcome, RequestStatus,
+    RuleCacheLookup, RuleEvaluated, RuleMatched, RulePhase, UpstreamAttempt, UpstreamOutcome,
+    UpstreamResult,
 };
 
 #[ctor::ctor]
@@ -78,7 +79,7 @@ enum Event {
         qname: String,
         listener: String,
         client: SocketAddr,
-        transport: Option<Transport>,
+        transport: Option<ClientTransport>,
         background: bool,
     },
     Finished {
@@ -1128,7 +1129,7 @@ async fn background_refresh_reports_no_cache_events() {
     // The stale request arrives through a listener's handle; the refresh it
     // schedules is the engine's own query and names no transport.
     // 过期请求经由监听器的句柄到达；它安排的刷新是引擎自己的查询，不带传输。
-    let engine = engine.with_client_transport(Transport::Udp);
+    let engine = engine.with_client_transport(ClientTransport::Udp);
 
     engine
         .handle_packet(&query("stale.example"), peer())
@@ -1182,7 +1183,7 @@ async fn background_refresh_reports_no_cache_events() {
             _ => None,
         })
     };
-    assert_eq!(transport_of(foreground), Some(Some(Transport::Udp)));
+    assert_eq!(transport_of(foreground), Some(Some(ClientTransport::Udp)));
     assert_eq!(transport_of(background), Some(None));
 
     let foreground_events = events_of(&events, foreground);
@@ -1569,7 +1570,7 @@ async fn doh_listener_reports_the_same_lifecycle_as_in_process_requests() {
         panic!("first event must be request_started: {mine:#?}");
     };
     assert_eq!(qname, "doh.example");
-    assert_eq!(*transport, Some(Transport::Doh));
+    assert_eq!(*transport, Some(ClientTransport::Doh));
     assert!(!background);
     assert_eq!(
         mine[1..],
@@ -1650,7 +1651,7 @@ async fn doh_listener_reports_the_same_lifecycle_as_in_process_requests() {
     assert!(matches!(
         mine.first(),
         Some(Event::Started {
-            transport: Some(Transport::Doh),
+            transport: Some(ClientTransport::Doh),
             ..
         })
     ));
@@ -2296,7 +2297,7 @@ async fn a_request_whose_inflight_query_is_dropped_queries_by_itself() {
 #[tokio::test]
 async fn a_tagged_handle_reports_its_transport_on_both_paths() {
     let (engine, recorder) = observed_engine(&static_config("192.0.2.1"));
-    let tcp = engine.clone().with_client_transport(Transport::Tcp);
+    let tcp = engine.clone().with_client_transport(ClientTransport::Tcp);
 
     tcp.handle_packet(&query("tagged.example"), peer())
         .await
@@ -2312,7 +2313,7 @@ async fn a_tagged_handle_reports_its_transport_on_both_paths() {
         .await
         .unwrap();
 
-    let transports: Vec<(String, Option<Transport>)> = recorder
+    let transports: Vec<(String, Option<ClientTransport>)> = recorder
         .events()
         .into_iter()
         .filter_map(|event| match event {
@@ -2325,8 +2326,8 @@ async fn a_tagged_handle_reports_its_transport_on_both_paths() {
     assert_eq!(
         transports,
         [
-            ("tagged.example".to_string(), Some(Transport::Tcp)),
-            ("tagged.example".to_string(), Some(Transport::Tcp)),
+            ("tagged.example".to_string(), Some(ClientTransport::Tcp)),
+            ("tagged.example".to_string(), Some(ClientTransport::Tcp)),
             ("untagged.example".to_string(), None),
         ]
     );

@@ -923,6 +923,12 @@ impl Engine {
         // (listener timeouts drop the future) are reported as well.
         // 本请求的观察者句柄：借用已解析的查询，drop 时上报 request_finished，
         // 因此被取消的请求（监听器超时会丢弃 future）同样会上报。
+        // In this crate only background refresh skips the cache (see the design
+        // note on handle_packet_internal). Both fields below follow this one
+        // flag, so a new use of skip_cache has to decide on it here.
+        // 本 crate 里只有后台刷新跳过缓存（见 handle_packet_internal 的设计说明）。
+        // 下面两个字段都跟着这一个判断；skip_cache 有了新用法，要在这里一起定。
+        let background_refresh = skip_cache;
         let mut observed = self.observer.as_deref().map(|observer| {
             ObservedRequest::new(
                 observer,
@@ -932,7 +938,7 @@ impl Engine {
                     client: peer,
                     // A refresh is the engine's own query, whichever listener's request scheduled it.
                     // 刷新是引擎自己的查询，与安排它的请求来自哪个监听器无关。
-                    transport: if skip_cache {
+                    transport: if background_refresh {
                         None
                     } else {
                         self.client_transport
@@ -940,7 +946,7 @@ impl Engine {
                     qname: qname_ref,
                     qtype,
                     qclass,
-                    background_refresh: skip_cache,
+                    background_refresh,
                 },
                 start,
             )

@@ -13,13 +13,12 @@ use tracing::{info, warn};
 
 use super::utils::{extract_geosite_tags_from_config, uses_geoip_matchers};
 use crate::cache::{CacheEntry, DnsCache, new_cache};
-use crate::config::Transport;
 use crate::lock::RwLock;
 use crate::matcher::RuntimePipelineConfig;
 use crate::matcher::advanced_rule::compile_pipelines;
 use crate::matcher::geoip::GeoIpManager;
 use crate::matcher::geosite::GeoSiteManager;
-use crate::observe::{ConfigLoaded, ConfigReloadFailed, EngineObserver};
+use crate::observe::{ClientTransport, ConfigLoaded, ConfigReloadFailed, EngineObserver};
 
 use super::concurrency::{FlowControlState, PermitManager};
 use super::rules::RuleCacheRecord;
@@ -38,7 +37,7 @@ pub struct Engine {
     pub listener_label: Arc<str>,
     // Transport this handle's requests arrive over, set by the listener that owns the handle.
     // 本句柄的请求经由的传输，由持有该句柄的监听器设置。
-    pub(crate) client_transport: Option<Transport>,
+    pub(crate) client_transport: Option<ClientTransport>,
     // Optional event sink; None keeps the request path free of event construction.
     // 可选事件接收器；None 时请求路径不构造任何事件。
     pub(crate) observer: Option<Arc<dyn EngineObserver>>,
@@ -166,8 +165,12 @@ impl Engine {
     /// handle of its own; the engine behind it (configuration, caches,
     /// metrics, observer) stays shared, and pipeline selection is unaffected.
     ///
+    /// The tag travels with [`Clone`], and tagging again replaces it: clone
+    /// the untagged engine for each listener, or re-tag the clone, rather
+    /// than serving one transport with a handle tagged for another.
+    ///
     /// [`RequestContext::transport`]: crate::observe::RequestContext::transport
-    pub fn with_client_transport(mut self, transport: Transport) -> Self {
+    pub fn with_client_transport(mut self, transport: ClientTransport) -> Self {
         self.client_transport = Some(transport);
         self
     }

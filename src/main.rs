@@ -10,10 +10,10 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use kixdns::config::{Transport, load_config_with_source};
+use kixdns::config::load_config_with_source;
 use kixdns::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers};
 use kixdns::matcher::RuntimePipelineConfig;
-use kixdns::observe::TracingObserver;
+use kixdns::observe::{ClientTransport, TracingObserver};
 use kixdns::proto_utils::{is_standard_query_header, truncate_udp_response};
 use kixdns::watcher;
 
@@ -593,7 +593,7 @@ async fn run_udp_worker(
     socket: Arc<UdpSocket>,
     engine: Engine,
 ) -> anyhow::Result<()> {
-    let engine = engine.with_client_transport(Transport::Udp);
+    let engine = engine.with_client_transport(ClientTransport::Udp);
     // 预分配缓冲区 / Pre-allocate buffer
     // 使用 BytesMut 避免 Bytes::copy_from_slice 的内存分配 / Use BytesMut to avoid memory allocation in Bytes::copy_from_slice
     use bytes::BytesMut;
@@ -861,7 +861,7 @@ async fn handle_tcp_conn(
     peer: SocketAddr,
     engine: Engine,
 ) -> anyhow::Result<()> {
-    let engine = engine.with_client_transport(Transport::Tcp);
+    let engine = engine.with_client_transport(ClientTransport::Tcp);
     const MAX_TCP_FRAME: usize = 64 * 1024;
     let mut len_buf = [0u8; 2];
 
@@ -1104,7 +1104,7 @@ mod tests {
 
     /// 记录每个请求上报的传输 / Records the transport each request reports
     #[derive(Default)]
-    struct TransportRecorder(std::sync::Mutex<Vec<Option<Transport>>>);
+    struct TransportRecorder(std::sync::Mutex<Vec<Option<ClientTransport>>>);
 
     impl kixdns::observe::EngineObserver for TransportRecorder {
         fn request_started(&self, ctx: &kixdns::observe::RequestContext<'_>) {
@@ -1156,7 +1156,7 @@ mod tests {
 
         assert_eq!(
             *recorder.0.lock().unwrap(),
-            [Some(Transport::Udp), Some(Transport::Tcp)]
+            [Some(ClientTransport::Udp), Some(ClientTransport::Tcp)]
         );
         worker.abort();
         connection.abort();
