@@ -134,9 +134,14 @@ pub trait EngineObserver: Send + Sync + 'static {
     /// An identical query was already in flight, and the request took that
     /// query's answer instead of forwarding its own. Reported when the answer
     /// arrives, in place of the [`upstream_attempt`]s this forward would
-    /// have made. If the query it waited for ends without an answer (it
-    /// failed or was cancelled), the request forwards by itself and this is
-    /// not reported.
+    /// have made.
+    ///
+    /// An upstream failure still ends with an answer: the engine synthesises
+    /// SERVFAIL (or serves a stale entry) and shares it, so the request
+    /// reports this event and completes with that answer. Only when the query
+    /// it waited for ends without one (the engine returned an error, or the
+    /// query was cancelled) does the request forward by itself, and then this
+    /// is not reported.
     ///
     /// [`upstream_attempt`]: EngineObserver::upstream_attempt
     fn inflight_joined(&self, ctx: &RequestContext<'_>) {}
@@ -209,9 +214,15 @@ pub struct RequestOutcome<'a> {
     /// Set exactly when [`status`] is [`RequestStatus::Completed`]; a failed
     /// or cancelled request never produced one. The engine lends the bytes
     /// it already holds and parses nothing; an observer that wants the
-    /// response code or the records parses them itself. A fresh cache hit on
-    /// the synchronous fast path is lent as stored: the listener still
-    /// rewrites its transaction id and ages its TTLs before sending.
+    /// response code or the records parses them itself.
+    ///
+    /// These are the bytes before the listener's own rewriting, so they can
+    /// differ from what the client receives. A fresh cache hit on the
+    /// synchronous fast path is lent as stored: the listener still rewrites
+    /// its transaction id and ages its TTLs. A UDP response larger than the
+    /// client's limit is truncated by the listener: it sets TC, drops the
+    /// records that do not fit and lowers the advertised EDNS payload size to
+    /// the client's. The response code is not changed.
     ///
     /// [`status`]: RequestOutcome::status
     pub response: Option<&'a [u8]>,
