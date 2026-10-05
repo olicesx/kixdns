@@ -1400,6 +1400,12 @@ impl Engine {
                                 continue 'decision_loop;
                             }
                             Err(e) => {
+                                // A background refresh answers no client: it gets the
+                                // failure itself, which refresh.rs logs.
+                                // 后台刷新没有要应答的客户端：失败原样交回，由 refresh.rs 记录。
+                                if skip_cache {
+                                    return Err(e);
+                                }
                                 // A rule continued (response_actions_on_match: [continue])
                                 // and the next Forward attempt failed. The client must
                                 // receive a definitive answer, never silence: DNS clients
@@ -3166,6 +3172,273 @@ mod tests {
         assert!(
             engine.cache.get(&dedupe_hash).is_some(),
             "serve_stale enabled by the reload must keep the expired entry"
+        );
+    }
+
+    /// 一条 `stale.com` 的 A 查询。 / A query for `stale.com` A.
+    fn stale_com_query() -> Vec<u8> {
+        let mut packet = vec![0u8; 12];
+        packet[0] = 0xAA;
+        packet[1] = 0xBB;
+        packet[5] = 1;
+        packet.extend_from_slice(b"\x05stale\x03com\x00\x00\x01\x00\x01");
+        packet
+    }
+
+    /// 没有人监听的本机端口：查询被拒或得不到应答，不会发到机器外面。
+    /// A local port nobody listens on: queries are refused or go unanswered, and
+    /// nothing leaves the machine.
+    const DEAD_UPSTREAM: &str = "127.0.0.1:9";
+
+    /// 只有一个死上游、上游超时很短的引擎，以及 `stale.com` 查询的去重 hash。
+    /// An engine whose only upstream is dead, with a short upstream timeout, plus
+    /// the dedupe hash of the `stale.com` query.
+    fn engine_without_an_answering_upstream(serve_stale: bool) -> (Engine, u64) {
+        let engine = Engine::new(
+            RuntimePipelineConfig {
+                settings: GlobalSettings {
+                    default_upstream: DEAD_UPSTREAM.to_string(),
+                    upstream_timeout_ms: 100,
+                    serve_stale,
+                    serve_stale_ttl_reset: true,
+                    ..Default::default()
+                },
+                pipeline_select: Vec::new(),
+                pipelines: Vec::new(),
+                pipeline_id_index: FxHashMap::default(),
+            },
+            "lbl".to_string(),
+        )
+        .expect("initialize engine");
+
+        let pipeline_id: Arc<str> = Arc::from("default");
+        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(
+            engine.state.load().cache_namespace(&pipeline_id),
+            &pipeline_id,
+            b"stale.com",
+            RecordType::A,
+            DNSClass::IN,
+            None,
+        );
+        (engine, dedupe_hash)
+    }
+
+    fn engine_from_json(raw: serde_json::Value) -> Engine {
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        Engine::new(
+            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
+            "lbl".to_string(),
+        )
+        .expect("initialize engine")
+    }
+
+    /// 一条已经过期的 `stale.com` 缓存条目。 / An expired `stale.com` cache entry.
+    fn stale_entry(pipeline_id: &str) -> Arc<CacheEntry> {
+        Arc::new(CacheEntry {
+            bytes: Bytes::from_static(b"old_resp"),
+            rcode: ResponseCode::NoError,
+            upstream: None,
+            qname: Arc::from("stale.com"),
+            pipeline_id: Arc::from(pipeline_id),
+            qtype: u16::from(RecordType::A),
+            inserted_at: Instant::now() - Duration::from_secs(10),
+            original_ttl: 5,
+            refresh_ttl: 5,
+        })
+    }
+
+    /// 以后台刷新的身份处理 `stale.com` 查询，结果写入 `cache_hash`。
+    /// Handle the `stale.com` query as a background refresh writing to `cache_hash`.
+    async fn refresh(engine: &Engine, cache_hash: u64) -> anyhow::Result<Bytes> {
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        engine
+            .handle_packet_internal(&stale_com_query(), peer, true, None, Some(cache_hash), None)
+            .await
+    }
+
+    fn assert_upstream_failure(err: &anyhow::Error) {
+        assert!(
+            err.downcast_ref::<crate::engine::upstream::UpstreamFailure>()
+                .is_some(),
+            "the refresh must get the upstream failure itself, got: {err:#}"
+        );
+    }
+
+    /// 所有上游都失败时，后台刷新要把失败原样交回刷新任务，由它记录。以前刷新会拿
+    /// 过期应答（或合成的 SERVFAIL）当成功返回：任务不告警，开着
+    /// serve_stale_ttl_reset 时还会给一条没有任何客户端拿到的过期条目重新计时。
+    /// When every upstream fails, a background refresh must hand the failure back to
+    /// the refresh task, which logs it. It used to return the stale answer (or a
+    /// synthesized SERVFAIL) as a success: the task did not warn, and with
+    /// serve_stale_ttl_reset it re-armed an entry no client was served.
+    #[tokio::test]
+    async fn a_failed_background_refresh_reports_the_failure_and_leaves_the_entry_alone() {
+        let (engine, dedupe_hash) = engine_without_an_answering_upstream(true);
+        let stale = stale_entry("default");
+        engine.cache.insert(dedupe_hash, stale.clone());
+
+        let err = refresh(&engine, dedupe_hash)
+            .await
+            .expect_err("a refresh whose upstreams all failed must not report success");
+
+        assert_upstream_failure(&err);
+        let cached = engine
+            .cache
+            .get(&dedupe_hash)
+            .expect("a failed refresh must keep the stale entry");
+        assert!(
+            Arc::ptr_eq(&cached, &stale),
+            "a refresh serves no client, so it must not re-arm the stale entry"
+        );
+    }
+
+    /// 后台刷新不在 inflight 里登记，失败时也不能去完成同一 hash 下别的请求的
+    /// 等待者：那个请求自己的上游查询可能会成功，它的等待者不该先收到刷新的 SERVFAIL。
+    /// A background refresh never registers in `inflight`, so its failure must not
+    /// complete the waiters of another request for the same hash: that request's
+    /// own upstream query may still succeed, and its waiters must not get the
+    /// refresh's SERVFAIL first.
+    #[tokio::test]
+    async fn a_failed_background_refresh_leaves_other_requests_waiters_alone() {
+        let (engine, dedupe_hash) = engine_without_an_answering_upstream(false);
+        let (tx, rx) = tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
+        engine.inflight.insert(dedupe_hash, tx);
+
+        let result = refresh(&engine, dedupe_hash).await;
+
+        assert!(
+            result.is_err(),
+            "a refresh whose upstreams all failed must fail"
+        );
+        assert!(
+            engine.inflight.contains_key(&dedupe_hash),
+            "the other request's inflight entry must stay registered"
+        );
+        assert!(
+            matches!(rx.has_changed(), Ok(false)),
+            "the other request's waiters must not receive anything from the refresh"
+        );
+    }
+
+    /// 失败的刷新一结束就释放刷新标记。开着 serve_stale_client_timeout_ms 时，请求
+    /// 要等下一次过期命中发起的刷新；标记一直占着，它们只能等到超时再拿过期应答。
+    /// A failed refresh releases its mark as soon as it ends. With
+    /// serve_stale_client_timeout_ms, requests wait for the refresh the next stale
+    /// hit starts; a mark held on would leave them waiting out the timeout instead.
+    #[tokio::test]
+    async fn a_failed_background_refresh_releases_its_mark_when_it_ends() {
+        let (engine, dedupe_hash) = engine_without_an_answering_upstream(false);
+        let marked = || {
+            is_refreshing(
+                &engine.refreshing_bitmap,
+                &engine.refreshing_set,
+                dedupe_hash,
+            )
+        };
+        engine.spawn_background_refresh(
+            engine.state.load_full(),
+            dedupe_hash,
+            "default",
+            "stale.com",
+            RecordType::A,
+            DNSClass::IN,
+            "127.0.0.1".parse().unwrap(),
+        );
+        assert!(marked(), "the refresh must be marked while it runs");
+
+        let released = tokio::time::timeout(Duration::from_secs(3), async {
+            while marked() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "a failed refresh must release its mark when it ends"
+        );
+    }
+
+    /// 刷新经 response_actions_on_miss 跳到备用 Pipeline、备用上游也失败时，同样要把
+    /// 失败交回刷新任务，而不是一条合成的 SERVFAIL。
+    /// When a refresh jumps to a backup Pipeline through response_actions_on_miss and
+    /// the backup upstream fails too, the refresh task must still get the failure,
+    /// not a synthesized SERVFAIL.
+    #[tokio::test]
+    async fn a_failed_background_refresh_reports_the_failure_through_an_on_miss_jump() {
+        let engine = engine_from_json(serde_json::json!({
+            "settings": { "default_upstream": DEAD_UPSTREAM, "upstream_timeout_ms": 100 },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [{
+                        "name": "forward",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": DEAD_UPSTREAM }],
+                        "response_actions_on_miss": [
+                            { "type": "jump_to_pipeline", "pipeline": "backup" }
+                        ]
+                    }]
+                },
+                {
+                    "id": "backup",
+                    "rules": [{
+                        "name": "forward",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": DEAD_UPSTREAM }]
+                    }]
+                }
+            ]
+        }));
+
+        let err = refresh(&engine, 1)
+            .await
+            .expect_err("a refresh whose backup upstream also failed must not report success");
+
+        assert_upstream_failure(&err);
+    }
+
+    /// 上游失败、on_miss 的转发也失败时，动作合成的 SERVFAIL 不能被刷新写进缓存，
+    /// 盖掉它要刷新的过期条目（min_ttl 大于 0 时就会写）。
+    /// When the upstream fails and the on-miss forward fails too, the SERVFAIL the
+    /// actions synthesize must not be cached by the refresh over the stale entry it
+    /// was refreshing, which happens whenever min_ttl is above zero.
+    #[tokio::test]
+    async fn a_failed_background_refresh_does_not_cache_an_on_miss_servfail() {
+        let engine = engine_from_json(serde_json::json!({
+            "settings": {
+                "default_upstream": DEAD_UPSTREAM,
+                "upstream_timeout_ms": 100,
+                "min_ttl": 30,
+                "serve_stale": true
+            },
+            "pipelines": [{
+                "id": "main",
+                "rules": [{
+                    "name": "forward",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": DEAD_UPSTREAM }],
+                    "response_actions_on_miss": [
+                        { "type": "forward", "upstream": DEAD_UPSTREAM }
+                    ]
+                }]
+            }]
+        }));
+        let stale = stale_entry("main");
+        engine.cache.insert(1, stale.clone());
+
+        let err = refresh(&engine, 1)
+            .await
+            .expect_err("a refresh whose on-miss forward also failed must not report success");
+
+        assert_upstream_failure(&err);
+        let cached = engine
+            .cache
+            .get(&1)
+            .expect("a failed refresh must keep the stale entry");
+        assert!(
+            Arc::ptr_eq(&cached, &stale),
+            "a failed refresh must not cache SERVFAIL over the stale entry"
         );
     }
 
