@@ -1163,7 +1163,10 @@ pub(crate) async fn process_response_jump(
                         }
                     }
                     Err(err) => {
-                        if err.downcast_ref::<UpstreamFailure>().is_none() {
+                        // A background refresh answers no client, so it gets the failure
+                        // itself (see handle_forward_decision_logged).
+                        // 后台刷新没有要应答的客户端，失败原样交回（同 handle_forward_decision_logged）。
+                        if skip_cache || err.downcast_ref::<UpstreamFailure>().is_none() {
                             return Err(err);
                         }
                         let resp_bytes = engine_helpers::build_servfail_response(req)?;

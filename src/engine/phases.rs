@@ -1018,9 +1018,15 @@ pub(crate) async fn handle_forward_decision_logged(
         }
         Err(e) => {
             if response_actions_on_miss.is_empty() {
-                // Only send SERVFAIL when upstream attempts are fully exhausted.
-                // 仅在所有上游尝试都耗尽时发送 SERVFAIL。
-                if e.downcast_ref::<UpstreamFailure>().is_none() {
+                // The stale answer and the SERVFAIL below answer a client once every
+                // upstream attempt is exhausted. A background refresh has no client and
+                // never registered in `inflight`, so it gets the failure itself, which
+                // refresh.rs logs, and neither the cached entry nor other requests'
+                // waiters are touched.
+                // 下面的过期应答和 SERVFAIL 只在所有上游尝试都耗尽时用来应答客户端。
+                // 后台刷新没有客户端，也没在 inflight 里登记，所以把失败原样交回，由
+                // refresh.rs 记录；缓存条目和别的请求的等待者都不受影响。
+                if skip_cache || e.downcast_ref::<UpstreamFailure>().is_none() {
                     return Err(e);
                 }
 
@@ -1038,9 +1044,7 @@ pub(crate) async fn handle_forward_decision_logged(
                         tx_id,
                         start,
                         peer,
-                        // A background refresh never looked the cache up, so it
-                        // must not report a hit either / 后台刷新没有查过缓存，也不能上报命中
-                        observed: if skip_cache { None } else { observed },
+                        observed,
                     },
                     CacheHitKind::StaleUpstreamFailure,
                     response,
@@ -1162,6 +1166,14 @@ pub(crate) async fn handle_forward_decision_logged(
                         Ok(ForwardResult::Success(ctx.raw))
                     }
                     ResponseActionResult::Static { bytes, rcode, .. } => {
+                        // The upstream already failed, so a SERVFAIL here means the miss
+                        // actions found no answer either. A refresh gets the failure rather
+                        // than caching SERVFAIL over the entry it was refreshing.
+                        // 上游已经失败，这里的 SERVFAIL 说明 on_miss 动作也没拿到应答。刷新
+                        // 把失败交回，而不是把 SERVFAIL 写进缓存、盖掉它要刷新的那条。
+                        if skip_cache && rcode == ResponseCode::ServFail {
+                            return Err(e);
+                        }
                         if min_ttl > Duration::from_secs(0) {
                             let ttl = proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
                             engine.insert_dns_cache_entry(

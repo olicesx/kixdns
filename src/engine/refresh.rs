@@ -115,6 +115,14 @@ pub fn spawn_background_refresh(
                     "Background refresh completed successfully"
                 );
             }
+            // The refresh mark is released as soon as the task ends, failure or not. A
+            // stale hit starts a refresh only while the mark is clear, and with
+            // serve_stale_client_timeout_ms the request then waits for that refresh, so
+            // holding the mark for a backoff would leave it waiting for a refresh that
+            // never starts.
+            // 无论成败，任务一结束就释放刷新标记。过期命中只在标记空闲时才发起刷新，
+            // 开着 serve_stale_client_timeout_ms 时请求随后就等这次刷新；退避期间占着
+            // 标记，请求等的就是一个根本没有发起的刷新。
             Err(e) => {
                 warn!(
                     event = "background_refresh_failed",
@@ -124,19 +132,6 @@ pub fn spawn_background_refresh(
                     error = %e,
                     "Background refresh failed"
                 );
-                // Keep the refresh marker during a short retry backoff. This reuses the existing
-                // singleflight state and prevents repeated stale hits from spawning a retry storm.
-                // 在短暂退避期间保留刷新标记，避免 stale 请求持续触发失败重试。
-                tokio::time::sleep(std::time::Duration::from_secs(
-                    engine
-                        .state
-                        .load()
-                        .pipeline
-                        .settings
-                        .cache_refresh_min_ttl
-                        .max(1) as u64,
-                ))
-                .await;
             }
         }
         // _guard dropped here, automatically clearing the refresh mark
