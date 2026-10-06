@@ -271,7 +271,15 @@ impl Engine {
             client_ip,
             include_ip,
         );
-        let allow_rule_cache_lookup = !skip_cache && skip_rules.is_none_or(|set| set.is_empty());
+        // With rules skipped (the ones a continue passed), this evaluation does not
+        // give the pipeline's decision for the name, so it neither reads nor writes
+        // the rule cache. A background refresh evaluates the whole pipeline: it does
+        // not read the cache but still writes its decision.
+        // 跳过了规则（continue 越过的那些）时，这次求值得出的不是这个 pipeline 对这个
+        // 名字的决策，所以既不读也不写规则缓存。后台刷新求值的是整条 pipeline：不读
+        // 缓存，但照常写入决策。
+        let whole_pipeline = skip_rules.is_none_or(|set| set.is_empty());
+        let allow_rule_cache_lookup = !skip_cache && whole_pipeline;
 
         if allow_rule_cache_lookup && let Some(record) = self.rule_cache.get(&rule_hash) {
             let entry = &record.entry;
@@ -364,15 +372,17 @@ impl Engine {
                 &decision,
             );
         }
-        self.insert_rule_cache(
-            rule_hash,
-            pipeline.id.clone(),
-            request,
-            decision.clone(),
-            include_ip,
-            &matched_rules,
-            decided_by_rule,
-        );
+        if whole_pipeline {
+            self.insert_rule_cache(
+                rule_hash,
+                pipeline.id.clone(),
+                request,
+                decision.clone(),
+                include_ip,
+                &matched_rules,
+                decided_by_rule,
+            );
+        }
         decision
     }
 
@@ -712,5 +722,97 @@ mod observer_rule_cache_tests {
             .expect("engine");
         let records = recorded_rules(engine).await;
         assert_eq!(records, vec![Some(1)]);
+    }
+}
+
+#[cfg(test)]
+mod continued_rule_cache_tests {
+    use std::sync::Arc;
+
+    use hickory_proto::rr::{DNSClass, RecordType};
+    use rustc_hash::FxHashSet;
+
+    use super::RuleEvaluationContext;
+    use crate::config::PipelineConfig;
+    use crate::engine::Engine;
+    use crate::engine::rules::Decision;
+    use crate::matcher::RuntimePipelineConfig;
+
+    /// `first` forwards and continues on a miss; `next` forwards elsewhere.
+    /// `first` 转发，未命中时 continue；`next` 转发到别处。
+    fn runtime() -> RuntimePipelineConfig {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 60 },
+            "pipelines": [{
+                "id": "main",
+                "rules": [
+                    {
+                        "name": "first",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }],
+                        "response_actions_on_miss": [{ "type": "continue" }]
+                    },
+                    {
+                        "name": "next",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": "127.0.0.1:10" }]
+                    }
+                ]
+            }]
+        });
+        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        RuntimePipelineConfig::from_config(cfg).expect("runtime config")
+    }
+
+    fn rule_of(decision: &Decision) -> &str {
+        match decision {
+            Decision::Forward { rule_name, .. } => rule_name,
+            other => panic!("expected a forward decision, got {other:?}"),
+        }
+    }
+
+    /// continue 之后，决策循环跳过越过的规则重新求值。那时得出的决策不是这个
+    /// pipeline 对这个名字的决策：以前它被写进规则缓存，在缓存过期前（最长 60 秒）
+    /// 之后的请求都直接从 `next` 开始，不经过 `first`。
+    /// After a continue, the decision loop evaluates the pipeline again without the
+    /// rules it passed. The decision it reaches then is not the pipeline's decision
+    /// for the name: it used to be written to the rule cache, so until that entry
+    /// expired (up to 60 s) later requests started at `next` and skipped `first`.
+    #[tokio::test]
+    async fn a_decision_reached_after_a_continue_is_not_cached() {
+        let engine = Engine::new(runtime(), "test".to_string()).expect("engine");
+        let state = engine.state.load_full();
+        let pipeline = &state.pipeline.pipelines[0];
+        let continued: FxHashSet<Arc<str>> = [Arc::from("first")].into_iter().collect();
+        let request = |skip_rules| {
+            RuleEvaluationContext::new(
+                "127.0.0.1".parse().unwrap(),
+                "example.com",
+                RecordType::A,
+                DNSClass::IN,
+                false,
+                skip_rules,
+                false,
+            )
+        };
+
+        let after_continue = engine.apply_rules(&state, pipeline, &request(Some(&continued)));
+        assert_eq!(rule_of(&after_continue), "next");
+
+        let fresh = engine.apply_rules(&state, pipeline, &request(None));
+        assert_eq!(
+            rule_of(&fresh),
+            "first",
+            "a new request must start at the first rule again"
+        );
+
+        // 正常求值的决策照常缓存 / A decision from a normal evaluation is still cached
+        engine.rule_cache.run_pending_tasks();
+        let cached: Vec<_> = engine
+            .rule_cache
+            .iter()
+            .map(|(_, record)| rule_of(&record.entry.decision).to_owned())
+            .collect();
+        assert_eq!(cached, ["first"]);
     }
 }
