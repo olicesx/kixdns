@@ -6,7 +6,7 @@ use crate::engine::response::{extract_ttl, extract_ttl_for_refresh};
 use crate::engine::response_log::ResponseInfo;
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
 use crate::engine::types::EngineInner;
-use crate::engine::upstream::UpstreamFailure;
+use crate::engine::upstream::{UpstreamFailure, reject_failure_reply_on_refresh};
 use crate::engine::utils::InflightCleanupGuard;
 use crate::engine::utils::engine_helpers::{build_response, build_servfail_response_fast};
 use crate::matcher::{RuntimeResponseMatcherWithOp, eval_match_chain};
@@ -835,6 +835,8 @@ pub(crate) async fn handle_forward_decision_logged(
             };
 
             if actions_to_run.is_empty() {
+                // See reject_failure_reply_on_refresh / 见 reject_failure_reply_on_refresh
+                reject_failure_reply_on_refresh(skip_cache, &raw)?;
                 if effective_ttl > Duration::from_secs(0) {
                     let cache_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_cache);
                     let refresh_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_refresh);
@@ -1134,6 +1136,8 @@ pub(crate) async fn handle_forward_decision_logged(
 
                 match action_result {
                     ResponseActionResult::Upstream { ctx, resp_match: _ } => {
+                        // The reply to a miss action's forward / on_miss 动作转发拿到的应答
+                        reject_failure_reply_on_refresh(skip_cache, &ctx.raw)?;
                         let ttl_secs_cache = extract_ttl(&ctx.msg);
                         let ttl_secs_refresh = extract_ttl_for_refresh(&ctx.msg);
                         let effective_ttl =
