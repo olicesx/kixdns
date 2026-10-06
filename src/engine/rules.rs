@@ -934,6 +934,10 @@ pub(crate) async fn process_response_jump(
                     )
                     .await
                 };
+                // As in handle_forward_decision_logged / 同 handle_forward_decision_logged
+                let resp = resp.and_then(|reply| {
+                    reject_failure_reply_on_refresh(skip_cache, &reply.0).map(|()| reply)
+                });
 
                 match resp {
                     Ok((raw, actual_upstream)) => {
@@ -1030,8 +1034,6 @@ pub(crate) async fn process_response_jump(
                         };
 
                         if actions_to_run.is_empty() {
-                            // See reject_failure_reply_on_refresh / 见 reject_failure_reply_on_refresh
-                            reject_failure_reply_on_refresh(skip_cache, &raw)?;
                             if resp_match_ok && effective_ttl > Duration::from_secs(0) {
                                 let entry = CacheEntry {
                                     bytes: raw.clone(),
