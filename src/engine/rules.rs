@@ -22,7 +22,7 @@ use crate::engine::response::{
 };
 use crate::engine::types::EngineInner;
 use crate::engine::types::InflightMap;
-use crate::engine::upstream::UpstreamFailure;
+use crate::engine::upstream::{UpstreamFailure, reject_failure_reply_on_refresh};
 use crate::engine::utils::engine_helpers::{self, build_response};
 use crate::engine::utils::parse_rcode;
 use crate::matcher::RuntimeResponseMatcherWithOp;
@@ -1030,6 +1030,8 @@ pub(crate) async fn process_response_jump(
                         };
 
                         if actions_to_run.is_empty() {
+                            // See reject_failure_reply_on_refresh / 见 reject_failure_reply_on_refresh
+                            reject_failure_reply_on_refresh(skip_cache, &raw)?;
                             if resp_match_ok && effective_ttl > Duration::from_secs(0) {
                                 let entry = CacheEntry {
                                     bytes: raw.clone(),
@@ -1085,6 +1087,8 @@ pub(crate) async fn process_response_jump(
 
                         match action_result {
                             ResponseActionResult::Upstream { ctx, resp_match } => {
+                                // The reply to a response action's forward / 响应动作转发拿到的应答
+                                reject_failure_reply_on_refresh(skip_cache, &ctx.raw)?;
                                 // Extract TTL for cache entry (use min for RFC 1035 compliance)
                                 // 提取 TTL 用于缓存条目 (使用最小值符合 RFC 1035)
                                 let ttl_secs_cache = extract_ttl(&ctx.msg);

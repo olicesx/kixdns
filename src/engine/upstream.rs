@@ -39,6 +39,38 @@ impl std::error::Error for UpstreamFailure {
     }
 }
 
+/// Whether a reply's response code makes it a failed attempt: [`forward_upstream`]
+/// rejects a SERVFAIL or REFUSED reply for a rule with several upstreams, and hands
+/// it back as the answer only when the rule has a single upstream.
+/// 应答的响应码是否表示一次失败的尝试：规则有多个上游时，[`forward_upstream`] 拒绝
+/// SERVFAIL 或 REFUSED 应答；只有规则只有一个上游时，才把它当作应答交回。
+pub(crate) fn is_failure_reply(rcode: ResponseCode) -> bool {
+    matches!(rcode, ResponseCode::ServFail | ResponseCode::Refused)
+}
+
+/// A background refresh does not cache a failure reply (see [`is_failure_reply`]),
+/// which a rule with a single upstream gets back as its answer: it would replace the
+/// answer cached under the same key, and a lookup never serves such an entry as
+/// stale. The refresh gets an error here instead of caching it, and the cached
+/// answer stays.
+/// 后台刷新不缓存失败应答（见 [`is_failure_reply`]；只有一个上游的规则会把它当作应答
+/// 拿回来）：它会替换掉同一个键下缓存的应答，而查缓存时这样的条目不会被当作旧结果返回。
+/// 刷新在这里拿到一个错误，不缓存它，缓存的应答保留。
+pub(crate) fn reject_failure_reply_on_refresh(
+    skip_cache: bool,
+    reply: &[u8],
+) -> anyhow::Result<()> {
+    if !skip_cache {
+        return Ok(());
+    }
+    match crate::proto_utils::parse_response_quick(reply).map(|qr| qr.rcode) {
+        Some(rcode) if is_failure_reply(rcode) => Err(anyhow::Error::new(UpstreamFailure::new(
+            anyhow::anyhow!("the upstream answered {rcode}"),
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Whether an upstream address carries a `scheme://` transport prefix, which
 /// [`parse_upstream_addr`] lets override the configured transport.
 /// 上游地址是否带 `scheme://` 传输前缀（parse_upstream_addr 以前缀覆盖配置的传输）。
@@ -533,15 +565,7 @@ pub async fn forward_upstream(
                         let quick = crate::proto_utils::parse_response_quick(&bytes);
                         let rcode = quick.as_ref().map(|qr| qr.rcode);
                         let truncated = quick.as_ref().map(|qr| qr.truncated);
-                        let should_accept = if let Some(qr) = quick {
-                            match qr.rcode {
-                                ResponseCode::NoError => true,
-                                ResponseCode::ServFail | ResponseCode::Refused => false,
-                                _ => true,
-                            }
-                        } else {
-                            true
-                        };
+                        let should_accept = quick.is_none_or(|qr| !is_failure_reply(qr.rcode));
 
                         if should_accept {
                             report(UpstreamOutcome::Success, rcode, truncated, None);
@@ -986,5 +1010,285 @@ mod tests {
             0,
             "tcp fallback should be disabled in dual-send udp path"
         );
+    }
+}
+
+#[cfg(test)]
+mod refresh_failure_reply_tests {
+    use super::{UpstreamFailure, is_failure_reply, reject_failure_reply_on_refresh};
+    use crate::engine::core::Engine;
+    use crate::engine::response_log::ResponseInfo;
+    use crate::engine::rules::{ResponseJumpContext, process_response_jump};
+    use crate::matcher::RuntimePipelineConfig;
+    use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+    use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+    use hickory_proto::serialize::binary::BinDecodable;
+    use serde_json::{Value, json};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::str::FromStr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU16, Ordering};
+    use std::time::Duration;
+
+    const CLIENT: &str = "127.0.0.1:53000";
+    /// Nothing listens here / 这里没有监听
+    const DEAD_UPSTREAM: &str = "127.0.0.1:9";
+
+    /// A local UDP upstream answering with one A record while its rcode is
+    /// NOERROR, and with that rcode and no records once switched.
+    /// 本机 UDP 上游：响应码为 NOERROR 时回一条 A 记录，切换后回该响应码、不带记录。
+    struct Upstream {
+        addr: String,
+        rcode: Arc<AtomicU16>,
+    }
+
+    impl Upstream {
+        async fn spawn() -> Self {
+            let rcode = Arc::new(AtomicU16::new(u16::from(ResponseCode::NoError)));
+            let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = sock.local_addr().unwrap().to_string();
+            let current = rcode.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1500];
+                while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                    let Ok(query) = Message::from_bytes(&buf[..n]) else {
+                        continue;
+                    };
+                    let Some(question) = query.queries.first().cloned() else {
+                        continue;
+                    };
+                    let code = ResponseCode::from_low(current.load(Ordering::SeqCst) as u8);
+                    let mut resp = Message::new(query.id, MessageType::Response, OpCode::Query);
+                    resp.metadata.response_code = code;
+                    resp.add_query(question.clone());
+                    if code == ResponseCode::NoError {
+                        resp.add_answer(Record::from_rdata(
+                            question.name().clone(),
+                            300,
+                            RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::new(192, 0, 2, 1))),
+                        ));
+                    }
+                    let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
+                }
+            });
+            Self { addr, rcode }
+        }
+
+        fn answer(&self, rcode: ResponseCode) {
+            self.rcode.store(u16::from(rcode), Ordering::SeqCst);
+        }
+    }
+
+    fn engine_with(pipeline: Value) -> Engine {
+        let raw = json!({
+            "settings": {
+                "default_upstream": DEAD_UPSTREAM,
+                "upstream_timeout_ms": 200,
+                "min_ttl": 60
+            },
+            "pipelines": [pipeline]
+        });
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        Engine::new(
+            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
+            "test".to_string(),
+        )
+        .expect("engine")
+    }
+
+    /// Pipeline `id` with one rule forwarding to `upstream`, plus `response_rules`.
+    /// 只有一条规则的 pipeline `id`：转发到 `upstream`，带上 `response_rules`。
+    fn forwarding(id: &str, upstream: &str, response_rules: Value) -> Value {
+        let mut rule = json!({
+            "name": "forward",
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "forward", "upstream": upstream }]
+        });
+        for (key, value) in response_rules.as_object().unwrap() {
+            rule[key] = value.clone();
+        }
+        json!({ "id": id, "rules": [rule] })
+    }
+
+    fn forward_to(upstream: &str) -> Value {
+        json!([{ "type": "forward", "upstream": upstream }])
+    }
+
+    fn query() -> Message {
+        let mut request = Message::new(0x5157, MessageType::Query, OpCode::Query);
+        request.add_query(Query::query(
+            Name::from_str("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        request
+    }
+
+    fn cache_key(engine: &Engine, pipeline: &str) -> u64 {
+        let state = engine.state.load_full();
+        Engine::calculate_cache_hash_for_dedupe(
+            state.cache_namespace(pipeline),
+            pipeline,
+            b"example.com",
+            RecordType::A,
+            DNSClass::IN,
+            None,
+        )
+    }
+
+    /// The entry a client request leaves under `key`, holding an answer.
+    /// 客户端请求在 `key` 下留下的、带应答的缓存条目。
+    async fn cache_an_answer(engine: &Engine, key: u64) -> Arc<crate::cache::CacheEntry> {
+        let client: SocketAddr = CLIENT.parse().unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.handle_packet(&query().to_vec().unwrap(), client),
+        )
+        .await
+        .expect("client request finishes")
+        .expect("client request succeeds");
+        let cached = engine.cache.get(&key).expect("the client answer is cached");
+        assert_eq!(cached.rcode, ResponseCode::NoError);
+        cached
+    }
+
+    /// Runs the call `spawn_background_refresh` makes / 执行与 `spawn_background_refresh` 相同的调用
+    async fn refresh(engine: &Engine, key: u64) {
+        let state = engine.state.load_full();
+        let client: SocketAddr = CLIENT.parse().unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.handle_packet_internal(
+                &query().to_vec().unwrap(),
+                client,
+                true,
+                None,
+                Some(key),
+                Some(state),
+            ),
+        )
+        .await
+        .expect("refresh finishes");
+    }
+
+    /// Enters `pipeline` through a response-phase jump, as a refresh does.
+    /// 像刷新那样，经由响应阶段的跳转进入 `pipeline`。
+    async fn refresh_through_a_jump_into(engine: &Engine, pipeline: &str) {
+        let state = engine.state.load_full();
+        let request = query();
+        let packet = request.to_vec().unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            process_response_jump(
+                engine,
+                ResponseJumpContext {
+                    state: &state,
+                    pipeline_id: Arc::from(pipeline),
+                    remaining_jumps: 1,
+                    req: &request,
+                    packet: &packet,
+                    peer: CLIENT.parse().unwrap(),
+                    qname: "example.com",
+                    qtype: RecordType::A,
+                    qclass: DNSClass::IN,
+                    edns_present: false,
+                    min_ttl: Duration::from_secs(60),
+                    upstream_timeout: Duration::from_millis(200),
+                    skip_cache: true,
+                    observed: None,
+                },
+                &mut ResponseInfo::default(),
+            ),
+        )
+        .await
+        .expect("refresh finishes");
+    }
+
+    fn assert_still_cached(engine: &Engine, key: u64, entry: &Arc<crate::cache::CacheEntry>) {
+        let cached = engine.cache.get(&key).expect("the entry stays cached");
+        assert!(
+            Arc::ptr_eq(&cached, entry),
+            "the refresh replaced the entry"
+        );
+    }
+
+    async fn assert_a_refreshed_reply_of(failure: ResponseCode) {
+        let upstream = Upstream::spawn().await;
+        let engine = engine_with(forwarding("main", &upstream.addr, json!({})));
+        let key = cache_key(&engine, "main");
+        let entry = cache_an_answer(&engine, key).await;
+
+        upstream.answer(failure);
+        refresh(&engine, key).await;
+        assert_still_cached(&engine, key, &entry);
+    }
+
+    #[tokio::test]
+    async fn a_refresh_answered_servfail_keeps_the_entry() {
+        assert_a_refreshed_reply_of(ResponseCode::ServFail).await;
+    }
+
+    #[tokio::test]
+    async fn a_refresh_answered_refused_keeps_the_entry() {
+        assert_a_refreshed_reply_of(ResponseCode::Refused).await;
+    }
+
+    #[tokio::test]
+    async fn a_refresh_keeps_the_entry_when_a_miss_action_forward_answers_servfail() {
+        let fallback = Upstream::spawn().await;
+        let on_miss = json!({ "response_actions_on_miss": forward_to(&fallback.addr) });
+        let engine = engine_with(forwarding("main", DEAD_UPSTREAM, on_miss));
+        let key = cache_key(&engine, "main");
+        let entry = cache_an_answer(&engine, key).await;
+
+        fallback.answer(ResponseCode::ServFail);
+        refresh(&engine, key).await;
+        assert_still_cached(&engine, key, &entry);
+    }
+
+    #[tokio::test]
+    async fn a_refresh_through_a_jump_keeps_the_entry() {
+        let upstream = Upstream::spawn().await;
+        let engine = engine_with(forwarding("target", &upstream.addr, json!({})));
+        let key = cache_key(&engine, "target");
+        let entry = cache_an_answer(&engine, key).await;
+
+        upstream.answer(ResponseCode::ServFail);
+        refresh_through_a_jump_into(&engine, "target").await;
+        assert_still_cached(&engine, key, &entry);
+    }
+
+    #[tokio::test]
+    async fn a_refresh_through_a_jump_keeps_the_entry_when_a_match_action_forward_answers_servfail()
+    {
+        let first = Upstream::spawn().await;
+        let second = Upstream::spawn().await;
+        let on_match = json!({ "response_actions_on_match": forward_to(&second.addr) });
+        let engine = engine_with(forwarding("target", &first.addr, on_match));
+        let key = cache_key(&engine, "target");
+        let entry = cache_an_answer(&engine, key).await;
+
+        second.answer(ResponseCode::ServFail);
+        refresh_through_a_jump_into(&engine, "target").await;
+        assert_still_cached(&engine, key, &entry);
+    }
+
+    #[test]
+    fn only_servfail_and_refused_are_failure_replies() {
+        let reply = |code: ResponseCode| {
+            let mut reply = Message::new(1, MessageType::Response, OpCode::Query);
+            reply.metadata.response_code = code;
+            reply.to_vec().unwrap()
+        };
+        for code in [ResponseCode::ServFail, ResponseCode::Refused] {
+            assert!(is_failure_reply(code), "{code}");
+            let err = reject_failure_reply_on_refresh(true, &reply(code)).unwrap_err();
+            assert!(err.downcast_ref::<UpstreamFailure>().is_some());
+            assert!(reject_failure_reply_on_refresh(false, &reply(code)).is_ok());
+        }
+        for code in [ResponseCode::NoError, ResponseCode::NXDomain] {
+            assert!(!is_failure_reply(code), "{code}");
+            assert!(reject_failure_reply_on_refresh(true, &reply(code)).is_ok());
+        }
     }
 }
