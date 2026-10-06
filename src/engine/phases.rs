@@ -504,6 +504,14 @@ pub struct ForwardDecisionContext<'a> {
     pub ecs: Option<&'a crate::config::EcsMode>,
     pub allow_reuse: bool,
     pub reused_response: &'a mut Option<ResponseContext>,
+    /// The inflight entry this request registered and still holds after a rule
+    /// continued. The request keeps it for the rest of the decision loop, so its
+    /// waiters get the final answer rather than one a rule continued past; a
+    /// request holding an entry never waits on one.
+    /// 规则 continue 后本请求仍持有的 inflight 条目。它在决策循环余下的部分一直由
+    /// 本请求持有，等待者拿到的是最终应答，而不是规则越过的那一个；持有条目的请求
+    /// 从不等条目。
+    pub held_inflight: &'a mut Option<InflightCleanupGuard>,
     /// Observer context of the request / 所属请求的观察者上下文
     pub observed: Observed<'a>,
 }
@@ -546,6 +554,7 @@ pub(crate) async fn handle_forward_decision_logged(
         ecs,
         allow_reuse,
         reused_response,
+        held_inflight,
         observed,
     } = context;
 
@@ -588,6 +597,16 @@ pub(crate) async fn handle_forward_decision_logged(
                         ));
                         None
                     }
+                    // A request holding an entry (see `held_inflight`) never waits
+                    // on one: the entry may be its own, which the next rule forwards
+                    // under after a continue, or another request's that waits on
+                    // this one in turn (continue, then jump into each other's
+                    // pipeline). It forwards itself instead.
+                    // 持有条目的请求（见 `held_inflight`）从不等条目：这一条可能就是它
+                    // 自己的（continue 后下一条规则以相同 hash 转发），也可能是另一个
+                    // 反过来在等它的请求的（continue 后互相跳进对方的 pipeline）。它
+                    // 自己转发。
+                    Entry::Occupied(_) if held_inflight.is_some() => None,
                     Entry::Occupied(entry) => {
                         let rx = entry.get().subscribe();
                         Some(rx)
@@ -638,6 +657,8 @@ pub(crate) async fn handle_forward_decision_logged(
                     ));
                     None
                 }
+                // See the same arm above / 同上
+                Entry::Occupied(_) if held_inflight.is_some() => None,
                 Entry::Occupied(entry) => {
                     let rx = entry.get().subscribe();
                     Some(rx)
@@ -989,28 +1010,13 @@ pub(crate) async fn handle_forward_decision_logged(
                     Ok(ForwardResult::Success(resp_bytes))
                 }
                 ResponseActionResult::Continue { ctx } => {
-                    // Defusing here would leave the inflight entry (dedupe_hash)
-                    // in the map without ever notifying it: concurrent same-hash
-                    // requests wait on rx.changed() forever, and — worse — the
-                    // re-evaluated next rule (execution.rs re-applies rules and
-                    // forwards again with the same dedupe_hash) finds the entry
-                    // Occupied and hangs until the outer timeout, which surfaces
-                    // as a client TIMEOUT instead of a fallback answer.
-                    // 此处 defuse 会让 inflight 条目（dedupe_hash）留在 map 中且
-                    // 永远不通知：并发同 hash 请求会永久等待 rx.changed()，更糟的
-                    // 是——continue 后重新评估的下一条规则（execution.rs 重新
-                    // apply_rules 并以相同 dedupe_hash 再次转发）会看到 Occupied
-                    // 条目并挂起直到外层超时，表现为客户端 TIMEOUT 而非 fallback。
-                    //
-                    // So: notify waiters with the response received so far, and
-                    // let the cleanup guard (kept active) remove the entry on
-                    // return, so the next Forward attempt starts fresh.
-                    // 因此：先以已收到的响应通知等待者，并让清理守卫（保持 active）
-                    // 在返回时移除条目，使下一次 Forward 尝试从全新条目开始。
-                    if let Some(ctx_ref) = ctx.as_ref() {
-                        engine
-                            .notify_inflight_waiters(dedupe_hash, &ctx_ref.raw)
-                            .await;
+                    // The rule continued past this response, so it is not the
+                    // answer: keep the entry for the rest of the decision loop
+                    // (see `held_inflight`) instead of handing it to waiters.
+                    // 规则越过了这个应答，它不是最终结果：条目留给决策循环的后续
+                    // 部分（见 `held_inflight`），不把它交给等待者。
+                    if let Some(guard) = cleanup_guard.take() {
+                        *held_inflight = Some(guard);
                     }
                     Ok(ForwardResult::Continue(Box::new(ctx)))
                 }
@@ -1232,12 +1238,14 @@ pub(crate) async fn handle_forward_decision_logged(
                         Ok(ForwardResult::Success(resp_bytes))
                     }
                     ResponseActionResult::Continue { ctx } => {
-                        // Defuse cleanup guard: we're returning Continue which re-enters
-                        // the decision loop. The inflight entry must survive for waiters.
-                        // If we don't defuse, Drop will remove the inflight entry without
-                        // notifying waiters, causing them to hang forever on rx.changed().
-                        if let Some(g) = cleanup_guard.as_mut() {
-                            g.defuse();
+                        // Same as the Continue on a response above (see `held_inflight`).
+                        // Defusing the guard here used to leave the entry behind with
+                        // nobody holding it, so the next Forward waited on it until the
+                        // listener timeout.
+                        // 同上面有应答时的 Continue（见 `held_inflight`）。以前这里 defuse
+                        // 守卫，条目留在表里却没人持有，下一条转发会一直等它到监听器超时。
+                        if let Some(guard) = cleanup_guard.take() {
+                            *held_inflight = Some(guard);
                         }
                         Ok(ForwardResult::Continue(Box::new(ctx)))
                     }

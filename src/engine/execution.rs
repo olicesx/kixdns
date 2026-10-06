@@ -36,7 +36,7 @@ use super::response::build_fast_static_response;
 use super::response_log::ResponseLog;
 use super::rules::RuleCacheRecord;
 use super::types::{EngineInner, FastPathResponse, build_cache_namespaces};
-use super::utils::{engine_helpers, is_refreshing};
+use super::utils::{InflightCleanupGuard, engine_helpers, is_refreshing};
 #[cfg(test)]
 use crate::engine::rules::calculate_rule_hash;
 use crate::engine::rules::{Decision, ResponseContext};
@@ -942,6 +942,10 @@ impl Engine {
         // observer learns the outcome; the block is awaited immediately.
         // 以下代码在多处返回响应；用 async 块包裹使所有出口汇聚到一处，便于观察者
         // 获得请求结果。该块会被立即 await。
+        // Inflight entry the request still holds after a rule continued (see
+        // `ForwardDecisionContext::held_inflight`)
+        // 规则 continue 后本请求仍持有的 inflight 条目
+        let mut held_inflight: Option<InflightCleanupGuard> = None;
         let result: anyhow::Result<Bytes> = async {
             // Find pipeline_opt from pipeline_id / 从 pipeline_id 查找 pipeline_opt
             let pipeline_opt = cfg
@@ -1294,6 +1298,14 @@ impl Engine {
                         anyhow::bail!("unresolved pipeline jump");
                     }
                     Decision::Static { rcode, answers } => {
+                        // A static answer from a pipeline that matches on the client
+                        // is that client's alone: let the waiters run the rules
+                        // themselves rather than hand it to them.
+                        // 按客户端匹配的 pipeline 给出的静态应答只属于这个客户端：让
+                        // 等待者自己走规则，不把它交给它们。
+                        if current_uses_client_ip {
+                            drop(held_inflight.take());
+                        }
                         response_log.info.upstream = Some(Arc::from("static"));
                         return phases::handle_static_decision(
                             self,
@@ -1352,6 +1364,7 @@ impl Engine {
                                 ecs: ecs.as_ref(),
                                 allow_reuse,
                                 reused_response: &mut reused_response,
+                                held_inflight: &mut held_inflight,
                                 observed: observed_ctx,
                             },
                             &mut response_log.info,
@@ -1424,6 +1437,17 @@ impl Engine {
             }
         }
         .await;
+        // A request that continued still holds its entry here: its waiters get the
+        // final answer. On failure, or if the request is cancelled, the guard drops
+        // and removes the entry, and the waiters forward themselves.
+        // continue 过的请求走到这里仍持有条目：等待者拿到最终应答。失败或请求被
+        // 取消时，守卫被丢弃并移除条目，等待者自己转发。
+        if let Some(mut guard) = held_inflight.take()
+            && let Ok(bytes) = &result
+        {
+            guard.defuse();
+            self.notify_inflight_waiters(guard.hash, bytes).await;
+        }
         response_log.finish(&result);
         if let Some(observed) = observed.as_mut() {
             observed.set_status(if result.is_ok() {
@@ -1809,6 +1833,373 @@ mod tests {
         assert!(
             engine.cache_get(&new_target_key).is_none(),
             "the response jump must not populate the active generation"
+        );
+    }
+
+    /// 用一条 A 记录 `answer` 回应每个查询的本机 UDP 上游，并数收到了多少个查询。
+    /// A local UDP upstream that answers every query with one A record `answer`,
+    /// counting the queries it receives.
+    async fn spawn_answering_upstream(
+        answer: std::net::Ipv4Addr,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap().to_string();
+        let queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = queries.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                let Ok(query) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                let Some(question) = query.queries.first().cloned() else {
+                    continue;
+                };
+                counted.fetch_add(1, Ordering::Relaxed);
+                let mut resp = Message::new(query.id(), MessageType::Response, OpCode::Query);
+                resp.add_query(question.clone());
+                resp.add_answer(Record::from_rdata(
+                    question.name().clone(),
+                    300,
+                    RData::A(hickory_proto::rr::rdata::A(answer)),
+                ));
+                let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
+            }
+        });
+        (addr, queries)
+    }
+
+    /// 只收不答的本机 UDP 上游，数收到了多少个数据包。
+    /// A local UDP upstream that never answers, counting the datagrams it receives.
+    async fn spawn_silent_upstream() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap().to_string();
+        let datagrams = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = datagrams.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while sock.recv_from(&mut buf).await.is_ok() {
+                counted.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        (addr, datagrams)
+    }
+
+    fn continue_config(
+        pipeline_select: serde_json::Value,
+        pipelines: serde_json::Value,
+    ) -> RuntimePipelineConfig {
+        let raw = serde_json::json!({
+            "settings": {
+                "default_upstream": "127.0.0.1:9",
+                "upstream_timeout_ms": 100,
+                "enable_tcp_fallback": false
+            },
+            "pipeline_select": pipeline_select,
+            "pipelines": pipelines
+        });
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        RuntimePipelineConfig::from_config(config).expect("build runtime config")
+    }
+
+    fn example_query() -> Vec<u8> {
+        let mut request = Message::new(0xBEEF, MessageType::Query, OpCode::Query);
+        request.add_query(Query::query(
+            Name::from_str("example.com").unwrap(),
+            RecordType::A,
+        ));
+        request.to_vec().unwrap()
+    }
+
+    fn first_a_record(response: anyhow::Result<Bytes>) -> Option<std::net::Ipv4Addr> {
+        let response = Message::from_bytes(&response.expect("answer")).expect("parse");
+        match response.answers.first().map(|record| &record.data) {
+            Some(RData::A(address)) => Some(address.0),
+            _ => None,
+        }
+    }
+
+    /// 同一个 example.com 查询从 `clients` 同时发出：第一个登记 inflight，第二个等在
+    /// 它上面。按顺序返回两个应答的 A 记录（没有就是 None），并断言没有留下 inflight 条目。
+    /// The same example.com query sent from `clients` at once: the first registers
+    /// in inflight and the second waits on it. Returns both answers' A records in
+    /// order (None without one) and asserts that no inflight entry is left behind.
+    async fn ask_at_once(engine: &Engine, clients: [&str; 2]) -> [Option<std::net::Ipv4Addr>; 2] {
+        let packet = example_query();
+        let [first, second] = clients.map(|client| client.parse::<SocketAddr>().unwrap());
+        // 修复前会挂到监听器超时；5 秒只用来区分「挂住」
+        // Before the fix these hung until the listener timeout; 5 s only tells a hang apart
+        let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                engine.handle_packet(&packet, first),
+                engine.handle_packet(&packet, second)
+            )
+        })
+        .await
+        .expect("a request after a continue must not hang");
+        assert!(
+            engine.inflight.is_empty(),
+            "a finished request must not leave its inflight entry behind"
+        );
+        [first_a_record(first), first_a_record(second)]
+    }
+
+    const ONE_CLIENT: [&str; 2] = ["127.0.0.1:53000"; 2];
+
+    /// 先 continue 到下一条规则的配置：`first` 转发到 `first_upstream`，失败后 continue，
+    /// 下一条是 `next`。
+    /// A configuration that continues on a miss: `first` forwards to
+    /// `first_upstream` and continues when it fails; the next rule is `next`.
+    fn continue_on_miss_to(first_upstream: &str, next: serde_json::Value) -> RuntimePipelineConfig {
+        continue_config(
+            serde_json::json!([]),
+            serde_json::json!([{
+                "id": "main",
+                "rules": [
+                    {
+                        "name": "first",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": first_upstream }],
+                        "response_actions_on_miss": [{ "type": "continue" }]
+                    },
+                    next
+                ]
+            }]),
+        )
+    }
+
+    /// 同一份配置下，一个请求单独发出和两个请求同时发出，`first` 的死上游各收到多少
+    /// 数据包。两者相等说明等待者没有自己再转发一遍。
+    /// Datagrams the dead `first` upstream receives for one request alone and for
+    /// two at once under the same configuration. Equal counts show the waiting
+    /// request did not forward again itself.
+    async fn datagrams_alone_and_at_once(
+        next: serde_json::Value,
+    ) -> (usize, usize, [Option<std::net::Ipv4Addr>; 2]) {
+        let (alone, sent_alone) = spawn_silent_upstream().await;
+        let engine = Engine::new(
+            continue_on_miss_to(&alone, next.clone()),
+            "test".to_string(),
+        )
+        .expect("engine");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.handle_packet(&example_query(), ONE_CLIENT[0].parse().unwrap()),
+        )
+        .await
+        .expect("a request after a continue must not hang")
+        .expect("answer");
+
+        let (silent, sent) = spawn_silent_upstream().await;
+        let engine =
+            Engine::new(continue_on_miss_to(&silent, next), "test".to_string()).expect("engine");
+        let answers = ask_at_once(&engine, ONE_CLIENT).await;
+        (
+            sent_alone.load(Ordering::Relaxed),
+            sent.load(Ordering::Relaxed),
+            answers,
+        )
+    }
+
+    /// on_miss 里的 continue 要把请求交给下一条规则。以前这里卸掉清理守卫，条目留在
+    /// 表里却没人持有：下一条规则以相同 dedupe_hash 转发时等的正是这一条，请求和等在
+    /// 它上面的请求一起挂到监听器超时。现在条目由请求一直持有，等待者拿到下一条规则
+    /// 的应答，不会自己再转发一遍。
+    /// A continue in response_actions_on_miss must hand the request to the next
+    /// rule. The guard used to be defused here, leaving the entry behind with
+    /// nobody holding it: the next rule's Forward, under the same dedupe_hash,
+    /// waited on that very entry, and the request hung until the listener timeout
+    /// along with every request waiting on it. Now the request keeps holding the
+    /// entry, and waiters get the next rule's answer without forwarding again.
+    #[tokio::test]
+    async fn a_continue_on_miss_hands_the_request_to_the_next_rule() {
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+        let (alone, at_once, answers) = datagrams_alone_and_at_once(serde_json::json!({
+            "name": "next",
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "forward", "upstream": answering }]
+        }))
+        .await;
+
+        assert_eq!(answers, [Some(answer); 2]);
+        assert_eq!(
+            at_once, alone,
+            "the waiting request must get the answer, not forward again"
+        );
+    }
+
+    /// continue 之后以静态应答结束时，等待者拿到同一个应答，不会自己再转发。
+    /// When a continue ends on a static answer, waiters get that same answer
+    /// without forwarding again.
+    #[tokio::test]
+    async fn waiters_get_a_static_answer_reached_after_a_continue() {
+        let (alone, at_once, answers) = datagrams_alone_and_at_once(serde_json::json!({
+            "name": "static",
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "static_ip_response", "ip": "192.0.2.30" }]
+        }))
+        .await;
+
+        assert_eq!(answers, [Some("192.0.2.30".parse().unwrap()); 2]);
+        assert_eq!(
+            at_once, alone,
+            "the waiting request must get the answer, not forward again"
+        );
+    }
+
+    /// continue 之后下一条规则也失败：两个请求都拿到 SERVFAIL，不挂，也不留下条目。
+    /// When the next rule after a continue fails too, both requests get SERVFAIL,
+    /// neither hangs, and no entry is left behind.
+    #[tokio::test]
+    async fn a_failure_after_a_continue_answers_every_request() {
+        let (silent, _) = spawn_silent_upstream().await;
+        let engine = Engine::new(
+            continue_on_miss_to(
+                &silent,
+                serde_json::json!({
+                    "name": "next",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": silent }]
+                }),
+            ),
+            "test".to_string(),
+        )
+        .expect("engine");
+
+        assert_eq!(ask_at_once(&engine, ONE_CLIENT).await, [None; 2]);
+    }
+
+    /// `check` 转发到 `checked`，应答来自它就 continue；`then` 接在后面。
+    /// `check` forwards to `checked` and continues when the answer comes from it;
+    /// `then` follows.
+    fn continue_on_match_rules(checked: &str, then: serde_json::Value) -> serde_json::Value {
+        let mut rules = vec![serde_json::json!({
+            "name": "check",
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "forward", "upstream": checked }],
+            "response_matchers": [{ "type": "upstream_equals", "value": checked }],
+            "response_actions_on_match": [{ "type": "continue" }]
+        })];
+        rules.extend(then.as_array().expect("rules").iter().cloned());
+        serde_json::Value::Array(rules)
+    }
+
+    /// on_match 里的 continue：规则越过了第一个上游的应答，等待者也必须拿到最终
+    /// 应答。以前它们拿到的是被越过的那个，例如防污染配置里被判为污染的应答。
+    /// A continue in response_actions_on_match: the rule continued past the first
+    /// upstream's answer, so waiters must get the final answer too. They used to
+    /// get the one continued past, such as an answer judged poisoned.
+    #[tokio::test]
+    async fn waiters_get_the_final_answer_after_a_continue_on_match() {
+        let (checked, _) = spawn_answering_upstream("192.0.2.10".parse().unwrap()).await;
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+        let engine = Engine::new(
+            continue_config(
+                serde_json::json!([]),
+                serde_json::json!([{
+                    "id": "main",
+                    "rules": continue_on_match_rules(&checked, serde_json::json!([{
+                        "name": "next",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": answering }]
+                    }]))
+                }]),
+            ),
+            "test".to_string(),
+        )
+        .expect("engine");
+
+        assert_eq!(ask_at_once(&engine, ONE_CLIENT).await, [Some(answer); 2]);
+    }
+
+    /// 按客户端匹配的 pipeline 在 continue 之后给出的静态应答只属于那个客户端（例如
+    /// 只对某台设备屏蔽），不能交给等在它上面的另一个客户端。
+    /// A static answer a client-matching pipeline gives after a continue belongs to
+    /// that client alone (such as blocking one device) and must not reach another
+    /// client waiting on it.
+    #[tokio::test]
+    async fn a_client_specific_static_answer_is_not_handed_to_another_client() {
+        let (checked, _) = spawn_answering_upstream("192.0.2.10".parse().unwrap()).await;
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+        let engine = Engine::new(
+            continue_config(
+                serde_json::json!([]),
+                serde_json::json!([{
+                    "id": "main",
+                    "rules": continue_on_match_rules(&checked, serde_json::json!([
+                        {
+                            "name": "block",
+                            "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }],
+                            "actions": [{ "type": "static_ip_response", "ip": "0.0.0.0" }]
+                        },
+                        {
+                            "name": "next",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "forward", "upstream": answering }]
+                        }
+                    ]))
+                }]),
+            ),
+            "test".to_string(),
+        )
+        .expect("engine");
+
+        let blocked = std::net::Ipv4Addr::UNSPECIFIED;
+        assert_eq!(
+            ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
+            [Some(blocked), Some(answer)]
+        );
+    }
+
+    /// 两个 pipeline 都在 continue 之后按客户端跳进对方。持有条目的请求如果还会去等
+    /// 别人，两个请求就各自持有对方在等的条目，互相等到监听器超时。
+    /// Two pipelines that each continue and then jump into the other by client. If
+    /// a request holding an entry still waited on others, each request would hold
+    /// what the other waits on, and both would wait until the listener timeout.
+    #[tokio::test]
+    async fn requests_holding_entries_never_wait_on_each_other() {
+        let (checked, _) = spawn_answering_upstream("192.0.2.10".parse().unwrap()).await;
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+        let pipeline = |id: &str, client: &str, other: &str| {
+            serde_json::json!({
+                "id": id,
+                "rules": continue_on_match_rules(&checked, serde_json::json!([
+                    {
+                        "name": "cross",
+                        "matchers": [{ "type": "client_ip", "cidr": client }],
+                        "actions": [{ "type": "jump_to_pipeline", "pipeline": other }]
+                    },
+                    {
+                        "name": "next",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": answering }]
+                    }
+                ]))
+            })
+        };
+        let engine = Engine::new(
+            continue_config(
+                serde_json::json!([
+                    { "pipeline": "p1", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                    { "pipeline": "p2", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+                ]),
+                serde_json::json!([
+                    pipeline("p1", "10.0.0.1/32", "p2"),
+                    pipeline("p2", "10.0.0.2/32", "p1")
+                ]),
+            ),
+            "test".to_string(),
+        )
+        .expect("engine");
+
+        assert_eq!(
+            ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
+            [Some(answer); 2]
         );
     }
 
