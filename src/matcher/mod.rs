@@ -48,6 +48,40 @@ impl TxtMatchMode {
 }
 
 // ============================================================================
+// Domain Suffix / 域名后缀
+// ============================================================================
+
+/// 域名后缀按点分段比较：`example.com` 命中它本身和每个子域名，`.example.com` 只命中子域名，
+/// `notexample.com` 两种都不命中。请求名在解析时已转小写、不带结尾的点，配置值在加载时已转小写。
+/// 规则、Pipeline 入口和响应阶段的 `request_domain_suffix` 都用这一个比较，按索引查到的候选和逐条检查的规则结果一致。
+///
+/// Domain suffixes compare label by label: `example.com` matches itself and every subdomain,
+/// `.example.com` subdomains only, and `notexample.com` matches neither. The query name is lowercased
+/// without a trailing dot when parsed, and the configured value is lowercased when loaded. Rules,
+/// pipeline selectors and the response-phase `request_domain_suffix` all use this one comparison, so a
+/// rule found through an index and a rule checked one by one agree.
+#[inline]
+pub(crate) fn domain_suffix_matches(qname: &str, suffix: &str) -> bool {
+    if suffix.is_empty() || suffix.starts_with('.') {
+        return qname.ends_with(suffix);
+    }
+    qname
+        .strip_suffix(suffix)
+        .is_some_and(|head| head.is_empty() || head.ends_with('.'))
+}
+
+/// 后缀索引的键：查找时从整个请求名开始，每次去掉最左边一段，所以键里不带开头的点。
+/// 带点的值（只命中子域名）同样能被查到，是否命中本身交给 [`domain_suffix_matches`]。
+///
+/// The suffix index key. A lookup starts from the whole query name and drops the leftmost label each
+/// step, so a key carries no leading dot. A dotted value (subdomains only) is found the same way, and
+/// [`domain_suffix_matches`] then decides whether the name itself counts.
+#[inline]
+pub(crate) fn domain_suffix_index_key(suffix: &str) -> &str {
+    suffix.strip_prefix('.').unwrap_or(suffix)
+}
+
+// ============================================================================
 // Matcher Helper Functions / 匹配器辅助函数
 // ============================================================================
 
@@ -510,11 +544,14 @@ impl RuntimePipelineConfig {
                                 indexed = true;
                             }
                             RuntimeMatcher::DomainSuffix { value } => {
-                                domain_suffix_index
-                                    .entry(value.clone())
-                                    .or_default()
-                                    .push(idx);
-                                indexed = true;
+                                let key = domain_suffix_index_key(value);
+                                if !key.is_empty() {
+                                    domain_suffix_index
+                                        .entry(Arc::from(key))
+                                        .or_default()
+                                        .push(idx);
+                                    indexed = true;
+                                }
                             }
                             RuntimeMatcher::DomainRegex { .. }
                             | RuntimeMatcher::ClientIp { .. }
@@ -885,7 +922,7 @@ impl RuntimeMatcher {
                 // 完全匹配，大小写不敏感 / Exact match, case insensitive
                 qname.eq_ignore_ascii_case(value)
             }
-            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value.as_ref()),
+            RuntimeMatcher::DomainSuffix { value } => domain_suffix_matches(qname, value),
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes } => {
@@ -939,7 +976,7 @@ impl RuntimeMatcher {
                 // 完全匹配，大小写不敏感 / Exact match, case insensitive
                 qname.eq_ignore_ascii_case(value)
             }
-            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value.as_ref()),
+            RuntimeMatcher::DomainSuffix { value } => domain_suffix_matches(qname, value),
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes } => {
@@ -1112,7 +1149,7 @@ impl RuntimePipelineSelectorMatcher {
             }
             RuntimePipelineSelectorMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimePipelineSelectorMatcher::DomainSuffix { value } => {
-                qname.ends_with(value.as_ref())
+                domain_suffix_matches(qname, value)
             }
             RuntimePipelineSelectorMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimePipelineSelectorMatcher::Any => true,
@@ -1164,7 +1201,7 @@ impl RuntimePipelineSelectorMatcher {
             }
             RuntimePipelineSelectorMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimePipelineSelectorMatcher::DomainSuffix { value } => {
-                qname.ends_with(value.as_ref())
+                domain_suffix_matches(qname, value)
             }
             RuntimePipelineSelectorMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimePipelineSelectorMatcher::Any => true,
@@ -1408,7 +1445,7 @@ impl RuntimeResponseMatcher {
         match self {
             RuntimeResponseMatcher::UpstreamEquals { value } => upstream == value.as_ref(),
             RuntimeResponseMatcher::RequestDomainSuffix { value } => {
-                qname.ends_with(value.as_ref())
+                domain_suffix_matches(qname, value)
             }
             RuntimeResponseMatcher::RequestDomainRegex { regex } => regex.is_match(qname),
             RuntimeResponseMatcher::ResponseUpstreamIp { nets } => try_parse_upstream_ip(upstream)
@@ -1941,5 +1978,83 @@ mod tests {
 
         drop(guard);
         let _ = std::fs::remove_file(path);
+    }
+
+    /// 域名后缀按点分段：不带点的值命中它本身和子域名，带点的值只命中子域名，尾巴相同的别的域名都不算。
+    /// Domain suffixes compare by label: a plain value matches itself and subdomains, a dotted one subdomains
+    /// only, and another name that merely ends in the same letters matches neither.
+    #[test]
+    fn domain_suffix_matches_by_label() {
+        let cases = [
+            ("example.com", "example.com", true),
+            ("www.example.com", "example.com", true),
+            ("a.b.example.com", "example.com", true),
+            ("notexample.com", "example.com", false),
+            ("example.com.cn", "example.com", false),
+            ("example.com", ".example.com", false),
+            ("www.example.com", ".example.com", true),
+            ("notexample.com", ".example.com", false),
+            ("cn", "cn", true),
+            ("example.cn", "cn", true),
+            ("examplecn", "cn", false),
+            ("anything.test", "", true),
+        ];
+        for (qname, suffix, expected) in cases {
+            assert_eq!(
+                domain_suffix_matches(qname, suffix),
+                expected,
+                "{qname} against {suffix:?}"
+            );
+        }
+    }
+
+    /// 两种写法进后缀索引时用同一个键：查找是按点从整名往上走的，带开头的点就永远查不到。
+    /// Both spellings enter the suffix index under one key: lookups walk up the name by label, so a key with
+    /// a leading dot would never be found.
+    #[test]
+    fn domain_suffix_index_keys_drop_the_leading_dot() {
+        assert_eq!(domain_suffix_index_key(".example.com"), "example.com");
+        assert_eq!(domain_suffix_index_key("example.com"), "example.com");
+        let cfg: PipelineConfig = serde_json::from_value(serde_json::json!({
+            "pipelines": [{
+                "id": "main",
+                "rules": [
+                    { "name": "dotted", "matchers": [{ "type": "domain_suffix", "value": ".dotted.test" }], "actions": [{ "type": "deny" }] },
+                    { "name": "plain", "matchers": [{ "type": "domain_suffix", "value": "Plain.Test" }], "actions": [{ "type": "deny" }] }
+                ]
+            }]
+        }))
+        .expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
+        let index = &runtime.pipelines[0].domain_suffix_index;
+        assert_eq!(index.get("dotted.test").map(Vec::as_slice), Some(&[0][..]));
+        assert_eq!(index.get("plain.test").map(Vec::as_slice), Some(&[1][..]));
+        assert!(!index.contains_key(".dotted.test"));
+    }
+
+    /// 响应阶段的 request_domain_suffix 和请求阶段同一个比较。
+    /// The response-phase request_domain_suffix uses the same comparison as the request phase.
+    #[test]
+    fn response_request_domain_suffix_matches_by_label() {
+        let message = Message::new(0, MessageType::Response, OpCode::Query);
+        let check = |value: &str, qname: &str| {
+            RuntimeResponseMatcher::RequestDomainSuffix {
+                value: Arc::from(value),
+            }
+            .matches(
+                "udp:test",
+                qname,
+                RecordType::A,
+                DNSClass::IN,
+                &message,
+                None,
+                None,
+            )
+        };
+        assert!(check("svc.test", "svc.test"));
+        assert!(check("svc.test", "a.svc.test"));
+        assert!(!check("svc.test", "notsvc.test"));
+        assert!(!check(".svc.test", "svc.test"));
+        assert!(check(".svc.test", "a.svc.test"));
     }
 }

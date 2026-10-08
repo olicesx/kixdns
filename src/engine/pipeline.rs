@@ -714,3 +714,132 @@ mod observer_rule_cache_tests {
         assert_eq!(records, vec![Some(1)]);
     }
 }
+
+/// 域名后缀在每条路径上结果一样：Pipeline 入口、只有一个条件的规则（走索引）、几个条件「满足任一」的规则（逐条检查），
+/// 而且静态快速路径和普通路径各测一遍（规则的第一个动作是 log 时不走快速路径）。
+/// Domain suffixes give one answer on every path: pipeline selectors, single-condition rules (found through
+/// the index) and any-of rules (checked one by one), each on both the static fast path and the regular path
+/// (a rule whose first action is log skips the fast path).
+#[cfg(test)]
+mod domain_suffix_path_tests {
+    use std::net::Ipv4Addr;
+
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::{Name, RData, RecordType};
+
+    use crate::config::PipelineConfig;
+    use crate::engine::Engine;
+    use crate::matcher::RuntimePipelineConfig;
+
+    fn rule(
+        name: &str,
+        operator: &str,
+        suffixes: &[&str],
+        ip: &str,
+        fast: bool,
+    ) -> serde_json::Value {
+        let matchers: Vec<_> = suffixes
+            .iter()
+            .map(|value| serde_json::json!({ "type": "domain_suffix", "value": value, "operator": operator }))
+            .collect();
+        let answer = serde_json::json!({ "type": "static_ip_response", "ip": ip });
+        let actions = if fast {
+            serde_json::json!([answer])
+        } else {
+            serde_json::json!([{ "type": "log", "level": "debug" }, answer])
+        };
+        serde_json::json!({ "name": name, "matcher_operator": operator, "matchers": matchers, "actions": actions })
+    }
+
+    fn engine() -> Engine {
+        let rules = vec![
+            rule("fast-plain", "and", &["fast.test"], "10.0.1.1", true),
+            rule("fast-dotted", "and", &[".fastdot.test"], "10.0.1.2", true),
+            rule(
+                "fast-any",
+                "or",
+                &["unused.invalid", "fastany.test"],
+                "10.0.1.3",
+                true,
+            ),
+            rule("slow-plain", "and", &["slow.test"], "10.0.2.1", false),
+            rule("slow-dotted", "and", &[".slowdot.test"], "10.0.2.2", false),
+            rule(
+                "slow-any",
+                "or",
+                &["unused.invalid", "slowany.test"],
+                "10.0.2.3",
+                false,
+            ),
+            serde_json::json!({ "name": "rest", "matchers": [{ "type": "any" }], "actions": [{ "type": "static_ip_response", "ip": "10.0.9.9" }] }),
+        ];
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipeline_select": [
+                { "pipeline": "dotted", "matchers": [{ "type": "domain_suffix", "value": ".seldot.test" }] },
+                { "pipeline": "plain", "matchers": [{ "type": "domain_suffix", "value": "sel.test" }] }
+            ],
+            "pipelines": [
+                { "id": "main", "rules": rules },
+                { "id": "dotted", "rules": [{ "name": "dotted", "matchers": [{ "type": "any" }], "actions": [{ "type": "static_ip_response", "ip": "10.0.0.1" }] }] },
+                { "id": "plain", "rules": [{ "name": "plain", "matchers": [{ "type": "any" }], "actions": [{ "type": "static_ip_response", "ip": "10.0.0.2" }] }] }
+            ]
+        });
+        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
+        Engine::new(runtime, "test".to_string()).expect("engine")
+    }
+
+    async fn answer(engine: &Engine, qname: &str) -> Ipv4Addr {
+        let mut message = Message::new(7, MessageType::Query, OpCode::Query);
+        message.add_query(Query::query(
+            Name::from_str_relaxed(qname).unwrap(),
+            RecordType::A,
+        ));
+        let bytes = engine
+            .handle_packet(
+                &message.to_vec().unwrap(),
+                "127.0.0.1:53000".parse().unwrap(),
+            )
+            .await
+            .expect("static answer");
+        let response = Message::from_vec(&bytes).expect("parse response");
+        match response.answers.first().map(|record| &record.data) {
+            Some(RData::A(a)) => a.0,
+            other => panic!("{qname}: expected one A record, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn domain_suffix_matches_by_label_on_every_path() {
+        let engine = engine();
+        let rest = Ipv4Addr::new(10, 0, 9, 9);
+        let cases = [
+            // 入口 / pipeline selectors
+            ("sel.test", Ipv4Addr::new(10, 0, 0, 2)),
+            ("a.sel.test", Ipv4Addr::new(10, 0, 0, 2)),
+            ("notsel.test", rest),
+            ("seldot.test", rest),
+            ("a.seldot.test", Ipv4Addr::new(10, 0, 0, 1)),
+            // 快速路径 / static fast path
+            ("fast.test", Ipv4Addr::new(10, 0, 1, 1)),
+            ("a.fast.test", Ipv4Addr::new(10, 0, 1, 1)),
+            ("notfast.test", rest),
+            ("fastdot.test", rest),
+            ("a.fastdot.test", Ipv4Addr::new(10, 0, 1, 2)),
+            ("fastany.test", Ipv4Addr::new(10, 0, 1, 3)),
+            ("notfastany.test", rest),
+            // 普通路径 / regular path
+            ("slow.test", Ipv4Addr::new(10, 0, 2, 1)),
+            ("a.slow.test", Ipv4Addr::new(10, 0, 2, 1)),
+            ("notslow.test", rest),
+            ("slowdot.test", rest),
+            ("a.slowdot.test", Ipv4Addr::new(10, 0, 2, 2)),
+            ("slowany.test", Ipv4Addr::new(10, 0, 2, 3)),
+            ("notslowany.test", rest),
+        ];
+        for (qname, expected) in cases {
+            assert_eq!(answer(&engine, qname).await, expected, "{qname}");
+        }
+    }
+}

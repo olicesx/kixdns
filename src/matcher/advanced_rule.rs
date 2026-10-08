@@ -11,8 +11,8 @@ use smallvec::SmallVec;
 use crate::config::{Action, MatchOperator};
 use crate::engine::utils::parse_rcode;
 use crate::engine::{Decision, make_static_cname_answer, make_static_ip_answer};
-use crate::matcher::eval_match_chain;
 use crate::matcher::{RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig, RuntimeRule};
+use crate::matcher::{domain_suffix_index_key, domain_suffix_matches, eval_match_chain};
 
 #[derive(Debug, Clone)]
 pub struct CompiledPipeline {
@@ -110,9 +110,11 @@ impl RuleIndex {
                     indexed = true;
                     break;
                 }
-                CompiledMatcher::DomainSuffix { suffix } if !suffix.is_empty() => {
+                CompiledMatcher::DomainSuffix { suffix }
+                    if !domain_suffix_index_key(suffix).is_empty() =>
+                {
                     self.domain_suffix
-                        .entry(suffix.clone())
+                        .entry(Arc::from(domain_suffix_index_key(suffix)))
                         .or_default()
                         .push(rule_idx);
                     indexed = true;
@@ -345,13 +347,7 @@ fn compiled_matcher_matches(
 ) -> bool {
     match matcher {
         CompiledMatcher::DomainExact { domain } => qname.eq_ignore_ascii_case(domain),
-        CompiledMatcher::DomainSuffix { suffix } => {
-            if suffix.is_empty() {
-                true
-            } else {
-                qname.ends_with(suffix.as_ref())
-            }
-        }
+        CompiledMatcher::DomainSuffix { suffix } => domain_suffix_matches(qname, suffix),
         CompiledMatcher::ClientIp { net } => net.contains(&client_ip),
         CompiledMatcher::QueryType { qtype: rt } => *rt == qtype,
         CompiledMatcher::Qclass { qclass: cls } => *cls == qclass,
@@ -359,7 +355,7 @@ fn compiled_matcher_matches(
         CompiledMatcher::Complex { matcher } => match matcher {
             RuntimeMatcher::Any => true,
             RuntimeMatcher::DomainExact { value } => qname.eq_ignore_ascii_case(value),
-            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value.as_ref()),
+            RuntimeMatcher::DomainSuffix { value } => domain_suffix_matches(qname, value),
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes: _ } => {
