@@ -213,10 +213,12 @@ pub struct RuntimePipeline {
     /// 是否包含依赖客户端 IP 的匹配规则 / Whether it contains rules that match based on client IP
     pub uses_client_ip: bool,
     /// How the answer can depend on the requester: through this pipeline's rules,
-    /// and the rules along the response-jump paths its answer checks start.
-    /// Response cache, inflight and rule cache keys tell requesters apart by it.
-    /// 应答如何取决于请求方：来自本 pipeline 的规则，以及它的回答检查开始的响应跳转
-    /// 路径上的规则。响应缓存、inflight 和规则缓存的键按它区分请求方。
+    /// the rules along the response-jump paths its answer checks start, and, when
+    /// an answer check continues, the pipelines its rules jump to. Response cache,
+    /// inflight and rule cache keys tell requesters apart by it.
+    /// 应答如何取决于请求方：来自本 pipeline 的规则、它的回答检查开始的响应跳转路径上的
+    /// 规则，以及回答检查会 continue 时它的规则跳到的 pipeline。响应缓存、inflight 和
+    /// 规则缓存的键按它区分请求方。
     pub requester: RequesterScope,
     /// What this pipeline's own request matchers tell requesters apart by. A rule
     /// decision depends on nothing else, so the rule cache keys on it.
@@ -426,10 +428,17 @@ struct RuleReads {
     /// `ecs` does not already key as finely
     /// 转发发送的取自客户端的 ECS，且 pipeline 自己的 `ecs` 没有按同样细的子网区分
     unkeyed_subnets: RequesterScope,
+    /// Every ECS from the client that its forwards send, keyed or not
+    /// 转发发送的每种取自客户端的 ECS，不论是否已区分
+    forward_subnets: RequesterScope,
     /// Pipelines its answer checks jump to / 回答检查跳到的 pipeline
     response_jumps: Vec<Arc<str>>,
+    /// Pipelines its rules jump to / 规则跳到的 pipeline
+    request_jumps: Vec<Arc<str>>,
     /// Pipelines its rules or answer checks jump to / 规则或回答检查跳到的 pipeline
     jumps: Vec<Arc<str>>,
+    /// Whether an answer check continues / 是否有回答检查会 continue
+    continues: bool,
 }
 
 impl RuleReads {
@@ -438,8 +447,11 @@ impl RuleReads {
             request_matchers: RequesterScope::default(),
             matchers: RequesterScope::default(),
             unkeyed_subnets: RequesterScope::default(),
+            forward_subnets: RequesterScope::default(),
             response_jumps: Vec::new(),
+            request_jumps: Vec::new(),
             jumps: Vec::new(),
+            continues: false,
         };
         let mut answer_edns = false;
         for rule in rules {
@@ -483,10 +495,16 @@ impl RuleReads {
                             if v4 >= prefix_v4 && v6 >= prefix_v6
                     );
                     if !keyed {
-                        reads.unkeyed_subnets.add(test);
+                        reads.unkeyed_subnets.add(test.clone());
                     }
+                    reads.forward_subnets.add(test);
                 }
             }
+            reads.continues |= rule
+                .response_actions_on_match
+                .iter()
+                .chain(&rule.response_actions_on_miss)
+                .any(|action| matches!(action, Action::Continue));
             let jump_target = |action: &Action| match action {
                 Action::JumpToPipeline { pipeline } => Some(Arc::<str>::from(pipeline.as_str())),
                 _ => None,
@@ -500,9 +518,10 @@ impl RuleReads {
                 reads.response_jumps.push(target.clone());
                 reads.jumps.push(target);
             }
-            reads
-                .jumps
-                .extend(rule.actions.iter().filter_map(jump_target));
+            for target in rule.actions.iter().filter_map(jump_target) {
+                reads.request_jumps.push(target.clone());
+                reads.jumps.push(target);
+            }
         }
         reads.matchers = reads.request_matchers.clone();
         if answer_edns {
@@ -561,6 +580,25 @@ fn requester_scopes(
                 .filter_map(|target| index.get(target).copied());
             for reached in reachable_pipelines(reads, index, targets) {
                 scope.extend(&reads[reached].matchers);
+            }
+            // After an answer check continues, the request keeps its entry for the
+            // rest of the decision loop (see `ForwardDecisionContext::held_inflight`)
+            // and its waiters take the final answer. The rest of the pipeline and
+            // the pipelines it jumps to may decide that answer, and forwards there
+            // send their own ECS, which this pipeline's key does not carry.
+            // 回答检查 continue 之后，请求在决策循环余下的部分一直持有条目（见
+            // `ForwardDecisionContext::held_inflight`），等待者拿到最终应答。这个应答可能由
+            // pipeline 余下的规则和它跳到的 pipeline 决定，而那里的转发发送自己的 ECS，
+            // 本 pipeline 的键并不带着。
+            if reads[idx].continues {
+                let targets = reads[idx]
+                    .request_jumps
+                    .iter()
+                    .filter_map(|target| index.get(target).copied());
+                for reached in reachable_pipelines(reads, index, targets) {
+                    scope.extend(&reads[reached].matchers);
+                    scope.extend(&reads[reached].forward_subnets);
+                }
             }
             scope
         })

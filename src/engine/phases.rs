@@ -526,10 +526,13 @@ pub struct ForwardDecisionContext<'a> {
     /// The inflight entry this request registered and still holds after a rule
     /// continued. The request keeps it for the rest of the decision loop, so its
     /// waiters get the final answer rather than one a rule continued past; a
-    /// request holding an entry never waits on one.
+    /// request holding an entry never waits on one. The entry's key keeps its
+    /// waiters to requesters that the rules run after the continue treat alike
+    /// (see `RuntimePipeline::requester`).
     /// 规则 continue 后本请求仍持有的 inflight 条目。它在决策循环余下的部分一直由
     /// 本请求持有，等待者拿到的是最终应答，而不是规则越过的那一个；持有条目的请求
-    /// 从不等条目。
+    /// 从不等条目。条目的键只让 continue 之后运行的规则一样对待的请求方等在上面（见
+    /// `RuntimePipeline::requester`）。
     pub held_inflight: &'a mut Option<InflightCleanupGuard>,
     /// Observer context of the request / 所属请求的观察者上下文
     pub observed: Observed<'a>,
@@ -1036,9 +1039,12 @@ pub(crate) async fn handle_forward_decision_logged(
                 ResponseActionResult::Continue { ctx } => {
                     // The rule continued past this response, so it is not the
                     // answer: keep the entry for the rest of the decision loop
-                    // (see `held_inflight`) instead of handing it to waiters.
+                    // (see `held_inflight`) instead of handing it to waiters. An
+                    // entry held from an earlier continue is dropped in its place,
+                    // and its waiters forward themselves.
                     // 规则越过了这个应答，它不是最终结果：条目留给决策循环的后续
-                    // 部分（见 `held_inflight`），不把它交给等待者。
+                    // 部分（见 `held_inflight`），不把它交给等待者。之前 continue
+                    // 时持有的条目被它替换掉，那一条的等待者自己转发。
                     if let Some(guard) = cleanup_guard.take() {
                         *held_inflight = Some(guard);
                     }
