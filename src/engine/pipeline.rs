@@ -15,7 +15,8 @@ use crate::matcher::advanced_rule::CompiledPipeline;
 use crate::matcher::geoip::GeoIpManager;
 use crate::matcher::geosite::GeoSiteManager;
 use crate::matcher::{
-    PipelineSelectorQuery, RuntimePipeline, RuntimePipelineConfig, eval_match_chain,
+    PipelineSelectorQuery, Requester, RequesterKey, RuntimePipeline, RuntimePipelineConfig,
+    eval_match_chain,
 };
 
 use super::core::Engine;
@@ -24,6 +25,7 @@ use super::observation::{Observed, decision_kind, report_decision, report_matche
 use super::rules::Decision;
 use super::rules::{
     RuleCacheEntry, RuleCacheRecord, calculate_rule_hash, contains_continue, fast_hash_str,
+    rule_cache_requester,
 };
 use super::types::EngineInner;
 use super::{make_static_cname_answer, make_static_ip_answer};
@@ -173,12 +175,11 @@ impl Engine {
         pipeline_id: Arc<str>,
         request: &RuleEvaluationContext<'_>,
         decision: Decision,
-        include_ip: bool,
+        requester: RequesterKey,
         matched_rules: &[Arc<str>],
         decided_by_rule: bool,
     ) {
         let RuleEvaluationContext {
-            client_ip,
             qname,
             qtype,
             qclass,
@@ -223,8 +224,6 @@ impl Engine {
 
         let expires_at = ttl.map(|d| Instant::now() + d);
 
-        // 优化：根据配置决定是否包含client_ip
-        // Optimization: only include client_ip in cache entry when configured or required by rule
         self.rule_cache.insert(
             hash,
             RuleCacheRecord {
@@ -233,7 +232,7 @@ impl Engine {
                     qname_hash: fast_hash_str(qname),
                     qtype: u16::from(qtype),
                     qclass: u16::from(qclass),
-                    client_ip: if include_ip { Some(client_ip) } else { None },
+                    requester,
                     decision: Arc::new(decision),
                     expires_at,
                 },
@@ -254,22 +253,29 @@ impl Engine {
             qname,
             qtype,
             qclass,
+            edns_present,
             skip_rules,
             skip_cache,
             ..
         } = *request;
         // 1. Check Rule Cache
         // Use hash for lookup to avoid cloning String for key on every lookup
-        let include_ip =
-            pipeline.uses_client_ip || state.pipeline.settings.cache_background_refresh;
+        let requester_key = rule_cache_requester(
+            pipeline,
+            state.pipeline.settings.cache_background_refresh,
+            Requester {
+                address: client_ip,
+                edns: edns_present,
+            },
+            Some(&self.geoip_manager),
+        );
         let rule_hash = calculate_rule_hash(
             state.cache_namespace(&pipeline.id),
             &pipeline.id,
             qname,
             qtype,
             qclass,
-            client_ip,
-            include_ip,
+            &requester_key,
         );
         let allow_rule_cache_lookup = !skip_cache && skip_rules.is_none_or(|set| set.is_empty());
 
@@ -279,7 +285,7 @@ impl Engine {
             // 检查有效性，如果过期则清理
             if !entry.is_valid() {
                 self.rule_cache.remove(&rule_hash);
-            } else if entry.matches(&pipeline.id, qname, qtype, qclass, client_ip, include_ip) {
+            } else if entry.matches(&pipeline.id, qname, qtype, qclass, &requester_key) {
                 if let Some((observer, ctx)) = request.observed {
                     let recorded = record.matched_rules.as_deref();
                     observer.rule_cache_lookup(
@@ -369,7 +375,7 @@ impl Engine {
             pipeline.id.clone(),
             request,
             decision.clone(),
-            include_ip,
+            requester_key,
             &matched_rules,
             decided_by_rule,
         );

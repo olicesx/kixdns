@@ -27,6 +27,7 @@ use crate::engine::utils::engine_helpers::{self, build_response};
 use crate::engine::utils::parse_rcode;
 use crate::matcher::RuntimeResponseMatcherWithOp;
 use crate::matcher::eval_match_chain;
+use crate::matcher::{Requester, RequesterKey, RuntimePipeline};
 use crate::observe::{RuleEvaluated, RuleMatched, RulePhase};
 
 use super::observation::{Observed, response_decision_kind};
@@ -96,8 +97,7 @@ pub fn calculate_rule_hash(
     qname: &str,
     qtype: RecordType,
     qclass: DNSClass,
-    client_ip: IpAddr,
-    uses_client_ip: bool,
+    requester: &RequesterKey,
 ) -> u64 {
     let mut hasher = FxHasher::default();
     cache_namespace.hash(&mut hasher);
@@ -105,10 +105,27 @@ pub fn calculate_rule_hash(
     qname.hash(&mut hasher);
     u16::from(qtype).hash(&mut hasher);
     u16::from(qclass).hash(&mut hasher);
-    if uses_client_ip {
-        client_ip.hash(&mut hasher);
-    }
+    requester.hash_into(&mut hasher);
     hasher.finish()
+}
+
+/// The requester's part of a rule cache key for `pipeline`: how its own request
+/// matchers judge the requester (see `RuntimePipeline::rule_requester`). With
+/// background refresh on, it also carries the client address, as the rule
+/// cache did before scopes existed.
+/// `pipeline` 的规则缓存键里属于请求方的部分：它自己的请求匹配器对请求方的判定（见
+/// `RuntimePipeline::rule_requester`）。开着后台刷新时还带上客户端地址，和引入范围
+/// 之前的规则缓存一样。
+pub fn rule_cache_requester(
+    pipeline: &RuntimePipeline,
+    background_refresh: bool,
+    requester: Requester,
+    geoip_manager: Option<&Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>>,
+) -> RequesterKey {
+    RequesterKey {
+        address: background_refresh.then_some(requester.address),
+        ..pipeline.rule_requester.key(requester, geoip_manager)
+    }
 }
 
 #[derive(Clone)]
@@ -117,7 +134,9 @@ pub struct RuleCacheEntry {
     pub qname_hash: u64,
     pub qtype: u16,
     pub qclass: u16,
-    pub client_ip: Option<IpAddr>,
+    /// The requester the decision was made for, as far as the key separates it
+    /// 决策是为哪个请求方做的（以键区分到的程度为限）
+    pub requester: RequesterKey,
     pub decision: Arc<Decision>,
     /// Expiration time based on DNS TTL / 基于 DNS TTL 的过期时间
     pub expires_at: Option<Instant>,
@@ -145,20 +164,15 @@ impl RuleCacheEntry {
         qname: &str,
         qtype: RecordType,
         qclass: DNSClass,
-        client_ip: IpAddr,
+        requester: RequesterKey,
         decision: Decision,
-        uses_client_ip: bool,
     ) -> Self {
         Self {
             pipeline_id,
             qname_hash: fast_hash_str(qname),
             qtype: u16::from(qtype),
             qclass: u16::from(qclass),
-            client_ip: if uses_client_ip {
-                Some(client_ip)
-            } else {
-                None
-            },
+            requester,
             decision: Arc::new(decision),
             expires_at: None,
         }
@@ -171,8 +185,7 @@ impl RuleCacheEntry {
         qname: &str,
         qtype: RecordType,
         qclass: DNSClass,
-        client_ip: IpAddr,
-        uses_client_ip: bool,
+        requester: &RequesterKey,
     ) -> bool {
         // Check expiration first / 首先检查过期
         if let Some(expires) = self.expires_at
@@ -185,13 +198,7 @@ impl RuleCacheEntry {
             return false;
         }
 
-        if uses_client_ip {
-            if self.client_ip != Some(client_ip) {
-                return false;
-            }
-        } else if self.client_ip.is_some() {
-            // Entry has IP but we don't care now?
-            // This case shouldn't happen if we use the same uses_client_ip for both hash and entry.
+        if self.requester != *requester {
             return false;
         }
 
@@ -553,6 +560,9 @@ pub(crate) struct ResponseJumpContext<'a> {
     pub min_ttl: Duration,
     pub upstream_timeout: Duration,
     pub skip_cache: bool,
+    /// The ECS the packet carries, which the forward before the jump added, if any
+    /// 包里携带的 ECS，即跳转前那次转发加上的（如有）
+    pub carried_ecs: Option<crate::ecs::EcsKey>,
     /// Observer context of the request / 所属请求的观察者上下文
     pub observed: Observed<'a>,
 }
@@ -576,6 +586,7 @@ pub(crate) async fn process_response_jump(
         min_ttl,
         upstream_timeout,
         skip_cache,
+        carried_ecs,
         observed,
     } = context;
     let cfg = &state.pipeline;
@@ -735,6 +746,15 @@ pub(crate) async fn process_response_jump(
             qtype,
             qclass,
             ecs_key.as_ref(),
+            &cfg.requester_key(
+                &pipeline_id,
+                Requester {
+                    address: peer.ip(),
+                    edns: edns_present,
+                },
+                Some(&engine.geoip_manager),
+            )
+            .on_response_jump_path(carried_ecs.as_ref()),
         );
 
         match decision {
