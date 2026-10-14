@@ -16,6 +16,7 @@ use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
+use super::domain_suffix_matches;
 use crate::lock::RwLock;
 
 /// 域名匹配器类型 / Domain matcher type
@@ -23,7 +24,8 @@ use crate::lock::RwLock;
 pub enum DomainMatcher {
     /// 完全匹配 / Full domain match
     Full(String),
-    /// 后缀匹配 / Suffix match
+    /// 后缀匹配：域名本身及其所有子域名，按整段比较；开头的点不计
+    /// Suffix match: the domain itself and every subdomain, by whole labels; a leading dot is ignored
     Suffix(String),
     /// 关键词匹配 / Keyword match
     Keyword(String),
@@ -37,14 +39,27 @@ impl DomainMatcher {
         match self {
             DomainMatcher::Full(pattern) => domain.eq_ignore_ascii_case(pattern),
             DomainMatcher::Suffix(suffix) => {
-                // 移除前导点后再进行匹配，让 .github.com 也能匹配 github.com
-                // Remove leading dot for matching, so .github.com can match github.com
-                let suffix_clean = if let Some(stripped) = suffix.strip_prefix('.') {
-                    stripped
+                // 开头的点不计：.github.com 和 github.com 一样匹配 github.com 及其子域名。按整段比较，
+                // 所以 github.com 不匹配 notgithub.com。
+                // A leading dot is ignored: .github.com, like github.com, matches github.com and its
+                // subdomains. Labels compare whole, so github.com does not match notgithub.com.
+                let suffix = suffix.strip_prefix('.').unwrap_or(suffix);
+                if suffix.is_empty() {
+                    // 空值匹配不到任何域名，而不是全部 / An empty value matches no domain, not every one
+                    return false;
+                }
+                if domain
+                    .bytes()
+                    .chain(suffix.bytes())
+                    .any(|b| b.is_ascii_uppercase())
+                {
+                    domain_suffix_matches(
+                        &domain.to_ascii_lowercase(),
+                        &suffix.to_ascii_lowercase(),
+                    )
                 } else {
-                    suffix
-                };
-                domain.eq_ignore_ascii_case(suffix_clean) || domain.ends_with(suffix)
+                    domain_suffix_matches(domain, suffix)
+                }
             }
             DomainMatcher::Keyword(keyword) => {
                 // 智能检查：先看是否需要转换 / Smart check: see if conversion is needed
@@ -190,54 +205,11 @@ impl GeoSiteManager {
         false
     }
 
-    /// 检查单个域名匹配器 / Check single domain matcher
+    /// 检查单个域名匹配器：和 [`DomainMatcher::matches`] 是同一套比较
+    /// Check a single domain matcher, with the same comparison as [`DomainMatcher::matches`]
+    #[inline]
     fn matcher_matches(&self, matcher: &DomainMatcher, domain: &str) -> bool {
-        match matcher {
-            DomainMatcher::Full(d) => {
-                // 完全匹配，不区分大小写 / Full match, case insensitive
-                // d 已经在加载时预小写 / d already lowercased during loading
-                domain.eq_ignore_ascii_case(d)
-            }
-            DomainMatcher::Suffix(s) => {
-                // 后缀匹配，不区分大小写 / Suffix match, case insensitive
-                // s 已经在加载时预小写 / s already lowercased during loading
-                // 移除前导点后再进行匹配，让 .github.com 也能匹配 github.com
-                // Remove leading dot for matching, so .github.com can match github.com
-                let s_clean = if let Some(stripped) = s.strip_prefix('.') {
-                    stripped
-                } else {
-                    s
-                };
-
-                // 先尝试完全匹配（快速路径）/ Try exact match first (fast path)
-                if domain.eq_ignore_ascii_case(s_clean) {
-                    return true;
-                }
-                // 再尝试后缀匹配 / Then try suffix match
-                if domain.ends_with(s) {
-                    return true;
-                }
-
-                // 兜底：转换后比较 / Fallback: compare after conversion
-                domain.to_ascii_lowercase().ends_with(s)
-            }
-            DomainMatcher::Keyword(k) => {
-                // 关键词匹配，不区分大小写 / Keyword match, case insensitive
-                // k 已经在加载时预小写 / k already lowercased during loading
-                // 智能检查：先看是否需要转换 / Smart check: see if conversion is needed
-                if domain.bytes().all(|b| !b.is_ascii_uppercase()) {
-                    // domain 已经是小写，零分配比较 / domain already lowercase, zero-allocation compare
-                    domain.contains(k)
-                } else {
-                    // 需要转换 / Need conversion
-                    domain.to_ascii_lowercase().contains(k)
-                }
-            }
-            DomainMatcher::Regex(re) => {
-                // 正则匹配 / Regex match
-                re.is_match(domain)
-            }
-        }
+        matcher.matches(domain)
     }
 
     /// 获取已加载的标签列表 / Get list of loaded tags
@@ -1201,62 +1173,88 @@ impl GeoSiteManager {
     }
 
     /// 转换 V2Ray 格式为 GeoSiteEntry 列表 / Convert V2Ray format to GeoSiteEntry list
+    ///
+    /// 写法与 V2Ray 一致：`domain:` 和不带前缀的值匹配域名本身及其所有子域名，`full:` 只匹配域名本身，
+    /// `keyword:` 按关键词、`regexp:` 按正则匹配；不带前缀且含 `*` 的值按通配符转成正则。
+    /// 前缀不认识、没有值或正则无效的条目会跳过并告警，不再留下永远匹配不到（空值则匹配一切）的条目。
+    /// Entries are written as in V2Ray: `domain:` and unprefixed values match the domain and every
+    /// subdomain, `full:` the domain only, `keyword:` a keyword and `regexp:` a regular expression; an
+    /// unprefixed value containing `*` becomes a wildcard regex. An entry with an unknown prefix, no
+    /// value or an invalid regex is skipped with a warning, instead of staying as an entry that never
+    /// matches (or, when empty, matches everything).
     fn convert_v2ray_to_entries(v2ray_data: V2RayGeoSiteList) -> Vec<GeoSiteEntry> {
         v2ray_data
             .entries
             .into_iter()
             .map(|v2ray_entry| {
-                // 将域名列表转换为 DomainMatcher 列表
-                // Convert domain list to DomainMatcher list
+                // 分类名转小写，和 .dat 一样：查找时按小写查 / Tags are lower-cased, as for .dat:
+                // lookups use the lower-cased tag
+                let tag = v2ray_entry.tag.to_ascii_lowercase();
+                let mut skipped = 0usize;
+                let mut first_skipped = None;
                 let matchers = v2ray_entry
                     .domains
                     .into_iter()
-                    .map(|domain| {
-                        // 根据域名格式选择合适的匹配器
-                        // Select appropriate matcher based on domain format
-                        if domain.starts_with("regexp:") {
-                            // 正则匹配器 / Regex matcher
-                            let pattern = domain.trim_start_matches("regexp:");
-                            DomainMatcher::Regex(
-                                RegexBuilder::new(pattern)
-                                    .size_limit(1_000_000)
-                                    .dfa_size_limit(1_000_000)
-                                    .build()
-                                    .unwrap_or_else(|_| Regex::new(r"^$").unwrap()),
-                            )
-                        } else if domain.starts_with("domain:") {
-                            // 完整域名匹配器 / Full domain matcher
-                            let pattern = domain.trim_start_matches("domain:");
-                            DomainMatcher::Full(pattern.to_string())
-                        } else if domain.starts_with("keyword:") {
-                            // 关键词匹配器 / Keyword matcher
-                            let pattern = domain.trim_start_matches("keyword:");
-                            DomainMatcher::Keyword(pattern.to_string())
-                        } else {
-                            // 默认为后缀匹配器 / Default to suffix matcher
-                            // 如果域名包含通配符，使用正则
-                            if domain.contains('*') {
-                                let pattern = domain.replace('.', r"\.").replace('*', ".*");
-                                DomainMatcher::Regex(
-                                    RegexBuilder::new(&format!("^{}$", pattern))
-                                        .size_limit(1_000_000)
-                                        .dfa_size_limit(1_000_000)
-                                        .build()
-                                        .unwrap_or_else(|_| Regex::new(r"^$").unwrap()),
-                                )
-                            } else {
-                                DomainMatcher::Suffix(domain)
-                            }
+                    .filter_map(|domain| {
+                        let matcher = Self::v2ray_json_matcher(&domain);
+                        if matcher.is_none() {
+                            skipped += 1;
+                            first_skipped.get_or_insert(domain);
                         }
+                        matcher
                     })
                     .collect();
-
-                GeoSiteEntry {
-                    tag: v2ray_entry.tag,
-                    matchers,
+                if let Some(example) = first_skipped {
+                    warn!(
+                        target = "geosite",
+                        tag = %tag,
+                        skipped,
+                        example = %example,
+                        "skipped GeoSite JSON entries that cannot match: unknown prefix, no value or invalid regex"
+                    );
                 }
+
+                GeoSiteEntry { tag, matchers }
             })
             .collect()
+    }
+
+    /// 一条 V2Ray JSON 域名对应的匹配器；前缀不认识、没有值或正则无效时为 `None`。
+    /// 通配符在转成正则之前转小写：其余的值由 `GeoSiteEntry::normalized` 转，正则它转不了。
+    /// The matcher for one V2Ray JSON domain entry; `None` for an unknown prefix, no value or an
+    /// invalid regex. A wildcard is lower-cased before it becomes a regex: `GeoSiteEntry::normalized`
+    /// lower-cases the other values but cannot reach into a regex.
+    fn v2ray_json_matcher(entry: &str) -> Option<DomainMatcher> {
+        let (prefix, value) = match entry.split_once(':') {
+            Some((prefix, value)) => (Some(prefix), value),
+            None => (None, entry),
+        };
+        if value.is_empty() {
+            return None;
+        }
+        let build_regex = |pattern: &str| {
+            RegexBuilder::new(pattern)
+                .size_limit(1_000_000)
+                .dfa_size_limit(1_000_000)
+                .build()
+                .ok()
+                .map(DomainMatcher::Regex)
+        };
+        match prefix {
+            Some("domain") => Some(DomainMatcher::Suffix(value.to_string())),
+            Some("full") => Some(DomainMatcher::Full(value.to_string())),
+            Some("keyword") => Some(DomainMatcher::Keyword(value.to_string())),
+            Some("regexp") => build_regex(value),
+            Some(_) => None,
+            None if value.contains('*') => {
+                let pattern = value
+                    .to_ascii_lowercase()
+                    .replace('.', r"\.")
+                    .replace('*', ".*");
+                build_regex(&format!("^{}$", pattern))
+            }
+            None => Some(DomainMatcher::Suffix(value.to_string())),
+        }
     }
 }
 
@@ -2058,5 +2056,132 @@ mod tests {
         assert!(!m.matches("dual@cn", "b.com"));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    const V2RAY_JSON_ENTRIES: &str = r#"{"entries":[{"tag":"t","domains":[
+        "github.com", "domain:example.org", "full:exact.net", ".dotted.io",
+        "Upper.Case", "keyword:kw", "keyword:UP", "regexp:^re\\.x$", "*.wild.dev", "*.Mixed.dev"
+    ]}]}"#;
+
+    fn assert_v2ray_json_entries(manager: &GeoSiteManager) {
+        let cases = [
+            ("github.com", true),
+            ("www.github.com", true),
+            ("WWW.GitHub.com", true),
+            ("notgithub.com", false),
+            ("example.org", true),
+            ("a.example.org", true),
+            ("notexample.org", false),
+            ("exact.net", true),
+            ("www.exact.net", false),
+            ("dotted.io", true),
+            ("a.dotted.io", true),
+            ("notdotted.io", false),
+            ("upper.case", true),
+            ("a.upper.case", true),
+            ("akwb.com", true),
+            ("xupx.com", true),
+            ("re.x", true),
+            ("a.wild.dev", true),
+            ("wild.dev", false),
+            ("a.mixed.dev", true),
+            ("unrelated.com", false),
+        ];
+        for (domain, expected) in cases {
+            assert_eq!(manager.matches("t", domain), expected, "{domain}");
+        }
+    }
+
+    /// JSON 条目按 V2Ray 的写法匹配：`domain:` 和不带前缀的值含子域名并按整段比较，`full:` 只匹配本身，
+    /// 不区分大小写。字符串和配置文件（parse_json_file）两条加载路径都测。
+    /// JSON entries follow V2Ray: `domain:` and unprefixed values take in subdomains by whole labels,
+    /// `full:` the name only, ignoring case. Both the string loader and the configured-file path
+    /// (parse_json_file) are checked.
+    #[test]
+    fn json_entries_follow_v2ray_and_match_whole_labels() {
+        let mut from_string = GeoSiteManager::new();
+        from_string
+            .load_from_v2ray_string(V2RAY_JSON_ENTRIES)
+            .unwrap();
+        assert_v2ray_json_entries(&from_string);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geosite.json");
+        std::fs::write(&path, V2RAY_JSON_ENTRIES).unwrap();
+        let mut from_file = GeoSiteManager::new();
+        let parsed = GeoSiteManager::parse_json_file(&path).unwrap();
+        from_file.apply_source(&path, parsed);
+        assert_v2ray_json_entries(&from_file);
+    }
+
+    /// 前缀不认识、没有值或正则无效的条目跳过，其余照常加载；空值不会让整个分类匹配一切。
+    /// Entries with an unknown prefix, no value or an invalid regex are skipped and the rest load;
+    /// an empty value does not make the whole tag match everything.
+    #[test]
+    fn json_entries_that_cannot_match_are_skipped() {
+        let mut manager = GeoSiteManager::new();
+        manager
+            .load_from_v2ray_string(
+                r#"{"entries":[{"tag":"t","domains":[
+                    "include:other", "ext:file:tag", "", "domain:", "full:",
+                    "keyword:", "regexp:", "regexp:(", "ok.com"
+                ]}]}"#,
+            )
+            .unwrap();
+        assert_eq!(manager.get_tag_matchers("t").map(|m| m.len()), Some(1));
+        assert!(manager.matches("t", "ok.com"));
+        assert!(!manager.matches("t", "anything.example"));
+    }
+
+    /// .dat 里的根域名（V2Ray 的 `domain:`）同样按整段比较；空值匹配不到任何域名。
+    /// Root domains in a .dat file (V2Ray's `domain:`) compare whole labels too; an empty value
+    /// matches no domain.
+    #[test]
+    fn dat_root_domains_match_whole_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dat(
+            &dir,
+            &[
+                build_geosite("t", &[build_domain(2, "github.com", &[])]),
+                build_geosite("empty", &[build_domain(2, "", &[])]),
+            ],
+        );
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_dat_file(&path).unwrap();
+        assert!(manager.matches("t", "github.com"));
+        assert!(manager.matches("t", "api.github.com"));
+        assert!(!manager.matches("t", "notgithub.com"));
+        assert!(!manager.matches("empty", "github.com"));
+    }
+
+    /// JSON 的分类名和 .dat 一样不区分大小写；原来写成大写的分类永远查不到。
+    /// JSON tags ignore case as .dat tags do; a tag written in capitals used to be unreachable.
+    #[test]
+    fn json_tags_ignore_case() {
+        let json = r#"{"entries":[{"tag":"Ads","domains":["ads.example"]}]}"#;
+        let mut from_string = GeoSiteManager::new();
+        from_string.load_from_v2ray_string(json).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geosite.json");
+        std::fs::write(&path, json).unwrap();
+        let mut from_file = GeoSiteManager::new();
+        let parsed = GeoSiteManager::parse_json_file(&path).unwrap();
+        from_file.apply_source(&path, parsed);
+        for manager in [&from_string, &from_file] {
+            assert!(manager.matches("ads", "ads.example"));
+            assert!(manager.matches("ADS", "ads.example"));
+            assert!(manager.matches("Ads", "ads.example"));
+        }
+    }
+
+    #[test]
+    fn domain_matcher_suffix_compares_whole_labels_ignoring_case() {
+        let suffix = DomainMatcher::Suffix("GitHub.com".to_string());
+        assert!(suffix.matches("github.com"));
+        assert!(suffix.matches("WWW.GITHUB.COM"));
+        assert!(!suffix.matches("notgithub.com"));
+        assert!(DomainMatcher::Suffix(".github.com".to_string()).matches("github.com"));
+        assert!(!DomainMatcher::Suffix(String::new()).matches("github.com"));
+        assert!(!DomainMatcher::Suffix(".".to_string()).matches("github.com"));
     }
 }
