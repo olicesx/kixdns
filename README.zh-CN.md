@@ -402,7 +402,7 @@ ECS 配置在 Forward 动作中：
 - from_client_ip：根据客户端地址生成子网，IPv4 默认 /24、IPv6 默认 /56；私有地址、回环地址和 ULA 地址不会注入；
 - static：使用配置的 IP 和前缀注入。
 
-Pipeline 级 ecs 会改变缓存键，使不同客户端子网的响应可以隔离；它不会替代 Forward 动作的 ECS 改写设置。当 action 使用 ECS 但 Pipeline 没有 ecs 时，运行引擎会发出警告。
+Pipeline 级 ecs 会改变缓存键，使不同客户端子网的响应可以隔离；它不会替代 Forward 动作的 ECS 改写设置。当 action 使用 ECS 但 Pipeline 没有 ecs 时，运行引擎会发出警告；此时使用取自客户端的 ECS 转发的应答按该动作发送的子网分别缓存。
 
 ## 配置示例
 
@@ -532,6 +532,8 @@ Pipeline 级 ecs 会改变缓存键，使不同客户端子网的响应可以隔
 ## 缓存和重载行为
 
 DNS 响应缓存使用上游响应的最小 TTL；配置 min_ttl 时会将其提高到该下限，并受 cache_max_ttl 和 cache_capacity 限制。否定响应在存在 SOA 时使用 SOA 负缓存 TTL。相同的进行中缓存未命中会共享一次上游操作。
+
+Pipeline 的应答可能因请求方而不同时，响应缓存、并发未命中去重和规则缓存会按规则对请求方的判定把它们分开，而不是按地址：客户端地址是否在各个 client_ip 网段内，是否为私有地址（geoip_private），GeoIP 国家或标签是否匹配（geoip_country），查询是否带 EDNS（edns_present、response_edns_present），以及转发从客户端取 ECS、且比 Pipeline 自身 ecs 设置更细时发送的是哪个子网。判定相同的请求方共用条目。Pipeline 的回答检查开始的响应跳转路径上的规则也算在内，因为请求在应答之前会运行它们。这条路径转发的是跳转前那次转发准备的包，连同 ECS，所以它的条目和直接进入该 Pipeline 的请求分开。规则缓存保存的是 Pipeline 自身规则的决策，因此只按该 Pipeline 的请求匹配器判定；开启 cache_background_refresh 时还按客户端地址区分，与以前相同。规则不判定任何请求方信息的 Pipeline 照旧在所有客户端之间共享。客户端自己带来的 ECS 选项原样发往上游，不进入任何键。后台刷新从同一个客户端地址重放请求，原请求带 EDNS 时也带 EDNS，因此 Pipeline 选择和请求规则读到的地址和 EDNS 与那次请求相同。
 
 启用 cache_background_refresh 后，接近过期的条目可以触发异步刷新；刷新失败会保留现有条目。启用 serve_stale 后，可以返回过期条目，并使用 serve_stale_ttl 作为响应 TTL，同时受 serve_stale_expire_ttl 和 serve_stale_client_timeout_ms 限制。该客户端等待还会被本次请求 request_timeout_ms 的剩余预算截断，配得比请求预算还长也不会把过期应答拖过截止时刻。
 
