@@ -1885,7 +1885,16 @@ mod tests {
     async fn spawn_answering_upstream(
         answer: std::net::Ipv4Addr,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        spawn_answering_upstream_after(answer, Duration::ZERO).await
+    }
+
+    /// 同上，但每个应答都晚 `delay` 才发出。
+    /// The same, with every answer sent `delay` late.
+    async fn spawn_answering_upstream_after(
+        answer: std::net::Ipv4Addr,
+        delay: Duration,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let addr = sock.local_addr().unwrap().to_string();
         let queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = queries.clone();
@@ -1906,7 +1915,16 @@ mod tests {
                     300,
                     RData::A(hickory_proto::rr::rdata::A(answer)),
                 ));
-                let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
+                let resp = resp.to_vec().unwrap();
+                if delay.is_zero() {
+                    let _ = sock.send_to(&resp, peer).await;
+                } else {
+                    let sock = sock.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = sock.send_to(&resp, peer).await;
+                    });
+                }
             }
         });
         (addr, queries)
@@ -2380,6 +2398,62 @@ mod tests {
         assert_eq!(
             ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
             [None; 2]
+        );
+    }
+
+    /// 两个请求各自经响应跳转进入同一个 pipeline，第二个等在第一个的转发上；第一个的
+    /// 规则随后 continue 越过了这个应答。等待者必须拿到最终应答，而不是被越过的那个。
+    /// Two requests each enter the same pipeline through a response jump, the second
+    /// waiting on the first's forward, whose rule then continues past the answer.
+    /// The waiter must get the final answer, not the one continued past.
+    #[tokio::test]
+    async fn a_waiter_on_a_jump_path_does_not_get_an_answer_continued_past() {
+        let (entry, _) = spawn_answering_upstream("192.0.2.50".parse().unwrap()).await;
+        // 慢一点，保证第二个请求到达时第一个还在等它
+        // Slow, so the second request arrives while the first still waits on it
+        let (checked, _) = spawn_answering_upstream_after(
+            "192.0.2.10".parse().unwrap(),
+            Duration::from_millis(50),
+        )
+        .await;
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+        let enter = |id: &str| {
+            pipeline_of(
+                id,
+                serde_json::json!([{ "type": "forward", "upstream": entry }]),
+                serde_json::json!({
+                    "response_matchers": [{ "type": "upstream_equals", "value": entry }],
+                    "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "shared" }]
+                }),
+            )
+        };
+        let engine = Engine::new(
+            continue_config(
+                serde_json::json!([
+                    { "pipeline": "p1", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                    { "pipeline": "p2", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+                ]),
+                serde_json::json!([
+                    enter("p1"),
+                    enter("p2"),
+                    {
+                        "id": "shared",
+                        "rules": continue_on_match_rules(&checked, serde_json::json!([{
+                            "name": "next",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "forward", "upstream": answering }]
+                        }]))
+                    }
+                ]),
+            ),
+            "test".to_string(),
+        )
+        .expect("engine");
+
+        assert_eq!(
+            ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
+            [Some(answer); 2]
         );
     }
 

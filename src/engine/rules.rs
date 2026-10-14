@@ -1159,23 +1159,17 @@ pub(crate) async fn process_response_jump(
                                 continue;
                             }
                             ResponseActionResult::Continue { ctx } => {
-                                // Same inflight hazard as phases.rs: keep the
-                                // entry notified and removed so the next rule's
-                                // Forward (same dedupe_hash) does not hang on an
-                                // Occupied entry. Here the guards live across the
-                                // loop, so remove the entries explicitly.
-                                // 与 phases.rs 相同的 inflight 风险：通知并移除条目，
-                                // 避免下一条规则的 Forward（相同 dedupe_hash）卡在
-                                // Occupied 条目上。此处的守卫跨循环存活，因此显式移除。
-                                if let Some(ctx_ref) = ctx.as_ref() {
-                                    for h in &inflight_hashes {
-                                        engine.notify_inflight_waiters(*h, &ctx_ref.raw).await;
-                                    }
-                                    for g in &mut cleanup_guards {
-                                        g.defuse();
-                                    }
-                                    inflight_hashes.clear();
-                                }
+                                // The rule continued past this answer, so it is not one
+                                // to hand over: drop the guards, which removes the
+                                // entries without it, and their waiters forward
+                                // themselves. The next rule's Forward (same
+                                // dedupe_hash) then finds no entry of this request's to
+                                // wait on.
+                                // 规则越过了这个应答，它不该交给别人：丢弃守卫，条目随之
+                                // 移除而不交出它，等待者自己转发。下一条规则的 Forward
+                                // （相同 dedupe_hash）也就不会等在本请求自己的条目上。
+                                cleanup_guards.clear();
+                                inflight_hashes.clear();
                                 reused_response = ctx;
                                 skip_rules.insert(rule_name.clone());
                                 continue;
