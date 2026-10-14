@@ -798,8 +798,10 @@ pub(crate) async fn handle_forward_decision_logged(
                 }
             };
 
-            if !skip_cache
-                && !response_matchers.is_empty()
+            // A refresh reports these too: it acts on the response rules like a client
+            // request, and the observer tells the two apart by background_refresh.
+            // 刷新同样上报：它和客户端请求一样按响应规则行事，观察者按 background_refresh 区分。
+            if !response_matchers.is_empty()
                 && let Some((observer, ctx)) = observed
             {
                 observer.rule_evaluated(

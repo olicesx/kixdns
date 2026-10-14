@@ -175,7 +175,10 @@ pub struct RequestContext<'a> {
     /// Query class.
     pub qclass: DNSClass,
     /// `true` when the request is an internal cache refresh rather than a
-    /// client query. Refresh requests bypass the cache lookup.
+    /// client query. Refresh requests bypass the cache lookup. Otherwise a
+    /// refresh reports the steps it takes as a client query does, rule events
+    /// of both phases included, so an observer counting client traffic
+    /// filters on this flag.
     pub background_refresh: bool,
 }
 
