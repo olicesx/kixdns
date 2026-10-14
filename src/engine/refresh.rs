@@ -1,4 +1,3 @@
-use std::net::IpAddr;
 use std::sync::Arc;
 
 use hickory_proto::rr::{DNSClass, RecordType};
@@ -7,6 +6,7 @@ use tracing::{debug, error, warn};
 use crate::engine::Engine;
 use crate::engine::types::EngineInner;
 use crate::engine::utils::{RefreshingGuard, is_refreshing};
+use crate::matcher::Requester;
 
 /// spawn_background_refresh spawns a task to refresh a DNS record in the background.
 ///
@@ -33,7 +33,7 @@ pub fn spawn_background_refresh(
     qname: &str,
     qtype: RecordType,
     qclass: DNSClass,
-    peer_ip: IpAddr,
+    requester: Requester,
 ) {
     // FIX: Check if already refreshing to prevent duplicate refreshes
     // 修复：检查是否已在刷新，防止重复刷新
@@ -49,7 +49,13 @@ pub fn spawn_background_refresh(
 
     // Step 1: Construct standard DNS query packet
     // 步骤 1：构造标准 DNS 查询包
-    let packet = match engine.construct_dns_packet(qname, qtype, qclass) {
+    // Replay the request as its client sent it, as far as routing can tell:
+    // from the same address, with or without EDNS. Pipeline selection and rules
+    // can depend on either, and the answer is stored under the key the request
+    // looked up.
+    // 按客户端发来的样子重放，以路由能分辨的为限：同一个地址，带或不带 EDNS。
+    // pipeline 的选择和规则都可能取决于它们，而应答会存进请求查过的那个键。
+    let packet = match engine.construct_dns_packet(qname, qtype, qclass, requester.edns) {
         Ok(pkt) => pkt,
         Err(e) => {
             error!(
@@ -86,7 +92,7 @@ pub fn spawn_background_refresh(
         //
         // 使用原始客户端 peer IP 确保正确的 ECS 注入 (RFC 7871) 和 pipeline 选择。
         // 端口无关 — 下游仅消费 .ip()。
-        let peer_addr = std::net::SocketAddr::new(peer_ip, 53);
+        let peer_addr = std::net::SocketAddr::new(requester.address, 53);
 
         // Call handle_packet_internal with skip_cache=true and explicit cache_hash.
         // Together with the original peer_ip, this ensures the background refresh
