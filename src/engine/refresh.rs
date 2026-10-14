@@ -56,7 +56,7 @@ pub fn spawn_background_refresh(
                 event = "background_refresh_construct_packet_failed",
                 qname = %qname,
                 qtype = ?qtype,
-                error = %e,
+                error = %format_args!("{e:#}"),
                 "Failed to construct DNS packet for background refresh"
             );
             return;
@@ -121,7 +121,7 @@ pub fn spawn_background_refresh(
                     qname = %qname_owned,
                     qtype = ?qtype,
                     pipeline_id = %pipeline_id_owned,
-                    error = %e,
+                    error = %format_args!("{e:#}"),
                     "Background refresh failed"
                 );
                 // Keep the refresh marker during a short retry backoff. This reuses the existing

@@ -1087,6 +1087,104 @@ async fn background_refresh_reports_no_cache_events() {
 }
 
 #[tokio::test]
+async fn a_background_refresh_reports_its_response_rules() {
+    // A refresh acts on the response rules as a client query does, so it
+    // reports them too, flagged as a background refresh.
+    // 刷新和客户端请求一样按响应规则行事，所以同样上报，并标为后台刷新。
+    let (upstream, _echo) = spawn_echo_upstream(1).await;
+    let raw = serde_json::json!({
+        "settings": {
+            "default_upstream": "127.0.0.1:9",
+            "min_ttl": 0,
+            "serve_stale": true,
+            "serve_stale_client_timeout_ms": 0,
+            "upstream_timeout_ms": 500,
+            "enable_tcp_fallback": false
+        },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "checked",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream }],
+                "response_matchers": [{ "type": "upstream_equals", "value": upstream }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+
+    engine
+        .handle_packet(&query("refresh.example"), peer())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    recorder.drain();
+
+    // Served stale; the refresh it spawns forwards and checks the answer.
+    // 返回过期缓存；它触发的刷新会转发并检查应答。
+    engine
+        .handle_packet(&query("refresh.example"), peer())
+        .await
+        .unwrap();
+    assert!(
+        recorder
+            .wait_for(Duration::from_secs(5), |events| {
+                events.iter().any(|event| {
+                    matches!(
+                        event,
+                        Event::Finished { id, .. }
+                            if events.iter().any(|started| matches!(
+                                started,
+                                Event::Started { id: sid, background: true, .. } if sid == id
+                            ))
+                    )
+                })
+            })
+            .await,
+        "background refresh must finish: {:#?}",
+        recorder.events()
+    );
+
+    let events = recorder.drain();
+    let background = events
+        .iter()
+        .find_map(|event| match event {
+            Event::Started {
+                id,
+                background: true,
+                ..
+            } => Some(*id),
+            _ => None,
+        })
+        .expect("background refresh request");
+    let background_events = events_of(&events, background);
+    assert!(
+        background_events.iter().any(|event| matches!(
+            event,
+            Event::RuleEvaluated {
+                rule,
+                phase: RulePhase::Response,
+                matched: true,
+                ..
+            } if rule == "checked"
+        )),
+        "the refresh must report its answer check: {background_events:#?}"
+    );
+    assert!(
+        background_events.iter().any(|event| matches!(
+            event,
+            Event::Rule {
+                rule,
+                phase: RulePhase::Response,
+                ..
+            } if rule == "checked"
+        )),
+        "the refresh must report the response rule it matched: {background_events:#?}"
+    );
+}
+
+#[tokio::test]
 async fn concurrent_upstreams_report_the_loser_as_aborted() {
     // One upstream answers at once, the other never does / 一个立即应答，一个黑洞
     let (echo, _echo_task) = spawn_echo_upstream(60).await;

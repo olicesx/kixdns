@@ -1228,6 +1228,13 @@ impl Engine {
             // Without this, the response_jump_limit could be bypassed via:
             //   Jump → Forward(Continue) → [jump_count reset to 0] → Jump → …
             let mut jump_count = 0;
+            // A refresh renews the entry under `refresh_key`. Once a rule has continued
+            // past an answer, the outcome may be a static answer or come from a jump
+            // target, which do not renew it: see the Static branch and the Success arm.
+            // 刷新更新的是 `refresh_key` 下的条目。规则越过一个应答之后，结果可能是静态
+            // 应答或来自跳转目标，它们不会更新这条：见 Static 分支和 Success 分支。
+            let refresh_key = dedupe_hash;
+            let mut refresh_passed_an_answer = false;
             'decision_loop: loop {
                 while let Decision::Jump { pipeline } = &decision {
                     jump_count += 1;
@@ -1295,6 +1302,23 @@ impl Engine {
                     }
                     Decision::Static { rcode, answers } => {
                         response_log.info.upstream = Some(Arc::from("static"));
+                        // After a refresh continued past an answer: a SERVFAIL here (a
+                        // jump target that does not exist, the jump limit, or a static
+                        // SERVFAIL the rules configure) ends the refresh as a failure
+                        // and the entry stays; any other static answer replaces the
+                        // entry, which handle_static_decision stores again when it
+                        // caches the answer there.
+                        // 刷新越过一个应答之后：这里的 SERVFAIL（跳转目标不存在、到了跳转
+                        // 上限，或规则配置的静态 SERVFAIL）让刷新以失败结束，条目保留；其他
+                        // 静态应答取代这条，handle_static_decision 在那里缓存应答时会重新写入。
+                        if refresh_passed_an_answer {
+                            if rcode == ResponseCode::ServFail {
+                                return Err(phases::refresh_found_no_answer(
+                                    "no answer after a continue",
+                                ));
+                            }
+                            self.cache_invalidate(&refresh_key);
+                        }
                         return phases::handle_static_decision(
                             self,
                             &phases::StaticDecisionContext {
@@ -1359,8 +1383,27 @@ impl Engine {
                         .await;
 
                         match res {
-                            Ok(phases::ForwardResult::Success(bytes)) => return Ok(bytes),
+                            Ok(phases::ForwardResult::Success(bytes)) => {
+                                // After a refresh continued past an answer and then
+                                // jumped, the answer is not stored under `refresh_key`:
+                                // unless it is a failure (SERVFAIL, or the target's
+                                // stale answer served on one, the only cache hit a
+                                // refresh can have), the entry there no longer matches
+                                // the rules.
+                                // 刷新越过一个应答又跳转之后，应答不会存进 `refresh_key`：
+                                // 只要不是失败（SERVFAIL，或失败时返回的目标旧结果，也是
+                                // 刷新唯一可能的缓存命中），那里的条目就已经和规则对不上。
+                                if refresh_passed_an_answer
+                                    && dedupe_hash != refresh_key
+                                    && !phases::is_servfail(&bytes)
+                                    && !response_log.info.cache_hit
+                                {
+                                    self.cache_invalidate(&refresh_key);
+                                }
+                                return Ok(bytes);
+                            }
                             Ok(phases::ForwardResult::Continue(ctx)) => {
+                                refresh_passed_an_answer |= skip_cache && ctx.is_some();
                                 reused_response = *ctx;
                                 skip_rules.insert(rule_name.clone());
                                 let skip_ref = if skip_rules.is_empty() {
