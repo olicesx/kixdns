@@ -601,6 +601,12 @@ pub(crate) async fn handle_forward_decision_logged(
     };
     let packet = ecs_packet.as_ref();
 
+    // Only the request that registered an entry hands it an answer. One that
+    // forwards under another's entry (a request holding an entry of its own, a
+    // waiter forwarding itself after the leader went away, or a background
+    // refresh, which registers none) leaves it to its owner.
+    // 只有登记了条目的请求才把应答交给它。在别人的条目下转发的请求（持有自己条目的
+    // 请求、领头请求离开后自己转发的等待者、不登记条目的后台刷新）把它留给条目的主人。
     let mut cleanup_guard = None;
 
     let resp = if allow_reuse {
@@ -897,8 +903,8 @@ pub(crate) async fn handle_forward_decision_logged(
                 }
                 if let Some(g) = cleanup_guard.as_mut() {
                     g.defuse();
+                    engine.notify_inflight_waiters(dedupe_hash, &raw).await;
                 }
-                engine.notify_inflight_waiters(dedupe_hash, &raw).await;
 
                 return Ok(ForwardResult::Success(raw));
             }
@@ -966,8 +972,8 @@ pub(crate) async fn handle_forward_decision_logged(
                     }
                     if let Some(g) = cleanup_guard.as_mut() {
                         g.defuse();
+                        engine.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
                     }
-                    engine.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
                     response.upstream = Some(ctx.upstream);
                     Ok(ForwardResult::Success(ctx.raw))
                 }
@@ -989,8 +995,8 @@ pub(crate) async fn handle_forward_decision_logged(
                     }
                     if let Some(g) = cleanup_guard.as_mut() {
                         g.defuse();
+                        engine.notify_inflight_waiters(dedupe_hash, &bytes).await;
                     }
-                    engine.notify_inflight_waiters(dedupe_hash, &bytes).await;
                     response.upstream = Some(Arc::from("static"));
                     Ok(ForwardResult::Success(bytes))
                 }
@@ -1030,10 +1036,11 @@ pub(crate) async fn handle_forward_decision_logged(
 
                     if let Some(g) = cleanup_guard.as_mut() {
                         g.defuse();
+
+                        engine
+                            .notify_inflight_waiters(dedupe_hash, &resp_bytes)
+                            .await;
                     }
-                    engine
-                        .notify_inflight_waiters(dedupe_hash, &resp_bytes)
-                        .await;
                     Ok(ForwardResult::Success(resp_bytes))
                 }
                 ResponseActionResult::Continue { ctx } => {
@@ -1094,10 +1101,10 @@ pub(crate) async fn handle_forward_decision_logged(
                     );
                     if let Some(g) = cleanup_guard.as_mut() {
                         g.defuse();
+                        engine
+                            .notify_inflight_waiters(dedupe_hash, &stale_bytes)
+                            .await;
                     }
-                    engine
-                        .notify_inflight_waiters(dedupe_hash, &stale_bytes)
-                        .await;
                     return Ok(ForwardResult::Success(stale_bytes));
                 }
 
@@ -1136,10 +1143,11 @@ pub(crate) async fn handle_forward_decision_logged(
 
                 if let Some(g) = cleanup_guard.as_mut() {
                     g.defuse();
+
+                    engine
+                        .notify_inflight_waiters(dedupe_hash, &resp_bytes)
+                        .await;
                 }
-                engine
-                    .notify_inflight_waiters(dedupe_hash, &resp_bytes)
-                    .await;
 
                 Ok(ForwardResult::Success(resp_bytes))
             } else {
@@ -1193,8 +1201,8 @@ pub(crate) async fn handle_forward_decision_logged(
                         }
                         if let Some(g) = cleanup_guard.as_mut() {
                             g.defuse();
+                            engine.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
                         }
-                        engine.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
                         response.upstream = Some(ctx.upstream);
                         Ok(ForwardResult::Success(ctx.raw))
                     }
@@ -1216,8 +1224,8 @@ pub(crate) async fn handle_forward_decision_logged(
                         }
                         if let Some(g) = cleanup_guard.as_mut() {
                             g.defuse();
+                            engine.notify_inflight_waiters(dedupe_hash, &bytes).await;
                         }
-                        engine.notify_inflight_waiters(dedupe_hash, &bytes).await;
                         response.upstream = Some(Arc::from("static"));
                         Ok(ForwardResult::Success(bytes))
                     }
@@ -1266,10 +1274,11 @@ pub(crate) async fn handle_forward_decision_logged(
 
                         if let Some(g) = cleanup_guard.as_mut() {
                             g.defuse();
+
+                            engine
+                                .notify_inflight_waiters(dedupe_hash, &resp_bytes)
+                                .await;
                         }
-                        engine
-                            .notify_inflight_waiters(dedupe_hash, &resp_bytes)
-                            .await;
                         Ok(ForwardResult::Success(resp_bytes))
                     }
                     ResponseActionResult::Continue { ctx } => {

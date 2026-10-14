@@ -1265,11 +1265,18 @@ impl Engine {
                     jump_count += 1;
                     if jump_count > response_jump_limit {
                         warn!("max jump limit reached");
-                        decision = Decision::Static {
-                            rcode: ResponseCode::ServFail,
-                            answers: Vec::new(),
-                        };
-                        break;
+                        // How many jumps a request has left depends on the way it
+                        // came, which no key carries, so this SERVFAIL is its own: a
+                        // waiter on its held entry may have jumps to spare, so the
+                        // entry goes rather than hand it over, and it is not cached
+                        // for a request that enters this pipeline directly.
+                        // 请求还能跳几次取决于它一路怎么来的，键里没有这一项，所以这个
+                        // SERVFAIL 只属于它：等在持有条目上的请求可能还有余量，所以放掉
+                        // 条目，不把它交出去；也不缓存给直接进入这个 pipeline 的请求。
+                        drop(held_inflight.take());
+                        response_log.info.upstream = Some(Arc::from("static"));
+                        let req = Message::from_bytes(packet).context("parse request")?;
+                        return engine_helpers::build_servfail_response(&req);
                     }
                     if let Some(&idx) = cfg.pipeline_id_index.get(pipeline.as_ref()) {
                         let p = &cfg.pipelines[idx];
@@ -2455,6 +2462,307 @@ mod tests {
             ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
             [Some(answer); 2]
         );
+    }
+
+    /// 后台刷新不登记 inflight 条目，也就不能把自己的应答交给别人登记的条目：刷新不运行
+    /// 响应动作，它的应答可能正是规则会越过的那一个。
+    /// A background refresh registers no inflight entry, so it must not hand its
+    /// answer to an entry another request registered: a refresh runs no response
+    /// actions, and its answer may be the one a rule would continue past.
+    #[tokio::test]
+    async fn a_background_refresh_hands_nothing_to_an_entry_it_did_not_register() {
+        let (answering, _) = spawn_answering_upstream("192.0.2.20".parse().unwrap()).await;
+        let engine = Engine::new(
+            continue_config(
+                serde_json::json!([]),
+                serde_json::json!([{ "id": "main", "rules": [{
+                    "name": "next",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": answering }]
+                }] }]),
+            ),
+            "test".to_string(),
+        )
+        .expect("engine");
+        let key = Engine::calculate_cache_hash_for_dedupe(
+            engine.state.load().cache_namespace("main"),
+            "main",
+            b"example.com",
+            RecordType::A,
+            DNSClass::IN,
+            None,
+            &RequesterKey::NONE,
+        );
+        // 另一个请求在刷新的键下登记的条目 / Another request's entry under the refresh's key
+        let (owner, waiter) =
+            tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
+        engine.inflight.insert(key, owner);
+
+        let refreshed = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.handle_packet_internal(
+                &example_query(),
+                "10.0.0.1:53000".parse().unwrap(),
+                true,
+                None,
+                Some(key),
+                None,
+            ),
+        )
+        .await
+        .expect("the refresh finishes");
+        assert!(refreshed.is_ok());
+        assert!(
+            !waiter
+                .has_changed()
+                .expect("the entry's owner is still there"),
+            "the refresh must not hand its answer to another request's entry"
+        );
+        assert!(engine.inflight.contains_key(&key));
+    }
+
+    /// continue 之后还能跳几次，取决于请求一路怎么来的，键里没有这一项。经过两次跳转才到
+    /// `r` 的请求先用完了次数；直接进入 `r`、等在它上面的请求还有余量，不能拿到它的
+    /// SERVFAIL。
+    /// How many jumps a request has left after a continue depends on the way it
+    /// came, which no key carries. One that reached `r` through two jumps runs out
+    /// first; one that entered `r` directly and waits on it has jumps to spare
+    /// and must not get its SERVFAIL.
+    #[tokio::test]
+    async fn a_waiter_with_jumps_to_spare_does_not_take_the_jump_limit() {
+        let (checked, _) = spawn_answering_upstream_after(
+            "192.0.2.10".parse().unwrap(),
+            Duration::from_millis(50),
+        )
+        .await;
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+        let jump = |name: &str, target: &str| {
+            serde_json::json!({
+                "name": name,
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "jump_to_pipeline", "pipeline": target }]
+            })
+        };
+        let raw = serde_json::json!({
+            "settings": {
+                "default_upstream": "127.0.0.1:9",
+                "upstream_timeout_ms": 100,
+                "enable_tcp_fallback": false,
+                "response_jump_limit": 3
+            },
+            "pipeline_select": [
+                { "pipeline": "a1", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                { "pipeline": "r", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+            ],
+            "pipelines": [
+                { "id": "a1", "rules": [jump("a1", "a2")] },
+                { "id": "a2", "rules": [jump("a2", "r")] },
+                { "id": "r", "rules": continue_on_match_rules(&checked, serde_json::json!([jump("to-t", "t")])) },
+                { "id": "t", "rules": [jump("to-u", "u")] },
+                { "id": "u", "rules": [{
+                    "name": "next",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": answering }]
+                }] }
+            ]
+        });
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        let engine = Engine::new(
+            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
+            "test".to_string(),
+        )
+        .expect("engine");
+
+        assert_eq!(
+            ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
+            [None, Some(answer)]
+        );
+    }
+
+    /// 请求阶段到达跳转上限给出的 SERVFAIL 只属于这个请求：开着 min_ttl 时也不缓存给
+    /// 直接进入同一个 pipeline、还有余量的请求。
+    /// The SERVFAIL a request gets at the request-phase jump limit is its own: even
+    /// with min_ttl on, it is not cached for a request that enters the same
+    /// pipeline directly with jumps to spare.
+    #[tokio::test]
+    async fn a_jump_limit_servfail_is_not_cached_for_another_request() {
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+        let jump = |name: &str, target: &str| {
+            serde_json::json!({
+                "name": name,
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "jump_to_pipeline", "pipeline": target }]
+            })
+        };
+        let raw = serde_json::json!({
+            "settings": {
+                "default_upstream": "127.0.0.1:9",
+                "upstream_timeout_ms": 100,
+                "enable_tcp_fallback": false,
+                "response_jump_limit": 1,
+                "min_ttl": 60
+            },
+            "pipeline_select": [
+                { "pipeline": "a", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                { "pipeline": "b", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+            ],
+            "pipelines": [
+                { "id": "a", "rules": [jump("a", "b")] },
+                { "id": "b", "rules": [jump("b", "c")] },
+                { "id": "c", "rules": [{
+                    "name": "c",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": answering }]
+                }] }
+            ]
+        });
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        let engine = Engine::new(
+            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
+            "test".to_string(),
+        )
+        .expect("engine");
+        let ask = |client: &str| {
+            let peer = client.parse().unwrap();
+            let engine = &engine;
+            async move {
+                first_a_record(
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        engine.handle_packet(&example_query(), peer),
+                    )
+                    .await
+                    .expect("answer in time"),
+                )
+            }
+        };
+
+        // a → b → c 用完了次数；直接进入 b 的 b → c 还有余量
+        // a → b → c runs out of jumps; b → c from a direct entry into b does not
+        assert_eq!(ask("10.0.0.1:53000").await, None);
+        assert_eq!(ask("10.0.0.2:53000").await, Some(answer));
+    }
+
+    /// 在响应跳转路径上，跳转次数同样取决于请求一路怎么来的。经过更多跳转才到 `s` 的
+    /// 请求先用完了次数（在下一个 pipeline 的入口，或在 `s` 的回答检查要跳转时），它的
+    /// SERVFAIL 不能交给直接从 `p2` 跳来、还有余量的请求。
+    /// On the response-jump path too, the jumps left depend on the way a request
+    /// came. One that reached `s` through more jumps runs out first (entering the
+    /// next pipeline, or when the answer check in `s` jumps), and its SERVFAIL
+    /// must not reach a request that jumped there from `p2` with jumps to spare.
+    #[tokio::test]
+    async fn a_jump_path_waiter_with_jumps_to_spare_does_not_take_the_jump_limit() {
+        let (entry, _) = spawn_answering_upstream("192.0.2.50".parse().unwrap()).await;
+        // p2 慢一点，第一个请求先在 s 登记 / p2 is slower, so the first request registers at s first
+        let (later_entry, _) = spawn_answering_upstream_after(
+            "192.0.2.51".parse().unwrap(),
+            Duration::from_millis(30),
+        )
+        .await;
+        let (slow, _) = spawn_answering_upstream_after(
+            "192.0.2.10".parse().unwrap(),
+            Duration::from_millis(100),
+        )
+        .await;
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+        let checked_jump = |id: &str, upstream: &str, target: &str| {
+            pipeline_of(
+                id,
+                serde_json::json!([{ "type": "forward", "upstream": upstream }]),
+                serde_json::json!({
+                    "response_matchers": [{ "type": "upstream_equals", "value": upstream }],
+                    "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": target }]
+                }),
+            )
+        };
+        let hop = |id: &str, target: &str| {
+            pipeline_of(
+                id,
+                serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": target }]),
+                serde_json::json!({}),
+            )
+        };
+        let answers_at = |id: &str| {
+            pipeline_of(
+                id,
+                serde_json::json!([{ "type": "forward", "upstream": answering }]),
+                serde_json::json!({}),
+            )
+        };
+        // 第一个请求在 s 之前多走一次或两次规则级跳转，于是比从 p2 来的请求先用完次数：
+        // 在下一个 pipeline 的入口、在 s 的回答检查要跳转时，或在之后一次规则级跳转时。
+        // The first request takes one or two more rule-level hops before s, so it
+        // runs out before the one from p2: entering the next pipeline, when the
+        // answer check in s jumps, or at a rule-level hop after it.
+        let paths = [
+            (
+                "entering the next pipeline",
+                3,
+                vec![
+                    hop("y", "s"),
+                    checked_jump("s", &slow, "t"),
+                    answers_at("t"),
+                ],
+            ),
+            (
+                "at the answer check's jump",
+                3,
+                vec![
+                    hop("y", "y2"),
+                    hop("y2", "s"),
+                    checked_jump("s", &slow, "t"),
+                    answers_at("t"),
+                ],
+            ),
+            (
+                "at a rule-level hop after the answer check",
+                4,
+                vec![
+                    hop("y", "s"),
+                    checked_jump("s", &slow, "z"),
+                    hop("z", "z2"),
+                    hop("z2", "z3"),
+                    answers_at("z3"),
+                ],
+            ),
+        ];
+        for (where_it_runs_out, limit, rest) in paths {
+            let mut pipelines = vec![
+                checked_jump("p1", &entry, "y"),
+                checked_jump("p2", &later_entry, "s"),
+            ];
+            pipelines.extend(rest);
+            let raw = serde_json::json!({
+                "settings": {
+                    "default_upstream": "127.0.0.1:9",
+                    "upstream_timeout_ms": 500,
+                    "enable_tcp_fallback": false,
+                    "response_jump_limit": limit
+                },
+                "pipeline_select": [
+                    { "pipeline": "p1", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                    { "pipeline": "p2", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+                ],
+                "pipelines": pipelines
+            });
+            let config: crate::config::PipelineConfig =
+                serde_json::from_value(raw).expect("parse config");
+            let engine = Engine::new(
+                RuntimePipelineConfig::from_config(config).expect("build runtime config"),
+                "test".to_string(),
+            )
+            .expect("engine");
+            assert_eq!(
+                ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
+                [None, Some(answer)],
+                "{where_it_runs_out}"
+            );
+        }
     }
 
     // ========================================================================
