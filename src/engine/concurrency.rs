@@ -203,6 +203,12 @@ impl PermitManager {
     /// 会拒绝所有 acquire 直到重启。
     #[inline]
     fn release_one(&self) {
+        // Rust 1.99 renamed fetch_update to try_update. The crate declares no
+        // minimum toolchain, so keep the old name, which every toolchain has,
+        // until one is set at 1.99 or later.
+        // Rust 1.99 把 fetch_update 改名为 try_update。crate 没有声明最低工具链，
+        // 先保留所有版本都有的旧名字，等最低版本定到 1.99 以上再换。
+        #[allow(deprecated)]
         let _ = self
             .active_permits
             .fetch_update(Ordering::Release, Ordering::Relaxed, |active| {
