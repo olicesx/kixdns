@@ -319,7 +319,7 @@ Pipeline selector 支持上表全部类型；请求规则支持除 listener_labe
 - 同时配置两种数据源时，两位国家代码以 MMDB 为准；命名标签仍从 `geoip_dat_path` 读取。
 - 标签匹配不区分大小写。`country_codes` 建议使用 JSON 字符串数组，例如 `["CN", "cloudflare"]`；为兼容旧配置，也接受单个字符串或逗号分隔字符串。
 
-域名后缀和 GeoSite 标签匹配也不区分大小写。domain_regex 和 request_domain_regex 使用 Rust 正则语法。
+域名后缀和 GeoSite 标签匹配也不区分大小写。domain_suffix 和 request_domain_suffix 按整段域名比较：`example.com` 命中它本身和 `www.example.com` 这样的子域名，`.example.com` 只命中子域名；两种写法都不命中 `notexample.com`。domain_regex 和 request_domain_regex 使用 Rust 正则语法。
 
 ### 响应匹配器
 

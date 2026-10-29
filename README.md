@@ -325,7 +325,7 @@ Pipeline selectors support all of the rows above. Request rules support all rows
 - When both sources are configured, MMDB decides two-letter country codes; named tags still come from `geoip_dat_path`.
 - Tag matching is case-insensitive. `country_codes` should normally be a JSON string array, for example `["CN", "cloudflare"]`; a single or comma-separated string is also accepted for compatibility.
 
-Domain suffix and GeoSite matching are also case-insensitive. `domain_regex` and `request_domain_regex` use Rust regular-expression syntax.
+Domain suffix and GeoSite matching are also case-insensitive. `domain_suffix` and `request_domain_suffix` compare whole labels: `example.com` matches `example.com` itself and every subdomain such as `www.example.com`, while `.example.com` matches subdomains only; neither matches `notexample.com`. `domain_regex` and `request_domain_regex` use Rust regular-expression syntax.
 
 ### Response matchers
 
