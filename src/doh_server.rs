@@ -30,6 +30,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
 
 use crate::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers};
+use crate::observe::ClientTransport;
 use crate::proto_utils;
 use crate::watcher;
 
@@ -74,6 +75,7 @@ pub async fn run_doh_with_listener(
     engine: Engine,
     doh_path: String,
 ) -> anyhow::Result<()> {
+    let engine = engine.with_client_transport(ClientTransport::Doh);
     let acceptor: SharedTlsAcceptor = Arc::new(ArcSwap::from_pointee(build_tls_acceptor(
         cert_path, key_path,
     )?));

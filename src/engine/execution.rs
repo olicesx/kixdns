@@ -31,7 +31,7 @@ use crate::observe::{
 };
 use crate::proto_utils::parse_quick;
 
-use super::observation::{ObservedRequest, report_decision, report_matched_rules};
+use super::observation::{ObservedRequest, cached_source, report_decision, report_matched_rules};
 use super::response::build_fast_static_response;
 use super::response_log::ResponseLog;
 use super::rules::RuleCacheRecord;
@@ -86,6 +86,7 @@ enum FastPathAnswer<'a> {
     Cache {
         original_ttl: u32,
         elapsed_secs: u32,
+        source: Option<&'a str>,
     },
     /// Compiled static rule matched directly / 编译后的静态规则直接命中
     StaticRule {
@@ -334,6 +335,7 @@ impl Engine {
             request_id: self.request_id_counter.fetch_add(1, Ordering::Relaxed),
             listener_label: &self.listener_label,
             client: peer,
+            transport: self.client_transport,
             qname,
             qtype,
             qclass,
@@ -343,7 +345,10 @@ impl Engine {
 
     /// Report a request that `handle_packet_fast` answered without the async
     /// path: the whole lifecycle is emitted in one batch at the answering site.
+    /// `response` is the answer, or the error that stopped the engine from
+    /// building one; the listener then answers SERVFAIL by itself.
     /// 上报由 handle_packet_fast 直接应答的请求：整个生命周期在应答处一次性上报。
+    /// `response` 是应答，或者引擎没能构造出应答的错误；此时由监听器自己回 SERVFAIL。
     fn observe_fast_path(
         &self,
         observer: &dyn EngineObserver,
@@ -351,6 +356,7 @@ impl Engine {
         ctx: &RequestContext<'_>,
         pipeline_id: &str,
         answer: FastPathAnswer<'_>,
+        response: Result<&[u8], &anyhow::Error>,
     ) {
         observer.request_started(ctx);
         observer.pipeline_selected(ctx, pipeline_id);
@@ -359,6 +365,7 @@ impl Engine {
             FastPathAnswer::Cache {
                 original_ttl,
                 elapsed_secs,
+                source,
             } => observer.cache_hit(
                 ctx,
                 &CacheHit {
@@ -367,6 +374,7 @@ impl Engine {
                         original_ttl.saturating_sub(elapsed_secs) as u64,
                     )),
                     original_ttl: Some(Duration::from_secs(original_ttl as u64)),
+                    source,
                 },
             ),
             FastPathAnswer::StaticRule {
@@ -425,11 +433,18 @@ impl Engine {
                 );
             }
         }
+        let error = response.as_ref().err().map(|error| format!("{error:#}"));
         observer.request_finished(
             ctx,
             &RequestOutcome {
                 latency: start.elapsed(),
-                status: RequestStatus::Completed,
+                status: if error.is_some() {
+                    RequestStatus::Failed
+                } else {
+                    RequestStatus::Completed
+                },
+                response: response.ok(),
+                error: error.as_deref(),
             },
         );
     }
@@ -625,7 +640,9 @@ impl Engine {
                             FastPathAnswer::Cache {
                                 original_ttl: hit.original_ttl,
                                 elapsed_secs,
+                                source: cached_source(hit.upstream.as_deref()),
                             },
+                            Ok(&hit.bytes),
                         );
                     }
                     let mut log = ResponseLog::new(
@@ -663,10 +680,12 @@ impl Engine {
                     q.edns_present,
                 )
             {
-                let resp = build_fast_static_response(
+                // Report before `?`: a response that cannot be built still ends the
+                // request here, and the listener answers SERVFAIL by itself.
+                // 在 `?` 之前上报：构造不出应答的请求也在这里结束，由监听器自己回 SERVFAIL。
+                let built = build_fast_static_response(
                     q.tx_id, qname_str, q.qtype, q.qclass, rcode, &answers,
-                )?;
-                self.incr_fastpath_hits();
+                );
                 if let Some((observer, start)) = observed {
                     self.observe_fast_path(
                         observer,
@@ -678,8 +697,11 @@ impl Engine {
                             rcode,
                             answers: answers.len(),
                         },
+                        built.as_deref(),
                     );
                 }
+                let resp = built?;
+                self.incr_fastpath_hits();
                 let mut log = ResponseLog::new(
                     qname_str,
                     qtype,
@@ -722,10 +744,11 @@ impl Engine {
                 } else if entry.matches(&pipeline_id, qname_str, qtype, qclass, &rule_requester)
                     && let Decision::Static { rcode, answers } = entry.decision.as_ref()
                 {
-                    let resp = build_fast_static_response(
+                    // Report before `?`, as for the compiled static rule above.
+                    // 在 `?` 之前上报，同上面的编译静态规则。
+                    let built = build_fast_static_response(
                         q.tx_id, qname_str, q.qtype, q.qclass, *rcode, answers,
-                    )?;
-                    self.incr_fastpath_hits();
+                    );
                     if let Some((observer, start)) = observed {
                         self.observe_fast_path(
                             observer,
@@ -733,8 +756,11 @@ impl Engine {
                             &self.fast_path_context(peer, qname_str, qtype, qclass),
                             &pipeline_id,
                             FastPathAnswer::CachedRules { record: &record },
+                            built.as_deref(),
                         );
                     }
+                    let resp = built?;
+                    self.incr_fastpath_hits();
                     let mut log = ResponseLog::new(
                         qname_str,
                         qtype,
@@ -929,6 +955,12 @@ impl Engine {
         // (listener timeouts drop the future) are reported as well.
         // 本请求的观察者句柄：借用已解析的查询，drop 时上报 request_finished，
         // 因此被取消的请求（监听器超时会丢弃 future）同样会上报。
+        // In this crate only background refresh skips the cache (see the design
+        // note on handle_packet_internal). Both fields below follow this one
+        // flag, so a new use of skip_cache has to decide on it here.
+        // 本 crate 里只有后台刷新跳过缓存（见 handle_packet_internal 的设计说明）。
+        // 下面两个字段都跟着这一个判断；skip_cache 有了新用法，要在这里一起定。
+        let background_refresh = skip_cache;
         let mut observed = self.observer.as_deref().map(|observer| {
             ObservedRequest::new(
                 observer,
@@ -936,10 +968,17 @@ impl Engine {
                     request_id,
                     listener_label: &self.listener_label,
                     client: peer,
+                    // A refresh is the engine's own query, whichever listener's request scheduled it.
+                    // 刷新是引擎自己的查询，与安排它的请求来自哪个监听器无关。
+                    transport: if background_refresh {
+                        None
+                    } else {
+                        self.client_transport
+                    },
                     qname: qname_ref,
                     qtype,
                     qclass,
-                    background_refresh: skip_cache,
+                    background_refresh,
                 },
                 start,
             )
@@ -1482,11 +1521,7 @@ impl Engine {
         }
         response_log.finish(&result);
         if let Some(observed) = observed.as_mut() {
-            observed.set_status(if result.is_ok() {
-                RequestStatus::Completed
-            } else {
-                RequestStatus::Failed
-            });
+            observed.finish(&result);
         }
         result
     }

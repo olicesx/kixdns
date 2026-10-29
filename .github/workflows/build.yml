@@ -241,6 +241,9 @@ jobs:
       - name: Run response log tests
         run: cargo test --test response_log
 
+      - name: Run observer API tests
+        run: cargo test --test observer_api
+
   lint-linux:
     name: Lint (clippy + fmt)
     runs-on: ubuntu-24.04

@@ -13,7 +13,7 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 use kixdns::config::load_config_with_source;
 use kixdns::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers};
 use kixdns::matcher::RuntimePipelineConfig;
-use kixdns::observe::TracingObserver;
+use kixdns::observe::{ClientTransport, TracingObserver};
 use kixdns::proto_utils::{is_standard_query_header, truncate_udp_response};
 use kixdns::watcher;
 
@@ -593,6 +593,7 @@ async fn run_udp_worker(
     socket: Arc<UdpSocket>,
     engine: Engine,
 ) -> anyhow::Result<()> {
+    let engine = engine.with_client_transport(ClientTransport::Udp);
     // 预分配缓冲区 / Pre-allocate buffer
     // 使用 BytesMut 避免 Bytes::copy_from_slice 的内存分配 / Use BytesMut to avoid memory allocation in Bytes::copy_from_slice
     use bytes::BytesMut;
@@ -860,6 +861,7 @@ async fn handle_tcp_conn(
     peer: SocketAddr,
     engine: Engine,
 ) -> anyhow::Result<()> {
+    let engine = engine.with_client_transport(ClientTransport::Tcp);
     const MAX_TCP_FRAME: usize = 64 * 1024;
     let mut len_buf = [0u8; 2];
 
@@ -1079,6 +1081,10 @@ mod tests {
     }
 
     fn static_engine() -> Engine {
+        Engine::new(static_runtime(), "test".to_string()).expect("initialize engine")
+    }
+
+    fn static_runtime() -> RuntimePipelineConfig {
         use kixdns::config::PipelineConfig;
 
         let config: PipelineConfig = serde_json::from_value(serde_json::json!({
@@ -1093,8 +1099,67 @@ mod tests {
             }]
         }))
         .expect("parse config");
-        let runtime = RuntimePipelineConfig::from_config(config).expect("build runtime config");
-        Engine::new(runtime, "test".to_string()).expect("initialize engine")
+        RuntimePipelineConfig::from_config(config).expect("build runtime config")
+    }
+
+    /// 记录每个请求上报的传输 / Records the transport each request reports
+    #[derive(Default)]
+    struct TransportRecorder(std::sync::Mutex<Vec<Option<ClientTransport>>>);
+
+    impl kixdns::observe::EngineObserver for TransportRecorder {
+        fn request_started(&self, ctx: &kixdns::observe::RequestContext<'_>) {
+            self.0.lock().unwrap().push(ctx.transport);
+        }
+    }
+
+    /// UDP 与 TCP 监听器为交给引擎的请求标注查询经由的传输。
+    /// The UDP and TCP listeners tag the requests they hand to the engine
+    /// with the transport the query arrived over.
+    #[tokio::test]
+    async fn listeners_report_the_transport_the_query_arrived_over() {
+        let recorder = Arc::new(TransportRecorder::default());
+        let engine = Engine::builder(static_runtime())
+            .observer(recorder.clone())
+            .build()
+            .expect("initialize engine");
+
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let worker = tokio::spawn(run_udp_worker(0, Arc::clone(&server), engine.clone()));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(&dns_query(), server_addr).await.unwrap();
+        let mut response = [0u8; 512];
+        tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut response))
+            .await
+            .expect("udp answer")
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server_stream, peer) = listener.accept().await.unwrap();
+        let connection = tokio::spawn(handle_tcp_conn(server_stream, peer, engine.clone()));
+        let query = dns_query();
+        client
+            .write_all(&(query.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        client.write_all(&query).await.unwrap();
+        let mut len_buf = [0u8; 2];
+        client
+            .read_exact(&mut len_buf)
+            .await
+            .expect("length prefix");
+        let mut response = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+        client.read_exact(&mut response).await.expect("dns frame");
+
+        assert_eq!(
+            *recorder.0.lock().unwrap(),
+            [Some(ClientTransport::Udp), Some(ClientTransport::Tcp)]
+        );
+        worker.abort();
+        connection.abort();
     }
 
     fn dns_query() -> Vec<u8> {
