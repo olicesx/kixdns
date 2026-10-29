@@ -4,6 +4,7 @@ pub mod geoip_converter;
 mod geoip_proto;
 pub mod geosite;
 
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -211,6 +212,19 @@ pub struct RuntimePipeline {
     pub rules: Vec<RuntimeRule>,
     /// 是否包含依赖客户端 IP 的匹配规则 / Whether it contains rules that match based on client IP
     pub uses_client_ip: bool,
+    /// How the answer can depend on the requester: through this pipeline's rules,
+    /// the rules along the response-jump paths its answer checks start, and, when
+    /// an answer check continues, the pipelines its rules jump to. Response cache,
+    /// inflight and rule cache keys tell requesters apart by it.
+    /// 应答如何取决于请求方：来自本 pipeline 的规则、它的回答检查开始的响应跳转路径上的
+    /// 规则，以及回答检查会 continue 时它的规则跳到的 pipeline。响应缓存、inflight 和
+    /// 规则缓存的键按它区分请求方。
+    pub requester: RequesterScope,
+    /// What this pipeline's own request matchers tell requesters apart by. A rule
+    /// decision depends on nothing else, so the rule cache keys on it.
+    /// 本 pipeline 自己的请求匹配器区分请求方的依据。规则决策只取决于它，所以规则
+    /// 缓存按它区分。
+    pub rule_requester: RequesterScope,
     /// Pipeline 级 ECS 配置（缓存隔离维度）/ Pipeline-level ECS config (cache isolation dimension)
     pub ecs: Option<crate::config::EcsMode>,
     /// Pipeline 内是否有 action 使用了 ECS 配置 / Whether any action in this pipeline uses ECS config
@@ -224,6 +238,371 @@ pub struct RuntimePipeline {
     pub query_type_index: FxHashMap<RecordType, Vec<usize>>,
     // Rules that are NOT indexed by domain (must always be checked)
     pub always_check_rules: Vec<usize>,
+}
+
+/// Who is asking, as far as rules can tell.
+/// 规则能分辨的请求方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Requester {
+    /// The client's address / 客户端地址
+    pub address: IpAddr,
+    /// Whether the query carries EDNS / 查询是否带 EDNS
+    pub edns: bool,
+}
+
+/// One way a pipeline's rules can tell requesters apart.
+/// 管道的规则区分请求方的一种依据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequesterTest {
+    /// `client_ip`: whether the address is in the network / 地址是否在该网段内
+    InNet(IpNet),
+    /// `geoip_private`: whether the address is private / 地址是否私有
+    Private,
+    /// `geoip_country`: whether the address's GeoIP country or tag is one of these
+    /// 地址的 GeoIP 国家或标签是否在其中
+    Country(Vec<Arc<str>>),
+    /// `edns_present`, and `response_edns_present`, since an upstream answers with
+    /// EDNS when it is asked with it: whether the query carries EDNS
+    /// `edns_present`，以及 `response_edns_present`（上游被带着 EDNS 询问时才带着 EDNS
+    /// 回答）：查询是否带 EDNS
+    Edns,
+    /// ECS derived from the client: the subnet sent at these prefixes, none for a
+    /// private address / 取自客户端的 ECS：按这些前缀发送的子网，私有地址不发送
+    Subnet { prefix_v4: u8, prefix_v6: u8 },
+}
+
+impl RequesterTest {
+    fn hash_outcome<H: Hasher>(
+        &self,
+        requester: Requester,
+        geoip_manager: Option<&Arc<crate::lock::RwLock<geoip::GeoIpManager>>>,
+        hasher: &mut H,
+    ) {
+        match self {
+            Self::InNet(net) => net.contains(&requester.address).hash(hasher),
+            Self::Private => geoip::is_private_ip(requester.address).hash(hasher),
+            Self::Country(codes) => geoip_manager
+                .is_some_and(|manager| {
+                    matcher_helpers::match_geoip_country(&manager.read(), requester.address, codes)
+                })
+                .hash(hasher),
+            Self::Edns => requester.edns.hash(hasher),
+            Self::Subnet {
+                prefix_v4,
+                prefix_v6,
+            } => {
+                let mode = config::EcsMode::FromClientIp {
+                    prefix_v4: *prefix_v4,
+                    prefix_v6: *prefix_v6,
+                };
+                match crate::ecs::EcsKey::from_pipeline_config(&mode, requester.address) {
+                    Some(subnet) => {
+                        hasher.write_u8(1);
+                        subnet.hash_into(hasher);
+                    }
+                    None => hasher.write_u8(0),
+                }
+            }
+        }
+    }
+}
+
+/// How a pipeline's answer can depend on the requester: the tests its rules,
+/// and the rules a request may run before it answers, tell requesters apart by.
+/// Those rules treat two requesters alike when every test does, so the two can
+/// share cache and inflight entries.
+/// 管道的应答如何取决于请求方：它的规则、以及请求在应答之前可能运行的规则，用来区分
+/// 请求方的各项依据。每项依据都一样对待两个请求方时，这些规则对它们也一样，二者可以
+/// 共用缓存和 inflight 条目。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequesterScope {
+    tests: Vec<RequesterTest>,
+}
+
+impl RequesterScope {
+    /// The tests, in a fixed order / 各项依据，顺序固定
+    pub fn tests(&self) -> &[RequesterTest] {
+        &self.tests
+    }
+
+    fn add(&mut self, test: RequesterTest) {
+        if !self.tests.contains(&test) {
+            self.tests.push(test);
+        }
+    }
+
+    fn extend(&mut self, other: &Self) {
+        for test in &other.tests {
+            self.add(test.clone());
+        }
+    }
+
+    /// The requester's part of a key: how each test judges `requester`. Empty
+    /// for a scope without tests.
+    /// 键里属于请求方的部分：每项依据对 `requester` 的判定。没有依据时为空。
+    pub fn key(
+        &self,
+        requester: Requester,
+        geoip_manager: Option<&Arc<crate::lock::RwLock<geoip::GeoIpManager>>>,
+    ) -> RequesterKey {
+        if self.tests.is_empty() {
+            return RequesterKey::NONE;
+        }
+        let mut hasher = rustc_hash::FxHasher::default();
+        for test in &self.tests {
+            test.hash_outcome(requester, geoip_manager, &mut hasher);
+        }
+        RequesterKey {
+            class: Some(hasher.finish()),
+            address: None,
+        }
+    }
+}
+
+/// The requester's part of a response cache, inflight or rule cache key. Empty
+/// for a pipeline whose answer does not depend on the requester, so its keys
+/// stay as they were.
+/// 响应缓存、inflight 和规则缓存键里属于请求方的部分。应答与请求方无关的 pipeline
+/// 这里为空，键保持原样。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequesterKey {
+    /// How the scope's tests judge the requester / 范围内各项依据对请求方的判定
+    pub class: Option<u64>,
+    /// The client address itself, which only the rule cache adds, and only with
+    /// background refresh on, as it did before scopes existed
+    /// 客户端地址本身：只有规则缓存在开着后台刷新时加入，与引入范围之前一样
+    pub address: Option<IpAddr>,
+}
+
+impl RequesterKey {
+    /// No requester facts / 不含请求方信息
+    pub const NONE: Self = Self {
+        class: None,
+        address: None,
+    };
+
+    /// The key of a request on the response-jump path. That path forwards the
+    /// packet the forward before the jump sent, with `carried` as its ECS, while
+    /// a request that entered the pipeline otherwise sends a packet the
+    /// pipeline's own forwards prepare, so the two never share entries.
+    /// 响应跳转路径上的请求所用的键。跳转路径转发的是跳转前那次转发发出的包，`carried`
+    /// 是它的 ECS；以别的方式进入 pipeline 的请求发出的是本 pipeline 自己的转发准备的包，
+    /// 所以两者从不共用条目。
+    pub fn on_response_jump_path(self, carried: Option<&crate::ecs::EcsKey>) -> Self {
+        let mut hasher = rustc_hash::FxHasher::default();
+        hasher.write_u8(b'J');
+        self.class.hash(&mut hasher);
+        match carried {
+            Some(carried) => {
+                hasher.write_u8(1);
+                carried.hash_into(&mut hasher);
+            }
+            None => hasher.write_u8(0),
+        }
+        Self {
+            class: Some(hasher.finish()),
+            ..self
+        }
+    }
+
+    pub fn hash_into<H: Hasher>(&self, hasher: &mut H) {
+        if let Some(class) = self.class {
+            hasher.write_u8(1);
+            class.hash(hasher);
+        }
+        if let Some(address) = self.address {
+            hasher.write_u8(2);
+            address.hash(hasher);
+        }
+    }
+}
+
+/// What a pipeline's rules tell requesters apart by, each part for one use
+/// below / 一个 pipeline 的规则区分请求方的依据，按下面的用途分开
+struct RuleReads {
+    /// Request matchers / 请求匹配器
+    request_matchers: RequesterScope,
+    /// Request and response matchers / 请求匹配器和响应匹配器
+    matchers: RequesterScope,
+    /// ECS from the client that its forwards send, which the pipeline's own
+    /// `ecs` does not already key as finely
+    /// 转发发送的取自客户端的 ECS，且 pipeline 自己的 `ecs` 没有按同样细的子网区分
+    unkeyed_subnets: RequesterScope,
+    /// Every ECS from the client that its forwards send, keyed or not
+    /// 转发发送的每种取自客户端的 ECS，不论是否已区分
+    forward_subnets: RequesterScope,
+    /// Pipelines its answer checks jump to / 回答检查跳到的 pipeline
+    response_jumps: Vec<Arc<str>>,
+    /// Pipelines its rules jump to / 规则跳到的 pipeline
+    request_jumps: Vec<Arc<str>>,
+    /// Pipelines its rules or answer checks jump to / 规则或回答检查跳到的 pipeline
+    jumps: Vec<Arc<str>>,
+    /// Whether an answer check continues / 是否有回答检查会 continue
+    continues: bool,
+}
+
+impl RuleReads {
+    fn of(rules: &[RuntimeRule], keyed_ecs: Option<&config::EcsMode>) -> Self {
+        let mut reads = Self {
+            request_matchers: RequesterScope::default(),
+            matchers: RequesterScope::default(),
+            unkeyed_subnets: RequesterScope::default(),
+            forward_subnets: RequesterScope::default(),
+            response_jumps: Vec::new(),
+            request_jumps: Vec::new(),
+            jumps: Vec::new(),
+            continues: false,
+        };
+        let mut answer_edns = false;
+        for rule in rules {
+            for m in &rule.matchers {
+                let test = match &m.matcher {
+                    RuntimeMatcher::ClientIp { net } => RequesterTest::InNet(*net),
+                    RuntimeMatcher::GeoipPrivate { .. } => RequesterTest::Private,
+                    RuntimeMatcher::GeoipCountry { country_codes } => {
+                        RequesterTest::Country(country_codes.clone())
+                    }
+                    RuntimeMatcher::EdnsPresent { .. } => RequesterTest::Edns,
+                    _ => continue,
+                };
+                reads.request_matchers.add(test);
+            }
+            answer_edns |= rule.response_matchers.iter().any(|m| {
+                matches!(
+                    m.matcher,
+                    RuntimeResponseMatcher::ResponseEdnsPresent { .. }
+                )
+            });
+            // Response actions forward without ECS of their own, so only the rule's
+            // own forward sends any / 响应动作转发时不加自己的 ECS，只有规则自己的转发会发送
+            for action in &rule.actions {
+                if let Action::Forward {
+                    ecs:
+                        Some(config::EcsMode::FromClientIp {
+                            prefix_v4,
+                            prefix_v6,
+                        }),
+                    ..
+                } = action
+                {
+                    let test = RequesterTest::Subnet {
+                        prefix_v4: *prefix_v4,
+                        prefix_v6: *prefix_v6,
+                    };
+                    let keyed = matches!(
+                        keyed_ecs,
+                        Some(config::EcsMode::FromClientIp { prefix_v4: v4, prefix_v6: v6 })
+                            if v4 >= prefix_v4 && v6 >= prefix_v6
+                    );
+                    if !keyed {
+                        reads.unkeyed_subnets.add(test.clone());
+                    }
+                    reads.forward_subnets.add(test);
+                }
+            }
+            reads.continues |= rule
+                .response_actions_on_match
+                .iter()
+                .chain(&rule.response_actions_on_miss)
+                .any(|action| matches!(action, Action::Continue));
+            let jump_target = |action: &Action| match action {
+                Action::JumpToPipeline { pipeline } => Some(Arc::<str>::from(pipeline.as_str())),
+                _ => None,
+            };
+            for target in rule
+                .response_actions_on_match
+                .iter()
+                .chain(&rule.response_actions_on_miss)
+                .filter_map(jump_target)
+            {
+                reads.response_jumps.push(target.clone());
+                reads.jumps.push(target);
+            }
+            for target in rule.actions.iter().filter_map(jump_target) {
+                reads.request_jumps.push(target.clone());
+                reads.jumps.push(target);
+            }
+        }
+        reads.matchers = reads.request_matchers.clone();
+        if answer_edns {
+            reads.matchers.add(RequesterTest::Edns);
+        }
+        reads
+    }
+}
+
+/// Every pipeline reachable from `starts` by `jump_to_pipeline`, in rule actions
+/// or answer checks, `starts` included / 从 `starts` 经规则动作或回答检查里的
+/// `jump_to_pipeline` 能到达的每个 pipeline，含 `starts` 本身
+fn reachable_pipelines(
+    reads: &[RuleReads],
+    index: &FxHashMap<Arc<str>, usize>,
+    starts: impl IntoIterator<Item = usize>,
+) -> Vec<usize> {
+    let mut seen = vec![false; reads.len()];
+    let mut stack: Vec<usize> = starts.into_iter().collect();
+    let mut reached = Vec::new();
+    while let Some(idx) = stack.pop() {
+        if std::mem::replace(&mut seen[idx], true) {
+            continue;
+        }
+        reached.push(idx);
+        stack.extend(
+            reads[idx]
+                .jumps
+                .iter()
+                .filter_map(|target| index.get(target).copied()),
+        );
+    }
+    reached
+}
+
+/// Each pipeline's scope (see `RuntimePipeline::requester`) / 每个 pipeline 的范围
+fn requester_scopes(
+    reads: &[RuleReads],
+    index: &FxHashMap<Arc<str>, usize>,
+) -> Vec<RequesterScope> {
+    (0..reads.len())
+        .map(|idx| {
+            let mut scope = reads[idx].matchers.clone();
+            scope.extend(&reads[idx].unkeyed_subnets);
+            // After a forward, an answer check may jump, and the request runs the
+            // rules along the jump path before its waiters take the answer.
+            // Forwards there send the packet as it is (keys on that path carry
+            // its ECS, see `RequesterKey::on_response_jump_path`), so only
+            // matchers count.
+            // 转发之后回答检查可能跳转，请求在等待者拿到应答之前运行跳转路径上的规则。
+            // 那里的转发原样发送包（那条路径上的键带着它的 ECS，见
+            // `RequesterKey::on_response_jump_path`），所以只有匹配器计入。
+            let targets = reads[idx]
+                .response_jumps
+                .iter()
+                .filter_map(|target| index.get(target).copied());
+            for reached in reachable_pipelines(reads, index, targets) {
+                scope.extend(&reads[reached].matchers);
+            }
+            // After an answer check continues, the request keeps its entry for the
+            // rest of the decision loop (see `ForwardDecisionContext::held_inflight`)
+            // and its waiters take the final answer. The rest of the pipeline and
+            // the pipelines it jumps to may decide that answer, and forwards there
+            // send their own ECS, which this pipeline's key does not carry.
+            // 回答检查 continue 之后，请求在决策循环余下的部分一直持有条目（见
+            // `ForwardDecisionContext::held_inflight`），等待者拿到最终应答。这个应答可能由
+            // pipeline 余下的规则和它跳到的 pipeline 决定，而那里的转发发送自己的 ECS，
+            // 本 pipeline 的键并不带着。
+            if reads[idx].continues {
+                let targets = reads[idx]
+                    .request_jumps
+                    .iter()
+                    .filter_map(|target| index.get(target).copied());
+                for reached in reachable_pipelines(reads, index, targets) {
+                    scope.extend(&reads[reached].matchers);
+                    scope.extend(&reads[reached].forward_subnets);
+                }
+            }
+            scope
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -431,6 +810,8 @@ impl RuntimePipelineConfig {
             .context("validate timeout configuration")?;
 
         let mut pipelines = Vec::new();
+        // What each pipeline's rules tell requesters apart by / 每个 pipeline 的规则区分请求方的依据
+        let mut reads = Vec::new();
         for p in cfg.pipelines {
             let mut rules = Vec::new();
             for r in p.rules {
@@ -593,17 +974,21 @@ impl RuntimePipelineConfig {
                 tracing::warn!(
                     pipeline = %p.id,
                     "Pipeline has Forward actions with 'ecs' but no pipeline-level 'ecs' config. \
-                     Cache isolation may be incorrect. Consider setting pipeline-level 'ecs' or \
-                     splitting into separate pipelines. / \
+                     Answers of from_client_ip actions are cached per subnet they send. \
+                     Consider setting pipeline-level 'ecs' or splitting into separate pipelines. / \
                      Pipeline 的 Forward action 有 'ecs' 但 pipeline 级未配置 'ecs'。\
-                     缓存隔离可能不正确。建议设置 pipeline 级 'ecs' 或拆分为独立 pipeline。"
+                     from_client_ip 动作的应答按它发送的子网分别缓存。建议设置 pipeline 级 'ecs' 或拆分为独立 pipeline。"
                 );
             }
 
+            reads.push(RuleReads::of(&rules, p.ecs.as_ref()));
             pipelines.push(RuntimePipeline {
                 id: Arc::from(p.id),
                 rules,
                 uses_client_ip: pipeline_uses_client_ip,
+                // Filled in below, once every pipeline is known / 所有 pipeline 都建好后在下面填入
+                requester: RequesterScope::default(),
+                rule_requester: RequesterScope::default(),
                 ecs: p.ecs.clone(),
                 uses_ecs: pipeline_uses_ecs,
                 domain_exact_index, // 添加完全匹配索引 / Add exact match index
@@ -698,6 +1083,15 @@ impl RuntimePipelineConfig {
             .map(|(i, p)| (p.id.clone(), i))
             .collect();
 
+        for ((pipeline, scope), rule_reads) in pipelines
+            .iter_mut()
+            .zip(requester_scopes(&reads, &pipeline_id_index))
+            .zip(&reads)
+        {
+            pipeline.requester = scope;
+            pipeline.rule_requester = rule_reads.request_matchers.clone();
+        }
+
         Ok(Self {
             settings: cfg.settings,
             pipeline_select,
@@ -709,6 +1103,21 @@ impl RuntimePipelineConfig {
 
     pub fn min_ttl(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.settings.min_ttl as u64)
+    }
+
+    /// The requester's part of the keys for `pipeline` (none for an unknown pipeline).
+    /// `pipeline` 的键里属于请求方的部分（pipeline 不存在时为空）。
+    pub fn requester_key(
+        &self,
+        pipeline: &str,
+        requester: Requester,
+        geoip_manager: Option<&Arc<crate::lock::RwLock<geoip::GeoIpManager>>>,
+    ) -> RequesterKey {
+        self.pipeline_id_index
+            .get(pipeline)
+            .map_or(RequesterKey::NONE, |&idx| {
+                self.pipelines[idx].requester.key(requester, geoip_manager)
+            })
     }
 
     pub fn upstream_timeout(&self) -> std::time::Duration {

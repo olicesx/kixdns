@@ -36,10 +36,12 @@ use super::response::build_fast_static_response;
 use super::response_log::ResponseLog;
 use super::rules::RuleCacheRecord;
 use super::types::{EngineInner, FastPathResponse, build_cache_namespaces};
-use super::utils::{engine_helpers, is_refreshing};
+use super::utils::{InflightCleanupGuard, engine_helpers, is_refreshing};
 #[cfg(test)]
 use crate::engine::rules::calculate_rule_hash;
+use crate::engine::rules::rule_cache_requester;
 use crate::engine::rules::{Decision, ResponseContext};
+use crate::matcher::{Requester, RequesterKey};
 
 /// Pre-parsed data from handle_packet_fast to avoid re-parsing
 /// 来自 handle_packet_fast 的预解析数据，避免重新解析
@@ -112,6 +114,11 @@ use super::pipeline::{PipelineSelectionContext, RuleEvaluationContext, select_pi
 /// answer back. It comes off the remaining request budget so the wait never
 /// runs right up to the deadline and loses the race with the outer timeout.
 const STALE_SERVE_RESERVE: Duration = Duration::from_millis(20);
+
+/// UDP payload size a background refresh advertises when it replays a request
+/// that carried EDNS, the same 1232 the ECS rewrite advertises.
+/// 后台刷新重放带 EDNS 的请求时声明的 UDP 载荷大小，与 ECS 改写声明的 1232 相同。
+const REFRESH_EDNS_PAYLOAD: u16 = 1232;
 
 /// 整体请求超时：显式配置优先，否则按 upstream_timeout_ms 的 2.5 倍推导
 /// （hedge 1/3 + 全量 1 倍 + TCP 回落 1 倍，再留一点余量）。
@@ -280,6 +287,7 @@ impl Engine {
         qtype: hickory_proto::rr::RecordType,
         qclass: hickory_proto::rr::DNSClass,
         ecs_key: Option<&crate::ecs::EcsKey>,
+        requester: &RequesterKey,
     ) -> u64 {
         let mut h = FxHasher::default();
         cache_namespace.hash(&mut h);
@@ -298,6 +306,11 @@ impl Engine {
         if let Some(ecs) = ecs_key {
             ecs.hash_into(&mut h);
         }
+        // The requester, for a pipeline whose answer depends on it (see
+        // `RuntimePipeline::requester`); nothing otherwise, so the key is unchanged
+        // 请求方，仅当 pipeline 的应答取决于它时（见 `RuntimePipeline::requester`）；
+        // 否则不写入，键不变
+        requester.hash_into(&mut h);
         h.finish()
     }
 
@@ -503,6 +516,13 @@ impl Engine {
                 .and_then(|mode| crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip()))
         });
         let cache_namespace = state.cache_namespace(&pipeline_id);
+        let requester = Requester {
+            address: peer.ip(),
+            edns: q.edns_present,
+        };
+        let requester_key = pipeline_opt.map_or(RequesterKey::NONE, |p| {
+            p.requester.key(requester, Some(&self.geoip_manager))
+        });
         let cache_hash = Self::calculate_cache_hash_for_dedupe(
             cache_namespace,
             &pipeline_id,
@@ -510,6 +530,7 @@ impl Engine {
             qtype,
             qclass,
             ecs_key.as_ref(),
+            &requester_key,
         );
 
         if let Some(hit) = self.cache.get(&cache_hash) {
@@ -585,7 +606,7 @@ impl Engine {
                                 qname_str,
                                 qtype,
                                 qclass,
-                                peer.ip(),
+                                requester,
                             );
                         }
                     }
@@ -676,17 +697,19 @@ impl Engine {
         // 3. Check Rule Cache (L1) for Static Responses / 3. 检查规则缓存（L1）的静态响应
         // Zero-allocation lookup using hash / 使用哈希的零分配查找
         if let Some(p) = pipeline_opt {
-            // Optimization: only include IP in hash when rule uses client_ip matcher or config requires it
-            // 优化：仅当规则使用client_ip匹配器或配置要求时才包含IP在哈希中
-            let include_ip_in_hash = p.uses_client_ip || cfg.settings.cache_background_refresh;
+            let rule_requester = rule_cache_requester(
+                p,
+                cfg.settings.cache_background_refresh,
+                requester,
+                Some(&self.geoip_manager),
+            );
             let rule_hash = crate::engine::rules::calculate_rule_hash(
                 cache_namespace,
                 &pipeline_id,
                 qname_str,
                 qtype,
                 qclass,
-                peer.ip(),
-                include_ip_in_hash,
+                &rule_requester,
             );
             if let Some(record) = self.rule_cache.get(&rule_hash) {
                 let entry = &record.entry;
@@ -696,14 +719,8 @@ impl Engine {
                     // Remove expired entry
                     // 删除过期条目
                     self.rule_cache.remove(&rule_hash);
-                } else if entry.matches(
-                    &pipeline_id,
-                    qname_str,
-                    qtype,
-                    qclass,
-                    peer.ip(),
-                    include_ip_in_hash,
-                ) && let Decision::Static { rcode, answers } = entry.decision.as_ref()
+                } else if entry.matches(&pipeline_id, qname_str, qtype, qclass, &rule_requester)
+                    && let Decision::Static { rcode, answers } = entry.decision.as_ref()
                 {
                     let resp = build_fast_static_response(
                         q.tx_id, qname_str, q.qtype, q.qclass, *rcode, answers,
@@ -942,6 +959,10 @@ impl Engine {
         // observer learns the outcome; the block is awaited immediately.
         // 以下代码在多处返回响应；用 async 块包裹使所有出口汇聚到一处，便于观察者
         // 获得请求结果。该块会被立即 await。
+        // Inflight entry the request still holds after a rule continued (see
+        // `ForwardDecisionContext::held_inflight`)
+        // 规则 continue 后本请求仍持有的 inflight 条目
+        let mut held_inflight: Option<InflightCleanupGuard> = None;
         let result: anyhow::Result<Bytes> = async {
             // Find pipeline_opt from pipeline_id / 从 pipeline_id 查找 pipeline_opt
             let pipeline_opt = cfg
@@ -954,6 +975,11 @@ impl Engine {
             // Compute dedupe hash: use explicit hash for background refresh, or pre-computed ECS key,
             // otherwise compute with ECS key from pipeline config
             // 计算 dedupe hash：后台刷新用显式 hash，或用预计算 ECS key，否则从 pipeline 配置计算
+            // Who is asking, as far as rules can tell / 规则能分辨的请求方
+            let requester = Requester {
+                address: peer.ip(),
+                edns: edns_present,
+            };
             let ecs_key = if explicit_cache_hash.is_some() {
                 None // explicit hash overrides; ecs_key not needed / 显式 hash 优先；不需要 ecs_key
             } else {
@@ -975,6 +1001,9 @@ impl Engine {
                     qtype,
                     qclass,
                     ecs_key.as_ref(),
+                    &pipeline_opt.map_or(RequesterKey::NONE, |p| {
+                        p.requester.key(requester, Some(&self.geoip_manager))
+                    }),
                 )
             };
 
@@ -996,6 +1025,7 @@ impl Engine {
                         tx_id,
                         start,
                         peer: &peer,
+                        edns_present,
                         observed: observed_ctx,
                     },
                     &mut response_log.info,
@@ -1084,6 +1114,7 @@ impl Engine {
                                     tx_id,
                                     start,
                                     peer: &peer,
+                                    edns_present,
                                     observed: observed_ctx,
                                 },
                                 &mut response_log.info,
@@ -1113,6 +1144,7 @@ impl Engine {
                             tx_id,
                             start,
                             peer: &peer,
+                            edns_present,
                             observed: observed_ctx,
                         },
                         CacheHitKind::StaleClientTimeout,
@@ -1233,11 +1265,18 @@ impl Engine {
                     jump_count += 1;
                     if jump_count > response_jump_limit {
                         warn!("max jump limit reached");
-                        decision = Decision::Static {
-                            rcode: ResponseCode::ServFail,
-                            answers: Vec::new(),
-                        };
-                        break;
+                        // How many jumps a request has left depends on the way it
+                        // came, which no key carries, so this SERVFAIL is its own: a
+                        // waiter on its held entry may have jumps to spare, so the
+                        // entry goes rather than hand it over, and it is not cached
+                        // for a request that enters this pipeline directly.
+                        // 请求还能跳几次取决于它一路怎么来的，键里没有这一项，所以这个
+                        // SERVFAIL 只属于它：等在持有条目上的请求可能还有余量，所以放掉
+                        // 条目，不把它交出去；也不缓存给直接进入这个 pipeline 的请求。
+                        drop(held_inflight.take());
+                        response_log.info.upstream = Some(Arc::from("static"));
+                        let req = Message::from_bytes(packet).context("parse request")?;
+                        return engine_helpers::build_servfail_response(&req);
                     }
                     if let Some(&idx) = cfg.pipeline_id_index.get(pipeline.as_ref()) {
                         let p = &cfg.pipelines[idx];
@@ -1263,6 +1302,7 @@ impl Engine {
                             qtype,
                             qclass,
                             jump_ecs_key.as_ref(),
+                            &p.requester.key(requester, Some(&self.geoip_manager)),
                         );
                         skip_rules.clear();
                         decision = self.apply_rules(
@@ -1342,6 +1382,7 @@ impl Engine {
                                 upstream_timeout,
                                 start,
                                 peer: &peer,
+                                edns_present,
                                 skip_cache,
                                 upstream: &upstream,
                                 pre_split_upstreams: pre_split_upstreams.as_ref(),
@@ -1352,6 +1393,7 @@ impl Engine {
                                 ecs: ecs.as_ref(),
                                 allow_reuse,
                                 reused_response: &mut reused_response,
+                                held_inflight: &mut held_inflight,
                                 observed: observed_ctx,
                             },
                             &mut response_log.info,
@@ -1424,6 +1466,20 @@ impl Engine {
             }
         }
         .await;
+        // A request that continued still holds its entry here, and its waiters get
+        // the final answer: the entry's key keeps them to requesters that the rules
+        // run after the continue treat alike (see `RuntimePipeline::requester`). If
+        // the request returns an error or is cancelled, the guard drops and removes
+        // the entry, and the waiters forward themselves.
+        // continue 过的请求走到这里仍持有条目，等待者拿到最终应答：条目的键只让 continue
+        // 之后运行的规则一样对待的请求方等在上面（见 `RuntimePipeline::requester`）。请求
+        // 返回错误或被取消时，守卫被丢弃并移除条目，等待者自己转发。
+        if let Some(mut guard) = held_inflight.take()
+            && let Ok(bytes) = &result
+        {
+            guard.defuse();
+            self.notify_inflight_waiters(guard.hash, bytes).await;
+        }
         response_log.finish(&result);
         if let Some(observed) = observed.as_mut() {
             observed.set_status(if result.is_ok() {
@@ -1463,7 +1519,7 @@ impl Engine {
         qname: &str,
         qtype: hickory_proto::rr::RecordType,
         qclass: DNSClass,
-        peer_ip: std::net::IpAddr,
+        requester: Requester,
     ) {
         crate::engine::refresh::spawn_background_refresh(
             self,
@@ -1473,7 +1529,7 @@ impl Engine {
             qname,
             qtype,
             qclass,
-            peer_ip,
+            requester,
         )
     }
 
@@ -1488,11 +1544,14 @@ impl Engine {
     /// - 生成有效的 TXID（不是 0）
     /// - 设置正确的标志（需要递归）
     /// - 正确编码 QNAME
+    /// - Carries EDNS when `edns` is set, as the request being replayed did
+    /// - `edns` 为真时带上 EDNS，与被重放的请求一致
     pub(crate) fn construct_dns_packet(
         &self,
         qname: &str,
         qtype: hickory_proto::rr::RecordType,
         _qclass: DNSClass, // Currently defaults to IN class, parameter reserved for future use
+        edns: bool,
     ) -> anyhow::Result<Bytes> {
         use hickory_proto::op::{Message, MessageType, Query};
         use hickory_proto::rr::Name;
@@ -1515,6 +1574,11 @@ impl Engine {
         let name = Name::from_str(qname)?;
         let query = Query::query(name.clone(), qtype);
         msg.add_query(query);
+        if edns {
+            let mut opt = hickory_proto::op::Edns::new();
+            opt.set_max_payload(REFRESH_EDNS_PAYLOAD);
+            msg.edns = Some(opt);
+        }
 
         // Serialize to bytes
         // 序列化为字节
@@ -1589,6 +1653,7 @@ mod tests {
             RecordType::A,
             DNSClass::IN,
             None,
+            &RequesterKey::NONE,
         );
         engine.insert_dns_cache_entry(
             old_key,
@@ -1625,6 +1690,7 @@ mod tests {
             RecordType::A,
             DNSClass::IN,
             None,
+            &RequesterKey::NONE,
         );
         assert_ne!(old_key, new_key);
         assert!(
@@ -1646,6 +1712,7 @@ mod tests {
             RecordType::A,
             DNSClass::IN,
             None,
+            &RequesterKey::NONE,
         );
 
         engine.reload(runtime_with_static_ip("192.0.2.2"));
@@ -1657,6 +1724,7 @@ mod tests {
             RecordType::A,
             DNSClass::IN,
             None,
+            &RequesterKey::NONE,
         );
 
         let mut request = Message::new(0xCAFE, MessageType::Query, OpCode::Query);
@@ -1761,6 +1829,9 @@ mod tests {
             RecordType::A,
             DNSClass::IN,
             None,
+            // Keys on the response-jump path are kept apart from direct ones
+            // 响应跳转路径上的键与直接进入的分开
+            &RequesterKey::NONE.on_response_jump_path(None),
         );
 
         // Reload changes only the jump target, so "target" rotates its
@@ -1774,6 +1845,9 @@ mod tests {
             RecordType::A,
             DNSClass::IN,
             None,
+            // Keys on the response-jump path are kept apart from direct ones
+            // 响应跳转路径上的键与直接进入的分开
+            &RequesterKey::NONE.on_response_jump_path(None),
         );
 
         let mut request = Message::new(0xBEEF, MessageType::Query, OpCode::Query);
@@ -1810,6 +1884,885 @@ mod tests {
             engine.cache_get(&new_target_key).is_none(),
             "the response jump must not populate the active generation"
         );
+    }
+
+    /// 用一条 A 记录 `answer` 回应每个查询的本机 UDP 上游，并数收到了多少个查询。
+    /// A local UDP upstream that answers every query with one A record `answer`,
+    /// counting the queries it receives.
+    async fn spawn_answering_upstream(
+        answer: std::net::Ipv4Addr,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        spawn_answering_upstream_after(answer, Duration::ZERO).await
+    }
+
+    /// 同上，但每个应答都晚 `delay` 才发出。
+    /// The same, with every answer sent `delay` late.
+    async fn spawn_answering_upstream_after(
+        answer: std::net::Ipv4Addr,
+        delay: Duration,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = sock.local_addr().unwrap().to_string();
+        let queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = queries.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                let Ok(query) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                let Some(question) = query.queries.first().cloned() else {
+                    continue;
+                };
+                counted.fetch_add(1, Ordering::Relaxed);
+                let mut resp = Message::new(query.id(), MessageType::Response, OpCode::Query);
+                resp.add_query(question.clone());
+                resp.add_answer(Record::from_rdata(
+                    question.name().clone(),
+                    300,
+                    RData::A(hickory_proto::rr::rdata::A(answer)),
+                ));
+                let resp = resp.to_vec().unwrap();
+                if delay.is_zero() {
+                    let _ = sock.send_to(&resp, peer).await;
+                } else {
+                    let sock = sock.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = sock.send_to(&resp, peer).await;
+                    });
+                }
+            }
+        });
+        (addr, queries)
+    }
+
+    /// 只收不答的本机 UDP 上游，数收到了多少个数据包。
+    /// A local UDP upstream that never answers, counting the datagrams it receives.
+    async fn spawn_silent_upstream() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap().to_string();
+        let datagrams = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = datagrams.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while sock.recv_from(&mut buf).await.is_ok() {
+                counted.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        (addr, datagrams)
+    }
+
+    fn continue_config(
+        pipeline_select: serde_json::Value,
+        pipelines: serde_json::Value,
+    ) -> RuntimePipelineConfig {
+        let raw = serde_json::json!({
+            "settings": {
+                "default_upstream": "127.0.0.1:9",
+                "upstream_timeout_ms": 100,
+                "enable_tcp_fallback": false
+            },
+            "pipeline_select": pipeline_select,
+            "pipelines": pipelines
+        });
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        RuntimePipelineConfig::from_config(config).expect("build runtime config")
+    }
+
+    fn example_query() -> Vec<u8> {
+        let mut request = Message::new(0xBEEF, MessageType::Query, OpCode::Query);
+        request.add_query(Query::query(
+            Name::from_str("example.com").unwrap(),
+            RecordType::A,
+        ));
+        request.to_vec().unwrap()
+    }
+
+    fn first_a_record(response: anyhow::Result<Bytes>) -> Option<std::net::Ipv4Addr> {
+        let response = Message::from_bytes(&response.expect("answer")).expect("parse");
+        match response.answers.first().map(|record| &record.data) {
+            Some(RData::A(address)) => Some(address.0),
+            _ => None,
+        }
+    }
+
+    /// 同一个 example.com 查询从 `clients` 同时发出：第一个登记 inflight，第二个等在
+    /// 它上面。按顺序返回两个应答的 A 记录（没有就是 None），并断言没有留下 inflight 条目。
+    /// The same example.com query sent from `clients` at once: the first registers
+    /// in inflight and the second waits on it. Returns both answers' A records in
+    /// order (None without one) and asserts that no inflight entry is left behind.
+    async fn ask_at_once(engine: &Engine, clients: [&str; 2]) -> [Option<std::net::Ipv4Addr>; 2] {
+        let packet = example_query();
+        let [first, second] = clients.map(|client| client.parse::<SocketAddr>().unwrap());
+        // 修复前会挂到监听器超时；5 秒只用来区分「挂住」
+        // Before the fix these hung until the listener timeout; 5 s only tells a hang apart
+        let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut leader = std::pin::pin!(engine.handle_packet(&packet, first));
+            // 先让第一个请求跑到等上游为止：它已登记条目，由它领头
+            // Run the first request until it waits on its upstream: it has registered
+            // its entry, so it leads
+            let polled =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(leader.as_mut().poll(cx))).await;
+            assert!(
+                polled.is_pending() && engine.inflight.len() == 1,
+                "the first request must lead"
+            );
+            tokio::join!(leader, engine.handle_packet(&packet, second))
+        })
+        .await
+        .expect("a request after a continue must not hang");
+        assert!(
+            engine.inflight.is_empty(),
+            "a finished request must not leave its inflight entry behind"
+        );
+        [first_a_record(first), first_a_record(second)]
+    }
+
+    const ONE_CLIENT: [&str; 2] = ["127.0.0.1:53000"; 2];
+
+    /// 先 continue 到下一条规则的配置：`first` 转发到 `first_upstream`，失败后 continue，
+    /// 下一条是 `next`。
+    /// A configuration that continues on a miss: `first` forwards to
+    /// `first_upstream` and continues when it fails; the next rule is `next`.
+    fn continue_on_miss_to(first_upstream: &str, next: serde_json::Value) -> RuntimePipelineConfig {
+        continue_config(
+            serde_json::json!([]),
+            serde_json::json!([{
+                "id": "main",
+                "rules": [
+                    {
+                        "name": "first",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": first_upstream }],
+                        "response_actions_on_miss": [{ "type": "continue" }]
+                    },
+                    next
+                ]
+            }]),
+        )
+    }
+
+    /// 同一份配置下，一个请求单独发出和两个请求同时发出，`first` 的死上游各收到多少
+    /// 数据包。两者相等说明等待者没有自己再转发一遍。
+    /// Datagrams the dead `first` upstream receives for one request alone and for
+    /// two at once under the same configuration. Equal counts show the waiting
+    /// request did not forward again itself.
+    async fn datagrams_alone_and_at_once(
+        next: serde_json::Value,
+    ) -> (usize, usize, [Option<std::net::Ipv4Addr>; 2]) {
+        let (alone, sent_alone) = spawn_silent_upstream().await;
+        let engine = Engine::new(
+            continue_on_miss_to(&alone, next.clone()),
+            "test".to_string(),
+        )
+        .expect("engine");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.handle_packet(&example_query(), ONE_CLIENT[0].parse().unwrap()),
+        )
+        .await
+        .expect("a request after a continue must not hang")
+        .expect("answer");
+
+        let (silent, sent) = spawn_silent_upstream().await;
+        let engine =
+            Engine::new(continue_on_miss_to(&silent, next), "test".to_string()).expect("engine");
+        let answers = ask_at_once(&engine, ONE_CLIENT).await;
+        (
+            sent_alone.load(Ordering::Relaxed),
+            sent.load(Ordering::Relaxed),
+            answers,
+        )
+    }
+
+    /// on_miss 里的 continue 要把请求交给下一条规则。以前这里卸掉清理守卫，条目留在
+    /// 表里却没人持有：下一条规则以相同 dedupe_hash 转发时等的正是这一条，请求和等在
+    /// 它上面的请求一起挂到监听器超时。现在条目由请求一直持有，等待者拿到下一条规则
+    /// 的应答，不会自己再转发一遍。
+    /// A continue in response_actions_on_miss must hand the request to the next
+    /// rule. The guard used to be defused here, leaving the entry behind with
+    /// nobody holding it: the next rule's Forward, under the same dedupe_hash,
+    /// waited on that very entry, and the request hung until the listener timeout
+    /// along with every request waiting on it. Now the request keeps holding the
+    /// entry, and waiters get the next rule's answer without forwarding again.
+    #[tokio::test]
+    async fn a_continue_on_miss_hands_the_request_to_the_next_rule() {
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+        let (alone, at_once, answers) = datagrams_alone_and_at_once(serde_json::json!({
+            "name": "next",
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "forward", "upstream": answering }]
+        }))
+        .await;
+
+        assert_eq!(answers, [Some(answer); 2]);
+        assert_eq!(
+            at_once, alone,
+            "the waiting request must get the answer, not forward again"
+        );
+    }
+
+    /// continue 之后以静态应答结束时，等待者拿到同一个应答，不会自己再转发。
+    /// When a continue ends on a static answer, waiters get that same answer
+    /// without forwarding again.
+    #[tokio::test]
+    async fn waiters_get_a_static_answer_reached_after_a_continue() {
+        let (alone, at_once, answers) = datagrams_alone_and_at_once(serde_json::json!({
+            "name": "static",
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "static_ip_response", "ip": "192.0.2.30" }]
+        }))
+        .await;
+
+        assert_eq!(answers, [Some("192.0.2.30".parse().unwrap()); 2]);
+        assert_eq!(
+            at_once, alone,
+            "the waiting request must get the answer, not forward again"
+        );
+    }
+
+    /// continue 之后下一条规则也失败：两个请求都拿到 SERVFAIL，不挂，也不留下条目。
+    /// When the next rule after a continue fails too, both requests get SERVFAIL,
+    /// neither hangs, and no entry is left behind.
+    #[tokio::test]
+    async fn a_failure_after_a_continue_answers_every_request() {
+        let (silent, _) = spawn_silent_upstream().await;
+        let engine = Engine::new(
+            continue_on_miss_to(
+                &silent,
+                serde_json::json!({
+                    "name": "next",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": silent }]
+                }),
+            ),
+            "test".to_string(),
+        )
+        .expect("engine");
+
+        assert_eq!(ask_at_once(&engine, ONE_CLIENT).await, [None; 2]);
+    }
+
+    /// `check` 转发到 `checked`，应答来自它就 continue；`then` 接在后面。
+    /// `check` forwards to `checked` and continues when the answer comes from it;
+    /// `then` follows.
+    fn continue_on_match_rules(checked: &str, then: serde_json::Value) -> serde_json::Value {
+        let mut rules = vec![serde_json::json!({
+            "name": "check",
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "forward", "upstream": checked }],
+            "response_matchers": [{ "type": "upstream_equals", "value": checked }],
+            "response_actions_on_match": [{ "type": "continue" }]
+        })];
+        rules.extend(then.as_array().expect("rules").iter().cloned());
+        serde_json::Value::Array(rules)
+    }
+
+    /// on_match 里的 continue：规则越过了第一个上游的应答，等待者也必须拿到最终
+    /// 应答。以前它们拿到的是被越过的那个，例如防污染配置里被判为污染的应答。
+    /// A continue in response_actions_on_match: the rule continued past the first
+    /// upstream's answer, so waiters must get the final answer too. They used to
+    /// get the one continued past, such as an answer judged poisoned.
+    #[tokio::test]
+    async fn waiters_get_the_final_answer_after_a_continue_on_match() {
+        let (checked, _) = spawn_answering_upstream("192.0.2.10".parse().unwrap()).await;
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+        let engine = Engine::new(
+            continue_config(
+                serde_json::json!([]),
+                serde_json::json!([{
+                    "id": "main",
+                    "rules": continue_on_match_rules(&checked, serde_json::json!([{
+                        "name": "next",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": answering }]
+                    }]))
+                }]),
+            ),
+            "test".to_string(),
+        )
+        .expect("engine");
+
+        assert_eq!(ask_at_once(&engine, ONE_CLIENT).await, [Some(answer); 2]);
+    }
+
+    /// 按客户端匹配的 pipeline 在 continue 之后给出的静态应答只属于那个客户端（例如
+    /// 只对某台设备屏蔽），不能交给等在它上面的另一个客户端。
+    /// A static answer a client-matching pipeline gives after a continue belongs to
+    /// that client alone (such as blocking one device) and must not reach another
+    /// client waiting on it.
+    #[tokio::test]
+    async fn a_client_specific_static_answer_is_not_handed_to_another_client() {
+        let (checked, _) = spawn_answering_upstream("192.0.2.10".parse().unwrap()).await;
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+        let engine = Engine::new(
+            continue_config(
+                serde_json::json!([]),
+                serde_json::json!([{
+                    "id": "main",
+                    "rules": continue_on_match_rules(&checked, serde_json::json!([
+                        {
+                            "name": "block",
+                            "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }],
+                            "actions": [{ "type": "static_ip_response", "ip": "0.0.0.0" }]
+                        },
+                        {
+                            "name": "next",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "forward", "upstream": answering }]
+                        }
+                    ]))
+                }]),
+            ),
+            "test".to_string(),
+        )
+        .expect("engine");
+
+        let blocked = std::net::Ipv4Addr::UNSPECIFIED;
+        assert_eq!(
+            ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
+            [Some(blocked), Some(answer)]
+        );
+    }
+
+    /// 只把 10.0.0.1 送进 `device` pipeline 的规则。
+    /// A rule that sends 10.0.0.1 alone to the `device` pipeline.
+    fn to_device() -> serde_json::Value {
+        serde_json::json!({
+            "name": "device",
+            "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }],
+            "actions": [{ "type": "jump_to_pipeline", "pipeline": "device" }]
+        })
+    }
+
+    /// `id` pipeline，只有一条匹配一切的规则。
+    /// The `id` pipeline with one rule that matches everything.
+    fn pipeline_of(
+        id: &str,
+        actions: serde_json::Value,
+        extra: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut rule =
+            serde_json::json!({ "name": id, "matchers": [{ "type": "any" }], "actions": actions });
+        if let (Some(rule), Some(extra)) = (rule.as_object_mut(), extra.as_object()) {
+            rule.extend(extra.clone());
+        }
+        serde_json::json!({ "id": id, "rules": [rule] })
+    }
+
+    /// continue 之后，只给 10.0.0.1 的应答（这里是 0.0.0.0）可能经由几条路径产生：
+    /// 同一 pipeline 里的客户端规则跳到静态应答或转发，跳进带客户端规则的 pipeline，
+    /// 或者响应跳转（应答之后或失败之后）进入那样的 pipeline。无论哪一条，等在它上面
+    /// 的 10.0.0.2 都必须拿到自己的应答。
+    /// After a continue, an answer meant for 10.0.0.1 alone (0.0.0.0 here) can come
+    /// from several paths: a client rule in the same pipeline jumping to a static
+    /// answer or to a forward, a jump into a pipeline with a client rule, or a
+    /// response jump (after an answer or after a failure) into one. Whichever it
+    /// is, 10.0.0.2 waiting on it must get its own answer.
+    #[tokio::test]
+    async fn a_client_specific_answer_after_a_continue_is_not_handed_to_another_client() {
+        let (checked, _) = spawn_answering_upstream("192.0.2.10".parse().unwrap()).await;
+        let (relay, _) = spawn_answering_upstream("192.0.2.40".parse().unwrap()).await;
+        let (sinkhole, _) = spawn_answering_upstream(std::net::Ipv4Addr::UNSPECIFIED).await;
+        let (silent, _) = spawn_silent_upstream().await;
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+
+        let next = serde_json::json!({
+            "name": "next",
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "forward", "upstream": answering }]
+        });
+        let static_device = pipeline_of(
+            "device",
+            serde_json::json!([{ "type": "static_ip_response", "ip": "0.0.0.0" }]),
+            serde_json::json!({}),
+        );
+        let split = serde_json::json!({ "id": "split", "rules": [to_device(), next.clone()] });
+        let into_split = |actions: serde_json::Value, extra: serde_json::Value| {
+            let mut rule = pipeline_of("into-split", actions, extra)["rules"][0].clone();
+            rule["name"] = serde_json::json!("into-split");
+            continue_on_match_rules(&checked, serde_json::json!([rule]))
+        };
+        let jump_to_split =
+            serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": "split" }]);
+
+        let paths = [
+            (
+                "a client rule in the same pipeline, then a static answer",
+                serde_json::json!([
+                    { "id": "main", "rules": continue_on_match_rules(&checked, serde_json::json!([to_device(), next.clone()])) },
+                    static_device.clone()
+                ]),
+            ),
+            (
+                "a client rule in the same pipeline, then a forward",
+                serde_json::json!([
+                    { "id": "main", "rules": continue_on_match_rules(&checked, serde_json::json!([to_device(), next.clone()])) },
+                    pipeline_of("device", serde_json::json!([{ "type": "forward", "upstream": sinkhole }]), serde_json::json!({}))
+                ]),
+            ),
+            (
+                "a jump into a pipeline with a client rule",
+                serde_json::json!([
+                    { "id": "main", "rules": into_split(jump_to_split.clone(), serde_json::json!({})) },
+                    split.clone(),
+                    static_device.clone()
+                ]),
+            ),
+            (
+                "a response jump into a pipeline with a client rule",
+                serde_json::json!([
+                    { "id": "main", "rules": into_split(
+                        serde_json::json!([{ "type": "forward", "upstream": relay }]),
+                        serde_json::json!({
+                            "response_matchers": [{ "type": "upstream_equals", "value": relay }],
+                            "response_actions_on_match": jump_to_split
+                        }),
+                    ) },
+                    split.clone(),
+                    static_device.clone()
+                ]),
+            ),
+            (
+                "a response jump on a failure into a pipeline with a client rule",
+                serde_json::json!([
+                    { "id": "main", "rules": into_split(
+                        serde_json::json!([{ "type": "forward", "upstream": silent }]),
+                        serde_json::json!({ "response_actions_on_miss": jump_to_split }),
+                    ) },
+                    split.clone(),
+                    static_device.clone()
+                ]),
+            ),
+        ];
+        let mut handed_over = Vec::new();
+        for (path, pipelines) in paths {
+            let engine = Engine::new(
+                continue_config(serde_json::json!([]), pipelines),
+                "test".to_string(),
+            )
+            .expect("engine");
+            let answers = ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await;
+            if answers != [Some(std::net::Ipv4Addr::UNSPECIFIED), Some(answer)] {
+                handed_over.push((path, answers));
+            }
+        }
+        assert!(handed_over.is_empty(), "{handed_over:#?}");
+    }
+
+    /// 两个客户端各进各的 pipeline，两边都在 continue 之后跳进对方。持有条目的请求如果
+    /// 还会去等别人，两个请求就各自持有对方在等的条目，互相等下去。两边一直来回跳，
+    /// 直到跳转上限给出 SERVFAIL。规则不看客户端，所以两个请求的条目落在同一个键上；
+    /// 规则缓存则按客户端分开（开着后台刷新时就是这样），免得 continue 之后缓存下来的
+    /// 决策把另一个请求直接送走。
+    /// Two clients enter a pipeline each, and both pipelines continue and then jump
+    /// into the other. If a request holding an entry still waited on others, each
+    /// would hold what the other waits on, and both would wait on. They jump back
+    /// and forth until the jump limit answers SERVFAIL. The rules do not look at
+    /// the client, so both requests' entries share keys, while the rule cache keys
+    /// by client (as it does with background refresh on), so that a decision cached
+    /// after a continue cannot send the other request on without forwarding.
+    #[tokio::test]
+    async fn requests_holding_entries_never_wait_on_each_other() {
+        let (checked, _) = spawn_answering_upstream("192.0.2.10".parse().unwrap()).await;
+        let pipeline = |id: &str, other: &str| {
+            serde_json::json!({
+                "id": id,
+                "rules": continue_on_match_rules(&checked, serde_json::json!([{
+                    "name": "cross",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "jump_to_pipeline", "pipeline": other }]
+                }]))
+            })
+        };
+        let raw = serde_json::json!({
+            "settings": {
+                "default_upstream": "127.0.0.1:9",
+                "upstream_timeout_ms": 100,
+                "enable_tcp_fallback": false,
+                "cache_background_refresh": true
+            },
+            "pipeline_select": [
+                { "pipeline": "p1", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                { "pipeline": "p2", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+            ],
+            "pipelines": [pipeline("p1", "p2"), pipeline("p2", "p1")]
+        });
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        let engine = Engine::new(
+            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
+            "test".to_string(),
+        )
+        .expect("engine");
+
+        assert_eq!(
+            ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
+            [None; 2]
+        );
+    }
+
+    /// 两个请求各自经响应跳转进入同一个 pipeline，第二个等在第一个的转发上；第一个的
+    /// 规则随后 continue 越过了这个应答。等待者必须拿到最终应答，而不是被越过的那个。
+    /// Two requests each enter the same pipeline through a response jump, the second
+    /// waiting on the first's forward, whose rule then continues past the answer.
+    /// The waiter must get the final answer, not the one continued past.
+    #[tokio::test]
+    async fn a_waiter_on_a_jump_path_does_not_get_an_answer_continued_past() {
+        let (entry, _) = spawn_answering_upstream("192.0.2.50".parse().unwrap()).await;
+        // 慢一点，保证第二个请求到达时第一个还在等它
+        // Slow, so the second request arrives while the first still waits on it
+        let (checked, _) = spawn_answering_upstream_after(
+            "192.0.2.10".parse().unwrap(),
+            Duration::from_millis(50),
+        )
+        .await;
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+        let enter = |id: &str| {
+            pipeline_of(
+                id,
+                serde_json::json!([{ "type": "forward", "upstream": entry }]),
+                serde_json::json!({
+                    "response_matchers": [{ "type": "upstream_equals", "value": entry }],
+                    "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "shared" }]
+                }),
+            )
+        };
+        let engine = Engine::new(
+            continue_config(
+                serde_json::json!([
+                    { "pipeline": "p1", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                    { "pipeline": "p2", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+                ]),
+                serde_json::json!([
+                    enter("p1"),
+                    enter("p2"),
+                    {
+                        "id": "shared",
+                        "rules": continue_on_match_rules(&checked, serde_json::json!([{
+                            "name": "next",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "forward", "upstream": answering }]
+                        }]))
+                    }
+                ]),
+            ),
+            "test".to_string(),
+        )
+        .expect("engine");
+
+        assert_eq!(
+            ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
+            [Some(answer); 2]
+        );
+    }
+
+    /// 后台刷新不登记 inflight 条目，也就不能把自己的应答交给别人登记的条目：刷新不运行
+    /// 响应动作，它的应答可能正是规则会越过的那一个。
+    /// A background refresh registers no inflight entry, so it must not hand its
+    /// answer to an entry another request registered: a refresh runs no response
+    /// actions, and its answer may be the one a rule would continue past.
+    #[tokio::test]
+    async fn a_background_refresh_hands_nothing_to_an_entry_it_did_not_register() {
+        let (answering, _) = spawn_answering_upstream("192.0.2.20".parse().unwrap()).await;
+        let engine = Engine::new(
+            continue_config(
+                serde_json::json!([]),
+                serde_json::json!([{ "id": "main", "rules": [{
+                    "name": "next",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": answering }]
+                }] }]),
+            ),
+            "test".to_string(),
+        )
+        .expect("engine");
+        let key = Engine::calculate_cache_hash_for_dedupe(
+            engine.state.load().cache_namespace("main"),
+            "main",
+            b"example.com",
+            RecordType::A,
+            DNSClass::IN,
+            None,
+            &RequesterKey::NONE,
+        );
+        // 另一个请求在刷新的键下登记的条目 / Another request's entry under the refresh's key
+        let (owner, waiter) =
+            tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
+        engine.inflight.insert(key, owner);
+
+        let refreshed = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.handle_packet_internal(
+                &example_query(),
+                "10.0.0.1:53000".parse().unwrap(),
+                true,
+                None,
+                Some(key),
+                None,
+            ),
+        )
+        .await
+        .expect("the refresh finishes");
+        assert!(refreshed.is_ok());
+        assert!(
+            !waiter
+                .has_changed()
+                .expect("the entry's owner is still there"),
+            "the refresh must not hand its answer to another request's entry"
+        );
+        assert!(engine.inflight.contains_key(&key));
+    }
+
+    /// continue 之后还能跳几次，取决于请求一路怎么来的，键里没有这一项。经过两次跳转才到
+    /// `r` 的请求先用完了次数；直接进入 `r`、等在它上面的请求还有余量，不能拿到它的
+    /// SERVFAIL。
+    /// How many jumps a request has left after a continue depends on the way it
+    /// came, which no key carries. One that reached `r` through two jumps runs out
+    /// first; one that entered `r` directly and waits on it has jumps to spare
+    /// and must not get its SERVFAIL.
+    #[tokio::test]
+    async fn a_waiter_with_jumps_to_spare_does_not_take_the_jump_limit() {
+        let (checked, _) = spawn_answering_upstream_after(
+            "192.0.2.10".parse().unwrap(),
+            Duration::from_millis(50),
+        )
+        .await;
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+        let jump = |name: &str, target: &str| {
+            serde_json::json!({
+                "name": name,
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "jump_to_pipeline", "pipeline": target }]
+            })
+        };
+        let raw = serde_json::json!({
+            "settings": {
+                "default_upstream": "127.0.0.1:9",
+                "upstream_timeout_ms": 100,
+                "enable_tcp_fallback": false,
+                "response_jump_limit": 3
+            },
+            "pipeline_select": [
+                { "pipeline": "a1", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                { "pipeline": "r", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+            ],
+            "pipelines": [
+                { "id": "a1", "rules": [jump("a1", "a2")] },
+                { "id": "a2", "rules": [jump("a2", "r")] },
+                { "id": "r", "rules": continue_on_match_rules(&checked, serde_json::json!([jump("to-t", "t")])) },
+                { "id": "t", "rules": [jump("to-u", "u")] },
+                { "id": "u", "rules": [{
+                    "name": "next",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": answering }]
+                }] }
+            ]
+        });
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        let engine = Engine::new(
+            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
+            "test".to_string(),
+        )
+        .expect("engine");
+
+        assert_eq!(
+            ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
+            [None, Some(answer)]
+        );
+    }
+
+    /// 请求阶段到达跳转上限给出的 SERVFAIL 只属于这个请求：开着 min_ttl 时也不缓存给
+    /// 直接进入同一个 pipeline、还有余量的请求。
+    /// The SERVFAIL a request gets at the request-phase jump limit is its own: even
+    /// with min_ttl on, it is not cached for a request that enters the same
+    /// pipeline directly with jumps to spare.
+    #[tokio::test]
+    async fn a_jump_limit_servfail_is_not_cached_for_another_request() {
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+        let jump = |name: &str, target: &str| {
+            serde_json::json!({
+                "name": name,
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "jump_to_pipeline", "pipeline": target }]
+            })
+        };
+        let raw = serde_json::json!({
+            "settings": {
+                "default_upstream": "127.0.0.1:9",
+                "upstream_timeout_ms": 100,
+                "enable_tcp_fallback": false,
+                "response_jump_limit": 1,
+                "min_ttl": 60
+            },
+            "pipeline_select": [
+                { "pipeline": "a", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                { "pipeline": "b", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+            ],
+            "pipelines": [
+                { "id": "a", "rules": [jump("a", "b")] },
+                { "id": "b", "rules": [jump("b", "c")] },
+                { "id": "c", "rules": [{
+                    "name": "c",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": answering }]
+                }] }
+            ]
+        });
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        let engine = Engine::new(
+            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
+            "test".to_string(),
+        )
+        .expect("engine");
+        let ask = |client: &str| {
+            let peer = client.parse().unwrap();
+            let engine = &engine;
+            async move {
+                first_a_record(
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        engine.handle_packet(&example_query(), peer),
+                    )
+                    .await
+                    .expect("answer in time"),
+                )
+            }
+        };
+
+        // a → b → c 用完了次数；直接进入 b 的 b → c 还有余量
+        // a → b → c runs out of jumps; b → c from a direct entry into b does not
+        assert_eq!(ask("10.0.0.1:53000").await, None);
+        assert_eq!(ask("10.0.0.2:53000").await, Some(answer));
+    }
+
+    /// 在响应跳转路径上，跳转次数同样取决于请求一路怎么来的。经过更多跳转才到 `s` 的
+    /// 请求先用完了次数（在下一个 pipeline 的入口，或在 `s` 的回答检查要跳转时），它的
+    /// SERVFAIL 不能交给直接从 `p2` 跳来、还有余量的请求。
+    /// On the response-jump path too, the jumps left depend on the way a request
+    /// came. One that reached `s` through more jumps runs out first (entering the
+    /// next pipeline, or when the answer check in `s` jumps), and its SERVFAIL
+    /// must not reach a request that jumped there from `p2` with jumps to spare.
+    #[tokio::test]
+    async fn a_jump_path_waiter_with_jumps_to_spare_does_not_take_the_jump_limit() {
+        let (entry, _) = spawn_answering_upstream("192.0.2.50".parse().unwrap()).await;
+        // p2 慢一点，第一个请求先在 s 登记 / p2 is slower, so the first request registers at s first
+        let (later_entry, _) = spawn_answering_upstream_after(
+            "192.0.2.51".parse().unwrap(),
+            Duration::from_millis(30),
+        )
+        .await;
+        let (slow, _) = spawn_answering_upstream_after(
+            "192.0.2.10".parse().unwrap(),
+            Duration::from_millis(100),
+        )
+        .await;
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+        let checked_jump = |id: &str, upstream: &str, target: &str| {
+            pipeline_of(
+                id,
+                serde_json::json!([{ "type": "forward", "upstream": upstream }]),
+                serde_json::json!({
+                    "response_matchers": [{ "type": "upstream_equals", "value": upstream }],
+                    "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": target }]
+                }),
+            )
+        };
+        let hop = |id: &str, target: &str| {
+            pipeline_of(
+                id,
+                serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": target }]),
+                serde_json::json!({}),
+            )
+        };
+        let answers_at = |id: &str| {
+            pipeline_of(
+                id,
+                serde_json::json!([{ "type": "forward", "upstream": answering }]),
+                serde_json::json!({}),
+            )
+        };
+        // 第一个请求在 s 之前多走一次或两次规则级跳转，于是比从 p2 来的请求先用完次数：
+        // 在下一个 pipeline 的入口、在 s 的回答检查要跳转时，或在之后一次规则级跳转时。
+        // The first request takes one or two more rule-level hops before s, so it
+        // runs out before the one from p2: entering the next pipeline, when the
+        // answer check in s jumps, or at a rule-level hop after it.
+        let paths = [
+            (
+                "entering the next pipeline",
+                3,
+                vec![
+                    hop("y", "s"),
+                    checked_jump("s", &slow, "t"),
+                    answers_at("t"),
+                ],
+            ),
+            (
+                "at the answer check's jump",
+                3,
+                vec![
+                    hop("y", "y2"),
+                    hop("y2", "s"),
+                    checked_jump("s", &slow, "t"),
+                    answers_at("t"),
+                ],
+            ),
+            (
+                "at a rule-level hop after the answer check",
+                4,
+                vec![
+                    hop("y", "s"),
+                    checked_jump("s", &slow, "z"),
+                    hop("z", "z2"),
+                    hop("z2", "z3"),
+                    answers_at("z3"),
+                ],
+            ),
+        ];
+        for (where_it_runs_out, limit, rest) in paths {
+            let mut pipelines = vec![
+                checked_jump("p1", &entry, "y"),
+                checked_jump("p2", &later_entry, "s"),
+            ];
+            pipelines.extend(rest);
+            let raw = serde_json::json!({
+                "settings": {
+                    "default_upstream": "127.0.0.1:9",
+                    "upstream_timeout_ms": 500,
+                    "enable_tcp_fallback": false,
+                    "response_jump_limit": limit
+                },
+                "pipeline_select": [
+                    { "pipeline": "p1", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                    { "pipeline": "p2", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+                ],
+                "pipelines": pipelines
+            });
+            let config: crate::config::PipelineConfig =
+                serde_json::from_value(raw).expect("parse config");
+            let engine = Engine::new(
+                RuntimePipelineConfig::from_config(config).expect("build runtime config"),
+                "test".to_string(),
+            )
+            .expect("engine");
+            assert_eq!(
+                ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
+                [None, Some(answer)],
+                "{where_it_runs_out}"
+            );
+        }
     }
 
     // ========================================================================
@@ -2895,7 +3848,7 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_rule_hash_respects_uses_client_ip() {
+    fn test_calculate_rule_hash_respects_the_requester_key() {
         // Arrange: Define test data with different IPs
         let pipeline_id = "test_p";
         let qname = "example.com";
@@ -2903,24 +3856,39 @@ mod tests {
         let qclass = DNSClass::IN;
         let ip1 = "1.2.3.4".parse::<IpAddr>().unwrap();
         let ip2 = "5.6.7.8".parse::<IpAddr>().unwrap();
+        let hash =
+            |key: RequesterKey| calculate_rule_hash(0, pipeline_id, qname, qtype, qclass, &key);
+        let address = |ip| RequesterKey {
+            address: Some(ip),
+            ..RequesterKey::NONE
+        };
+        let class = |class| RequesterKey {
+            class: Some(class),
+            ..RequesterKey::NONE
+        };
 
-        // Act & Assert: When uses_client_ip is false, both IPs should result in the same hash
-        let h1_no_ip = calculate_rule_hash(0, pipeline_id, qname, qtype, qclass, ip1, false);
-        let h2_no_ip = calculate_rule_hash(0, pipeline_id, qname, qtype, qclass, ip2, false);
-        assert_eq!(h1_no_ip, h2_no_ip, "Hashes should match when IP is ignored");
+        // Act & Assert: Without requester facts the hash is the one it always was
+        let mut base = FxHasher::default();
+        0u64.hash(&mut base);
+        pipeline_id.hash(&mut base);
+        qname.hash(&mut base);
+        u16::from(qtype).hash(&mut base);
+        u16::from(qclass).hash(&mut base);
+        assert_eq!(hash(RequesterKey::NONE), base.finish());
 
-        // Act & Assert: When uses_client_ip is true, different IPs should result in different hashes
-        let h1_with_ip = calculate_rule_hash(0, pipeline_id, qname, qtype, qclass, ip1, true);
-        let h2_with_ip = calculate_rule_hash(0, pipeline_id, qname, qtype, qclass, ip2, true);
+        // Act & Assert: Different IPs should result in different hashes when the IP is included
+        assert_ne!(hash(address(ip1)), hash(address(ip2)));
+        assert_ne!(hash(RequesterKey::NONE), hash(address(ip1)));
+
+        // Act & Assert: So should different requester classes, and a class with or without the IP
+        assert_ne!(hash(class(1)), hash(class(2)));
+        assert_ne!(hash(RequesterKey::NONE), hash(class(1)));
         assert_ne!(
-            h1_with_ip, h2_with_ip,
-            "Hashes should differ when IP is included"
-        );
-
-        // Assert: Hash with IP should differ from hash without IP
-        assert_ne!(
-            h1_no_ip, h1_with_ip,
-            "Hash with IP should differ from hash without IP"
+            hash(class(1)),
+            hash(RequesterKey {
+                class: Some(1),
+                address: Some(ip1)
+            })
         );
     }
 
@@ -2939,6 +3907,7 @@ mod tests {
             qtype,
             qclass,
             None,
+            &RequesterKey::NONE,
         );
 
         // Insert an entry that expired 5 seconds ago
@@ -3061,6 +4030,7 @@ mod tests {
             RecordType::A,
             DNSClass::IN,
             None,
+            &RequesterKey::NONE,
         );
         engine.cache.insert(
             dedupe_hash,
@@ -3137,6 +4107,7 @@ mod tests {
             RecordType::A,
             DNSClass::IN,
             None,
+            &RequesterKey::NONE,
         );
         engine.cache.insert(
             dedupe_hash,
@@ -3170,72 +4141,54 @@ mod tests {
     }
 
     #[test]
-    fn test_rule_cache_entry_matches_respects_uses_client_ip() {
-        // Arrange: Define test data with different IPs
+    fn test_rule_cache_entry_matches_respects_the_requester_key() {
         let pipeline_id: Arc<str> = Arc::from("test_p");
         let qname = "example.com";
         let qtype = RecordType::A;
         let qclass = DNSClass::IN;
         let ip1 = "1.2.3.4".parse::<IpAddr>().unwrap();
         let ip2 = "5.6.7.8".parse::<IpAddr>().unwrap();
-        let decision = Arc::new(Decision::Static {
-            rcode: ResponseCode::NoError,
-            answers: vec![],
-        });
-
-        // Arrange: Entry created WITHOUT IP
-        let entry_no_ip = RuleCacheEntry {
+        let entry = |requester| RuleCacheEntry {
             pipeline_id: pipeline_id.clone(),
             qname_hash: fast_hash_str(qname),
             qtype: u16::from(qtype),
             qclass: u16::from(qclass),
-            client_ip: None,
-            decision: decision.clone(),
+            requester,
+            decision: Arc::new(Decision::Static {
+                rcode: ResponseCode::NoError,
+                answers: vec![],
+            }),
             expires_at: None,
         };
-
-        // Act & Assert: Should match any IP if we don't care about it
-        assert!(
-            entry_no_ip.matches("test_p", qname, qtype, qclass, ip1, false),
-            "Entry without IP should match any IP when uses_client_ip is false"
-        );
-        assert!(
-            entry_no_ip.matches("test_p", qname, qtype, qclass, ip2, false),
-            "Entry without IP should match any IP when uses_client_ip is false"
-        );
-
-        // Act & Assert: Should NOT match if we now care about IP (since entry doesn't have it)
-        assert!(
-            !entry_no_ip.matches("test_p", qname, qtype, qclass, ip1, true),
-            "Entry without IP should not match when uses_client_ip is true"
-        );
-
-        // Arrange: Entry created WITH IP
-        let entry_with_ip = RuleCacheEntry {
-            pipeline_id: pipeline_id.clone(),
-            qname_hash: fast_hash_str(qname),
-            qtype: u16::from(qtype),
-            qclass: u16::from(qclass),
-            client_ip: Some(ip1),
-            decision,
-            expires_at: None,
+        let with_ip = |ip| RequesterKey {
+            address: Some(ip),
+            ..RequesterKey::NONE
+        };
+        let class = |class| RequesterKey {
+            class: Some(class),
+            ..RequesterKey::NONE
+        };
+        let matches = |entry: &RuleCacheEntry, key: RequesterKey| {
+            entry.matches("test_p", qname, qtype, qclass, &key)
         };
 
-        // Act & Assert: Should match same IP if we care
-        assert!(
-            entry_with_ip.matches("test_p", qname, qtype, qclass, ip1, true),
-            "Entry with IP should match same IP when uses_client_ip is true"
-        );
-        // Act & Assert: Should NOT match different IP if we care
-        assert!(
-            !entry_with_ip.matches("test_p", qname, qtype, qclass, ip2, true),
-            "Entry with IP should not match different IP when uses_client_ip is true"
-        );
-        // Act & Assert: Should NOT match even same IP if we don't care now (safety check)
-        assert!(
-            !entry_with_ip.matches("test_p", qname, qtype, qclass, ip1, false),
-            "Entry with IP should not match when uses_client_ip is false"
-        );
+        // An entry without requester facts matches only a key without them
+        let shared = entry(RequesterKey::NONE);
+        assert!(matches(&shared, RequesterKey::NONE));
+        assert!(!matches(&shared, with_ip(ip1)));
+        assert!(!matches(&shared, class(1)));
+
+        // An entry with an IP matches that IP only
+        let by_ip = entry(with_ip(ip1));
+        assert!(matches(&by_ip, with_ip(ip1)));
+        assert!(!matches(&by_ip, with_ip(ip2)));
+        assert!(!matches(&by_ip, RequesterKey::NONE));
+
+        // An entry for a requester class matches that class only
+        let by_class = entry(class(1));
+        assert!(matches(&by_class, class(1)));
+        assert!(!matches(&by_class, class(2)));
+        assert!(!matches(&by_class, RequesterKey::NONE));
     }
 
     #[test]
@@ -3245,7 +4198,6 @@ mod tests {
         let qname = "expire.com";
         let qtype = RecordType::A;
         let qclass = DNSClass::IN;
-        let ip = "1.2.3.4".parse::<IpAddr>().unwrap();
         let decision = Arc::new(Decision::Static {
             rcode: ResponseCode::NoError,
             answers: vec![],
@@ -3257,14 +4209,14 @@ mod tests {
             qname_hash: fast_hash_str(qname),
             qtype: u16::from(qtype),
             qclass: u16::from(qclass),
-            client_ip: None,
+            requester: RequesterKey::NONE,
             decision: decision.clone(),
             expires_at: Some(Instant::now() - Duration::from_secs(1)),
         };
 
         // Act & Assert: Expired entry should not match
         assert!(
-            !entry_expired.matches("test_p", qname, qtype, qclass, ip, false),
+            !entry_expired.matches("test_p", qname, qtype, qclass, &RequesterKey::NONE),
             "Expired entry should not match"
         );
 
@@ -3274,14 +4226,14 @@ mod tests {
             qname_hash: fast_hash_str(qname),
             qtype: u16::from(qtype),
             qclass: u16::from(qclass),
-            client_ip: None,
+            requester: RequesterKey::NONE,
             decision,
             expires_at: Some(Instant::now() + Duration::from_secs(60)),
         };
 
         // Act & Assert: Fresh entry should match
         assert!(
-            entry_fresh.matches("test_p", qname, qtype, qclass, ip, false),
+            entry_fresh.matches("test_p", qname, qtype, qclass, &RequesterKey::NONE),
             "Fresh entry should match"
         );
     }
@@ -3304,6 +4256,7 @@ mod tests {
             qtype,
             qclass_in,
             None,
+            &RequesterKey::NONE,
         );
         let hash_ch = Engine::calculate_cache_hash_for_dedupe(
             0,
@@ -3312,6 +4265,7 @@ mod tests {
             qtype,
             qclass_ch,
             None,
+            &RequesterKey::NONE,
         );
 
         // Assert: Verify different QCLASS produces different hashes
@@ -3328,6 +4282,7 @@ mod tests {
             qtype,
             qclass_in,
             None,
+            &RequesterKey::NONE,
         );
 
         // Assert: Verify same QCLASS produces same hash
@@ -3360,6 +4315,7 @@ mod tests {
             qtype,
             qclass,
             None,
+            &RequesterKey::NONE,
         );
         let hash2 = Engine::calculate_cache_hash_for_dedupe(
             0,
@@ -3368,6 +4324,7 @@ mod tests {
             qtype,
             qclass,
             None,
+            &RequesterKey::NONE,
         );
         let hash3 = Engine::calculate_cache_hash_for_dedupe(
             0,
@@ -3376,6 +4333,7 @@ mod tests {
             qtype,
             qclass,
             None,
+            &RequesterKey::NONE,
         );
 
         // Assert: Verify case-insensitive hashing produces same results
@@ -3401,6 +4359,7 @@ mod tests {
             qtype_a,
             qclass,
             None,
+            &RequesterKey::NONE,
         );
         let hash_aaaa = Engine::calculate_cache_hash_for_dedupe(
             0,
@@ -3409,6 +4368,7 @@ mod tests {
             qtype_aaaa,
             qclass,
             None,
+            &RequesterKey::NONE,
         );
 
         // Assert: Verify different QTYPE produces different hashes
@@ -3436,6 +4396,7 @@ mod tests {
             qtype,
             qclass,
             None,
+            &RequesterKey::NONE,
         );
         let hash2 = Engine::calculate_cache_hash_for_dedupe(
             0,
@@ -3444,6 +4405,7 @@ mod tests {
             qtype,
             qclass,
             None,
+            &RequesterKey::NONE,
         );
 
         // Assert: Verify different QNAME produces different hashes
@@ -3693,6 +4655,915 @@ mod tests_multi_upstream {
                 );
             }
             _ => panic!("expected forward action"),
+        }
+    }
+}
+
+/// 应答取决于请求方时，缓存、inflight 和规则缓存都按请求方分开。
+/// When the answer depends on the requester, the response cache, inflight and the
+/// rule cache keep requesters apart.
+#[cfg(test)]
+mod requester_scope_tests {
+    use super::*;
+    use crate::matcher::RequesterTest;
+    use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
+    use hickory_proto::rr::{Name, RData, Record, RecordType};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::str::FromStr;
+    use std::sync::atomic::AtomicUsize;
+
+    const SINK: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
+    const NORMAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 20);
+    const OTHER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 30);
+
+    /// 用一条 TTL 为 `ttl` 的 A 记录 `answer` 回应每个查询的本机上游，并计数。
+    /// A local upstream answering every query with one A record `answer` of TTL
+    /// `ttl`, counting the queries.
+    async fn upstream(answer: Ipv4Addr, ttl: u32) -> (String, Arc<AtomicUsize>) {
+        upstream_after(answer, ttl, Duration::ZERO).await
+    }
+
+    /// 同上，但每个应答晚 `delay` 才发出 / The same, with every answer sent `delay` late
+    async fn upstream_after(
+        answer: Ipv4Addr,
+        ttl: u32,
+        delay: Duration,
+    ) -> (String, Arc<AtomicUsize>) {
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = sock.local_addr().unwrap().to_string();
+        let queries = Arc::new(AtomicUsize::new(0));
+        let counted = queries.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                let Ok(query) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                let Some(question) = query.queries.first().cloned() else {
+                    continue;
+                };
+                counted.fetch_add(1, Ordering::Relaxed);
+                let mut resp =
+                    Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                resp.add_query(question.clone());
+                resp.add_answer(Record::from_rdata(
+                    question.name().clone(),
+                    ttl,
+                    RData::A(hickory_proto::rr::rdata::A(answer)),
+                ));
+                let resp = resp.to_vec().unwrap();
+                if delay.is_zero() {
+                    let _ = sock.send_to(&resp, peer).await;
+                } else {
+                    let sock = sock.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = sock.send_to(&resp, peer).await;
+                    });
+                }
+            }
+        });
+        (addr, queries)
+    }
+
+    const NO_SUBNET: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 99);
+
+    /// 按查询带来的 ECS 子网作答的本机上游：应答的地址就是子网地址，没有 ECS 时是
+    /// NO_SUBNET。并计数。
+    /// A local upstream that answers with the ECS subnet the query carries, or
+    /// NO_SUBNET without one, counting the queries.
+    async fn subnet_echo() -> (String, Arc<AtomicUsize>) {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap().to_string();
+        let queries = Arc::new(AtomicUsize::new(0));
+        let counted = queries.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                let Ok(query) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                let Some(question) = query.queries.first().cloned() else {
+                    continue;
+                };
+                counted.fetch_add(1, Ordering::Relaxed);
+                let subnet = query
+                    .edns
+                    .as_ref()
+                    .and_then(|edns| match edns.options().get(EdnsCode::Subnet) {
+                        Some(EdnsOption::Subnet(subnet)) => match subnet.addr() {
+                            IpAddr::V4(v4) => Some(v4),
+                            IpAddr::V6(_) => None,
+                        },
+                        _ => None,
+                    })
+                    .unwrap_or(NO_SUBNET);
+                let mut resp =
+                    Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                resp.add_query(question.clone());
+                resp.add_answer(Record::from_rdata(
+                    question.name().clone(),
+                    300,
+                    RData::A(hickory_proto::rr::rdata::A(subnet)),
+                ));
+                let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
+            }
+        });
+        (addr, queries)
+    }
+
+    fn runtime_config(
+        settings: serde_json::Value,
+        pipeline_select: serde_json::Value,
+        pipelines: serde_json::Value,
+    ) -> RuntimePipelineConfig {
+        let mut all = serde_json::json!({
+            "default_upstream": "127.0.0.1:9",
+            "upstream_timeout_ms": 500,
+            "enable_tcp_fallback": false
+        });
+        all.as_object_mut()
+            .unwrap()
+            .extend(settings.as_object().unwrap().clone());
+        let raw = serde_json::json!({
+            "settings": all,
+            "pipeline_select": pipeline_select,
+            "pipelines": pipelines
+        });
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        RuntimePipelineConfig::from_config(config).expect("build runtime config")
+    }
+
+    fn engine(pipeline_select: serde_json::Value, pipelines: serde_json::Value) -> Engine {
+        Engine::new(
+            runtime_config(serde_json::json!({}), pipeline_select, pipelines),
+            "test".to_string(),
+        )
+        .expect("engine")
+    }
+
+    fn rule(
+        name: &str,
+        matchers: serde_json::Value,
+        actions: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({ "name": name, "matchers": matchers, "actions": actions })
+    }
+
+    fn forward(upstream: &str) -> serde_json::Value {
+        serde_json::json!([{ "type": "forward", "upstream": upstream }])
+    }
+
+    fn any() -> serde_json::Value {
+        serde_json::json!([{ "type": "any" }])
+    }
+
+    /// 只匹配 10.0.0.1 / Matches 10.0.0.1 alone
+    fn device() -> serde_json::Value {
+        serde_json::json!([{ "type": "client_ip", "cidr": "10.0.0.1/32" }])
+    }
+
+    fn query(edns: bool) -> Vec<u8> {
+        let mut request = Message::new(0xBEEF, MessageType::Query, OpCode::Query);
+        request.metadata.recursion_desired = true;
+        request.add_query(Query::query(
+            Name::from_str("example.com").unwrap(),
+            RecordType::A,
+        ));
+        if edns {
+            request.edns = Some(Edns::new());
+        }
+        request.to_vec().unwrap()
+    }
+
+    fn first_a(response: anyhow::Result<Bytes>) -> Option<Ipv4Addr> {
+        let response = Message::from_bytes(&response.expect("answer")).expect("parse");
+        match response.answers.first().map(|record| &record.data) {
+            Some(RData::A(address)) => Some(address.0),
+            _ => None,
+        }
+    }
+
+    async fn ask(engine: &Engine, client: &str, edns: bool) -> Option<Ipv4Addr> {
+        let peer: SocketAddr = format!("{client}:53000").parse().unwrap();
+        first_a(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                engine.handle_packet(&query(edns), peer),
+            )
+            .await
+            .expect("answer in time"),
+        )
+    }
+
+    /// 两个客户端同时问 / Two clients asking at once
+    async fn ask_at_once(engine: &Engine, clients: [&str; 2]) -> [Option<Ipv4Addr>; 2] {
+        let packet = query(false);
+        let [first, second] =
+            clients.map(|client| format!("{client}:53000").parse::<SocketAddr>().unwrap());
+        let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                engine.handle_packet(&packet, first),
+                engine.handle_packet(&packet, second)
+            )
+        })
+        .await
+        .expect("answers in time");
+        [first_a(first), first_a(second)]
+    }
+
+    /// `pipeline` 的各项依据，写成短名 / The tests of `pipeline`, by short name
+    fn tests_of(config: &RuntimePipelineConfig, pipeline: &str) -> Vec<String> {
+        config.pipelines[config.pipeline_id_index[pipeline]]
+            .requester
+            .tests()
+            .iter()
+            .map(|test| match test {
+                RequesterTest::InNet(net) => format!("net {net}"),
+                RequesterTest::Private => "private".to_string(),
+                RequesterTest::Country(codes) => format!("country {}", codes.join(",")),
+                RequesterTest::Edns => "edns".to_string(),
+                RequesterTest::Subnet {
+                    prefix_v4,
+                    prefix_v6,
+                } => format!("subnet {prefix_v4}/{prefix_v6}"),
+            })
+            .collect()
+    }
+
+    const UP: &str = "127.0.0.1:5353";
+
+    fn ecs_forward(prefix_v4: u8, prefix_v6: u8) -> serde_json::Value {
+        serde_json::json!([{
+            "type": "forward",
+            "upstream": UP,
+            "ecs": { "mode": "from_client_ip", "prefix_v4": prefix_v4, "prefix_v6": prefix_v6 }
+        }])
+    }
+
+    fn pipeline_ecs(prefix_v4: u8, prefix_v6: u8) -> serde_json::Value {
+        serde_json::json!({ "mode": "from_client_ip", "prefix_v4": prefix_v4, "prefix_v6": prefix_v6 })
+    }
+
+    /// 转发到 UP，应答来自 UP 时执行 `on`（on_match 或 on_miss）里的跳转。
+    /// Forwards to UP with `actions`, jumping to `target` from `on` (on_match or on_miss).
+    fn checked(actions: serde_json::Value, on: &str, target: &str) -> serde_json::Value {
+        let mut rule = rule("check", any(), actions);
+        rule["response_matchers"] = serde_json::json!([{ "type": "upstream_equals", "value": UP }]);
+        rule[on] = serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": target }]);
+        rule
+    }
+
+    #[test]
+    fn a_scope_has_the_tests_the_rules_tell_requesters_apart_by() {
+        let config = runtime_config(
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!([
+                { "id": "plain", "rules": [rule("r", any(), forward(UP))] },
+                { "id": "client", "rules": [rule("r", device(), forward(UP))] },
+                { "id": "private", "rules": [rule("r", serde_json::json!([{ "type": "geoip_private", "expect": true }]), forward(UP))] },
+                { "id": "country", "rules": [rule("r", serde_json::json!([{ "type": "geoip_country", "country_codes": ["cn"] }]), forward(UP))] },
+                { "id": "edns", "rules": [rule("r", serde_json::json!([{ "type": "edns_present", "expect": true }]), forward(UP))] },
+                { "id": "answer-edns", "rules": [{
+                    "name": "r", "matchers": any(), "actions": forward(UP),
+                    "response_matchers": [{ "type": "response_edns_present", "expect": true }],
+                    "response_actions_on_match": [{ "type": "deny" }]
+                }] },
+                { "id": "twice", "rules": [rule("a", device(), forward(UP)), rule("b", device(), forward(UP))] },
+                { "id": "ecs-unkeyed", "rules": [rule("r", any(), ecs_forward(24, 56))] },
+                { "id": "ecs-keyed", "ecs": pipeline_ecs(24, 56), "rules": [rule("r", any(), ecs_forward(24, 56))] },
+                { "id": "ecs-finer", "ecs": pipeline_ecs(16, 48), "rules": [rule("r", any(), ecs_forward(24, 56))] }
+            ]),
+        );
+        for (pipeline, expected) in [
+            ("plain", vec![]),
+            ("client", vec!["net 10.0.0.1/32"]),
+            ("private", vec!["private"]),
+            ("country", vec!["country CN"]),
+            ("edns", vec!["edns"]),
+            ("answer-edns", vec!["edns"]),
+            ("twice", vec!["net 10.0.0.1/32"]),
+            ("ecs-unkeyed", vec!["subnet 24/56"]),
+            ("ecs-keyed", vec![]),
+            ("ecs-finer", vec!["subnet 24/56"]),
+        ] {
+            assert_eq!(tests_of(&config, pipeline), expected, "{pipeline}");
+        }
+    }
+
+    #[test]
+    fn a_scope_takes_in_the_response_jump_paths_it_starts() {
+        let jump =
+            |target: &str| serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": target }]);
+        let config = runtime_config(
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!([
+                { "id": "client", "rules": [rule("r", device(), forward(UP))] },
+                { "id": "edns", "rules": [rule("r", serde_json::json!([{ "type": "edns_present", "expect": true }]), forward(UP))] },
+                // 请求阶段的跳转换成目标自己的键 / A request-phase jump moves to the target's own key
+                { "id": "to-client", "rules": [rule("r", any(), jump("client"))] },
+                { "id": "check-to-client", "rules": [checked(forward(UP), "response_actions_on_match", "client")] },
+                { "id": "miss-to-edns", "rules": [checked(forward(UP), "response_actions_on_miss", "edns")] },
+                // 跳转路径上也跟着请求阶段的跳转 / The jump path follows request-phase jumps too
+                { "id": "check-to-to-client", "rules": [checked(forward(UP), "response_actions_on_match", "to-client")] },
+                { "id": "loop-a", "rules": [checked(forward(UP), "response_actions_on_match", "loop-b")] },
+                { "id": "loop-b", "rules": [
+                    checked(forward(UP), "response_actions_on_match", "loop-a"),
+                    rule("e", serde_json::json!([{ "type": "edns_present", "expect": true }]), forward(UP))
+                ] },
+                // 转发带着客户端 ECS 跳过去：目标转发的正是这个包
+                // A forward with client ECS jumps: the target forwards that very packet
+                { "id": "ecs-source", "rules": [checked(ecs_forward(24, 56), "response_actions_on_match", "ecs-target")] },
+                { "id": "ecs-target", "rules": [rule("r", any(), forward(UP))] },
+                { "id": "keyed-source", "ecs": pipeline_ecs(24, 56), "rules": [checked(ecs_forward(24, 56), "response_actions_on_match", "keyed-target")] },
+                { "id": "keyed-target", "rules": [rule("r", any(), forward(UP))] },
+                // 跳转路径上的转发不加自己的 ECS / Forwards on the jump path add no ECS of their own
+                { "id": "path-source", "rules": [checked(forward(UP), "response_actions_on_match", "ecs-on-path")] },
+                { "id": "ecs-on-path", "rules": [rule("r", any(), ecs_forward(24, 56))] },
+                { "id": "to-nowhere", "rules": [checked(forward(UP), "response_actions_on_match", "nowhere")] }
+            ]),
+        );
+        for (pipeline, expected) in [
+            ("to-client", vec![]),
+            ("check-to-client", vec!["net 10.0.0.1/32"]),
+            ("miss-to-edns", vec!["edns"]),
+            ("check-to-to-client", vec!["net 10.0.0.1/32"]),
+            ("loop-a", vec!["edns"]),
+            ("loop-b", vec!["edns"]),
+            ("ecs-source", vec!["subnet 24/56"]),
+            // 跳转路径的键带着包里的 ECS / The jump path's keys carry the packet's ECS
+            ("ecs-target", vec![]),
+            ("keyed-source", vec![]),
+            ("keyed-target", vec![]),
+            ("path-source", vec![]),
+            ("ecs-on-path", vec!["subnet 24/56"]),
+            ("to-nowhere", vec![]),
+        ] {
+            assert_eq!(tests_of(&config, pipeline), expected, "{pipeline}");
+        }
+    }
+
+    /// 规则缓存只缓存本 pipeline 规则做出的决策，所以只按它自己的请求匹配器区分请求方：
+    /// 不按转发的 ECS 子网，也不按回答检查跳到的 pipeline。
+    /// The rule cache holds decisions this pipeline's rules make, so it tells
+    /// requesters apart by the pipeline's own request matchers only: not by the
+    /// subnet a forward sends, nor by the pipelines its answer checks jump to.
+    #[test]
+    fn the_rule_cache_scope_is_the_pipelines_own_request_matchers() {
+        let config = runtime_config(
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!([
+                { "id": "client", "rules": [rule("r", device(), forward(UP))] },
+                { "id": "main", "rules": [
+                    rule("edns", serde_json::json!([{ "type": "edns_present", "expect": true }]), ecs_forward(24, 56)),
+                    {
+                        "name": "check", "matchers": any(), "actions": forward(UP),
+                        "response_matchers": [
+                            { "type": "upstream_equals", "value": UP },
+                            { "type": "response_edns_present", "expect": true }
+                        ],
+                        "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "client" }]
+                    }
+                ] }
+            ]),
+        );
+        let main = &config.pipelines[config.pipeline_id_index["main"]];
+        assert_eq!(main.rule_requester.tests(), [RequesterTest::Edns]);
+        assert_eq!(
+            tests_of(&config, "main"),
+            ["edns", "subnet 24/56", "net 10.0.0.1/32"]
+        );
+    }
+
+    /// 回答检查跳进一个 pipeline 之后，跳转路径转发的是跳转前那次转发发出的包，而直接
+    /// 进入这个 pipeline 的请求发出的是它自己的转发准备的包（这里带上取自客户端的 ECS）。
+    /// 两者同一子网也不能共用条目。
+    /// After an answer check jumps into a pipeline, the jump path forwards the
+    /// packet the forward before the jump sent, while a request entering that
+    /// pipeline directly sends the packet its own forward prepares (with ECS from
+    /// the client here). Even within one subnet the two must not share entries.
+    #[tokio::test]
+    async fn a_response_jump_path_does_not_share_with_direct_requests() {
+        let (relay, _) = upstream(OTHER, 300).await;
+        let (echo, _) = subnet_echo().await;
+        let engine = engine(
+            serde_json::json!([
+                { "pipeline": "geo", "matchers": [{ "type": "client_ip", "cidr": "198.51.100.50/32" }] },
+                { "pipeline": "main", "matchers": any() }
+            ]),
+            serde_json::json!([
+                { "id": "main", "rules": [{
+                    "name": "check", "matchers": any(), "actions": forward(&relay),
+                    "response_matchers": [{ "type": "upstream_equals", "value": relay }],
+                    "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "geo" }]
+                }] },
+                { "id": "geo", "rules": [rule("rest", any(), serde_json::json!([{
+                    "type": "forward", "upstream": echo,
+                    "ecs": { "mode": "from_client_ip", "prefix_v4": 24, "prefix_v6": 56 }
+                }]))] }
+            ]),
+        );
+        // 跳转路径不加 geo 自己的 ECS / The jump path adds no ECS of geo's own
+        assert_eq!(ask(&engine, "198.51.100.7", false).await, Some(NO_SUBNET));
+        assert_eq!(
+            ask(&engine, "198.51.100.50", false).await,
+            Some("198.51.100.0".parse().unwrap())
+        );
+    }
+
+    /// 回答检查 continue 之后再跳转：请求仍持有条目，等待者拿到跳转之后的最终应答。
+    /// A jump after an answer check continues: the request still holds its entry,
+    /// and its waiters take the final answer from after the jump.
+    #[test]
+    fn a_scope_takes_in_request_jumps_after_a_continue() {
+        let jump =
+            |target: &str| serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": target }]);
+        let continues = || {
+            let mut rule = rule("check", any(), forward(UP));
+            rule["response_matchers"] =
+                serde_json::json!([{ "type": "upstream_equals", "value": UP }]);
+            rule["response_actions_on_match"] = serde_json::json!([{ "type": "continue" }]);
+            rule
+        };
+        let config = runtime_config(
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!([
+                { "id": "client", "rules": [rule("r", device(), forward(UP))] },
+                { "id": "ecs-keyed", "ecs": pipeline_ecs(24, 56), "rules": [rule("r", any(), ecs_forward(24, 56))] },
+                { "id": "continue-to-client", "rules": [continues(), rule("all", any(), jump("client"))] },
+                { "id": "to-client", "rules": [rule("all", any(), jump("client"))] },
+                // 那里的 ECS 键带不过来 / Its ECS key does not carry over
+                { "id": "continue-to-ecs", "rules": [continues(), rule("all", any(), jump("ecs-keyed"))] }
+            ]),
+        );
+        for (pipeline, expected) in [
+            ("continue-to-client", vec!["net 10.0.0.1/32"]),
+            ("to-client", vec![]),
+            ("continue-to-ecs", vec!["subnet 24/56"]),
+            ("ecs-keyed", vec![]),
+        ] {
+            assert_eq!(tests_of(&config, pipeline), expected, "{pipeline}");
+        }
+    }
+
+    /// 回答检查 continue 之后跳进按客户端子网转发 ECS 的 pipeline：同时经过同一路线、
+    /// 子网不同的客户端不能拿到这个应答。
+    /// After an answer check continues, the request jumps into a pipeline that
+    /// forwards with ECS from the client: a client in another subnet taking the
+    /// same route at once must not get that answer.
+    #[tokio::test]
+    async fn an_ecs_answer_after_a_continue_stays_with_its_subnet() {
+        let (relay, _) = upstream(OTHER, 300).await;
+        let (echo, _) = subnet_echo().await;
+        let engine = engine(
+            serde_json::json!([]),
+            serde_json::json!([
+                { "id": "main", "rules": [
+                    {
+                        "name": "check", "matchers": any(), "actions": forward(&relay),
+                        "response_matchers": [{ "type": "upstream_equals", "value": relay }],
+                        "response_actions_on_match": [{ "type": "continue" }]
+                    },
+                    rule("all", any(), serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": "geo" }]))
+                ] },
+                { "id": "geo", "ecs": pipeline_ecs(24, 56), "rules": [rule("rest", any(), serde_json::json!([{
+                    "type": "forward", "upstream": echo,
+                    "ecs": { "mode": "from_client_ip", "prefix_v4": 24, "prefix_v6": 56 }
+                }]))] }
+            ]),
+        );
+        let subnet = |text: &str| Some(text.parse::<Ipv4Addr>().unwrap());
+        assert_eq!(
+            ask_at_once(&engine, ["198.51.100.7", "203.0.113.9"]).await,
+            [subnet("198.51.100.0"), subnet("203.0.113.0")]
+        );
+    }
+
+    /// 只给 10.0.0.1 换上游的 pipeline：sink 回 0.0.0.0，其余请求走 normal。
+    /// A pipeline that sends 10.0.0.1 alone to another upstream: sink answers
+    /// 0.0.0.0, every other request goes to normal.
+    async fn device_split() -> (Engine, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let (sink, sink_queries) = upstream(SINK, 300).await;
+        let (normal, normal_queries) = upstream(NORMAL, 300).await;
+        let engine = engine(
+            serde_json::json!([]),
+            serde_json::json!([{ "id": "main", "rules": [
+                rule("device", device(), forward(&sink)),
+                rule("rest", any(), forward(&normal))
+            ] }]),
+        );
+        (engine, sink_queries, normal_queries)
+    }
+
+    /// 一台设备的转发应答不能从缓存交给另一个客户端，而每个客户端照样用得上自己的缓存。
+    /// One device's forwarded answer must not reach another client from the cache,
+    /// while each client still gets its own cached answer.
+    #[tokio::test]
+    async fn a_device_specific_answer_is_not_served_to_another_client_from_the_cache() {
+        let (engine, sink_queries, normal_queries) = device_split().await;
+        let mut answers = Vec::new();
+        for client in ["10.0.0.1", "10.0.0.2", "10.0.0.1", "10.0.0.2", "10.0.0.3"] {
+            answers.push(ask(&engine, client, false).await);
+        }
+        assert_eq!(
+            answers,
+            [
+                Some(SINK),
+                Some(NORMAL),
+                Some(SINK),
+                Some(NORMAL),
+                Some(NORMAL)
+            ]
+        );
+        // 每个客户端的第二次、以及规则一样对待的其他客户端，都从缓存拿
+        // Each client's second query, and any other client the rules treat alike,
+        // comes from the cache
+        assert_eq!(
+            (
+                sink_queries.load(Ordering::Relaxed),
+                normal_queries.load(Ordering::Relaxed)
+            ),
+            (1, 1)
+        );
+        // 快速路径查的是同一个键 / The fast path looks up the same key
+        for (client, expected) in [("10.0.0.1", SINK), ("10.0.0.2", NORMAL)] {
+            let peer: SocketAddr = format!("{client}:53000").parse().unwrap();
+            let Ok(Some(FastPathResponse::CacheHit { cached, .. })) =
+                engine.handle_packet_fast(&query(false), peer)
+            else {
+                panic!("{client}: the fast path must find its own cached answer");
+            };
+            assert_eq!(first_a(Ok(cached)), Some(expected), "{client}");
+        }
+    }
+
+    /// 同时问时，另一个客户端不能等在这台设备的查询上拿走它的应答。
+    /// Asking at once, another client must not wait on the device's query and
+    /// take its answer.
+    #[tokio::test]
+    async fn a_device_specific_answer_is_not_handed_to_another_client_waiting() {
+        let (engine, _, _) = device_split().await;
+        assert_eq!(
+            ask_at_once(&engine, ["10.0.0.1", "10.0.0.2"]).await,
+            [Some(SINK), Some(NORMAL)]
+        );
+    }
+
+    /// 按 EDNS 分流时，带与不带 EDNS 的请求各拿各的应答：响应缓存和规则缓存都要分开。
+    /// Split by EDNS, requests with and without it each get their own answer:
+    /// the response cache and the rule cache must both keep them apart.
+    #[tokio::test]
+    async fn answers_split_by_edns_presence_stay_apart() {
+        let (with_edns, with_queries) = upstream(OTHER, 300).await;
+        let (without, without_queries) = upstream(NORMAL, 300).await;
+        let engine = engine(
+            serde_json::json!([]),
+            serde_json::json!([{ "id": "main", "rules": [
+                rule("edns", serde_json::json!([{ "type": "edns_present", "expect": true }]), forward(&with_edns)),
+                rule("rest", any(), forward(&without))
+            ] }]),
+        );
+        let mut answers = Vec::new();
+        for edns in [true, false, true, false] {
+            answers.push(ask(&engine, "10.0.0.1", edns).await);
+        }
+        assert_eq!(
+            answers,
+            [Some(OTHER), Some(NORMAL), Some(OTHER), Some(NORMAL)]
+        );
+        assert_eq!(
+            (
+                with_queries.load(Ordering::Relaxed),
+                without_queries.load(Ordering::Relaxed)
+            ),
+            (1, 1)
+        );
+    }
+
+    /// 按客户端地址的 GeoIP 分流（这里用私有地址判断）时，应答按地址分开。
+    /// Split by the client's GeoIP (private addresses here), answers stay apart by address.
+    #[tokio::test]
+    async fn answers_split_by_client_geoip_stay_apart() {
+        let (private, private_queries) = upstream(OTHER, 300).await;
+        let (public, public_queries) = upstream(NORMAL, 300).await;
+        let engine = engine(
+            serde_json::json!([]),
+            serde_json::json!([{ "id": "main", "rules": [
+                rule("private", serde_json::json!([{ "type": "geoip_private", "expect": true }]), forward(&private)),
+                rule("rest", any(), forward(&public))
+            ] }]),
+        );
+        let mut answers = Vec::new();
+        for client in ["10.0.0.1", "198.51.100.7", "10.0.0.2", "203.0.113.9"] {
+            answers.push(ask(&engine, client, false).await);
+        }
+        assert_eq!(
+            answers,
+            [Some(OTHER), Some(NORMAL), Some(OTHER), Some(NORMAL)]
+        );
+        // 同为私有或同为公网的客户端共用一份 / Private clients share, and so do public ones
+        assert_eq!(
+            (
+                private_queries.load(Ordering::Relaxed),
+                public_queries.load(Ordering::Relaxed)
+            ),
+            (1, 1)
+        );
+    }
+
+    /// 转发带取自客户端的 ECS、pipeline 没有自己的 ecs 时，应答按 ECS 子网分开：同一子网
+    /// 的客户端共用，私有地址不发送 ECS，也共用。
+    /// A forward that sends ECS from the client, in a pipeline without an ecs of
+    /// its own, keeps answers apart by subnet: clients in one subnet share, and so
+    /// do private addresses, which send no ECS.
+    #[tokio::test]
+    async fn answers_by_ecs_subnet_stay_apart_and_are_shared_within_a_subnet() {
+        let (echo, queries) = subnet_echo().await;
+        let engine = engine(
+            serde_json::json!([]),
+            serde_json::json!([{ "id": "main", "rules": [rule("rest", any(), serde_json::json!([{
+                "type": "forward", "upstream": echo,
+                "ecs": { "mode": "from_client_ip", "prefix_v4": 24, "prefix_v6": 56 }
+            }]))] }]),
+        );
+        let mut answers = Vec::new();
+        for client in [
+            "198.51.100.7",
+            "198.51.100.9",
+            "203.0.113.5",
+            "10.0.0.1",
+            "10.0.0.2",
+        ] {
+            answers.push(ask(&engine, client, false).await);
+        }
+        let subnet = |text: &str| Some(text.parse::<Ipv4Addr>().unwrap());
+        assert_eq!(
+            answers,
+            [
+                subnet("198.51.100.0"),
+                subnet("198.51.100.0"),
+                subnet("203.0.113.0"),
+                Some(NO_SUBNET),
+                Some(NO_SUBNET)
+            ]
+        );
+        assert_eq!(queries.load(Ordering::Relaxed), 3);
+        // 规则的决策不看子网，规则缓存里只有一份 / The rule decision ignores the subnet,
+        // so the rule cache holds one entry for everyone
+        let rule_key = calculate_rule_hash(
+            engine.state.load().cache_namespace("main"),
+            "main",
+            "example.com",
+            RecordType::A,
+            DNSClass::IN,
+            &RequesterKey::NONE,
+        );
+        assert!(engine.rule_cache.get(&rule_key).is_some());
+    }
+
+    /// 带着客户端 ECS 的转发之后，回答检查跳进另一个 pipeline：那里原样转发这个包，应答也
+    /// 因子网而不同。直接进入那个 pipeline 的客户端，以及同时经过同一路线、子网不同的客户端，
+    /// 都不能拿到它。
+    /// After a forward with ECS from the client, an answer check jumps into another
+    /// pipeline, which forwards that packet as it is, so its answer differs by
+    /// subnet too. Neither a client that enters that pipeline directly nor one in
+    /// another subnet taking the same route at once may get it.
+    #[tokio::test]
+    async fn ecs_carried_into_a_response_jump_keeps_answers_apart() {
+        let (echo, _) = subnet_echo().await;
+        let engine = engine(
+            serde_json::json!([
+                { "pipeline": "geo", "matchers": [{ "type": "client_ip", "cidr": "203.0.113.50/32" }] },
+                { "pipeline": "main", "matchers": any() }
+            ]),
+            serde_json::json!([
+                { "id": "main", "rules": [{
+                    "name": "check", "matchers": any(),
+                    "actions": [{
+                        "type": "forward", "upstream": echo,
+                        "ecs": { "mode": "from_client_ip", "prefix_v4": 24, "prefix_v6": 56 }
+                    }],
+                    "response_matchers": [{ "type": "upstream_equals", "value": echo }],
+                    "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "geo" }]
+                }] },
+                { "id": "geo", "rules": [rule("rest", any(), forward(&echo))] }
+            ]),
+        );
+        let subnet = |text: &str| Some(text.parse::<Ipv4Addr>().unwrap());
+        assert_eq!(
+            ask(&engine, "198.51.100.7", false).await,
+            subnet("198.51.100.0")
+        );
+        assert_eq!(ask(&engine, "203.0.113.50", false).await, Some(NO_SUBNET));
+        assert_eq!(
+            ask_at_once(&engine, ["192.0.2.7", "203.0.113.9"]).await,
+            [subnet("192.0.2.0"), subnet("203.0.113.0")]
+        );
+    }
+
+    /// 进入按客户端分流的 pipeline 后，这台设备得到静态应答，或者转发给一个慢的 sink 上游。
+    /// Inside a pipeline that splits by client the device gets a static answer, or
+    /// a forward to a slow sink upstream.
+    async fn device_actions() -> [(&'static str, serde_json::Value); 2] {
+        let (sink, _) = upstream_after(SINK, 300, Duration::from_millis(100)).await;
+        [
+            (
+                "static",
+                serde_json::json!([{ "type": "static_ip_response", "ip": "0.0.0.0" }]),
+            ),
+            ("slow forward", forward(&sink)),
+        ]
+    }
+
+    /// 转发之后回答检查跳进按客户端分流的 pipeline：等在这次转发上的另一个客户端不能拿到
+    /// 这台设备的应答；设备在那里转发时，另一个客户端也不能等在设备的转发上。
+    /// A forward whose answer check jumps into a pipeline that splits by client:
+    /// another client waiting on that forward must not get the device's answer, nor
+    /// wait on the device's own forward there.
+    #[tokio::test]
+    async fn an_answer_from_a_response_jump_into_a_client_split_stays_with_its_client() {
+        let (relay, _) = upstream(OTHER, 300).await;
+        let (normal, _) = upstream(NORMAL, 300).await;
+        for (device_does, action) in device_actions().await {
+            let engine = engine(
+                serde_json::json!([]),
+                serde_json::json!([
+                    { "id": "main", "rules": [{
+                        "name": "check", "matchers": any(), "actions": forward(&relay),
+                        "response_matchers": [{ "type": "upstream_equals", "value": relay }],
+                        "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "split" }]
+                    }] },
+                    { "id": "split", "rules": [
+                        rule("device", device(), action),
+                        rule("rest", any(), forward(&normal))
+                    ] }
+                ]),
+            );
+            assert_eq!(
+                ask_at_once(&engine, ["10.0.0.1", "10.0.0.2"]).await,
+                [Some(SINK), Some(NORMAL)],
+                "{device_does}"
+            );
+        }
+    }
+
+    /// 请求阶段跳进按客户端分流的 pipeline：另一个客户端不能等在设备的转发上。
+    /// A request-phase jump into a pipeline that splits by client: another client
+    /// must not wait on the device's forward there.
+    #[tokio::test]
+    async fn a_jump_into_a_client_split_keeps_answers_apart() {
+        let (normal, _) = upstream(NORMAL, 300).await;
+        for (device_does, action) in device_actions().await {
+            let engine = engine(
+                serde_json::json!([]),
+                serde_json::json!([
+                    { "id": "main", "rules": [rule("all", any(), serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": "split" }]))] },
+                    { "id": "split", "rules": [
+                        rule("device", device(), action),
+                        rule("rest", any(), forward(&normal))
+                    ] }
+                ]),
+            );
+            assert_eq!(
+                ask_at_once(&engine, ["10.0.0.1", "10.0.0.2"]).await,
+                [Some(SINK), Some(NORMAL)],
+                "{device_does}"
+            );
+        }
+    }
+
+    /// 回答检查一路跳转（p1/p2 → mid → split），最后进入按客户端分流的 pipeline：链上任何
+    /// 一个条目的等待者都不能拿到这台设备的应答。
+    /// Answer checks jumping along a chain (p1/p2 → mid → split) into a pipeline that
+    /// splits by client: no waiter on any entry along the chain may get the device's answer.
+    #[tokio::test]
+    async fn a_jump_chain_into_a_client_split_keeps_answers_apart() {
+        let (relay, _) = upstream(OTHER, 300).await;
+        let (normal, _) = upstream(NORMAL, 300).await;
+        let checked_jump = |id: &str, target: &str| {
+            serde_json::json!({ "id": id, "rules": [{
+                "name": id, "matchers": any(), "actions": forward(&relay),
+                "response_matchers": [{ "type": "upstream_equals", "value": relay }],
+                "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": target }]
+            }] })
+        };
+        for (device_does, action) in device_actions().await {
+            let engine = engine(
+                serde_json::json!([
+                    { "pipeline": "p1", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                    { "pipeline": "p2", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+                ]),
+                serde_json::json!([
+                    checked_jump("p1", "mid"),
+                    checked_jump("p2", "mid"),
+                    checked_jump("mid", "split"),
+                    { "id": "split", "rules": [
+                        rule("device", device(), action),
+                        rule("rest", any(), forward(&normal))
+                    ] }
+                ]),
+            );
+            assert_eq!(
+                ask_at_once(&engine, ["10.0.0.1", "10.0.0.2"]).await,
+                [Some(SINK), Some(NORMAL)],
+                "{device_does}"
+            );
+        }
+    }
+
+    /// 应答与请求方无关的 pipeline 照旧共享：不同客户端、带不带 EDNS，都只问一次上游。
+    /// A pipeline whose answer does not depend on the requester still shares: different
+    /// clients, with or without EDNS, ask the upstream once.
+    #[tokio::test]
+    async fn requester_independent_answers_are_still_shared() {
+        let (normal, queries) = upstream(NORMAL, 300).await;
+        let engine = engine(
+            serde_json::json!([]),
+            serde_json::json!([{ "id": "main", "rules": [rule("rest", any(), forward(&normal))] }]),
+        );
+        for (client, edns) in [
+            ("10.0.0.1", false),
+            ("10.0.0.2", true),
+            ("198.51.100.7", false),
+        ] {
+            assert_eq!(ask(&engine, client, edns).await, Some(NORMAL));
+        }
+        assert_eq!(queries.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            ask_at_once(&engine, ["10.0.0.3", "10.0.0.4"]).await,
+            [Some(NORMAL); 2]
+        );
+        assert_eq!(queries.load(Ordering::Relaxed), 1);
+    }
+
+    /// 后台刷新要按请求原来的样子重放：带 EDNS 的请求刷新时也带 EDNS，否则按 EDNS 分流的
+    /// 规则会走另一条路线，把别处的应答写进这个键。快速路径和异步路径两个触发点都测。
+    /// A background refresh replays the request as it came: one that carried EDNS
+    /// is refreshed with EDNS, or rules that split by EDNS take another route and
+    /// write another answer under its key. Both the fast path and the async path
+    /// trigger it.
+    #[tokio::test]
+    async fn a_background_refresh_replays_the_request_with_its_edns() {
+        for fast_path in [true, false] {
+            // 两秒的 TTL，阈值 99%：一秒之后的命中会触发刷新
+            // A two-second TTL at a 99% threshold: a hit after one second refreshes
+            let (with_edns, with_queries) = upstream(OTHER, 2).await;
+            let (without, without_queries) = upstream(NORMAL, 2).await;
+            let engine = Engine::new(
+                runtime_config(
+                    serde_json::json!({
+                        "cache_background_refresh": true,
+                        "cache_refresh_threshold_percent": 99,
+                        "cache_refresh_min_ttl": 1
+                    }),
+                    serde_json::json!([]),
+                    serde_json::json!([{ "id": "main", "rules": [
+                        rule("edns", serde_json::json!([{ "type": "edns_present", "expect": true }]), forward(&with_edns)),
+                        rule("rest", any(), forward(&without))
+                    ] }]),
+                ),
+                "test".to_string(),
+            )
+            .expect("engine");
+            assert_eq!(ask(&engine, "10.0.0.1", true).await, Some(OTHER));
+
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            let peer: SocketAddr = "10.0.0.1:53000".parse().unwrap();
+            if fast_path {
+                assert!(matches!(
+                    engine.handle_packet_fast(&query(true), peer),
+                    Ok(Some(FastPathResponse::CacheHit { .. }))
+                ));
+            } else {
+                assert_eq!(ask(&engine, "10.0.0.1", true).await, Some(OTHER));
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !engine.refreshing_set.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the refresh finishes");
+
+            assert_eq!(
+                (
+                    with_queries.load(Ordering::Relaxed),
+                    without_queries.load(Ordering::Relaxed)
+                ),
+                (2, 0),
+                "the refresh must take the EDNS route (fast path: {fast_path})"
+            );
+            assert_eq!(
+                ask(&engine, "10.0.0.1", true).await,
+                Some(OTHER),
+                "fast path: {fast_path}"
+            );
         }
     }
 }
