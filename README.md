@@ -41,6 +41,7 @@ This document describes the implementation currently on the main branch. Configu
 
 - **MaxMind GeoIP** — MMDB lookup and country/private-IP matchers.
 - **V2Ray GeoSite** — load `.dat` or supported JSON files for domain-category matchers.
+- **GeoSite entries** — written as in V2Ray's domain lists (domain-list-community). `domain:example.com` and a bare `example.com` match the domain and every subdomain by whole labels (not `notexample.com`); unlike `domain_suffix`, a leading dot changes nothing here. `full:example.com` matches the domain only, `keyword:` and `regexp:` match a keyword or a regular expression, and a bare value with `*` is a wildcard. JSON entries with an unknown prefix, no value or an invalid regex are skipped with a warning.
 - **Database reload** — configured GeoSite and GeoIP `.dat` files are watched and reloaded.
 - **DoQ 0-RTT handling** — global and per-upstream settings, with rejection/timeout fallback until restart.
 

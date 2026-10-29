@@ -40,6 +40,7 @@ KixDNS 是使用 Rust 编写的异步、非递归 DNS 转发服务器。它接�
 
 - **MaxMind GeoIP** — 支持 MMDB 查询以及国家和私有 IP 匹配器。
 - **V2Ray GeoSite** — 加载 `.dat` 或支持的 JSON 文件，用于域名分类匹配。
+- **GeoSite 条目** — 写法与 V2Ray 的域名列表（domain-list-community）相同。`domain:example.com` 和不带前缀的 `example.com` 按整段匹配域名本身及其所有子域名（不匹配 `notexample.com`）；和 domain_suffix 不同，这里开头加点不改变含义。`full:example.com` 只匹配域名本身，`keyword:`、`regexp:` 按关键词、正则匹配，不带前缀且含 `*` 的值按通配符匹配。JSON 里前缀不认识、没有值或正则无效的条目会跳过并给出警告。
 - **数据库重载** — 配置的 GeoSite 文件和 GeoIP `.dat` 文件会被监控并重载。
 - **DoQ 0-RTT 处理** — 支持全局和单上游配置；拒绝或超时后会回退，直到进程重启。
 
