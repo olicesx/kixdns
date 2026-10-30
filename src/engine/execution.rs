@@ -678,6 +678,7 @@ impl Engine {
                     qclass,
                     peer.ip(),
                     q.edns_present,
+                    Some(&self.geoip_manager),
                 )
             {
                 // Report before `?`: a response that cannot be built still ends the
@@ -4448,6 +4449,195 @@ mod tests {
             hash1, hash2,
             "Different QNAME should produce different cache hashes"
         );
+    }
+
+    /// 快速路径和完整规则路径对同一个查询不能有不同结论。以前快速路径把 GeoIP 和
+    /// GeoSite 条件一律当成不成立：越过本该决定的规则，用后面的静态规则作答；在「且非」
+    /// 里则反过来让规则命中。现在 GeoIP 条件在快速路径里判断；用到 GeoSite 的规则留给
+    /// 完整规则路径。
+    /// The fast path and the full rule path must not reach different decisions for
+    /// one query. The fast path used to take GeoIP and GeoSite matchers as never
+    /// matching: it passed over the rule that should decide and answered from a
+    /// later static rule, and under `and_not` it made a rule match the other way
+    /// round. GeoIP matchers are now judged on the fast path; rules that need
+    /// GeoSite are left to the full rule path.
+    #[tokio::test]
+    async fn the_fast_path_agrees_with_the_full_rule_path_on_geoip_and_geosite() {
+        use crate::matcher::advanced_rule::fast_static_match_with_rule;
+
+        let forward = |name: &str, matchers: serde_json::Value| {
+            serde_json::json!({
+                "name": name,
+                "matchers": matchers,
+                "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }]
+            })
+        };
+        let block = |name: &str, matchers: serde_json::Value| {
+            serde_json::json!({
+                "name": name,
+                "matchers": matchers,
+                "actions": [{ "type": "static_ip_response", "ip": "0.0.0.0" }]
+            })
+        };
+        let block_rest = block("rest", serde_json::json!([{ "type": "any" }]));
+        // (规则, 快速路径是否把它们留给完整规则路径)
+        // (rules, whether the fast path leaves them to the full rule path)
+        let rule_sets = [
+            (
+                serde_json::json!([
+                    forward(
+                        "public",
+                        serde_json::json!([{ "type": "geoip_private", "expect": false }])
+                    ),
+                    block_rest.clone()
+                ]),
+                false,
+            ),
+            (
+                serde_json::json!([
+                    forward(
+                        "from-jp",
+                        serde_json::json!([{ "type": "geoip_country", "country_codes": ["JP"] }])
+                    ),
+                    block_rest.clone()
+                ]),
+                false,
+            ),
+            (
+                serde_json::json!([
+                    forward(
+                        "not-cn",
+                        serde_json::json!([{ "type": "geo_site_not", "value": "cn" }])
+                    ),
+                    block_rest
+                ]),
+                true,
+            ),
+            (
+                serde_json::json!([block(
+                    "block-not-cn",
+                    serde_json::json!([
+                        { "type": "any" },
+                        { "type": "geo_site", "value": "cn", "operator": "and_not" }
+                    ])
+                )]),
+                true,
+            ),
+        ];
+        let dir = tempfile::tempdir().expect("temp dir");
+        let geoip = dir.path().join("geoip.json");
+        std::fs::write(
+            &geoip,
+            r#"{"entries":[{"country_code":"JP","ips":["198.51.100.0/24"]}]}"#,
+        )
+        .expect("write geoip");
+
+        let mut disagreements = Vec::new();
+        for (rules, left_to_full_path) in &rule_sets {
+            let raw = serde_json::json!({
+                "settings": { "default_upstream": "127.0.0.1:9" },
+                "pipelines": [{ "id": "main", "rules": rules }]
+            });
+            let cfg: crate::config::PipelineConfig =
+                serde_json::from_value(raw).expect("parse config");
+            let engine = Engine::new(
+                RuntimePipelineConfig::from_config(cfg).expect("runtime config"),
+                "test".to_string(),
+            )
+            .expect("engine");
+            engine
+                .geoip_manager
+                .write()
+                .load_from_v2ray_file(&geoip)
+                .expect("load geoip");
+            engine
+                .geosite_manager
+                .write()
+                .load_from_v2ray_string(
+                    r#"{"entries":[{"tag":"cn","domains":["domain:example.cn"]}]}"#,
+                )
+                .expect("load geosite");
+            let state = engine.state.load_full();
+            let pipeline = &state.pipeline.pipelines[0];
+            let compiled = engine.compiled_for(&state, "main").expect("compiled");
+
+            for client in ["198.51.100.7", "203.0.113.9", "10.0.0.1"] {
+                for domain in ["example.com", "example.cn"] {
+                    let client_ip: IpAddr = client.parse().unwrap();
+                    let case = format!("{} from {client} for {domain}", rules[0]["name"]);
+                    let full = engine.apply_rules(
+                        &state,
+                        pipeline,
+                        &RuleEvaluationContext::new(
+                            client_ip,
+                            domain,
+                            RecordType::A,
+                            DNSClass::IN,
+                            false,
+                            None,
+                            true,
+                        ),
+                    );
+                    let fast = fast_static_match_with_rule(
+                        compiled,
+                        domain,
+                        RecordType::A,
+                        DNSClass::IN,
+                        client_ip,
+                        false,
+                        Some(&engine.geoip_manager),
+                    );
+                    let agrees = match (&fast, &full) {
+                        // 快速路径只在不该作答时放手 / The fast path holds back only where it should
+                        (None, Decision::Static { .. }) => *left_to_full_path,
+                        (None, _) => true,
+                        (
+                            Some((Decision::Static { rcode, answers }, _)),
+                            Decision::Static {
+                                rcode: full_rcode,
+                                answers: full_answers,
+                            },
+                        ) => {
+                            !left_to_full_path
+                                && rcode == full_rcode
+                                && format!("{answers:?}") == format!("{full_answers:?}")
+                        }
+                        (Some(_), _) => false,
+                    };
+                    if !agrees {
+                        disagreements.push(case.clone());
+                    }
+
+                    // 再从监听器的入口走一遍：GeoIP 规则在快速路径里就答完，转发的交给完整路径
+                    // The same query through the listeners' entry: GeoIP rules are answered on
+                    // the fast path, and forwards are handed on to the full path
+                    if !left_to_full_path {
+                        let mut request = Message::new(0x5A5A, MessageType::Query, OpCode::Query);
+                        request.add_query(Query::query(
+                            Name::from_str(domain).unwrap(),
+                            RecordType::A,
+                        ));
+                        let answered = match engine
+                            .handle_packet_fast(
+                                &request.to_vec().unwrap(),
+                                SocketAddr::new(client_ip, 53000),
+                            )
+                            .expect("fast path")
+                        {
+                            Some(
+                                FastPathResponse::Direct(_) | FastPathResponse::CacheHit { .. },
+                            ) => true,
+                            Some(FastPathResponse::AsyncNeeded { .. }) => false,
+                            None => panic!("{case}: the quick parse must read this query"),
+                        };
+                        if answered != matches!(full, Decision::Static { .. }) {
+                            disagreements.push(format!("{case} (handle_packet_fast)"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(disagreements.is_empty(), "{disagreements:#?}");
     }
 
     /// 测试 fast_static_match 不会跳过不可预计算的规则

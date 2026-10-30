@@ -11,6 +11,8 @@ use smallvec::SmallVec;
 use crate::config::{Action, MatchOperator};
 use crate::engine::utils::parse_rcode;
 use crate::engine::{Decision, make_static_cname_answer, make_static_ip_answer};
+use crate::lock::RwLock;
+use crate::matcher::geoip::GeoIpManager;
 use crate::matcher::{RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig, RuntimeRule};
 use crate::matcher::{domain_suffix_index_key, domain_suffix_matches, eval_match_chain};
 
@@ -32,6 +34,11 @@ pub struct CompiledRule {
     pub matcher_operator: MatchOperator,
     pub matchers: Vec<CompiledMatcherWithOp>,
     pub precomputed: Option<PrecomputedAction>,
+    /// Whether a matcher needs GeoSite data, which the fast path leaves to the
+    /// full rule path (see `fast_static_match_with_rule`).
+    /// 是否有匹配器要用 GeoSite 数据；快速路径把这样的规则留给完整规则路径
+    /// （见 `fast_static_match_with_rule`）。
+    pub needs_geosite: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +221,12 @@ fn compile_rule(rule: &RuntimeRule, rule_idx: usize) -> CompiledRule {
         matcher_operator: rule.matcher_operator,
         matchers,
         precomputed,
+        needs_geosite: rule.matchers.iter().any(|m| {
+            matches!(
+                m.matcher,
+                RuntimeMatcher::GeoSite { .. } | RuntimeMatcher::GeoSiteNot { .. }
+            )
+        }),
     }
 }
 
@@ -272,7 +285,8 @@ fn precompute_action(rule: &RuntimeRule) -> Option<PrecomputedAction> {
     }
 }
 
-/// Test-only shorthand for [`fast_static_match_with_rule`] without the rule name.
+/// Test-only shorthand for [`fast_static_match_with_rule`] without the rule name
+/// and without GeoIP data.
 #[cfg(test)]
 pub(crate) fn fast_static_match(
     pipeline: &CompiledPipeline,
@@ -282,8 +296,16 @@ pub(crate) fn fast_static_match(
     client_ip: IpAddr,
     edns_present: bool,
 ) -> Option<Decision> {
-    fast_static_match_with_rule(pipeline, qname, qtype, qclass, client_ip, edns_present)
-        .map(|(decision, _)| decision)
+    fast_static_match_with_rule(
+        pipeline,
+        qname,
+        qtype,
+        qclass,
+        client_ip,
+        edns_present,
+        None,
+    )
+    .map(|(decision, _)| decision)
 }
 
 /// Like [`fast_static_match`], additionally returning the name of the rule
@@ -296,14 +318,33 @@ pub(crate) fn fast_static_match_with_rule<'a>(
     qclass: DNSClass,
     client_ip: IpAddr,
     edns_present: bool,
+    geoip: Option<&Arc<RwLock<GeoIpManager>>>,
 ) -> Option<(Decision, &'a str)> {
     let candidates = pipeline.index.get_candidates(qname, qtype);
     for idx in candidates {
         let rule = pipeline.rules.get(idx)?;
+        // GeoSite matching can scan a whole tag for a name it has not seen, and
+        // the fast path runs before a request is admitted, so a rule that needs
+        // it is left to the full rule path, which also keeps the rule order.
+        // GeoSite 匹配遇到没见过的域名可能要扫描整个标签，而快速路径运行在请求被准入
+        // 之前，所以用到它的规则留给完整规则路径，规则顺序也由那里保持。
+        if rule.needs_geosite {
+            return None;
+        }
         let matched = eval_match_chain(
             &rule.matchers,
             |m| m.operator,
-            |m| compiled_matcher_matches(&m.matcher, qname, qtype, qclass, client_ip, edns_present),
+            |m| {
+                compiled_matcher_matches(
+                    &m.matcher,
+                    qname,
+                    qtype,
+                    qclass,
+                    client_ip,
+                    edns_present,
+                    geoip,
+                )
+            },
         );
         if !matched {
             continue;
@@ -344,6 +385,7 @@ fn compiled_matcher_matches(
     qclass: DNSClass,
     client_ip: IpAddr,
     edns_present: bool,
+    geoip: Option<&Arc<RwLock<GeoIpManager>>>,
 ) -> bool {
     match matcher {
         CompiledMatcher::DomainExact { domain } => qname.eq_ignore_ascii_case(domain),
@@ -352,35 +394,13 @@ fn compiled_matcher_matches(
         CompiledMatcher::QueryType { qtype: rt } => *rt == qtype,
         CompiledMatcher::Qclass { qclass: cls } => *cls == qclass,
         CompiledMatcher::Regex { regex } => regex.is_match(qname),
-        CompiledMatcher::Complex { matcher } => match matcher {
-            RuntimeMatcher::Any => true,
-            RuntimeMatcher::DomainExact { value } => qname.eq_ignore_ascii_case(value),
-            RuntimeMatcher::DomainSuffix { value } => domain_suffix_matches(qname, value),
-            RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
-            RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
-            RuntimeMatcher::GeoipCountry { country_codes: _ } => {
-                // GeoIP matching requires GeoIpManager integration
-                // For now, return false (will be implemented in Engine integration)
-                false
-            }
-            RuntimeMatcher::GeoipPrivate { expect: _ } => {
-                // GeoIP private IP detection requires GeoIpManager integration
-                // For now, return false (will be implemented in Engine integration)
-                false
-            }
-            RuntimeMatcher::Qclass { value } => *value == qclass,
-            RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
-            RuntimeMatcher::GeoSite { tag: _ } => {
-                // GeoSite matching requires GeoSiteManager integration
-                // For now, return false (will be implemented in Engine integration)
-                false
-            }
-            RuntimeMatcher::GeoSiteNot { tag: _ } => {
-                // GeoSite negation matching requires GeoSiteManager integration
-                // For now, return false (will be implemented in Engine integration)
-                false
-            }
-            RuntimeMatcher::Qtype { value } => *value == qtype,
-        },
+        // Evaluated as on the full rule path, GeoIP included, so the two paths
+        // never disagree on whether a rule matches. GeoSite never reaches here
+        // (see `CompiledRule::needs_geosite`).
+        // 与完整规则路径一样求值，包括 GeoIP，两条路径对规则是否命中从不分歧。GeoSite
+        // 不会走到这里（见 `CompiledRule::needs_geosite`）。
+        CompiledMatcher::Complex { matcher } => {
+            matcher.matches_with_qtype(qname, qclass, client_ip, edns_present, qtype, geoip, None)
+        }
     }
 }
